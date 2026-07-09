@@ -1,0 +1,15 @@
+{
+  "name": "hyperdht-masked-transport",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Prototype: run the Hyperswarm DHT over a Tor circuit via @hyperswarm/dht-relay, hiding the client source IP",
+  "type": "commonjs",
+  "scripts": {
+    "demo": "node demo-local.js"
+  },
+  "dependencies": {
+    "@hyperswarm/dht-relay": "^0.4.3",
+    "@hyperswarm/secret-stream": "^6.6.2",
+    "hyperdht": "file:../.."
+  }
+}
