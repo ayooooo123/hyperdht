@@ -1,0 +1,31 @@
+{
+  "name": "dht-transport-policy",
+  "version": "0.0.1",
+  "description": "Per-peer transport policy for hyperdht: a trusted-peer whitelist that routes each connection direct (fast) or masked (Tor/relay)",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "lib/**/*.js"
+  ],
+  "scripts": {
+    "test": "prettier --check . && node test/all.js",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "b4a": "^1.6.4",
+    "hypercore-id-encoding": "^1.2.0"
+  },
+  "optionalDependencies": {
+    "bare-events": "^2.2.0"
+  },
+  "devDependencies": {
+    "@hyperswarm/dht-relay": "^0.4.3",
+    "brittle": "^3.0.0",
+    "dht-relay-tor": "file:../dht-relay-tor",
+    "hyperdht": "file:..",
+    "prettier": "^3.6.2",
+    "prettier-config-holepunch": "^2.0.0"
+  },
+  "prettier": "prettier-config-holepunch",
+  "license": "MIT"
+}
