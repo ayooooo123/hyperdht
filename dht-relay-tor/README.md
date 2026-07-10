@@ -85,7 +85,23 @@ The default export is `@hyperswarm/secret-stream` — the same Stream class
 dht-relay's `/tcp` transport exports — so `new Stream(isInitiator, socket)` works
 identically.
 
-## Run it over real Tor
+## Bundled Tor (no external daemon)
+
+Install the optional [bare-arti](../bare-arti) module and use the `arti` entry to
+boot an embedded Tor client instead of talking to a system `tor`:
+
+```js
+const { connect } = require('dht-relay-tor/arti')
+const DHT = require('@hyperswarm/dht-relay')
+
+const dht = new DHT(await connect({ onion: '<relay>.onion' }))
+```
+
+`bare-arti` starts Arti (Rust Tor) in the background, exposes a local SOCKS5 port,
+and this transport dials through it — nothing to install or run separately. See
+bare-arti's README for build/prebuild details.
+
+## Run it over real Tor (external daemon)
 
 1. Add a hidden service for the relay's port to your `torrc`:
 
