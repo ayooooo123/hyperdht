@@ -228,7 +228,8 @@ Private routing may be enabled at the Hyperswarm level:
 const swarm = new Hyperswarm({
   privacy: {
     mode: 'required',
-    allowLegacyEgress: true
+    allowLegacyEgress: true,
+    capabilityStore
   }
 })
 
@@ -241,7 +242,8 @@ The lower-level equivalent is:
 const dht = new HyperDHT({
   privateRouting: {
     mode: 'required',
-    allowLegacyEgress: true
+    allowLegacyEgress: true,
+    capabilityStore
   }
 })
 
@@ -251,6 +253,12 @@ const swarm = new Hyperswarm({ dht })
 If both `privacy` and an injected `dht` are provided, Hyperswarm validates that
 the injected instance satisfies the requested policy. It must not silently
 construct or select another DHT.
+
+`allowLegacyEgress: true` requires a durable `capabilityStore` implementing
+asynchronous `get(noisePublicKey)`, `put(noisePublicKey, record)`, and
+`delete(noisePublicKey, signedTombstone)` operations. Construction rejects
+without it. Node, Bare, Android, and iOS adapters must persist atomically in an
+application-private location and survive process restart.
 
 Relay service configuration is explicit and separate from client privacy:
 
@@ -307,8 +315,8 @@ contains route keys or complete paths. Stable private errors include
 `ERR_PRIVACY_UNAVAILABLE`, `ERR_PRIVATE_GUARD_UNAVAILABLE`,
 `ERR_PRIVATE_ROUTE_LOST`, `ERR_PRIVATE_ROUTE_ROTATING`,
 `ERR_PRIVATE_COMMAND_UNSUPPORTED`, `ERR_PRIVATE_RELAY_BUSY`,
-`ERR_PRIVATE_DESCRIPTOR_INVALID`, `ERR_PRIVATE_DOWNGRADE`, and
-`ERR_PRIVATE_AUTHENTICATION`.
+`ERR_PRIVATE_DESCRIPTOR_INVALID`, `ERR_PRIVATE_DOWNGRADE`,
+`ERR_PRIVATE_CAPABILITY_STORE_FULL`, and `ERR_PRIVATE_AUTHENTICATION`.
 
 ## Architecture
 
@@ -370,11 +378,25 @@ independent stream circuits, but every circuit and generation has fresh keys,
 counters, IDs, limits, and replay state.
 
 All identities in a compiled route are distinct. Safety and private roles are
-derived from a domain-separated hash of the long-term identity and protocol
-version; an advertisement cannot choose its role. Selection rejects repeated
-identities, repeated endpoints, IPv4 `/24` concentration when alternatives
-exist, incompatible versions or cell parameters, role mismatch, loops,
-expired advertisements, and locally quarantined nodes. Lookup and announce
+derived exactly as:
+
+```text
+digest = BLAKE2b-256(
+  UTF8("hyperdht-private-routes/role/v0") || identityPublicKey32
+)
+role = (digest[0] & 1) === 0 ? SAFETY : PRIVATE
+```
+
+The domain's `v0` is the inherited prototype role-format version; changing the
+domain, input encoding, hash, selected bit, or mapping requires a protocol
+version bump. An advertisement cannot choose its role.
+
+Selection rejects repeated identities, repeated endpoints, any two route
+positions in the same IPv4 `/24`, any two route positions in the same IPv6
+`/48`, incompatible versions or cell parameters, role mismatch, loops,
+expired advertisements, and locally quarantined nodes. IPv4-mapped IPv6 is
+normalized and evaluated as IPv4. There is no prefix-diversity relaxation in
+`required` mode; insufficient candidates fail closed. Lookup and announce
 branches share only the guard identity and endpoint; their middles and exits
 are pairwise distinct. Diversity is a placement heuristic, not Sybil proof.
 
@@ -409,6 +431,16 @@ probe and amplification budgets, validates reachability through the ordinary
 DHT exchange, derives the address-based node ID, and records provenance. A
 client-supplied address or self-signed advertisement alone never triggers an
 exit probe.
+
+Before any probe or table admission, the exit requires a globally routable
+unicast address and a port from 1 through 65,535. It rejects unspecified,
+loopback, private, carrier-grade NAT, link-local, unique-local, site-local,
+multicast, documentation, benchmarking, reserved, IPv4-mapped special-use,
+and other IANA special-purpose ranges. The check precedes network IO, signature
+work that depends on the target, and destination allocation. Production code
+has no override. The isolated namespace test harness injects a non-exported
+test authority that allowlists its exact synthetic endpoints; it cannot admit
+an address not signed into that test topology.
 
 Each reference maps server-side to the issuing exit, branch and circuit IDs,
 generation, address, derived DHT node ID, provenance, expiry, and allowed
@@ -515,10 +547,19 @@ receive-only tombstones and can never reopen or transfer a second duplex.
 Private capability is authenticated only by an endpoint-signed live descriptor
 or signed capability/tombstone record. A valid private descriptor always wins
 over legacy egress. Once a destination identity has presented a valid private
-capability, its local capability pin remains until the signed expiry or an
-identity-signed downgrade tombstone; missing, suppressed, malformed, or expired
-replacement data cannot silently select legacy egress and returns
-`ERR_PRIVATE_DOWNGRADE`.
+capability, its durable capability pin survives descriptor expiry and process
+restart until an identity-signed downgrade tombstone is accepted. Missing,
+suppressed, malformed, or expired replacement data cannot select legacy egress
+and returns `ERR_PRIVATE_DOWNGRADE`.
+
+The capability store is bounded to 4,096 identities by default. It never
+evicts a live privacy pin to make room: reaching capacity returns
+`ERR_PRIVATE_CAPABILITY_STORE_FULL` and disables legacy egress for untracked
+identities. A pin is deleted only by a valid identity-signed downgrade
+tombstone or an explicit user security reset that clearly warns that downgrade
+memory will be lost. Cache cleanup, application upgrade, descriptor expiry,
+ordinary LRU pressure, and crash recovery cannot turn a known private identity
+back into a first contact.
 
 On first contact, an identity for which no authenticated private capability has
 ever been observed may use legacy egress only when `allowLegacyEgress` is true
@@ -549,13 +590,15 @@ OFF -> BOOTSTRAPPING -> GUARD_PINNED -> READY -> ROTATING
 - Shutdown closes Hyperswarm and DHT activity before destroying routes and
   zeroizing owned secrets.
 
-Cold start is numerically bounded. `BootstrapIO` contacts at most three
-configured bootstrap endpoints sequentially and actively challenges at most
-three distinct prospective guards total across all referrals. Endpoints are
+Cold start is numerically bounded. V1 accepts only numeric IPv4 or IPv6
+bootstrap and guard endpoints and performs no DNS. `BootstrapIO` contacts at
+most three configured bootstrap endpoints sequentially and actively
+challenges at most three distinct prospective guards total across all
+referrals. Endpoints are
 deduplicated before contact; retries do not expand either set; only one direct
-challenge is in flight; and one ten-second global deadline covers resolution,
-cookies, challenges, and the first guard link. Bootstrap hostname resolution,
-when configured, occurs only inside this phase. Exhausting any bound returns
+challenge is in flight; and one ten-second global deadline covers cookies,
+challenges, and the first guard link. A hostname, multiple-address container,
+or nonnumeric referral is rejected before IO. Exhausting any bound returns
 `ERR_PRIVATE_GUARD_UNAVAILABLE`.
 
 The exposure report records phase, contact category, redacted endpoint hash,
@@ -583,9 +626,9 @@ unbounded configuration:
 
 - outer cell: exactly 1,200 bytes; outer payload: at most 1,146 bytes;
 - end-to-end route payload: at most 1,073 bytes per cell;
-- one stream write: at most eight route fragments, or 8,584 bytes;
-- queued/read stream data: at most eight fragments and 8,584 bytes per duplex
-  direction by default;
+- one internal route message: at most eight route fragments, or 8,584 bytes;
+- queued/in-flight and read data: at most eight route fragments and 8,584 bytes
+  per duplex direction by default;
 - half-open route or reassembly deadline: 5,000 ms;
 - remote actors: 128; pending remote requests: 64; replay and tombstone entries:
   64 each per host;
@@ -600,6 +643,15 @@ atomic per fragment/message, fair across circuits, and returns bounded `BUSY`
 or destroys the affected circuit without direct fallback. Production tuning
 may lower defaults; increasing a wire or security ceiling requires a reviewed
 spec amendment and adversarial memory/amplification tests.
+
+The public duplex accepts arbitrary legal write sizes. It lazily segments a
+large caller write across as many internal route messages as required and uses
+ordinary backpressure while keeping no more than the negotiated queued/in-flight
+ceiling. It does not reject a public write merely because it exceeds 8,584
+bytes. Ownership of the caller's buffer follows the existing stream contract;
+write completion occurs only after its segments have crossed the local bounded
+queue. This preserves transparent Hypercore replication without making an
+internal message unbounded.
 
 ## Authoritative Test Oracle
 
