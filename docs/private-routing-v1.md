@@ -265,12 +265,7 @@ Relay service configuration is explicit and separate from client privacy:
 ```js
 const relay = new HyperDHT({
   privateRelay: {
-    capabilities: [
-      'CIRCUIT_RELAY_V1',
-      'DHT_EXIT_V1',
-      'LEGACY_EGRESS_V1',
-      'PRIVATE_RECORDS_V1'
-    ],
+    capabilities: ['CIRCUIT_RELAY_V1', 'DHT_EXIT_V1', 'LEGACY_EGRESS_V1', 'PRIVATE_RECORDS_V1'],
     limits: {
       maxCircuits: 128,
       maxCircuitsPerNeighbor: 32,
@@ -289,19 +284,19 @@ service implicitly.
 
 ### Required-mode method contract
 
-| Surface | `required` behavior |
-| --- | --- |
-| `ready()` | Waits for private readiness, not merely socket binding. Rejects if no valid guard and routes are available. |
-| `destroy()`, `suspend()`, `resume()` | Use the private lifecycle and erase or rebuild route authority without direct fallback. |
-| `lookup`, `announce`, `unannounce` | Use native address-free private presence records only. |
-| `immutableGet`, `immutablePut`, `mutableGet`, `mutablePut` | Use typed routed DHT requests; mutation prepare and commit remain on one branch generation and exit. |
-| `findPeer` | Returns verified private descriptors or opaque legacy-egress targets, never caller-dialable private addresses. |
-| `connect` | Uses a verified private descriptor, or an opaque legacy-egress target when explicitly allowed. |
-| `createServer`, `listen` | Maintain and publish private route descriptors; never advertise or accept a direct endpoint route. |
-| `pool`, raw streams | May use only a routed implementation that carries no direct address/send authority; otherwise reject with `ERR_PRIVATE_COMMAND_UNSUPPORTED`. |
-| raw `query` or unregistered commands | Reject unless an immutable private command policy defines codecs, bounds, cost, amplification, destination provenance, and branch class. |
-| Hyperswarm `join`, `joinPeer`, `flush` | Preserve current lifecycle semantics while discovery and connection attempts remain routed. |
-| Hyperswarm `leave`, `leavePeer`, `suspend`, `resume`, `destroy` | Cancel and tear down private work with the same externally visible completion semantics as direct mode. |
+| Surface                                                         | `required` behavior                                                                                                                          |
+| --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ready()`                                                       | Waits for private readiness, not merely socket binding. Rejects if no valid guard and routes are available.                                  |
+| `destroy()`, `suspend()`, `resume()`                            | Use the private lifecycle and erase or rebuild route authority without direct fallback.                                                      |
+| `lookup`, `announce`, `unannounce`                              | Use native address-free private presence records only.                                                                                       |
+| `immutableGet`, `immutablePut`, `mutableGet`, `mutablePut`      | Use typed routed DHT requests; mutation prepare and commit remain on one branch generation and exit.                                         |
+| `findPeer`                                                      | Returns verified private descriptors or opaque legacy-egress targets, never caller-dialable private addresses.                               |
+| `connect`                                                       | Uses a verified private descriptor, or an opaque legacy-egress target when explicitly allowed.                                               |
+| `createServer`, `listen`                                        | Maintain and publish private route descriptors; never advertise or accept a direct endpoint route.                                           |
+| `pool`, raw streams                                             | May use only a routed implementation that carries no direct address/send authority; otherwise reject with `ERR_PRIVATE_COMMAND_UNSUPPORTED`. |
+| raw `query` or unregistered commands                            | Reject unless an immutable private command policy defines codecs, bounds, cost, amplification, destination provenance, and branch class.     |
+| Hyperswarm `join`, `joinPeer`, `flush`                          | Preserve current lifecycle semantics while discovery and connection attempts remain routed.                                                  |
+| Hyperswarm `leave`, `leavePeer`, `suspend`, `resume`, `destroy` | Cancel and tear down private work with the same externally visible completion semantics as direct mode.                                      |
 
 Existing firewall callbacks execute at the actual endpoint against the remote
 Noise public key and payload, not against an exit identity. Cancellation,
