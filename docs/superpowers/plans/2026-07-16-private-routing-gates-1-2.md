@@ -302,17 +302,17 @@ new DHT({
 
 The injected adapter contract is:
 
-```js
-{
-  ;(ready(),
-    suspend(),
-    resume(),
-    destroy(),
-    bootstrap({ target, limit }),
-    closest({ target, limit }),
-    key(destination),
-    id(destination),
-    request({ to, token, internal, command, target, value, attempt }))
+```text
+RequestTransport {
+  ready()
+  suspend()
+  resume()
+  destroy()
+  bootstrap({ target, limit })
+  closest({ target, limit })
+  key(destination)
+  id(destination)
+  request({ to, token, internal, command, target, value, attempt })
 }
 ```
 
@@ -320,17 +320,24 @@ Lifecycle methods may return promises. `bootstrap()` returns a promise or async 
 
 Each adapter `request()` call is one attempt and returns:
 
-```js
-{
-  ;(promise, cancel(reason))
+```text
+RequestOperation {
+  promise
+  cancel(reason)
 }
 ```
 
 `promise` resolves to the existing logical reply shape:
 
-```js
-{
-  ;(rtt, from, to, token, closerNodes, error, value)
+```text
+LogicalReply {
+  rtt
+  from
+  to
+  token
+  closerNodes
+  error
+  value
 }
 ```
 
@@ -338,11 +345,11 @@ The wrapper validates that `from` and every `closerNodes` entry have a valid ada
 
 Every admitted destination becomes an internal immutable candidate:
 
-```js
-{
-  ;(destination, // retained opaque adapter value; never cloned or mutated
-    key, // string copied from adapter.key(destination)
-    id) // copied 32-byte buffer from adapter.id(destination)
+```text
+Candidate {
+  destination  retained opaque adapter value; never cloned or mutated
+  key          string copied from adapter.key(destination)
+  id           copied 32-byte buffer from adapter.id(destination)
 }
 ```
 
@@ -537,25 +544,25 @@ Expected: FAIL on unimplemented request and lifecycle behavior.
 
 Inside `lib/request-transport.js`, add a private request class matching the subset Query and Session use:
 
-```js
-{
-  ;(to,
-    token,
-    internal,
-    command,
-    target,
-    value,
-    session,
-    index,
-    sent,
-    retries,
-    destroyed,
-    timeout,
-    oncycle,
-    onresponse,
-    onerror,
-    send(force),
-    destroy(error))
+```text
+TransportRequest {
+  to
+  token
+  internal
+  command
+  target
+  value
+  session
+  index
+  sent
+  retries
+  destroyed
+  timeout
+  oncycle
+  onresponse
+  onerror
+  send(force)
+  destroy(error)
 }
 ```
 
