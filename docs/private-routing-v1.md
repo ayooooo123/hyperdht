@@ -107,6 +107,63 @@ metadata. None of these parties can decrypt a later peer-to-peer Noise stream.
 - Host compromise or application-level identity correlation.
 - Constant-rate cover traffic, especially on mobile.
 
+### Active-relay adversary
+
+V1 assumes that any one guard, middle, exit, private-route relay, or storage
+node may be actively malicious. A single malicious participant may drop,
+delay, duplicate, reorder, replay, truncate, tag, or mutate traffic and may
+return dishonest unsigned DHT results. It may cause denial of service. Without
+collusion, it must not:
+
+- decrypt a source-to-exit or source-to-destination inner payload outside its
+  own terminal role;
+- learn a non-adjacent endpoint address from protocol state;
+- substitute a cell, control message, descriptor, or destination reference
+  across circuits, directions, branches, generations, or identities;
+- forge route readiness, route opening, storage receipts, or endpoint Noise
+  authentication;
+- turn an exit into an arbitrary network proxy.
+
+Collusion between the guard and an exit, one operator obtaining multiple path
+positions through distinct identities, and global timing correlation remain
+out of scope. The topology rules still prohibit one known identity or endpoint
+from occupying multiple positions in a route.
+
+### Minimum cryptographic invariants
+
+The experimental v1 implementation inherits the verified prototype's minimum
+cryptographic construction:
+
+- Ed25519-compatible Hypercore identity signatures;
+- X25519 ephemeral/static key agreement with all-zero shared-secret rejection;
+- domain-separated keyed BLAKE2b (`crypto_generichash`) derivation;
+- independent 32-byte keys and 16-byte nonce prefixes for every direction,
+  cell class, context, circuit, and generation;
+- XChaCha20-Poly1305 AEAD with a 24-byte nonce formed from the 16-byte prefix
+  and one unsigned 64-bit big-endian counter;
+- exact transcript binding of protocol version, identities, roles, branch and
+  circuit IDs, generation, direction, class, negotiated limits, and descriptor
+  or advertisement digests relevant to that context;
+- fixed 1,200-byte randomly padded outer cells;
+- source-to-exit and source-to-destination inner AEAD contexts, so removing one
+  hop layer never exposes DHT or application plaintext to an intermediate;
+- authentication before any counter, replay, route, or application state
+  changes.
+
+CONTROL and STREAM contexts accept exactly the next authenticated counter.
+DATAGRAM contexts use a bounded 64-counter replay window and deliver a counter
+at most once. Duplicate counters are always rejected. Gaps outside the
+applicable bound fail the circuit. Counter wrap is forbidden; approaching
+exhaustion starts rotation and exhaustion destroys the circuit.
+
+Every route generation creates fresh keys, nonce prefixes, circuit IDs,
+counters, replay state, and destination capabilities. Authentication failure,
+counter exhaustion, failed confirmation, close, or expiry tears down dependent
+state. Owned secret buffers are erased on transfer or teardown to the extent
+the JavaScript and native runtimes permit. Fixed-vector, substitution,
+property, fuzz, and external cryptographic review are required before the wire
+format may be called stable.
+
 ## Repository Boundaries
 
 ### `dht-rpc`
@@ -195,9 +252,63 @@ If both `privacy` and an injected `dht` are provided, Hyperswarm validates that
 the injected instance satisfies the requested policy. It must not silently
 construct or select another DHT.
 
-Relay service configuration is explicit and separate from client privacy
-configuration. Exact names and capacity fields are fixed only when the relay
-service implementation is designed and tested.
+Relay service configuration is explicit and separate from client privacy:
+
+```js
+const relay = new HyperDHT({
+  privateRelay: {
+    capabilities: [
+      'CIRCUIT_RELAY_V1',
+      'DHT_EXIT_V1',
+      'LEGACY_EGRESS_V1',
+      'PRIVATE_RECORDS_V1'
+    ],
+    limits: {
+      maxCircuits: 128,
+      maxCircuitsPerNeighbor: 32,
+      maxCircuitQueuedBytes: 256 * 1024,
+      maxQueuedBytes: 8 * 1024 * 1024
+    }
+  }
+})
+```
+
+Capabilities may be enabled independently except that every terminating exit
+also requires `CIRCUIT_RELAY_V1`. An advertisement is signed and binds the
+exact enabled capabilities, experimental protocol version, limits, identity,
+route-encryption key, epoch, and expiry. Client privacy never enables relay
+service implicitly.
+
+### Required-mode method contract
+
+| Surface | `required` behavior |
+| --- | --- |
+| `ready()` | Waits for private readiness, not merely socket binding. Rejects if no valid guard and routes are available. |
+| `destroy()`, `suspend()`, `resume()` | Use the private lifecycle and erase or rebuild route authority without direct fallback. |
+| `lookup`, `announce`, `unannounce` | Use native address-free private presence records only. |
+| `immutableGet`, `immutablePut`, `mutableGet`, `mutablePut` | Use typed routed DHT requests; mutation prepare and commit remain on one branch generation and exit. |
+| `findPeer` | Returns verified private descriptors or opaque legacy-egress targets, never caller-dialable private addresses. |
+| `connect` | Uses a verified private descriptor, or an opaque legacy-egress target when explicitly allowed. |
+| `createServer`, `listen` | Maintain and publish private route descriptors; never advertise or accept a direct endpoint route. |
+| `pool`, raw streams | May use only a routed implementation that carries no direct address/send authority; otherwise reject with `ERR_PRIVATE_COMMAND_UNSUPPORTED`. |
+| raw `query` or unregistered commands | Reject unless an immutable private command policy defines codecs, bounds, cost, amplification, destination provenance, and branch class. |
+| Hyperswarm `join`, `joinPeer`, `flush` | Preserve current lifecycle semantics while discovery and connection attempts remain routed. |
+| Hyperswarm `leave`, `leavePeer`, `suspend`, `resume`, `destroy` | Cancel and tear down private work with the same externally visible completion semantics as direct mode. |
+
+Existing firewall callbacks execute at the actual endpoint against the remote
+Noise public key and payload, not against an exit identity. Cancellation,
+timeout, half-close, error, and teardown propagate through the route and retain
+their ordinary stream meaning.
+
+`dht.privateRouting` exposes a read-only controller with `mode`, `ready()`,
+`status()`, and `exposureReport()`. The report contains only bounded bootstrap
+contact categories, counts, timestamps, and redacted endpoint hashes; it never
+contains route keys or complete paths. Stable private errors include
+`ERR_PRIVACY_UNAVAILABLE`, `ERR_PRIVATE_GUARD_UNAVAILABLE`,
+`ERR_PRIVATE_ROUTE_LOST`, `ERR_PRIVATE_ROUTE_ROTATING`,
+`ERR_PRIVATE_COMMAND_UNSUPPORTED`, `ERR_PRIVATE_RELAY_BUSY`,
+`ERR_PRIVATE_DESCRIPTOR_INVALID`, `ERR_PRIVATE_DOWNGRADE`, and
+`ERR_PRIVATE_AUTHENTICATION`.
 
 ## Architecture
 
@@ -238,6 +349,35 @@ The existing verified PearTube prototype may supply implementation material,
 tests, and commit attribution. It is not copied as an application package or
 treated as the canonical module boundary.
 
+### Normative v1 topology and diversity
+
+A routed DHT or legacy-egress branch has exactly three relay positions:
+
+```text
+endpoint -> guard -> safety middle -> DHT/egress exit
+```
+
+A private-to-private compiled route has two independently selected segments:
+
+```text
+source -> guard -> safety middle -> private entry -> private middle
+       -> private final -> destination
+```
+
+The source selects only the safety segment. The destination selects and
+publishes only the private segment. A source safety segment may carry multiple
+independent stream circuits, but every circuit and generation has fresh keys,
+counters, IDs, limits, and replay state.
+
+All identities in a compiled route are distinct. Safety and private roles are
+derived from a domain-separated hash of the long-term identity and protocol
+version; an advertisement cannot choose its role. Selection rejects repeated
+identities, repeated endpoints, IPv4 `/24` concentration when alternatives
+exist, incompatible versions or cell parameters, role mismatch, loops,
+expired advertisements, and locally quarantined nodes. Lookup and announce
+branches share only the guard identity and endpoint; their middles and exits
+are pairwise distinct. Diversity is a placement heuristic, not Sybil proof.
+
 ## Traffic Flows
 
 ### Routed DHT request
@@ -255,6 +395,36 @@ Lookup and announce use separate middle and exit branches while sharing a
 stable guard lease. This reduces trivial linkability without requiring
 continuous cover traffic.
 
+#### Opaque destination references
+
+The client never authorizes a raw host, port, or caller-computed DHT node ID.
+After branch opening, an exit creates a fresh branch handle secret and a
+bounded destination table. It mints an unpredictable `DESTINATION_REF_V1` only
+for a node learned from the exit's configured bootstrap set, current routing
+table, actively validated capability cache, recent valid protocol traffic, or
+a protocol-valid response from an already admitted reference.
+
+A referral is only evidence. Before exposing a reference, the exit applies
+probe and amplification budgets, validates reachability through the ordinary
+DHT exchange, derives the address-based node ID, and records provenance. A
+client-supplied address or self-signed advertisement alone never triggers an
+exit probe.
+
+Each reference maps server-side to the issuing exit, branch and circuit IDs,
+generation, address, derived DHT node ID, provenance, expiry, and allowed
+command classes. It is unforgeable under the branch handle secret and cannot
+be used at another exit, after rotation, or for a different command. Exit
+policy restricts targets to valid DHT address families and ports and restricts
+requests to registered DHT codecs and exact request/response and amplification
+bounds. Arbitrary UDP, hostname resolution, private-network scanning, and raw
+socket destinations are not registered commands.
+
+Mutation tokens remain bound to the destination reference, exit, observed
+exit address, branch generation, command, and expiry. If a branch rotates
+between prepare and commit, the client discards the token and restarts the
+operation. An exit may omit or lie about unsigned routing results, but cannot
+expand the permitted network or command surface.
+
 ### Connection to an unchanged peer
 
 ```text
@@ -269,6 +439,25 @@ This path provides source privacy during gradual adoption. A legacy peer cannot
 initiate a connection to a private-only listener without private descriptor
 support.
 
+The bridge reuses HyperDHT's existing `relayThrough` handshake and
+`blind-relay` stream pairing. Private discovery yields the expected remote
+Noise public key plus a single-use opaque egress target reference, never direct
+send authority. The source opens a routed stream to the egress exit. The exit
+binds that stream to one blind-relay session and issues the ordinary peer
+handshake with itself as `relayThrough`, `holepunch: false`, and local-address
+sharing disabled. The unchanged destination opens its normal raw relay stream
+to the exit and the exit pairs the two sides by the single-use session
+capability.
+
+The exit forwards stream bytes byte-for-byte and does not instantiate
+SecretStream. Source and destination each bind the existing Noise handshake to
+the expected remote public key; exit substitution therefore fails endpoint
+authentication. The routed source starts Noise only after authenticated relay
+pairing. Backpressure propagates between both bounded queues. Cancellation,
+firewall rejection, timeout, half-close, or either transport closing closes
+the paired side and erases the session capability. No signaling or data path
+may enable punch, direct race, address sharing, or relay-to-direct upgrade.
+
 ### Connection between private-capable peers
 
 ```text
@@ -281,6 +470,62 @@ source verifies its endpoint binding, expiry, protocol parameters, and route
 entry before compiling its safety route with the destination-selected route.
 Neither endpoint selects the complete path. Existing Hyperswarm then performs
 its normal Noise handshake inside the opened route.
+
+#### Private rendezvous and stream handoff
+
+A descriptor binds the destination Noise identity, descriptor ID and digest,
+public entry advertisement, private route-encryption key, protocol parameters,
+route epoch, expiry, and encrypted nested hop material under an endpoint
+signature or endpoint-scoped delegation.
+
+Opening uses this idempotent state machine:
+
+```text
+DESCRIPTOR_VERIFIED -> ACTIVATE -> READY -> ACK -> OPEN
+                `------ failure/timeout ------> DESTROYED
+```
+
+1. The source creates a fresh circuit identity, ephemeral route key, activation
+   nonce, circuit ID, and generation. `ACTIVATE` binds those values, the exact
+   descriptor digest, both expected Noise public keys, and negotiated bounds.
+2. Each private relay decrypts only its nested instruction, installs bounded
+   adjacent forwarding state, and forwards the remainder. The destination
+   verifies the complete destination-visible activation tuple and reserves the
+   redemption key `(descriptor ID, epoch, activation nonce, source route key)`.
+3. The destination returns authenticated `READY`. The source verifies it and
+   returns `ACK`. Neither side exposes a duplex or accepts Noise bytes yet.
+4. The destination atomically consumes the single-use redemption, installs the
+   final reverse state, returns authenticated `OPEN`, and transfers exactly one
+   routed duplex to its HyperDHT server.
+5. Only after verifying `OPEN` does the source transfer exactly one routed
+   duplex to HyperDHT `connect`. Existing Noise then authenticates the peers and
+   encrypts all stream bytes end to end.
+
+The complete open deadline is five seconds. Semantic messages use one initial
+send and at most four bounded retries under fresh datagram counters while
+retaining identical authenticated bodies. An identical duplicate receives the
+cached next response; a conflicting tuple, wrong identity or generation,
+expired descriptor, reused redemption, authentication failure, or deadline
+destroys all half-open state. Concurrent redemption of one capability has
+exactly one winner. Delayed setup messages are accepted only by bounded
+receive-only tombstones and can never reopen or transfer a second duplex.
+
+#### Capability negotiation and downgrade
+
+Private capability is authenticated only by an endpoint-signed live descriptor
+or signed capability/tombstone record. A valid private descriptor always wins
+over legacy egress. Once a destination identity has presented a valid private
+capability, its local capability pin remains until the signed expiry or an
+identity-signed downgrade tombstone; missing, suppressed, malformed, or expired
+replacement data cannot silently select legacy egress and returns
+`ERR_PRIVATE_DOWNGRADE`.
+
+On first contact, an identity for which no authenticated private capability has
+ever been observed may use legacy egress only when `allowLegacyEgress` is true
+and a valid legacy DHT result produced the opaque egress target. This preserves
+source address privacy but cannot prove that a first-contact attacker did not
+suppress an unknown destination's private descriptor. Applications requiring
+mutual private routing must disable legacy egress.
 
 ## Lifecycle and Failure Semantics
 
@@ -304,6 +549,23 @@ OFF -> BOOTSTRAPPING -> GUARD_PINNED -> READY -> ROTATING
 - Shutdown closes Hyperswarm and DHT activity before destroying routes and
   zeroizing owned secrets.
 
+Cold start is numerically bounded. `BootstrapIO` contacts at most three
+configured bootstrap endpoints sequentially and actively challenges at most
+three distinct prospective guards total across all referrals. Endpoints are
+deduplicated before contact; retries do not expand either set; only one direct
+challenge is in flight; and one ten-second global deadline covers resolution,
+cookies, challenges, and the first guard link. Bootstrap hostname resolution,
+when configured, occurs only inside this phase. Exhausting any bound returns
+`ERR_PRIVATE_GUARD_UNAVAILABLE`.
+
+The exposure report records phase, contact category, redacted endpoint hash,
+first/last attempt time, attempt count, and outcome for no more than those six
+distinct endpoints. Before `GUARD_PINNED`, the implementation proves that all
+bootstrap sockets, routing entries, DNS/discovery scratch state, callbacks, and
+generic send capabilities are destroyed. Post-readiness guard revalidation can
+contact exactly the pinned guard and cannot follow referrals or resolve another
+endpoint.
+
 Errors are structured and never recommend a direct retry. Stable categories
 include privacy unavailable, insufficient diverse relays, guard unavailable,
 route lost or expired, route rotating, unsupported private command, relay busy,
@@ -313,6 +575,31 @@ changed.
 Metrics may contain aggregate transitions, latency, generation, capacity, and
 error category. They must not log route keys, complete paths, topics, raw
 descriptors, private endpoints, or stable cross-generation identifiers.
+
+### Prototype resource ceilings
+
+The first implementation and all tests use explicit ceilings rather than
+unbounded configuration:
+
+- outer cell: exactly 1,200 bytes; outer payload: at most 1,146 bytes;
+- end-to-end route payload: at most 1,073 bytes per cell;
+- one stream write: at most eight route fragments, or 8,584 bytes;
+- queued/read stream data: at most eight fragments and 8,584 bytes per duplex
+  direction by default;
+- half-open route or reassembly deadline: 5,000 ms;
+- remote actors: 128; pending remote requests: 64; replay and tombstone entries:
+  64 each per host;
+- relay circuits: 128 globally and 32 per observed neighbor;
+- relay queued bytes: 256 KiB per circuit and 8 MiB globally;
+- finalization: one initial send plus four retries inside five seconds;
+- DATAGRAM replay window: 64 counters.
+
+Every limit is checked before allocation or callback. A peer may negotiate
+smaller limits, never larger values than local policy. Queue admission is
+atomic per fragment/message, fair across circuits, and returns bounded `BUSY`
+or destroys the affected circuit without direct fallback. Production tuning
+may lower defaults; increasing a wire or security ceiling requires a reviewed
+spec amendment and adversarial memory/amplification tests.
 
 ## Authoritative Test Oracle
 
@@ -335,6 +622,16 @@ Packet capture is authoritative. After guard pinning:
 - teardown leaves no process, socket, route, queue, or owned secret state.
 
 The readiness report separately lists the bounded pre-guard contacts.
+
+Network capture is paired with a semantic leak oracle. Test endpoints receive
+distinctive numeric addresses and byte sentinels. The harness inspects decoded
+DHT messages, capability advertisements, presence records, descriptors,
+connection metadata, routing and destination tables, public events, structured
+errors, metrics, logs, and teardown snapshots. Outside the explicitly allowed
+bootstrap/guard observations, it fails if an endpoint address or sentinel is
+present in plaintext, promoted to public dial authority, or returned through a
+public API. This detects address disclosure inside an otherwise correctly
+routed packet, which namespace edges alone cannot prove absent.
 
 ## Required Test Scenarios
 
@@ -370,13 +667,22 @@ The readiness report separately lists the bounded pre-guard contacts.
 - Insufficient relays or diversity.
 - Network changes, suspend/resume, and rotation races.
 - Every unavailable path fails or rebuilds privately without direct fallback.
+- Single malicious relay tagging, payload substitution, cross-circuit
+  injection, delayed replay, counter exhaustion, and selective forwarding.
+- Dishonest exit responses and response amplification attempts.
+- Descriptor replay across topics, endpoint identities, epochs, and route
+  generations, including concurrent single-use redemption.
+- Truncated or modified routed Noise streams; exits never obtain application
+  plaintext and tampering fails Noise authentication.
 
 ### Mobile lifecycle
 
 Portable deterministic tests simulate background suspension, long expiry,
 resume, and Wi-Fi/cellular address changes without continuous cover traffic.
 Actual Android and iOS tests begin only after the portable Node and Bare suites
-pass.
+pass. PearTube integration remains blocked until both native platforms also
+pass background/resume and network-transition tests with socket-edge and
+no-direct-fallback assertions.
 
 ## CI Responsibilities
 
@@ -401,10 +707,11 @@ pass.
 
 ### `hyperswarm-testnet`
 
-- Portable Node and Bare topologies.
+- Portable Node and Bare topologies on Linux, macOS, and Windows.
 - Privileged Linux capture gate.
 - Scheduled seeded fuzz and churn suite.
 - Exact commit pins for all integration dependencies.
+- Android emulator and iOS simulator lifecycle gates before PearTube work.
 
 ## Repository Workflow
 
@@ -432,7 +739,10 @@ experimental notices and their upstream license and authorship.
    Hyperswarm, and real Hypercore replication.
 6. **Reliability:** pass churn, rotation, quotas, network changes, Node/Bare,
    and simulated mobile lifecycle suites.
+7. **Native mobile:** pass Android and iOS background/resume and network-change
+   leak gates using the same required-mode policy.
 
-PearTube integration remains blocked until every gate passes. Passing the gates
-does not by itself authorize production anonymity claims; the cryptographic
-construction and wire format require external review before stabilization.
+PearTube integration remains blocked until all seven gates pass. Passing the
+gates does not by itself authorize production anonymity claims; the
+cryptographic construction and wire format require external review before
+stabilization.
