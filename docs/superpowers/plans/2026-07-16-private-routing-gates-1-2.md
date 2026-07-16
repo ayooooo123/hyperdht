@@ -290,9 +290,9 @@ The new constructor options are exact and intentionally low-level:
 
 ```js
 new DHT({
-  outboundPolicy: "transport-only",
-  requestTransport,
-});
+  outboundPolicy: 'transport-only',
+  requestTransport
+})
 ```
 
 `outboundPolicy` accepts only:
@@ -304,7 +304,7 @@ The injected adapter contract is:
 
 ```js
 {
-  (ready(),
+  ;(ready(),
     suspend(),
     resume(),
     destroy(),
@@ -312,7 +312,7 @@ The injected adapter contract is:
     closest({ target, limit }),
     key(destination),
     id(destination),
-    request({ to, token, internal, command, target, value, attempt }));
+    request({ to, token, internal, command, target, value, attempt }))
 }
 ```
 
@@ -322,7 +322,7 @@ Each adapter `request()` call is one attempt and returns:
 
 ```js
 {
-  (promise, cancel(reason));
+  ;(promise, cancel(reason))
 }
 ```
 
@@ -330,7 +330,7 @@ Each adapter `request()` call is one attempt and returns:
 
 ```js
 {
-  (rtt, from, to, token, closerNodes, error, value);
+  ;(rtt, from, to, token, closerNodes, error, value)
 }
 ```
 
@@ -340,9 +340,9 @@ Every admitted destination becomes an internal immutable candidate:
 
 ```js
 {
-  (destination, // retained opaque adapter value; never cloned or mutated
+  ;(destination, // retained opaque adapter value; never cloned or mutated
     key, // string copied from adapter.key(destination)
-    id); // copied 32-byte buffer from adapter.id(destination)
+    id) // copied 32-byte buffer from adapter.id(destination)
 }
 ```
 
@@ -399,7 +399,7 @@ Adapter failures map exactly:
 At the end of `test.js`, load the focused tests:
 
 ```js
-require("./test/request-transport");
+require('./test/request-transport')
 ```
 
 In `test/request-transport.js`, define `createTransport(overrides = {})` with every required method, deterministic 32-byte IDs, opaque refs, call logs, and deferred request promises. Do not open sockets in the fake.
@@ -409,19 +409,19 @@ In `test/request-transport.js`, define `createTransport(overrides = {})` with ev
 Cover these cases:
 
 ```js
-test("direct remains the default", async (t) => {
-  const dht = new DHT({ bootstrap: false });
-  t.is(dht.outboundPolicy, "direct");
-  t.ok(dht.io);
-  await dht.destroy();
-});
+test('direct remains the default', async (t) => {
+  const dht = new DHT({ bootstrap: false })
+  t.is(dht.outboundPolicy, 'direct')
+  t.ok(dht.io)
+  await dht.destroy()
+})
 
-test("transport-only requires a complete adapter", (t) => {
+test('transport-only requires a complete adapter', (t) => {
   t.exception(
-    () => new DHT({ outboundPolicy: "transport-only" }),
-    (err) => err.code === "TRANSPORT_INVALID",
-  );
-});
+    () => new DHT({ outboundPolicy: 'transport-only' }),
+    (err) => err.code === 'TRANSPORT_INVALID'
+  )
+})
 ```
 
 Also reject unknown `outboundPolicy` values, incomplete methods, `requestTransport` supplied without `transport-only`, invalid `maxTransportCandidates`, and every direct-only constructor option listed in the complete-state section. Assert their stable error codes rather than messages. Do not call `key()` or `id()` during construction because no destination has been admitted yet.
@@ -539,7 +539,7 @@ Inside `lib/request-transport.js`, add a private request class matching the subs
 
 ```js
 {
-  (to,
+  ;(to,
     token,
     internal,
     command,
@@ -555,7 +555,7 @@ Inside `lib/request-transport.js`, add a private request class matching the subs
     onresponse,
     onerror,
     send(force),
-    destroy(error));
+    destroy(error))
 }
 ```
 
@@ -645,10 +645,10 @@ Expected: FAIL on direct-address assumptions in `lib/query.js`.
 Add internal helpers in `index.js`:
 
 ```js
-_nodeKey(node);
-_nodeId(node);
-_closestQueryNodes(target, limit);
-_resolveQueryBootstrap(target, limit);
+_nodeKey(node)
+_nodeId(node)
+_closestQueryNodes(target, limit)
+_resolveQueryBootstrap(target, limit)
 ```
 
 Direct mode delegates to the existing host/port/table behavior. Transport-only delegates to the validated adapter. Return copied/validated node descriptors so adapter mutation cannot rewrite `_seen` or ordering state after admission.
@@ -783,7 +783,7 @@ Change workflow branch filters to:
 ```yaml
 push:
   tags:
-    - "*"
+    - '*'
   branches: [main, private-routing-v1]
 pull_request:
   branches: [main, private-routing-v1]
