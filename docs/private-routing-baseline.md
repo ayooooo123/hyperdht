@@ -35,6 +35,20 @@ Both runtimes reproduced the upstream chaos connection-count/startup failure on 
 
 ## GitHub CI evidence
 
+### DHT-RPC Gate 2
+
+DHT-RPC Gate 2 is pinned to commit `49fea12c6c7677e50b114de64226b1856e308f3c` and is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). The authoritative pull-request workflow [run 29621682832](https://github.com/ayooooo123/dht-rpc/actions/runs/29621682832) completed successfully with these job results:
+
+- `Lint`: PASS
+- `Test / linux`: PASS
+- `Test / darwin`: PASS
+- `Test / win32`: PASS
+- `trigger_canary`: SKIPPED as expected because this was not a tag build
+
+The matching branch-push workflow [run 29621681121](https://github.com/ayooooo123/dht-rpc/actions/runs/29621681121) independently produced the same results at the same commit. Each platform test job ran the repository's complete `npm test` command, covering both Node and Bare. This validates the generic, fail-closed request-transport seam and preservation of the direct-mode suite; it does not by itself establish an anonymous routing protocol.
+
+### Upstream and initial fork evidence
+
 - HyperDHT upstream SHA `ac6eaa5def633ccdd0b1c733f14b63036dbe4d33` passed its official Node, integration, and Bare jobs on Ubuntu, macOS, and Windows in [upstream workflow run 28976031145](https://github.com/holepunchto/hyperdht/actions/runs/28976031145).
 - Hyperswarm upstream SHA `48d4241f69f848bb4c9dccb65b6fce5a9f40009d` passed its official jobs on all configured CI platforms in [upstream workflow run 26114678837](https://github.com/holepunchto/hyperswarm/actions/runs/26114678837).
 
