@@ -37,7 +37,7 @@ Both runtimes reproduced the upstream chaos connection-count/startup failure on 
 
 ### Gate 3A DHT-RPC opaque-context compatibility
 
-HyperDHT Gate 3A pins DHT-RPC commit `be3317e2ad30e237e52169d1f72485a5b7d9d04b` with the exact dependency string `github:ayooooo123/dht-rpc#be3317e2ad30e237e52169d1f72485a5b7d9d04b`. The implementation is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). Its exact-head branch-push [run 29625387013](https://github.com/ayooooo123/dht-rpc/actions/runs/29625387013) and pull-request [run 29625388495](https://github.com/ayooooo123/dht-rpc/actions/runs/29625388495) both completed with the same results:
+HyperDHT Gate 3A pins DHT-RPC commit `8eea32f93fd83eb8de6bbddf9bb263720decb4af` with the exact dependency string `github:ayooooo123/dht-rpc#8eea32f93fd83eb8de6bbddf9bb263720decb4af`. The implementation is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). Its exact-head branch-push [run 29626703272](https://github.com/ayooooo123/dht-rpc/actions/runs/29626703272) and pull-request [run 29626704251](https://github.com/ayooooo123/dht-rpc/actions/runs/29626704251) both completed with the same results:
 
 - `Lint`: PASS
 - `Test / linux`: PASS
@@ -46,6 +46,8 @@ HyperDHT Gate 3A pins DHT-RPC commit `be3317e2ad30e237e52169d1f72485a5b7d9d04b` 
 - `trigger_canary`: SKIPPED as expected because these were not tag builds
 
 Each operating-system test job ran the repository's complete `npm test` command, covering both Node and Bare. This evidence proves only generic opaque-context propagation through the DHT-RPC request-transport seam and compatibility with its direct mode. It does not establish anonymity or demonstrate live private routing.
+
+HyperDHT [run 29625809850](https://github.com/ayooooo123/hyperdht/actions/runs/29625809850) caught a direct-root `Session.destroy()` compatibility regression in the earlier DHT-RPC pin. Commit `8eea32f93fd83eb8de6bbddf9bb263720decb4af` restores reusable cancellation only for legacy direct-root sessions; child sessions and transport-only sessions remain terminal after destruction. This compatibility correction does not add anonymity or demonstrate a live private route.
 
 ### DHT-RPC Gate 2
 
