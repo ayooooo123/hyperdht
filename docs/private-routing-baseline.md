@@ -37,7 +37,7 @@ Both runtimes reproduced the upstream chaos connection-count/startup failure on 
 
 ### Gate 3A DHT-RPC opaque-context compatibility
 
-HyperDHT Gate 3A pins DHT-RPC commit `42f954661994811ad9c187ace8e173e9146fc1ef` with the exact dependency string `github:ayooooo123/dht-rpc#42f954661994811ad9c187ace8e173e9146fc1ef`. The implementation is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). Its exact-head branch-push [run 29627693418](https://github.com/ayooooo123/dht-rpc/actions/runs/29627693418) and pull-request [run 29627694591](https://github.com/ayooooo123/dht-rpc/actions/runs/29627694591) both completed with the same results:
+HyperDHT Gate 3A pins the reviewed DHT-RPC commit `fe04496196ea2ce42d1de27b0f770b02d2a87cd5` with the exact dependency string `github:ayooooo123/dht-rpc#fe04496196ea2ce42d1de27b0f770b02d2a87cd5`. The implementation is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). Its exact-head branch-push [run 29646677295](https://github.com/ayooooo123/dht-rpc/actions/runs/29646677295) and pull-request [run 29646678762](https://github.com/ayooooo123/dht-rpc/actions/runs/29646678762) both completed with the same results:
 
 - `Lint`: PASS
 - `Test / linux`: PASS
@@ -46,6 +46,8 @@ HyperDHT Gate 3A pins DHT-RPC commit `42f954661994811ad9c187ace8e173e9146fc1ef` 
 - `trigger_canary`: SKIPPED as expected because these were not tag builds
 
 Each operating-system test job ran the repository's complete `npm test` command, covering both Node and Bare. This evidence proves only generic opaque-context propagation through the DHT-RPC request-transport seam and compatibility with its direct mode. It does not establish anonymity or demonstrate live private routing.
+
+Historical intermediate evidence: DHT-RPC commit `42f954661994811ad9c187ace8e173e9146fc1ef` previously passed exact-head branch-push [run 29627693418](https://github.com/ayooooo123/dht-rpc/actions/runs/29627693418) and pull-request [run 29627694591](https://github.com/ayooooo123/dht-rpc/actions/runs/29627694591). That commit was the approved opaque-context pin before later traversal-query seam hardening produced the current `fe04496196ea2ce42d1de27b0f770b02d2a87cd5` pin. It is retained here only as historical compatibility evidence, not as the current dependency.
 
 HyperDHT [run 29625809850](https://github.com/ayooooo123/hyperdht/actions/runs/29625809850) caught a direct-root `Session.destroy()` compatibility regression in an earlier DHT-RPC pin. Intermediate commit `8eea32f93fd83eb8de6bbddf9bb263720decb4af` restored reusable cancellation for legacy direct-root sessions while keeping child and transport-only sessions terminal.
 
@@ -63,6 +65,19 @@ The reviewed deterministic route-core head is `85d7b574496b7a6fda4b23290dd375ee4
 - `trigger_canary`: SKIPPED as expected because this was not a tag build
 
 The focused fragmentation suite passed 43/43 tests and 2,843/2,843 assertions independently in Node and Bare. The aggregate deterministic private-routing suite passed 175/175 tests and 5,620/5,620 assertions independently in Node and Bare. The reviewed core includes protocol errors and constants, cryptographic vectors and counters, fixed cells and authenticated route payloads, and bounded fragmentation/reassembly. This is deterministic protocol-core, resource-bound, compatibility, and regression evidence only. It does not establish a live route, anonymity, resistance to traffic analysis, or production readiness.
+
+### Gate 3A deterministic DHT adapter and traversal
+
+The reviewed deterministic adapter/traversal head is `e2da3a9c867eb4e077e7977330fa066a8ce2d4d6`. Its [exact-head workflow run 29646997859](https://github.com/ayooooo123/hyperdht/actions/runs/29646997859) completed successfully:
+
+- [Ubuntu job 88086804697](https://github.com/ayooooo123/hyperdht/actions/runs/29646997859/job/88086804697): PASS for `npm test`, `npm run integration`, and `npm run test:bare`
+- [macOS job 88086804707](https://github.com/ayooooo123/hyperdht/actions/runs/29646997859/job/88086804707): PASS for `npm test`, `npm run integration`, and `npm run test:bare`
+- [Windows job 88086804718](https://github.com/ayooooo123/hyperdht/actions/runs/29646997859/job/88086804718): PASS for `npm test`, `npm run integration`, and `npm run test:bare`
+- `trigger_canary`: SKIPPED as expected because this was not a tag build
+
+The focused `RoutedDHTIO` and deterministic traversal suites passed 42/42 tests and 377/377 assertions independently in Node and Bare. The aggregate deterministic private-routing suite passed 247/247 tests and 7,219/7,219 assertions independently in Node and Bare. The reviewed substrate proves immutable-get command binding, unforgeable query contexts, opaque branch-bound destinations, fail-closed adapter lifecycle and ownership, and iterative traversal over a trusted in-process five-node fake topology.
+
+This evidence is semantic-only compatibility and regression evidence. The fake topology sends no packets and contains no live authority, adjacent links, three-position route, routed-reply wire codec, DHT exit, or packet-capture oracle. It does not establish anonymity, traffic-analysis resistance, a live private route, or production readiness.
 
 ### DHT-RPC Gate 2
 
