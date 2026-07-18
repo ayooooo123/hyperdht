@@ -25,6 +25,17 @@ function seed(value) {
   return b4a.alloc(32, value)
 }
 
+function forgedByteLength(value, byteLength) {
+  Object.defineProperty(value, 'byteLength', { value: byteLength })
+  return value
+}
+
+function revokedBuffer(size) {
+  const revocable = Proxy.revocable(b4a.alloc(size), {})
+  revocable.revoke()
+  return revocable.proxy
+}
+
 test('encryption key pairs are deterministic for a 32-byte seed', (t) => {
   const first = cryptoSuite.encryptionKeyPair(seed(1))
   const second = cryptoSuite.encryptionKeyPair(seed(1))
@@ -371,6 +382,222 @@ test('AEAD rejects malformed keys and cells with stable errors', (t) => {
   expectCode(t, () => cryptoSuite.open({ ...openBase, ciphertext: 'ciphertext' }), 'CELL_INVALID')
   expectCode(t, () => cryptoSuite.seal(null), 'CELL_INVALID')
   expectCode(t, () => cryptoSuite.open(null), 'CELL_INVALID')
+})
+
+test('crypto validation uses intrinsic buffer lengths despite forged shadows', (t) => {
+  const alice = cryptoSuite.encryptionKeyPair(seed(1))
+  const shortSeed = forgedByteLength(b4a.alloc(31), 32)
+  const shortKey = forgedByteLength(b4a.alloc(31), 32)
+  const longTranscript = forgedByteLength(b4a.alloc(4097), 0)
+  const longAssociatedData = forgedByteLength(b4a.alloc(513), 1)
+  const plaintext = forgedByteLength(b4a.from('hello'), 0)
+  const noncePrefix = b4a.alloc(16, 4)
+  const key = seed(3)
+
+  expectCode(t, () => cryptoSuite.keyPair(shortSeed), 'INVALID_KEY')
+  expectCode(t, () => cryptoSuite.encryptionKeyPair(shortSeed), 'INVALID_KEY')
+  expectCode(t, () => cryptoSuite.keyAgreement(shortKey, alice.publicKey), 'INVALID_KEY')
+  expectCode(t, () => cryptoSuite.keyAgreement(alice.secretKey, shortKey), 'INVALID_KEY')
+  expectCode(t, () => cryptoSuite.deriveKeys(shortKey, b4a.alloc(0)), 'INVALID_KEY')
+  expectCode(t, () => cryptoSuite.deriveKeys(key, longTranscript), 'INVALID_KEY')
+  expectCode(
+    t,
+    () =>
+      cryptoSuite.seal({
+        key,
+        noncePrefix,
+        counter: 0n,
+        associatedData: longAssociatedData,
+        plaintext
+      }),
+    'CELL_INVALID'
+  )
+
+  const ciphertext = cryptoSuite.seal({
+    key,
+    noncePrefix,
+    counter: 0n,
+    associatedData: b4a.from('header-v0'),
+    plaintext
+  })
+  t.is(ciphertext.byteLength, 21, 'the five-byte plaintext was encrypted in full')
+
+  forgedByteLength(ciphertext, 16)
+  t.alike(
+    cryptoSuite.open({
+      key,
+      noncePrefix,
+      counter: 0n,
+      associatedData: b4a.from('header-v0'),
+      ciphertext
+    }),
+    b4a.from('hello'),
+    'the five-byte plaintext was opened in full'
+  )
+})
+
+test('a forged short nonce prefix is rejected before sodium sees it', (t) => {
+  const original = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt
+  const noncePrefix = forgedByteLength(b4a.alloc(15, 4), 16)
+  let calls = 0
+
+  sodium.crypto_aead_xchacha20poly1305_ietf_encrypt = (...args) => {
+    calls++
+    return original(...args)
+  }
+
+  try {
+    expectCode(
+      t,
+      () =>
+        cryptoSuite.seal({
+          key: seed(3),
+          noncePrefix,
+          counter: 0n,
+          associatedData: b4a.alloc(0),
+          plaintext: b4a.from('hello')
+        }),
+      'INVALID_KEY'
+    )
+    t.is(calls, 0)
+  } finally {
+    sodium.crypto_aead_xchacha20poly1305_ietf_encrypt = original
+  }
+})
+
+test('revoked buffer proxies fail with stable crypto errors', (t) => {
+  const key = seed(3)
+  const noncePrefix = b4a.alloc(16, 4)
+  const associatedData = b4a.from('header-v0')
+  const base = { key, noncePrefix, counter: 0n, associatedData }
+
+  expectCode(t, () => cryptoSuite.keyPair(revokedBuffer(32)), 'INVALID_KEY')
+  expectCode(t, () => cryptoSuite.keyAgreement(revokedBuffer(32), key), 'INVALID_KEY')
+  expectCode(t, () => cryptoSuite.deriveKeys(revokedBuffer(32), b4a.alloc(0)), 'INVALID_KEY')
+  expectCode(t, () => cryptoSuite.deriveKeys(key, revokedBuffer(0)), 'INVALID_KEY')
+  expectCode(
+    t,
+    () => cryptoSuite.seal({ ...base, key: revokedBuffer(32), plaintext: b4a.alloc(0) }),
+    'INVALID_KEY'
+  )
+  expectCode(
+    t,
+    () => cryptoSuite.seal({ ...base, noncePrefix: revokedBuffer(16), plaintext: b4a.alloc(0) }),
+    'INVALID_KEY'
+  )
+  expectCode(
+    t,
+    () => cryptoSuite.seal({ ...base, associatedData: revokedBuffer(0), plaintext: b4a.alloc(0) }),
+    'CELL_INVALID'
+  )
+  expectCode(t, () => cryptoSuite.seal({ ...base, plaintext: revokedBuffer(0) }), 'CELL_INVALID')
+  expectCode(t, () => cryptoSuite.open({ ...base, ciphertext: revokedBuffer(16) }), 'CELL_INVALID')
+})
+
+test('AEAD snapshots each option once and normalizes hostile access', (t) => {
+  const key = seed(3)
+  const noncePrefix = b4a.alloc(16, 4)
+  const associatedData = b4a.from('header-v0')
+  const plaintext = b4a.from('hello')
+  const values = { key, noncePrefix, counter: 0n, associatedData, plaintext }
+  const reads = new Map()
+  const options = {}
+
+  for (const [name, value] of Object.entries(values)) {
+    Object.defineProperty(options, name, {
+      get() {
+        reads.set(name, (reads.get(name) || 0) + 1)
+        return value
+      }
+    })
+  }
+
+  const ciphertext = cryptoSuite.seal(options)
+  t.is(ciphertext.byteLength, 21)
+  for (const name of Object.keys(values)) t.is(reads.get(name), 1, `${name} read once`)
+
+  let hostileReads = 0
+  const hostile = {}
+  Object.defineProperty(hostile, 'key', {
+    get() {
+      hostileReads++
+      throw new Error('hostile getter')
+    }
+  })
+  expectCode(t, () => cryptoSuite.seal(hostile), 'CELL_INVALID')
+  t.is(hostileReads, 1)
+
+  const revocable = Proxy.revocable({}, {})
+  revocable.revoke()
+  expectCode(t, () => cryptoSuite.seal(revocable.proxy), 'CELL_INVALID')
+  expectCode(t, () => cryptoSuite.open(revocable.proxy), 'CELL_INVALID')
+
+  const nullPrototype = Object.assign(Object.create(null), values)
+  t.alike(cryptoSuite.seal(nullPrototype), ciphertext)
+})
+
+test('AEAD open snapshots each option once', (t) => {
+  const values = {
+    key: seed(3),
+    noncePrefix: b4a.alloc(16, 4),
+    counter: 0n,
+    associatedData: b4a.from('header-v0')
+  }
+  const ciphertext = cryptoSuite.seal({ ...values, plaintext: b4a.from('hello') })
+  values.ciphertext = ciphertext
+  const reads = new Map()
+  const options = {}
+
+  for (const [name, value] of Object.entries(values)) {
+    Object.defineProperty(options, name, {
+      get() {
+        reads.set(name, (reads.get(name) || 0) + 1)
+        return value
+      }
+    })
+  }
+
+  t.alike(cryptoSuite.open(options), b4a.from('hello'))
+  for (const name of Object.keys(values)) t.is(reads.get(name), 1, `${name} read once`)
+})
+
+test('crypto primitives ignore overridden caller buffer methods', (t) => {
+  const alice = cryptoSuite.encryptionKeyPair(seed(1))
+  const bob = cryptoSuite.encryptionKeyPair(seed(2))
+  const sharedSecret = b4a.from(alice.secretKey)
+  const remotePublicKey = b4a.from(bob.publicKey)
+  const transcript = b4a.from('transcript-a')
+  const sentinel = () => {
+    throw new Error('overridden caller method')
+  }
+
+  for (const buffer of [sharedSecret, remotePublicKey, transcript]) {
+    buffer.set = sentinel
+    buffer.subarray = sentinel
+  }
+
+  t.alike(
+    cryptoSuite.keyAgreement(sharedSecret, remotePublicKey),
+    cryptoSuite.keyAgreement(alice.secretKey, bob.publicKey)
+  )
+  const keys = cryptoSuite.deriveKeys(sharedSecret, transcript)
+  const associatedData = b4a.from('header-v0')
+  const plaintext = b4a.from('hello')
+  for (const buffer of [keys.forwardKey, keys.forwardNoncePrefix, associatedData, plaintext]) {
+    buffer.set = sentinel
+    buffer.subarray = sentinel
+  }
+
+  const args = {
+    key: keys.forwardKey,
+    noncePrefix: keys.forwardNoncePrefix,
+    counter: 0n,
+    associatedData
+  }
+  const ciphertext = cryptoSuite.seal({ ...args, plaintext })
+  ciphertext.set = sentinel
+  ciphertext.subarray = sentinel
+  t.alike(cryptoSuite.open({ ...args, ciphertext }), b4a.from('hello'))
 })
 
 test('AEAD accepts exact primitive bounds', (t) => {
