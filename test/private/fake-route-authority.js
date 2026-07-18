@@ -3,6 +3,7 @@
 const b4a = require('b4a')
 
 const { BRANCH_CLASS } = require('../../lib/private/protocol')
+const { clearRoutedRequest, decodeRoutedRequest } = require('../../lib/private/routed-dht')
 
 class FakeRouteAuthority {
   constructor() {
@@ -19,8 +20,14 @@ class FakeRouteAuthority {
     this.lookup = []
     this.announce = []
     this.requests = []
+    this.semanticEdges = []
+    this.topologies = new Map()
     this.response = null
     this.requestHook = null
+  }
+
+  installTopology(branch, topology) {
+    this.topologies.set(branch, topology)
   }
 
   ready() {
@@ -79,6 +86,8 @@ class FakeRouteAuthority {
       }
     }
 
+    if (this.topologies.has(options.branch)) return this.#topologyRequest(state)
+
     const response = this.response
     return {
       promise: Promise.resolve(response).then((value) => {
@@ -96,8 +105,75 @@ class FakeRouteAuthority {
   }
 
   #records(options) {
+    const topology = this.topologies.get(options.branch)
+    if (topology !== undefined) {
+      return topology.seeds.slice(0, options.limit).map((index) => topology.records[index])
+    }
     const records = options.branch === BRANCH_CLASS.LOOKUP ? this.lookup : this.announce
     return records.slice(0, options.limit)
+  }
+
+  #topologyRequest(state) {
+    let routed = null
+    try {
+      routed = decodeRoutedRequest(state.encodedRequest)
+      const topology = this.topologies.get(state.branch)
+      const index = topology.records.findIndex((record) =>
+        b4a.equals(record.destinationRef, state.destinationRef)
+      )
+      if (index === -1) throw new Error('destination is outside the selected branch')
+
+      const parent = topology.parents[index]
+      this.semanticEdges.push({
+        branch: state.branch,
+        fromId: b4a.from(topology.records[parent].id),
+        toId: b4a.from(topology.records[index].id),
+        commandId: routed.commandId,
+        attempt: state.attempt
+      })
+
+      if (topology.pending && topology.pending.includes(index)) {
+        return operation(new Promise(() => {}), state, this)
+      }
+      if (topology.retryOnce && topology.retryOnce.includes(index) && state.attempt === 1) {
+        return operation(Promise.reject(new Error('deterministic retry')), state, this)
+      }
+
+      const response = {
+        rtt: index + 1,
+        from: topology.records[index],
+        to: null,
+        token: null,
+        closerNodes: topology.closer[index].map((closer) => topology.records[closer]),
+        error: 0,
+        value: topology.values[index]
+      }
+      return operation(Promise.resolve(response), state, this)
+    } finally {
+      if (routed !== null) clearRoutedRequest(routed)
+    }
+  }
+}
+
+function operation(promise, state, authority) {
+  return {
+    promise: promise.then(
+      (value) => {
+        revoke(state)
+        return value
+      },
+      (error) => {
+        revoke(state)
+        throw error
+      }
+    ),
+    cancel: (reason) => {
+      if (state.cancelled) return
+      state.cancelled = true
+      state.cancelReason = reason
+      revoke(state)
+      authority.calls.cancel++
+    }
   }
 }
 
