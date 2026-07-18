@@ -51,6 +51,8 @@ HyperDHT [run 29625809850](https://github.com/ayooooo123/hyperdht/actions/runs/2
 
 HyperDHT [run 29627213694](https://github.com/ayooooo123/hyperdht/actions/runs/29627213694) then passed the forced-holepunch regression but caught direct caller-owned queries being converted into terminal child sessions during the reusable-socket test. Commit `42f954661994811ad9c187ace8e173e9146fc1ef` restores legacy caller-session borrowing for direct queries, while transport-only queries retain scoped terminal child sessions. These compatibility corrections do not add anonymity or demonstrate a live private route.
 
+Final HyperDHT commit `5753a5b98a1e3dd5caabfcbd682df26b1111266f` completed [exact-head workflow run 29628278979](https://github.com/ayooooo123/hyperdht/actions/runs/29628278979) successfully. macOS, Ubuntu, and Windows each passed `npm install`, `npm test`, `npm run integration`, Bare installation, and `npm run test:bare`; the tag-only canary was skipped as expected. This is compatibility and regression evidence only. It does not establish anonymity or demonstrate a live private route.
+
 ### DHT-RPC Gate 2
 
 DHT-RPC Gate 2 is pinned to commit `49fea12c6c7677e50b114de64226b1856e308f3c` and is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). The authoritative pull-request workflow [run 29621682832](https://github.com/ayooooo123/dht-rpc/actions/runs/29621682832) completed successfully with these job results:
