@@ -228,24 +228,37 @@ test('random callback cannot mutate fragmentation arithmetic or buffer validatio
   }
 })
 
-test('random callback cannot replace the trusted frame allocator with caller memory', (t) => {
-  const allocate = b4a.allocUnsafeSlow
-  const backing = allocate(FRAGMENT_HEADER_SIZE + MAX_FRAGMENT_DATA)
+test('random callback cannot replace the concrete frame allocator with caller memory', (t) => {
+  const BufferConstructor = b4a.alloc(0).constructor
+  const allocateSlow = BufferConstructor.allocUnsafeSlow
+  const allocate = BufferConstructor.allocUnsafe
+  const backing = Reflect.apply(allocateSlow, BufferConstructor, [
+    FRAGMENT_HEADER_SIZE + MAX_FRAGMENT_DATA
+  ])
   const message = Uint8Array.prototype.subarray.call(backing, FRAGMENT_HEADER_SIZE)
   message.fill(0x64)
   let frames
   try {
     frames = fragment(message, {
       randomBytes() {
-        b4a.allocUnsafeSlow = (size) => (size === backing.byteLength ? backing : allocate(size))
+        const hostile = (size) =>
+          size === backing.byteLength
+            ? backing
+            : Reflect.apply(allocateSlow, BufferConstructor, [size])
+        BufferConstructor.allocUnsafeSlow = hostile
+        BufferConstructor.allocUnsafe = hostile
         return id(38)
       }
     })
   } finally {
-    b4a.allocUnsafeSlow = allocate
+    BufferConstructor.allocUnsafeSlow = allocateSlow
+    BufferConstructor.allocUnsafe = allocate
   }
 
   t.absent(frames[0] === backing)
+  t.absent(frames[0].buffer === backing.buffer)
+  t.is(frames[0].constructor, BufferConstructor)
+  t.ok(b4a.isBuffer(frames[0]))
   backing.fill(0)
   t.alike(
     Uint8Array.prototype.subarray.call(frames[0], FRAGMENT_HEADER_SIZE),
@@ -378,7 +391,7 @@ test('out-of-order fragments complete once and transfer an owned output', (t) =>
   })
 })
 
-test('malformed structural bounds fail before clock or observer callbacks', (t) => {
+test('malformed structural bounds fail before allocation, clock, or observer callbacks', (t) => {
   let clockCalls = 0
   let observerCalls = 0
   const reassembler = receiver({
@@ -407,6 +420,14 @@ test('malformed structural bounds fail before clock or observer callbacks', (t) 
   }
   t.is(clockCalls, 0)
   t.is(observerCalls, 0)
+
+  const valid = frame(id(115), 0, 1, b4a.from('valid'))
+  expectCode(t, () => reassembler.pushAuthenticated(valid), 'INVALID_ROUTE')
+  t.is(clockCalls, 0)
+  t.is(observerCalls, 0)
+  t.alike(reassembler.pushAuthenticated(valid), b4a.from('valid'))
+  t.is(clockCalls, 1)
+  t.is(observerCalls, 1)
 })
 
 test('identical duplicates are replay while conflicting duplicates clear only their message', (t) => {
@@ -1017,34 +1038,37 @@ test('collection prototype mutation cannot break replay, expiry, or destroy clea
   t.alike(destroyedOwned[0], b4a.alloc(destroyedOwned[0].byteLength))
 })
 
-test('clock allocator mutation cannot alias accepted storage to the caller frame', (t) => {
-  const allocate = b4a.allocUnsafeSlow
-  const message = b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x65)
-  const frames = fragment(message, { messageId: id(107) })
-  const callerData = Uint8Array.prototype.subarray.call(frames[0], FRAGMENT_HEADER_SIZE)
-  let mutate = true
-  const accepted = []
+test('clock cannot replace the concrete output allocator with caller memory', (t) => {
+  const BufferConstructor = b4a.alloc(0).constructor
+  const allocateSlow = BufferConstructor.allocUnsafeSlow
+  const allocate = BufferConstructor.allocUnsafe
+  const expected = b4a.from('owned clock output')
+  const input = fragment(expected, { messageId: id(107) })[0]
+  const backing = Reflect.apply(allocateSlow, BufferConstructor, [expected.byteLength])
   const reassembler = receiver({
     now() {
-      if (mutate) {
-        b4a.allocUnsafeSlow = (size) =>
-          size === callerData.byteLength ? callerData : allocate(size)
-      }
+      const hostile = (size) =>
+        size === backing.byteLength
+          ? backing
+          : Reflect.apply(allocateSlow, BufferConstructor, [size])
+      BufferConstructor.allocUnsafeSlow = hostile
+      BufferConstructor.allocUnsafe = hostile
       return 0
-    },
-    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
-      accepted.push(value)
     }
   })
+  let output
   try {
-    t.is(reassembler.pushAuthenticated(frames[0]), null)
+    output = reassembler.pushAuthenticated(input)
   } finally {
-    b4a.allocUnsafeSlow = allocate
+    BufferConstructor.allocUnsafeSlow = allocateSlow
+    BufferConstructor.allocUnsafe = allocate
   }
-  t.absent(accepted[0] === callerData)
-  callerData.fill(0)
-  mutate = false
-  t.alike(reassembler.pushAuthenticated(frames[1]), message)
+  t.absent(output === backing)
+  t.absent(output.buffer === backing.buffer)
+  t.is(output.constructor, BufferConstructor)
+  t.ok(b4a.isBuffer(output))
+  backing.fill(0)
+  t.alike(output, expected)
 })
 
 test('observer allocator mutation cannot alias completed output to the caller frame', (t) => {
