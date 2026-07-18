@@ -159,6 +159,55 @@ test('X25519 clears internal shared-secret scratch on success and failure', (t) 
   }
 })
 
+test('X25519 preserves unexpected native errors and clears its scratch', (t) => {
+  const original = sodium.crypto_scalarmult
+  const alice = cryptoSuite.encryptionKeyPair(seed(1))
+  const bob = cryptoSuite.encryptionKeyPair(seed(2))
+  const sentinel = new TypeError('unexpected scalarmult failure')
+  let scratch = null
+
+  sodium.crypto_scalarmult = (output) => {
+    scratch = output
+    output.fill(0x7f)
+    throw sentinel
+  }
+
+  try {
+    let error = null
+    try {
+      cryptoSuite.keyAgreement(alice.secretKey, bob.publicKey)
+    } catch (err) {
+      error = err
+    }
+
+    t.is(error, sentinel)
+    t.ok(scratch)
+    t.alike(scratch, b4a.alloc(32))
+  } finally {
+    sodium.crypto_scalarmult = original
+  }
+})
+
+test('X25519 maps the exact native low-order outcome to INVALID_KEY', (t) => {
+  const alice = cryptoSuite.encryptionKeyPair(seed(1))
+  const output = b4a.alloc(32)
+  let nativeError = null
+  let nativeResult = null
+
+  try {
+    nativeResult = sodium.crypto_scalarmult(output, alice.secretKey, b4a.alloc(32))
+  } catch (err) {
+    nativeError = err
+  }
+
+  t.ok(
+    nativeResult === false ||
+      b4a.equals(output, b4a.alloc(32)) ||
+      (nativeError && nativeError.message === 'status: -1')
+  )
+  expectCode(t, () => cryptoSuite.keyAgreement(alice.secretKey, b4a.alloc(32)), 'INVALID_KEY')
+})
+
 test('KDF separates direction, purpose, transcript, and nonce prefixes', (t) => {
   const a = cryptoSuite.deriveKeys(seed(3), b4a.from('transcript-a'))
   const b = cryptoSuite.deriveKeys(seed(3), b4a.from('transcript-b'))
@@ -341,6 +390,39 @@ test('AEAD encodes a nonzero counter as uint64 big-endian', (t) => {
   }
 })
 
+test('AEAD seal preserves unexpected native errors and clears its output', (t) => {
+  const original = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt
+  const sentinel = new TypeError('unexpected encrypt failure')
+  let output = null
+
+  sodium.crypto_aead_xchacha20poly1305_ietf_encrypt = (ciphertext) => {
+    output = ciphertext
+    ciphertext.fill(0x7f)
+    throw sentinel
+  }
+
+  try {
+    let error = null
+    try {
+      cryptoSuite.seal({
+        key: seed(3),
+        noncePrefix: b4a.alloc(16, 4),
+        counter: 0n,
+        associatedData: b4a.from('header-v0'),
+        plaintext: b4a.from('hello')
+      })
+    } catch (err) {
+      error = err
+    }
+
+    t.is(error, sentinel)
+    t.ok(output)
+    t.alike(output, b4a.alloc(21))
+  } finally {
+    sodium.crypto_aead_xchacha20poly1305_ietf_encrypt = original
+  }
+})
+
 test('AEAD rejects malformed keys and cells with stable errors', (t) => {
   const key = seed(3)
   const noncePrefix = b4a.alloc(16, 4)
@@ -494,49 +576,55 @@ test('revoked buffer proxies fail with stable crypto errors', (t) => {
   expectCode(t, () => cryptoSuite.open({ ...base, ciphertext: revokedBuffer(16) }), 'CELL_INVALID')
 })
 
-test('AEAD snapshots each option once and normalizes hostile access', (t) => {
+test('AEAD requires own data options without invoking accessors', (t) => {
   const key = seed(3)
   const noncePrefix = b4a.alloc(16, 4)
   const associatedData = b4a.from('header-v0')
   const plaintext = b4a.from('hello')
   const values = { key, noncePrefix, counter: 0n, associatedData, plaintext }
-  const reads = new Map()
-  const options = {}
-
-  for (const [name, value] of Object.entries(values)) {
-    Object.defineProperty(options, name, {
-      get() {
-        reads.set(name, (reads.get(name) || 0) + 1)
-        return value
-      }
-    })
-  }
-
-  const ciphertext = cryptoSuite.seal(options)
+  const ciphertext = cryptoSuite.seal(values)
   t.is(ciphertext.byteLength, 21)
-  for (const name of Object.keys(values)) t.is(reads.get(name), 1, `${name} read once`)
 
-  let hostileReads = 0
-  const hostile = {}
-  Object.defineProperty(hostile, 'key', {
+  let accessorReads = 0
+  const accessor = { noncePrefix, counter: 0n, associatedData, plaintext }
+  Object.defineProperty(accessor, 'key', {
     get() {
-      hostileReads++
-      throw new Error('hostile getter')
+      accessorReads++
+      return key
     }
   })
-  expectCode(t, () => cryptoSuite.seal(hostile), 'CELL_INVALID')
-  t.is(hostileReads, 1)
+  expectCode(t, () => cryptoSuite.seal(accessor), 'CELL_INVALID')
+  t.is(accessorReads, 0)
+
+  expectCode(t, () => cryptoSuite.seal(Object.create(values)), 'CELL_INVALID')
 
   const revocable = Proxy.revocable({}, {})
   revocable.revoke()
   expectCode(t, () => cryptoSuite.seal(revocable.proxy), 'CELL_INVALID')
   expectCode(t, () => cryptoSuite.open(revocable.proxy), 'CELL_INVALID')
 
+  const descriptorHostile = new Proxy(values, {
+    getOwnPropertyDescriptor() {
+      throw new Error('hostile descriptor trap')
+    }
+  })
+  expectCode(t, () => cryptoSuite.seal(descriptorHostile), 'CELL_INVALID')
+
+  const hasHostile = new Proxy(
+    {},
+    {
+      has() {
+        throw new Error('hostile has trap')
+      }
+    }
+  )
+  expectCode(t, () => cryptoSuite.seal(hasHostile), 'CELL_INVALID')
+
   const nullPrototype = Object.assign(Object.create(null), values)
   t.alike(cryptoSuite.seal(nullPrototype), ciphertext)
 })
 
-test('AEAD open snapshots each option once', (t) => {
+test('AEAD open requires own data options without invoking accessors', (t) => {
   const values = {
     key: seed(3),
     noncePrefix: b4a.alloc(16, 4),
@@ -545,20 +633,21 @@ test('AEAD open snapshots each option once', (t) => {
   }
   const ciphertext = cryptoSuite.seal({ ...values, plaintext: b4a.from('hello') })
   values.ciphertext = ciphertext
-  const reads = new Map()
-  const options = {}
+  let accessorReads = 0
+  const accessor = { ...values }
+  Object.defineProperty(accessor, 'ciphertext', {
+    get() {
+      accessorReads++
+      return ciphertext
+    }
+  })
 
-  for (const [name, value] of Object.entries(values)) {
-    Object.defineProperty(options, name, {
-      get() {
-        reads.set(name, (reads.get(name) || 0) + 1)
-        return value
-      }
-    })
-  }
+  expectCode(t, () => cryptoSuite.open(accessor), 'CELL_INVALID')
+  t.is(accessorReads, 0)
+  expectCode(t, () => cryptoSuite.open(Object.create(values)), 'CELL_INVALID')
 
-  t.alike(cryptoSuite.open(options), b4a.from('hello'))
-  for (const name of Object.keys(values)) t.is(reads.get(name), 1, `${name} read once`)
+  const nullPrototype = Object.assign(Object.create(null), values)
+  t.alike(cryptoSuite.open(nullPrototype), b4a.from('hello'))
 })
 
 test('crypto primitives ignore overridden caller buffer methods', (t) => {

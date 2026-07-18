@@ -25,7 +25,7 @@ function expectCode(t, fn, code) {
   t.is(error && error.code, code)
 }
 
-test('counter zeroization test hook is a non-public symbol', (t) => {
+test('counter zeroization hook is deep-importable but absent from the documented root', (t) => {
   t.is(typeof TEST_ONLY_BUFFER_OBSERVER, 'symbol')
   t.is('TEST_ONLY_BUFFER_OBSERVER' in publicHyperDHT, false)
 })
@@ -292,14 +292,40 @@ test('ordered receiver rejects reentrant state mutation from its clock', (t) => 
   t.is(receiver.buffered, 1)
 })
 
-test('ordered receiver reentrant destroy zeroes newly buffered authenticated payload', (t) => {
+test('ordered receiver fails closed when its buffer observer destroys reentrantly', (t) => {
   const owned = []
   let receiver = null
   receiver = new OrderedReceiver({
     window: 4,
     gapTimeout: 50,
-    now() {
+    now: () => 0,
+    [TEST_ONLY_BUFFER_OBSERVER](payload) {
+      owned.push(payload)
       receiver.destroy()
+    }
+  })
+
+  expectCode(
+    t,
+    () => receiver.pushAuthenticated(1n, b4a.from('authenticated secret')),
+    'COUNTER_EXHAUSTED'
+  )
+  t.is(receiver.closed, true)
+  t.is(receiver.buffered, 0)
+  t.is(owned.length, 1)
+  t.alike(owned[0], b4a.alloc(owned[0].byteLength))
+  expectCode(t, () => receiver.pushAuthenticated(0n, b4a.from('later')), 'COUNTER_EXHAUSTED')
+})
+
+test('ordered receiver cannot return a completed drain after clock-triggered destroy', (t) => {
+  const owned = []
+  let destroyOnRead = false
+  let receiver = null
+  receiver = new OrderedReceiver({
+    window: 4,
+    gapTimeout: 50,
+    now() {
+      if (destroyOnRead) receiver.destroy()
       return 0
     },
     [TEST_ONLY_BUFFER_OBSERVER](payload) {
@@ -307,12 +333,23 @@ test('ordered receiver reentrant destroy zeroes newly buffered authenticated pay
     }
   })
 
-  t.alike(receiver.pushAuthenticated(1n, b4a.from('authenticated secret')), [])
+  receiver.pushAuthenticated(1n, b4a.from('one'))
+  destroyOnRead = true
+  const callerPayload = b4a.from('zero')
+  let delivered = null
+  expectCode(
+    t,
+    () => {
+      delivered = receiver.pushAuthenticated(0n, callerPayload)
+    },
+    'COUNTER_EXHAUSTED'
+  )
+
+  t.is(delivered, null)
+  t.alike(callerPayload, b4a.from('zero'))
   t.is(receiver.closed, true)
   t.is(receiver.buffered, 0)
-  t.is(owned.length, 1)
   t.alike(owned[0], b4a.alloc(owned[0].byteLength))
-  expectCode(t, () => receiver.pushAuthenticated(0n, b4a.from('later')), 'COUNTER_EXHAUSTED')
 })
 
 test('window one accepts only the exact ordered counter and latest datagram', (t) => {
@@ -491,6 +528,38 @@ test('copy failure while draining closes and zeroes the undelivered payload', (t
   if (owned[0]) t.alike(owned[0], b4a.alloc(owned[0].byteLength))
 })
 
+test('partial ordered drain zeroes earlier module-owned delivery copies on later failure', (t) => {
+  const { owned, receiver } = observedOrdered()
+  receiver.pushAuthenticated(1n, b4a.from('one'))
+  receiver.pushAuthenticated(2n, b4a.from('two'))
+
+  const originalAllocUnsafeSlow = b4a.allocUnsafeSlow
+  const drainCopies = []
+  let calls = 0
+  b4a.allocUnsafeSlow = (size) => {
+    calls++
+    if (calls === 2) throw new Error('later drain copy failed')
+    const copy = originalAllocUnsafeSlow(size)
+    drainCopies.push(copy)
+    return copy
+  }
+
+  const callerPayload = b4a.from('zero')
+  try {
+    expectCode(t, () => receiver.pushAuthenticated(0n, callerPayload), 'COUNTER_INVALID')
+  } finally {
+    b4a.allocUnsafeSlow = originalAllocUnsafeSlow
+  }
+
+  t.is(drainCopies.length, 1)
+  t.alike(drainCopies[0], b4a.alloc(drainCopies[0].byteLength))
+  t.alike(callerPayload, b4a.from('zero'))
+  t.is(receiver.closed, true)
+  t.is(receiver.buffered, 0)
+  t.is(owned.length, 2)
+  for (const payload of owned) t.alike(payload, b4a.alloc(payload.byteLength))
+})
+
 test('ordered receiver destroy closes and zeroes every buffered payload', (t) => {
   const { owned, receiver } = observedOrdered()
   receiver.pushAuthenticated(1n, b4a.from('buffered secret'))
@@ -504,19 +573,82 @@ test('ordered receiver destroy closes and zeroes every buffered payload', (t) =>
   expectCode(t, () => receiver.pushAuthenticated(0n, b4a.from('later')), 'COUNTER_EXHAUSTED')
 })
 
-test('hostile and revoked constructor options use stable counter errors', (t) => {
-  const hostile = new Proxy(
+test('counter constructors require own data options without invoking accessors', (t) => {
+  let reads = 0
+  const senderAccessor = {}
+  Object.defineProperty(senderAccessor, 'initial', {
+    get() {
+      reads++
+      return 0n
+    }
+  })
+  expectCode(t, () => new SenderCounter(senderAccessor), 'COUNTER_INVALID')
+
+  const orderedAccessor = { gapTimeout: 50, now: () => 0 }
+  Object.defineProperty(orderedAccessor, 'window', {
+    get() {
+      reads++
+      return 4
+    }
+  })
+  expectCode(t, () => new OrderedReceiver(orderedAccessor), 'COUNTER_INVALID')
+
+  const datagramAccessor = {}
+  Object.defineProperty(datagramAccessor, 'window', {
+    get() {
+      reads++
+      return 8
+    }
+  })
+  expectCode(t, () => new DatagramReplayWindow(datagramAccessor), 'COUNTER_INVALID')
+  t.is(reads, 0)
+
+  expectCode(t, () => new SenderCounter(Object.create({ initial: 1n })), 'COUNTER_INVALID')
+  expectCode(
+    t,
+    () => new OrderedReceiver(Object.create({ window: 4, gapTimeout: 50, now: () => 0 })),
+    'COUNTER_INVALID'
+  )
+  expectCode(t, () => new DatagramReplayWindow(Object.create({ window: 8 })), 'COUNTER_INVALID')
+
+  const inheritedOptional = Object.assign(Object.create({ maximum: 10n }), {
+    window: 8
+  })
+  expectCode(t, () => new DatagramReplayWindow(inheritedOptional), 'COUNTER_INVALID')
+
+  const nullSender = Object.assign(Object.create(null), { initial: 1n, maximum: 2n })
+  t.is(new SenderCounter(nullSender).next(), 1n)
+  const nullOrdered = Object.assign(Object.create(null), {
+    window: 4,
+    gapTimeout: 50,
+    now: () => 0
+  })
+  t.alike(new OrderedReceiver(nullOrdered).pushAuthenticated(0n, 'zero'), ['zero'])
+  const nullDatagram = Object.assign(Object.create(null), { window: 8 })
+  t.is(new DatagramReplayWindow(nullDatagram).acceptAuthenticated(0n), true)
+})
+
+test('counter option descriptor and has traps use stable errors', (t) => {
+  const descriptorHostile = new Proxy(
     {},
     {
-      get() {
-        throw new Error('hostile getter')
+      getOwnPropertyDescriptor() {
+        throw new Error('hostile descriptor trap')
+      }
+    }
+  )
+  const hasHostile = new Proxy(
+    {},
+    {
+      has() {
+        throw new Error('hostile has trap')
       }
     }
   )
   const revocable = Proxy.revocable({}, {})
   revocable.revoke()
 
-  for (const options of [hostile, revocable.proxy]) {
+  for (const options of [descriptorHostile, hasHostile, revocable.proxy]) {
     expectCode(t, () => new SenderCounter(options), 'COUNTER_INVALID')
     expectCode(t, () => new OrderedReceiver(options), 'COUNTER_INVALID')
     expectCode(t, () => new DatagramReplayWindow(options), 'COUNTER_INVALID')
