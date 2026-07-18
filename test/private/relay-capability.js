@@ -73,7 +73,12 @@ function trackedRelayCapability() {
   const originalBuffer = BufferConstructor.allocUnsafeSlow
   const allocations = []
   let tracking = false
+  let failingSize = null
   const allocate = (size) => {
+    if (tracking && size === failingSize) {
+      failingSize = null
+      throw new Error('injected allocation failure')
+    }
     const value = Reflect.apply(originalBuffer, BufferConstructor, [size])
     if (tracking) allocations.push(value)
     return value
@@ -97,16 +102,22 @@ function trackedRelayCapability() {
     fresh,
     start() {
       allocations.length = 0
+      failingSize = null
       tracking = true
+    },
+    failAllocationOfSize(size) {
+      failingSize = size
     },
     take() {
       tracking = false
+      failingSize = null
       return allocations.splice(0)
     },
     restore() {
       if (restored) return
       restored = true
       tracking = false
+      failingSize = null
       b4a.allocUnsafeSlow = originalB4a
       BufferConstructor.allocUnsafeSlow = originalBuffer
     }
@@ -440,6 +451,49 @@ test('relay advertisement inputs require exact own data properties and never ali
   t.alike(signed.relayIdentity, expected)
 })
 
+test('advertisement signing clears normalized ownership on late setup failures', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const signer = exactRoleIdentity(ROLE.SAFETY)
+  const route = routeKey(92)
+  const value = advertisement(signer, route)
+  const invalidSecret = b4a.alloc(63, 0xa7)
+  const callerBuffers = [
+    value.relayIdentity,
+    value.currentDhtNodeId,
+    value.reachableEndpoint,
+    value.routeEncryptionPublicKey,
+    invalidSecret,
+    signer.secretKey
+  ]
+  const snapshots = callerBuffers.map((buffer) => b4a.from(buffer))
+
+  tracked.start()
+  expectCode(
+    t,
+    () => tracked.fresh.signRelayCapabilityAdvertisement(value, invalidSecret),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  const invalidSecretAllocations = tracked.take()
+  t.ok(invalidSecretAllocations.length > 4, 'normalization and body allocation completed')
+  for (const buffer of invalidSecretAllocations) t.alike(buffer, b4a.alloc(buffer.byteLength))
+
+  tracked.start()
+  tracked.failAllocationOfSize(252)
+  expectCode(
+    t,
+    () => tracked.fresh.signRelayCapabilityAdvertisement(value, signer.secretKey),
+    'ERR_AUTHENTICATION'
+  )
+  const signatureInputAllocations = tracked.take()
+  t.ok(signatureInputAllocations.length > 5, 'normalization, body, and secret were allocated')
+  for (const buffer of signatureInputAllocations) t.alike(buffer, b4a.alloc(buffer.byteLength))
+
+  for (let index = 0; index < callerBuffers.length; index++) {
+    t.alike(callerBuffers[index], snapshots[index], 'caller-owned signing input is unchanged')
+  }
+})
+
 test('verifier owns epochs, idempotence, equivocation quarantine, and projections', (t) => {
   const fake = clock()
   const owner = verifier(fake)
@@ -465,6 +519,109 @@ test('verifier owns epochs, idempotence, equivocation quarantine, and projection
   const original = signedAdvertisement()
   expectCode(t, () => acceptSafety(owner, original), 'ERR_AUTHENTICATION')
   owner.destroy()
+})
+
+test('verifier accept publishes nothing when expiry timer setup reenters and throws', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fixture = signedAdvertisement({ routeSeed: 93, expiresAtMs: NOW + 60_000n })
+  const encodedSnapshot = b4a.from(fixture.encoded)
+  const timers = new Map()
+  let nextTimer = 0
+  let armed = true
+  let invalidations = 0
+  let owner = null
+  let reentrantProjection = null
+  let reentrantError = null
+  const setTimer = (callback, delay) => {
+    if (armed) {
+      armed = false
+      callback()
+      try {
+        reentrantProjection = acceptSafety(owner, fixture)
+      } catch (err) {
+        reentrantError = err
+      }
+      throw new Error('injected timer setup failure')
+    }
+    const timer = ++nextTimer
+    timers.set(timer, { callback, delay })
+    return timer
+  }
+  owner = new tracked.fresh.RelayCapabilityVerifier({
+    wallNow: () => NOW,
+    monotonicNow: () => 0n,
+    setTimer,
+    clearTimer(timer) {
+      timers.delete(timer)
+    },
+    onInvalidated() {
+      invalidations++
+    }
+  })
+
+  tracked.start()
+  expectCode(t, () => acceptSafety(owner, fixture), 'ERR_AUTHENTICATION')
+  const failedAllocations = tracked.take()
+  t.is(reentrantProjection, null, 'timer reentry cannot observe a selectable candidate')
+  t.ok(reentrantError instanceof PrivateRouteError)
+  t.is(reentrantError && reentrantError.code, 'ERR_AUTHENTICATION')
+  t.is(timers.size, 0, 'failed acceptance retains no timer handle')
+  t.is(invalidations, 0, 'timer setup failure does not invalidate the verifier')
+  for (const buffer of failedAllocations) t.alike(buffer, b4a.alloc(buffer.byteLength))
+  t.alike(fixture.encoded, encodedSnapshot, 'caller advertisement bytes are unchanged')
+
+  const projection = acceptSafety(owner, fixture)
+  t.is(projection.epoch, fixture.signed.epoch)
+  t.is(timers.size, 1, 'retry installs the first live advertisement expiry timer')
+  t.is(invalidations, 0)
+  owner.destroy()
+  t.is(timers.size, 0)
+})
+
+test('verifier clears a timer handle whose callback fires during accept publication', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fixture = signedAdvertisement({ routeSeed: 94, expiresAtMs: NOW + 60_000n })
+  const encodedSnapshot = b4a.from(fixture.encoded)
+  const timers = new Set()
+  let fireSynchronously = true
+  let invalidations = 0
+  const owner = new tracked.fresh.RelayCapabilityVerifier({
+    wallNow: () => NOW,
+    monotonicNow: () => 0n,
+    setTimer(callback) {
+      const timer = {
+        unref() {
+          if (!fireSynchronously) return
+          fireSynchronously = false
+          callback()
+        }
+      }
+      timers.add(timer)
+      return timer
+    },
+    clearTimer(timer) {
+      timers.delete(timer)
+    },
+    onInvalidated() {
+      invalidations++
+    }
+  })
+
+  tracked.start()
+  expectCode(t, () => acceptSafety(owner, fixture), 'ERR_INCOMPATIBLE_RELAY')
+  const failedAllocations = tracked.take()
+  t.is(timers.size, 0, 'synchronously fired handle is cancelled before rollback')
+  t.is(invalidations, 0)
+  for (const buffer of failedAllocations) t.alike(buffer, b4a.alloc(buffer.byteLength))
+  t.alike(fixture.encoded, encodedSnapshot, 'caller advertisement bytes are unchanged')
+
+  const projection = acceptSafety(owner, fixture)
+  t.is(projection.epoch, fixture.signed.epoch)
+  t.is(timers.size, 1, 'retry remains a first acceptance with one live timer')
+  owner.destroy()
+  t.is(timers.size, 0)
 })
 
 test('verifier poisons rather than evicting a seventeenth route key', (t) => {
