@@ -79,6 +79,27 @@ The focused `RoutedDHTIO` and deterministic traversal suites passed 42/42 tests 
 
 This evidence is semantic-only compatibility and regression evidence. The fake topology sends no packets and contains no live authority, adjacent links, three-position route, routed-reply wire codec, DHT exit, or packet-capture oracle. It does not establish anonymity, traffic-analysis resistance, a live private route, or production readiness.
 
+### Final Gate 3A verification
+
+Final verification started from reviewed documentation head `68bd32a1d10ccd103a2ae27bb75e3846d90a5ab5`, with the branch and `origin/private-routing-v1` at that exact commit. Its [exact-head workflow run 29647577235](https://github.com/ayooooo123/hyperdht/actions/runs/29647577235) completed successfully:
+
+- [macOS job 88088283556](https://github.com/ayooooo123/hyperdht/actions/runs/29647577235/job/88088283556): PASS for `npm install`, `npm test`, `npm run integration`, Bare installation, and `npm run test:bare`
+- [Ubuntu job 88088283625](https://github.com/ayooooo123/hyperdht/actions/runs/29647577235/job/88088283625): PASS for the same commands
+- [Windows job 88088283578](https://github.com/ayooooo123/hyperdht/actions/runs/29647577235/job/88088283578): PASS for the same commands
+- `trigger_canary`: SKIPPED as expected because this was not a tag build
+
+Fresh local verification on Node v22.19.0, npm 11.10.0, and Bare v1.30.3 produced these results:
+
+- The focused `RoutedDHTIO` and deterministic traversal suites passed 42/42 tests and 377/377 assertions independently in Node and Bare.
+- The aggregate deterministic private-routing suite passed 247/247 tests and 7,219/7,219 assertions independently in Node and Bare.
+- `npm run integration` passed 1/1 test and 6/6 assertions in its separate-process connection path.
+- `npm test` passed its repository-wide Prettier check, then reproduced the documented local multi-interface exception in `createServer + connect - same-LAN explicit keypair opens server`: 17 top-level tests completed with all 67 of their assertions passing before test 18 emitted `client should not error: HOLEPUNCH_ABORTED` and the run timed out at 30 seconds without a final TAP summary. `npm run test:bare` reproduced the same exception after the same 17 completed tests and 67 passing assertions, then timed out. These two local full-suite runs are not reported as green; the exact-head clean-host matrix above is the authoritative full-suite evidence.
+- `npx prettier --check lib/private test/private docs README.md package.json` and `git diff --check` passed.
+- `npm ls dht-rpc --depth=0` resolved `dht-rpc@6.27.0` at exact approved commit `fe04496196ea2ce42d1de27b0f770b02d2a87cd5`. `package.json` had no verification-time diff, `package-lock.json` remained ignored and untracked, and no `node_modules`, `build`, `target`, or `coverage` artifact was tracked.
+- The Task 11 local documentation links resolve, its recorded GitHub runs and jobs still match their documented exact heads and successful conclusions, and the DHT-RPC review link remains open at the approved dependency head.
+
+The final scope audit found no public `privateRouting` or `privacy` option, no Hyperswarm or PearTube change, and no direct fallback or host/port input in `RoutedDHTIO`. This remains an internal, address-free deterministic substrate with no live route authority or production anonymity claim. Delivery Gate 3 remains open until all ten Gate 3B entry criteria pass fork-native CI.
+
 ### DHT-RPC Gate 2
 
 DHT-RPC Gate 2 is pinned to commit `49fea12c6c7677e50b114de64226b1856e308f3c` and is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). The authoritative pull-request workflow [run 29621682832](https://github.com/ayooooo123/dht-rpc/actions/runs/29621682832) completed successfully with these job results:
