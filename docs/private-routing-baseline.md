@@ -35,6 +35,18 @@ Both runtimes reproduced the upstream chaos connection-count/startup failure on 
 
 ## GitHub CI evidence
 
+### Gate 3A DHT-RPC opaque-context compatibility
+
+HyperDHT Gate 3A pins DHT-RPC commit `be3317e2ad30e237e52169d1f72485a5b7d9d04b` with the exact dependency string `github:ayooooo123/dht-rpc#be3317e2ad30e237e52169d1f72485a5b7d9d04b`. The implementation is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). Its exact-head branch-push [run 29625387013](https://github.com/ayooooo123/dht-rpc/actions/runs/29625387013) and pull-request [run 29625388495](https://github.com/ayooooo123/dht-rpc/actions/runs/29625388495) both completed with the same results:
+
+- `Lint`: PASS
+- `Test / linux`: PASS
+- `Test / darwin`: PASS
+- `Test / win32`: PASS
+- `trigger_canary`: SKIPPED as expected because these were not tag builds
+
+Each operating-system test job ran the repository's complete `npm test` command, covering both Node and Bare. This evidence proves only generic opaque-context propagation through the DHT-RPC request-transport seam and compatibility with its direct mode. It does not establish anonymity or demonstrate live private routing.
+
 ### DHT-RPC Gate 2
 
 DHT-RPC Gate 2 is pinned to commit `49fea12c6c7677e50b114de64226b1856e308f3c` and is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). The authoritative pull-request workflow [run 29621682832](https://github.com/ayooooo123/dht-rpc/actions/runs/29621682832) completed successfully with these job results:
