@@ -33,7 +33,10 @@ const {
   createRoutedReplyReferralAuthority,
   destroyLiveOpaqueDestinations,
   issueLiveOpaqueDestination,
-  revokeRoutedReplyReferralAuthority
+  revokeRoutedReplyReferralAuthority,
+  sealRoutedReplyAdmission,
+  stageRoutedReplyReferral,
+  verifyRoutedReplyReferralAuthority
 } = require('../../lib/private/opaque-destination')
 
 const COMMANDS = Object.freeze([
@@ -769,6 +772,85 @@ test('clearRoutedRequest is idempotent and ignores hostile arbitrary values', (t
   t.ok(allZero(decoded.encodedBody))
 })
 
+test('routed reply encoding ignores a poisoned requestId prototype setter', (t) => {
+  const expected = reply()
+  const value = {
+    requestId: seed(0x21, 16),
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    commandVersion: 1,
+    operationClass: BRANCH_CLASS.LOOKUP,
+    from: expectedDestination(),
+    errorCode: 0,
+    token: b4a.alloc(0),
+    closerNodes: [],
+    encodedResponse: b4a.alloc(0)
+  }
+  const sentinel = new Error('poisoned requestId setter')
+  let setterCalls = 0
+  let encoded = null
+  let error = null
+
+  Object.defineProperty(Object.prototype, 'requestId', {
+    configurable: true,
+    set() {
+      setterCalls++
+      throw sentinel
+    }
+  })
+  try {
+    encoded = encodeRoutedReply(value)
+  } catch (err) {
+    error = err
+  } finally {
+    delete Object.prototype.requestId
+  }
+
+  t.is(setterCalls, 0)
+  t.is(error, null)
+  t.alike(encoded, expected)
+})
+
+test('routed reply encoding canonicalizes each closer once', (t) => {
+  const closer = destinationRef(seed(0xd1, 32), 0xd2)
+  const isBuffer = Buffer.isBuffer
+  let closerBodyChecks = 0
+
+  Buffer.isBuffer = function (value) {
+    const result = isBuffer.call(Buffer, value)
+    if (
+      result &&
+      value.byteLength === 164 &&
+      value[0] === 0xd1 &&
+      value[31] === 0xd1 &&
+      value[34] === 0xd2 &&
+      value[163] === 0xd2
+    ) {
+      closerBodyChecks++
+    }
+    return result
+  }
+
+  let encoded
+  try {
+    encoded = reply({ closerNodes: [closer] })
+  } finally {
+    Buffer.isBuffer = isBuffer
+  }
+
+  t.is(closerBodyChecks, 2)
+  t.ok(encoded.byteLength > ROUTED_REPLY_FIXED_BODY_SIZE)
+})
+
+test('revoked array proxies normalize through routed and opaque validators', (t) => {
+  const closerNodes = Proxy.revocable([], {})
+  closerNodes.revoke()
+  expectCode(t, () => reply({ closerNodes: closerNodes.proxy }), 'INVALID_ROUTE')
+
+  const ownerFields = Proxy.revocable({}, {})
+  ownerFields.revoke()
+  expectCode(t, () => createLiveOpaqueDestinations(ownerFields.proxy), 'INVALID_ROUTE')
+})
+
 test('ROUTED_REPLY_V1 freezes exact minimum, maximum, and error vectors', (t) => {
   const minimumBody = b4a.concat([
     seed(0x21, 16),
@@ -893,6 +975,193 @@ test('routed reply validation binds the request and atomically admits sorted ref
 
   clearRoutedReply(result.reply)
   revokeRoutedReplyReferralAuthority(live.authority)
+  destroyLiveOpaqueDestinations(live.owner)
+})
+
+test('routed reply validation ignores a reentrant encodedRequest prototype setter', (t) => {
+  const target = seed(0, 32)
+  const live = liveReplyAuthority(target)
+  const options = replyOptions(live.authority, target)
+  const sentinel = new Error('poisoned encodedRequest setter')
+  let setterCalls = 0
+  let result = null
+  let error = null
+
+  Object.defineProperty(Object.prototype, 'encodedRequest', {
+    configurable: true,
+    set() {
+      setterCalls++
+      revokeRoutedReplyReferralAuthority(live.authority)
+      throw sentinel
+    }
+  })
+  try {
+    result = validateRoutedReplyForRequest(reply(), options)
+  } catch (err) {
+    error = err
+  } finally {
+    delete Object.prototype.encodedRequest
+  }
+
+  t.is(setterCalls, 0)
+  t.is(error, null)
+  t.ok(result !== null)
+  if (result !== null) {
+    abortRoutedReplyAdmission(result.admission)
+    clearRoutedReply(result.reply)
+  }
+  destroyLiveOpaqueDestinations(live.owner)
+})
+
+test('authority revocation during verification cannot validate or reactivate', (t) => {
+  const target = seed(0, 32)
+  let callback = null
+  const live = liveReplyAuthority(target, () => {
+    if (callback !== null) callback()
+    return 1_000n
+  })
+  const fields = {
+    fromEncoded: expectedDestination(),
+    target: b4a.from(target),
+    requestId: seed(0x21, 16),
+    branch: BRANCH_CLASS.LOOKUP,
+    circuitId: seed(0x31, 16),
+    generation: 7n,
+    now: 1_000n
+  }
+  let callbackCalls = 0
+  callback = () => {
+    callbackCalls++
+    revokeRoutedReplyReferralAuthority(live.authority)
+    fields.fromEncoded.fill(0)
+    fields.target.fill(0)
+    fields.requestId.fill(0)
+  }
+
+  expectCode(t, () => verifyRoutedReplyReferralAuthority(live.authority, fields), 'INVALID_ROUTE')
+  callback = null
+  t.is(callbackCalls, 1)
+  expectCode(t, () => verifyRoutedReplyReferralAuthority(live.authority, fields), 'INVALID_ROUTE')
+  destroyLiveOpaqueDestinations(live.owner)
+})
+
+test('authority revocation during staging cannot retain or publish a closer', (t) => {
+  const target = seed(0, 32)
+  const closerId = seed(0xe1, 32)
+  const closerEncoded = destinationRef(closerId, 0xe2)
+  const closer = decodeDestinationRef(closerEncoded)
+  let callback = null
+  const live = liveReplyAuthority(target, () => {
+    if (callback !== null) callback()
+    return 1_000n
+  })
+  let callbackCalls = 0
+  callback = () => {
+    callbackCalls++
+    revokeRoutedReplyReferralAuthority(live.authority)
+  }
+
+  expectCode(
+    t,
+    () => stageRoutedReplyReferral(live.authority, { encoded: closerEncoded, decoded: closer }),
+    'INVALID_ROUTE'
+  )
+  callback = null
+  t.is(callbackCalls, 1)
+  expectCode(t, () => sealRoutedReplyAdmission(live.authority), 'INVALID_ROUTE')
+
+  const retryAuthority = createRoutedReplyReferralAuthority(live.owner, {
+    from: live.seedDestination,
+    target,
+    requestId: seed(0x21, 16),
+    deadline: 4_000n
+  })
+  stageRoutedReplyReferral(retryAuthority, { encoded: closerEncoded, decoded: closer })
+  const admission = sealRoutedReplyAdmission(retryAuthority)
+  abortRoutedReplyAdmission(admission)
+  closer.id.fill(0)
+  closer.handle.fill(0)
+  destroyLiveOpaqueDestinations(live.owner)
+})
+
+test('authority revocation during sealing cannot return an admission', (t) => {
+  const target = seed(0, 32)
+  const closerId = seed(0xe3, 32)
+  const closerEncoded = destinationRef(closerId, 0xe4)
+  const closer = decodeDestinationRef(closerEncoded)
+  let callback = null
+  const live = liveReplyAuthority(target, () => {
+    if (callback !== null) callback()
+    return 1_000n
+  })
+  stageRoutedReplyReferral(live.authority, { encoded: closerEncoded, decoded: closer })
+  let callbackCalls = 0
+  callback = () => {
+    callbackCalls++
+    revokeRoutedReplyReferralAuthority(live.authority)
+  }
+
+  let admission = null
+  let error = null
+  try {
+    admission = sealRoutedReplyAdmission(live.authority)
+  } catch (err) {
+    error = err
+  }
+  callback = null
+
+  t.ok(error instanceof PrivateRouteError)
+  t.is(error && error.code, 'INVALID_ROUTE')
+  t.is(admission, null)
+  t.is(callbackCalls, 1)
+  if (admission !== null) abortRoutedReplyAdmission(admission)
+  expectCode(t, () => sealRoutedReplyAdmission(live.authority), 'INVALID_ROUTE')
+
+  const retryAuthority = createRoutedReplyReferralAuthority(live.owner, {
+    from: live.seedDestination,
+    target,
+    requestId: seed(0x21, 16),
+    deadline: 4_000n
+  })
+  stageRoutedReplyReferral(retryAuthority, { encoded: closerEncoded, decoded: closer })
+  abortRoutedReplyAdmission(sealRoutedReplyAdmission(retryAuthority))
+  closer.id.fill(0)
+  closer.handle.fill(0)
+  destroyLiveOpaqueDestinations(live.owner)
+})
+
+test('referral authority clock exceptions use stable private errors', (t) => {
+  const target = seed(0, 32)
+  const sentinel = new Error('callback-selected sentinel')
+  let callback = null
+  const live = liveReplyAuthority(target, () => {
+    if (callback !== null) callback()
+    return 1_000n
+  })
+  callback = () => {
+    revokeRoutedReplyReferralAuthority(live.authority)
+    throw sentinel
+  }
+
+  let error = null
+  try {
+    verifyRoutedReplyReferralAuthority(live.authority, {
+      fromEncoded: expectedDestination(),
+      target,
+      requestId: seed(0x21, 16),
+      branch: BRANCH_CLASS.LOOKUP,
+      circuitId: seed(0x31, 16),
+      generation: 7n,
+      now: 1_000n
+    })
+  } catch (err) {
+    error = err
+  }
+  callback = null
+
+  t.ok(error instanceof PrivateRouteError)
+  t.is(error && error.code, 'INVALID_ROUTE')
+  t.absent(error === sentinel)
   destroyLiveOpaqueDestinations(live.owner)
 })
 
