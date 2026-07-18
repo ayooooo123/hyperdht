@@ -145,13 +145,13 @@ function reply(overrides = {}) {
   })
 }
 
-function liveReplyAuthority(target = seed(0, 32)) {
+function liveReplyAuthority(target = seed(0, 32), wallNow = () => 1_000n) {
   const owner = createLiveOpaqueDestinations({
     branch: BRANCH_CLASS.LOOKUP,
     circuitId: seed(0x31, 16),
     generation: 7n,
     expiresAt: 5_000n,
-    wallNow: () => 1_000n
+    wallNow
   })
   const seedDestination = issueLiveOpaqueDestination(owner, {
     id: seed(0x11, 32),
@@ -946,7 +946,7 @@ test('routed reply rejects options and bindings before owning variable reply reg
   }
 })
 
-test('routed reply enforces immutable response bound before owning variable reply regions', (t) => {
+test('routed reply rolls back staged closers without owning an oversized response', (t) => {
   const target = seed(0, 32)
   const token = seed(0xa2, 32)
   const closer = destinationRef(seed(0xb3, 32), 0xb4)
@@ -968,19 +968,45 @@ test('routed reply enforces immutable response bound before owning variable repl
       response
     ])
   )
-  const live = liveReplyAuthority(target)
+  let wallCalls = 0
+  const live = liveReplyAuthority(target, () => {
+    wallCalls++
+    return 1_000n
+  })
+  const callsBeforeValidation = wallCalls
   const observed = observeBufferRegions(
     () => validateRoutedReplyForRequest(oversized, replyOptions(live.authority, target)),
     [
       (value) => value.byteLength === 32 && value[0] === 0xa2 && value[31] === 0xa2,
       (value) => value.byteLength === DESTINATION_REF_SIZE && value[8] === 0xb3,
-      (value) => value.byteLength === 1027 && value[0] === 0xc2 && value[1026] === 0xc2
+      (value) =>
+        value !== oversized &&
+        value !== response &&
+        value.byteLength >= response.byteLength &&
+        value[value.byteLength - response.byteLength] === 0xc2 &&
+        value[value.byteLength - 1] === 0xc2
     ]
   )
 
   t.ok(observed.error instanceof PrivateRouteError)
   t.is(observed.error && observed.error.code, 'INVALID_ROUTE')
-  t.alike(observed.observed, [0, 0, 0])
+  t.is(wallCalls - callsBeforeValidation, 2)
+  t.is(observed.observed[0], 0)
+  t.ok(observed.observed[1] > 0)
+  t.is(observed.observed[2], 0)
+
+  const retryAuthority = createRoutedReplyReferralAuthority(live.owner, {
+    from: live.seedDestination,
+    target,
+    requestId: seed(0x21, 16),
+    deadline: 4_000n
+  })
+  const retry = validateRoutedReplyForRequest(
+    reply({ closerNodes: [closer] }),
+    replyOptions(retryAuthority, target)
+  )
+  abortRoutedReplyAdmission(retry.admission)
+  clearRoutedReply(retry.reply)
   destroyLiveOpaqueDestinations(live.owner)
 })
 
