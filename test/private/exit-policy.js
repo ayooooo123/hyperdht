@@ -168,3 +168,46 @@ test('exit-origin encoder accepts own data only and never invokes accessors', (t
   revoked.revoke()
   expectCode(t, () => encodeExitOriginServicePolicy(revokedEntries), 'INVALID_ROUTE')
 })
+
+test('policy digest uses one owned snapshot across validation and hashing', (t) => {
+  const expected = b4a.from(EXPECTED_DIGEST, 'hex')
+  const canonical = expectedEncoding()
+  const shared = new Uint8Array(new SharedArrayBuffer(canonical.byteLength))
+  Uint8Array.prototype.set.call(shared, canonical)
+  const isBuffer = Buffer.isBuffer
+  let originalChecks = 0
+  let snapshot = null
+  let snapshotChecks = 0
+  let mutations = 0
+
+  Buffer.isBuffer = function (value) {
+    const result = isBuffer.call(Buffer, value)
+    if (value === shared) {
+      originalChecks++
+      if (originalChecks === 3 && mutations === 0) {
+        mutations++
+        shared[10] ^= 1
+      }
+    } else if (value && value.byteLength === shared.byteLength) {
+      if (snapshot === null) snapshot = value
+      if (value === snapshot) {
+        snapshotChecks++
+        if (snapshotChecks === 2 && mutations === 0) {
+          mutations++
+          shared[10] ^= 1
+        }
+      }
+    }
+    return result
+  }
+
+  let actual
+  try {
+    actual = digestExitOriginServicePolicy(shared)
+  } finally {
+    Buffer.isBuffer = isBuffer
+  }
+
+  t.is(mutations, 1)
+  t.alike(actual, expected)
+})

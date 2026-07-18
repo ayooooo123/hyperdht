@@ -210,6 +210,18 @@ test('routed command table preserves every body bound and branch permission', (t
         t.is(decoded.commandId, commandId)
         t.is(decoded.operationClass, operationClass)
         clearRoutedRequest(decoded)
+
+        const maximumDecoded = decodeRoutedRequest(
+          request({
+            commandId,
+            operationClass,
+            encodedBody: seed((commandId + 1) & 0xff, maximum)
+          })
+        )
+        t.is(maximumDecoded.commandId, commandId)
+        t.is(maximumDecoded.operationClass, operationClass)
+        t.is(maximumDecoded.encodedBody.byteLength, maximum)
+        clearRoutedRequest(maximumDecoded)
       } else {
         expectCode(t, operation, 'ERR_AUTHENTICATION')
       }
@@ -509,6 +521,49 @@ test('callbacks cannot mutate authenticated returned bytes or captured intrinsic
   clearRoutedRequest(decoded)
 })
 
+test('encoded destination uses one owned snapshot through validation and embedding', (t) => {
+  const canonicalDestination = expectedDestination()
+  const canonicalRequest = expectedRequest()
+  const shared = new Uint8Array(new SharedArrayBuffer(canonicalDestination.byteLength))
+  Uint8Array.prototype.set.call(shared, canonicalDestination)
+  const isBuffer = Buffer.isBuffer
+  let originalChecks = 0
+  let snapshot = null
+  let snapshotChecks = 0
+  let mutations = 0
+
+  Buffer.isBuffer = function (value) {
+    const result = isBuffer.call(Buffer, value)
+    if (value === shared) {
+      originalChecks++
+      if (originalChecks === 4 && mutations === 0) {
+        mutations++
+        shared[50] ^= 1
+      }
+    } else if (value && value.byteLength === shared.byteLength) {
+      if (snapshot === null) snapshot = value
+      if (value === snapshot) {
+        snapshotChecks++
+        if (snapshotChecks === 2 && mutations === 0) {
+          mutations++
+          shared[50] ^= 1
+        }
+      }
+    }
+    return result
+  }
+
+  let encoded
+  try {
+    encoded = request({ destination: shared })
+  } finally {
+    Buffer.isBuffer = isBuffer
+  }
+
+  t.is(mutations, 1)
+  t.alike(encoded, canonicalRequest)
+})
+
 test('caught validation reentry fails the outer request closed and clears callback copies', (t) => {
   const encoded = request()
   let callbackValue = null
@@ -566,4 +621,49 @@ test('failed authority validation and explicit clear zero every transferred buff
   t.ok(allZero(decoded.encodedBody))
   clearRoutedRequest(decoded)
   clearRoutedRequest(null)
+})
+
+test('clearRoutedRequest is idempotent and ignores hostile arbitrary values', (t) => {
+  let getterCalls = 0
+  const accessor = {}
+  for (const name of ['requestId', 'destination', 'destinationEncoded', 'encodedBody']) {
+    Object.defineProperty(accessor, name, {
+      get() {
+        getterCalls++
+        throw new Error('getter must not run')
+      }
+    })
+  }
+  const inherited = Object.create(accessor)
+  const trapped = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor() {
+        throw new Error('descriptor trap')
+      }
+    }
+  )
+  const revoked = Proxy.revocable({}, {})
+  revoked.revoke()
+
+  for (const value of [accessor, inherited, trapped, revoked.proxy, 1, 'request', true]) {
+    let error = null
+    try {
+      clearRoutedRequest(value)
+      clearRoutedRequest(value)
+    } catch (err) {
+      error = err
+    }
+    t.is(error, null)
+  }
+  t.is(getterCalls, 0)
+
+  const decoded = decodeRoutedRequest(request())
+  clearRoutedRequest(decoded)
+  clearRoutedRequest(decoded)
+  t.ok(allZero(decoded.requestId))
+  t.ok(allZero(decoded.destination.id))
+  t.ok(allZero(decoded.destination.handle))
+  t.ok(allZero(decoded.destinationEncoded))
+  t.ok(allZero(decoded.encodedBody))
 })
