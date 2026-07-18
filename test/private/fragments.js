@@ -13,6 +13,7 @@ const {
   MAX_COMPLETED_IDS,
   MESSAGE_TIMEOUT,
   Reassembler,
+  TEST_ONLY_FRAGMENT_ALLOCATION_FAILURE,
   TEST_ONLY_FRAGMENT_OBSERVER,
   fragment
 } = require('../../lib/private/fragments')
@@ -167,31 +168,32 @@ test('8,424 data bytes occupy exactly eight full 1,073-byte payloads', (t) => {
   t.alike(reassembler.pushAuthenticated(frames[7]), message)
 })
 
-test('8,425 data bytes fail before ID generation or allocation', (t) => {
+test('8,425 data bytes fail before options or ID generation', (t) => {
   let randomCalls = 0
-  let allocations = 0
-  const allocate = b4a.allocUnsafeSlow
-  b4a.allocUnsafeSlow = (size) => {
-    allocations++
-    return allocate(size)
-  }
-  try {
-    expectCode(
-      t,
-      () =>
-        fragment(b4a.alloc(MAX_MESSAGE_DATA_BYTES + 1), {
-          randomBytes() {
-            randomCalls++
-            return id(1)
-          }
-        }),
-      'INVALID_ROUTE'
-    )
-  } finally {
-    b4a.allocUnsafeSlow = allocate
-  }
+  let optionReads = 0
+  const options = new Proxy(
+    {},
+    {
+      getOwnPropertyDescriptor() {
+        optionReads++
+        return undefined
+      }
+    }
+  )
+  expectCode(t, () => fragment(b4a.alloc(MAX_MESSAGE_DATA_BYTES + 1), options), 'INVALID_ROUTE')
+  expectCode(
+    t,
+    () =>
+      fragment(b4a.alloc(MAX_MESSAGE_DATA_BYTES + 1), {
+        randomBytes() {
+          randomCalls++
+          return id(1)
+        }
+      }),
+    'INVALID_ROUTE'
+  )
+  t.is(optionReads, 0)
   t.is(randomCalls, 0)
-  t.is(allocations, 0)
 })
 
 test('random callback cannot mutate fragmentation arithmetic or buffer validation', (t) => {
@@ -224,6 +226,31 @@ test('random callback cannot mutate fragmentation arithmetic or buffer validatio
   for (const value of frames) {
     t.is(value.byteLength, FRAGMENT_HEADER_SIZE + MAX_FRAGMENT_DATA)
   }
+})
+
+test('random callback cannot replace the trusted frame allocator with caller memory', (t) => {
+  const allocate = b4a.allocUnsafeSlow
+  const backing = allocate(FRAGMENT_HEADER_SIZE + MAX_FRAGMENT_DATA)
+  const message = Uint8Array.prototype.subarray.call(backing, FRAGMENT_HEADER_SIZE)
+  message.fill(0x64)
+  let frames
+  try {
+    frames = fragment(message, {
+      randomBytes() {
+        b4a.allocUnsafeSlow = (size) => (size === backing.byteLength ? backing : allocate(size))
+        return id(38)
+      }
+    })
+  } finally {
+    b4a.allocUnsafeSlow = allocate
+  }
+
+  t.absent(frames[0] === backing)
+  backing.fill(0)
+  t.alike(
+    Uint8Array.prototype.subarray.call(frames[0], FRAGMENT_HEADER_SIZE),
+    b4a.alloc(MAX_FRAGMENT_DATA, 0x64)
+  )
 })
 
 test('fragment copies the message and identifier and supports empty data', (t) => {
@@ -301,22 +328,7 @@ test('fragment bypasses shadowed byteLength, subarray, set, and fill', (t) => {
     set: { value: hostile },
     fill: { value: hostile }
   })
-  const allocate = b4a.allocUnsafeSlow
-  b4a.allocUnsafeSlow = (size) => {
-    const value = allocate(size)
-    Object.defineProperties(value, {
-      subarray: { value: hostile },
-      set: { value: hostile },
-      fill: { value: hostile }
-    })
-    return value
-  }
-  let frames
-  try {
-    frames = fragment(message, { messageId: id(7) })
-  } finally {
-    b4a.allocUnsafeSlow = allocate
-  }
+  const frames = fragment(message, { messageId: id(7) })
   const reassembler = receiver()
   t.is(reassembler.pushAuthenticated(frames[0]), null)
   t.alike(reassembler.pushAuthenticated(frames[1]), b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x4a))
@@ -325,29 +337,17 @@ test('fragment bypasses shadowed byteLength, subarray, set, and fill', (t) => {
 
 test('fragment allocation failures clear every partial owned frame', (t) => {
   const message = b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x5a)
-  const allocate = b4a.allocUnsafeSlow
-  const owned = []
-  let calls = 0
-  b4a.allocUnsafeSlow = (size) => {
-    calls++
-    if (calls === 2) {
-      const partial = allocate(size - 1)
-      partial.fill(0xcc)
-      owned.push(partial)
-      return partial
-    }
-    const value = allocate(size)
-    value.fill(0xbb)
-    owned.push(value)
-    return value
-  }
-  try {
-    expectCode(t, () => fragment(message, { messageId: id(8) }), 'INVALID_ROUTE')
-  } finally {
-    b4a.allocUnsafeSlow = allocate
-  }
-  t.is(owned.length, 2)
-  for (const value of owned) t.alike(value, b4a.alloc(value.byteLength))
+  expectCode(
+    t,
+    () =>
+      fragment(message, {
+        messageId: id(8),
+        [TEST_ONLY_FRAGMENT_ALLOCATION_FAILURE]: 2
+      }),
+    'INVALID_ROUTE'
+  )
+  t.alike(message, b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x5a))
+  t.is(fragment(message, { messageId: id(8) }).length, 2)
 })
 
 test('out-of-order fragments complete once and transfer an owned output', (t) => {
@@ -378,24 +378,19 @@ test('out-of-order fragments complete once and transfer an owned output', (t) =>
   })
 })
 
-test('malformed structural bounds fail before clock, allocation, or observer callbacks', (t) => {
+test('malformed structural bounds fail before clock or observer callbacks', (t) => {
   let clockCalls = 0
   let observerCalls = 0
-  let allocations = 0
-  const allocate = b4a.allocUnsafeSlow
   const reassembler = receiver({
     now() {
       clockCalls++
       return 0
     },
+    [TEST_ONLY_FRAGMENT_ALLOCATION_FAILURE]: 1,
     [TEST_ONLY_FRAGMENT_OBSERVER]() {
       observerCalls++
     }
   })
-  b4a.allocUnsafeSlow = (size) => {
-    allocations++
-    return allocate(size)
-  }
   const cases = [
     b4a.alloc(0),
     b4a.alloc(15),
@@ -407,16 +402,11 @@ test('malformed structural bounds fail before clock, allocation, or observer cal
     frame(id(14), 1, 2),
     frame(id(15), 0, 1, b4a.alloc(MAX_FRAGMENT_DATA + 1))
   ]
-  try {
-    for (const value of cases) {
-      expectCode(t, () => reassembler.pushAuthenticated(value), 'INVALID_ROUTE')
-    }
-  } finally {
-    b4a.allocUnsafeSlow = allocate
+  for (const value of cases) {
+    expectCode(t, () => reassembler.pushAuthenticated(value), 'INVALID_ROUTE')
   }
   t.is(clockCalls, 0)
   t.is(observerCalls, 0)
-  t.is(allocations, 0)
 })
 
 test('identical duplicates are replay while conflicting duplicates clear only their message', (t) => {
@@ -672,7 +662,7 @@ test('exact eight-fragment aggregate is visible before atomic completion', (t) =
   t.is(observed.bufferedEncodedBytes, MAX_ENCODED_MESSAGE_BYTES)
 })
 
-test('completed-ID ceiling of 64 never evicts and rejects before copy', (t) => {
+test('completed-ID ceiling of 64 never evicts and preserves its state', (t) => {
   const reassembler = receiver()
   for (let i = 0; i < MAX_COMPLETED_IDS; i++) {
     const messageId = b4a.alloc(16)
@@ -681,27 +671,18 @@ test('completed-ID ceiling of 64 never evicts and rejects before copy', (t) => {
   }
   t.is(reassembler.stats.completedIds, MAX_COMPLETED_IDS)
 
-  let allocations = 0
-  const allocate = b4a.allocUnsafeSlow
-  b4a.allocUnsafeSlow = (size) => {
-    allocations++
-    return allocate(size)
-  }
-  try {
-    expectCode(
-      t,
-      () => reassembler.pushAuthenticated(frame(id(0xff), 0, 1, b4a.from('y'))),
-      'CIRCUIT_LIMIT'
-    )
-    expectCode(
-      t,
-      () => reassembler.pushAuthenticated(frame(id(0xfe), 0, 2, b4a.alloc(MAX_FRAGMENT_DATA))),
-      'CIRCUIT_LIMIT'
-    )
-  } finally {
-    b4a.allocUnsafeSlow = allocate
-  }
-  t.is(allocations, 0)
+  expectCode(
+    t,
+    () => reassembler.pushAuthenticated(frame(id(0xff), 0, 1, b4a.from('y'))),
+    'CIRCUIT_LIMIT'
+  )
+  expectCode(
+    t,
+    () => reassembler.pushAuthenticated(frame(id(0xfe), 0, 2, b4a.alloc(MAX_FRAGMENT_DATA))),
+    'CIRCUIT_LIMIT'
+  )
+  t.is(reassembler.stats.completedIds, MAX_COMPLETED_IDS)
+  t.is(reassembler.stats.messages, 0)
   expectCode(t, () => reassembler.pushAuthenticated(frame(b4a.alloc(16), 0, 1)), 'REPLAY')
 })
 
@@ -718,52 +699,27 @@ test('tombstone exhaustion transactionally clears a completing affected message'
 test('partial copy and completion allocation failures zero every affected owned buffer', (t) => {
   const accepted = []
   const reassembler = receiver({
+    [TEST_ONLY_FRAGMENT_ALLOCATION_FAILURE]: 2,
     [TEST_ONLY_FRAGMENT_OBSERVER](value) {
       accepted.push(value)
     }
   })
   const frames = fragment(b4a.alloc(MAX_FRAGMENT_DATA + 2, 7), { messageId: id(86) })
   reassembler.pushAuthenticated(frames[0])
-  const allocate = b4a.allocUnsafeSlow
-  let partial = null
-  b4a.allocUnsafeSlow = (size) => {
-    if (size === 2) {
-      partial = allocate(1)
-      partial.fill(0xcc)
-      return partial
-    }
-    return allocate(size)
-  }
-  try {
-    expectCode(t, () => reassembler.pushAuthenticated(frames[1]), 'INVALID_ROUTE')
-  } finally {
-    b4a.allocUnsafeSlow = allocate
-  }
-  t.alike(partial, b4a.alloc(1))
+  expectCode(t, () => reassembler.pushAuthenticated(frames[1]), 'INVALID_ROUTE')
   t.alike(accepted[0], b4a.alloc(accepted[0].byteLength))
   t.is(reassembler.stats.messages, 0)
 
   const assembled = []
   const other = receiver({
+    [TEST_ONLY_FRAGMENT_ALLOCATION_FAILURE]: 3,
     [TEST_ONLY_FRAGMENT_OBSERVER](value) {
       assembled.push(value)
     }
   })
   const two = fragment(b4a.alloc(MAX_FRAGMENT_DATA + 1, 8), { messageId: id(87) })
   other.pushAuthenticated(two[0])
-  b4a.allocUnsafeSlow = (size) => {
-    if (size === MAX_FRAGMENT_DATA + 1) {
-      const value = allocate(size - 1)
-      value.fill(0xdd)
-      return value
-    }
-    return allocate(size)
-  }
-  try {
-    expectCode(t, () => other.pushAuthenticated(two[1]), 'INVALID_ROUTE')
-  } finally {
-    b4a.allocUnsafeSlow = allocate
-  }
+  expectCode(t, () => other.pushAuthenticated(two[1]), 'INVALID_ROUTE')
   for (const value of assembled) t.alike(value, b4a.alloc(value.byteLength))
   t.is(other.stats.messages, 0)
 })
@@ -1061,6 +1017,143 @@ test('collection prototype mutation cannot break replay, expiry, or destroy clea
   t.alike(destroyedOwned[0], b4a.alloc(destroyedOwned[0].byteLength))
 })
 
+test('clock allocator mutation cannot alias accepted storage to the caller frame', (t) => {
+  const allocate = b4a.allocUnsafeSlow
+  const message = b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x65)
+  const frames = fragment(message, { messageId: id(107) })
+  const callerData = Uint8Array.prototype.subarray.call(frames[0], FRAGMENT_HEADER_SIZE)
+  let mutate = true
+  const accepted = []
+  const reassembler = receiver({
+    now() {
+      if (mutate) {
+        b4a.allocUnsafeSlow = (size) =>
+          size === callerData.byteLength ? callerData : allocate(size)
+      }
+      return 0
+    },
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      accepted.push(value)
+    }
+  })
+  try {
+    t.is(reassembler.pushAuthenticated(frames[0]), null)
+  } finally {
+    b4a.allocUnsafeSlow = allocate
+  }
+  t.absent(accepted[0] === callerData)
+  callerData.fill(0)
+  mutate = false
+  t.alike(reassembler.pushAuthenticated(frames[1]), message)
+})
+
+test('observer allocator mutation cannot alias completed output to the caller frame', (t) => {
+  const allocate = b4a.allocUnsafeSlow
+  const expected = b4a.from('owned output')
+  const input = fragment(expected, { messageId: id(108) })[0]
+  const callerData = Uint8Array.prototype.subarray.call(input, FRAGMENT_HEADER_SIZE)
+  const reassembler = receiver({
+    [TEST_ONLY_FRAGMENT_OBSERVER]() {
+      b4a.allocUnsafeSlow = (size) => (size === callerData.byteLength ? callerData : allocate(size))
+    }
+  })
+  let output
+  try {
+    output = reassembler.pushAuthenticated(input)
+  } finally {
+    b4a.allocUnsafeSlow = allocate
+  }
+  t.absent(output === callerData)
+  callerData.fill(0)
+  t.alike(output, expected)
+})
+
+test('authenticated data is snapshotted before the clock can mutate its frame', (t) => {
+  const message = b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x66)
+  const frames = fragment(message, { messageId: id(109) })
+  let active = frames[0]
+  let mutate = true
+  const reassembler = receiver({
+    now() {
+      if (mutate) {
+        Uint8Array.prototype.fill.call(active, 0x99, FRAGMENT_HEADER_SIZE)
+        mutate = false
+      }
+      return 0
+    }
+  })
+  t.is(reassembler.pushAuthenticated(frames[0]), null)
+  active = frames[1]
+  t.alike(reassembler.pushAuthenticated(frames[1]), message)
+})
+
+test('snapshot ownership clears on replay, limit, invalid clock, and completion', (t) => {
+  const accepted = []
+  const message = b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x67)
+  const frames = fragment(message, { messageId: id(110) })
+  const reassembler = receiver({
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      accepted.push(value)
+    }
+  })
+  reassembler.pushAuthenticated(frames[0])
+  expectCode(t, () => reassembler.pushAuthenticated(b4a.from(frames[0])), 'REPLAY')
+  t.is(reassembler.stats.messages, 1)
+  t.is(accepted.length, 1)
+  const output = reassembler.pushAuthenticated(frames[1])
+  t.alike(output, message)
+  for (const value of accepted) t.alike(value, b4a.alloc(value.byteLength))
+
+  const limitedAccepted = []
+  const limited = receiver({
+    maxMessages: 1,
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      limitedAccepted.push(value)
+    }
+  })
+  limited.pushAuthenticated(fragment(message, { messageId: id(111) })[0])
+  expectCode(
+    t,
+    () => limited.pushAuthenticated(fragment(message, { messageId: id(112) })[0]),
+    'CIRCUIT_LIMIT'
+  )
+  t.is(limited.stats.messages, 1)
+  t.is(limitedAccepted.length, 1)
+  limited.destroy()
+  t.alike(limitedAccepted[0], b4a.alloc(limitedAccepted[0].byteLength))
+
+  const invalidClock = receiver({
+    now: () => -1
+  })
+  expectCode(t, () => invalidClock.pushAuthenticated(frames[0]), 'INVALID_ROUTE')
+  t.is(invalidClock.stats.destroyed, true)
+  t.is(invalidClock.stats.bufferedFragments, 0)
+})
+
+test('exact maximum reassembly owns one bounded snapshot set and clears it', (t) => {
+  const accepted = []
+  const message = b4a.alloc(MAX_MESSAGE_DATA_BYTES, 0x68)
+  const frames = fragment(message, { messageId: id(113) })
+  const reassembler = receiver({
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      accepted.push(value)
+    }
+  })
+  for (let index = 0; index < frames.length - 1; index++) {
+    reassembler.pushAuthenticated(frames[index])
+  }
+  const output = reassembler.pushAuthenticated(frames[frames.length - 1])
+  t.alike(output, message)
+  t.is(accepted.length, MAX_FRAGMENTS)
+  let snapshotBytes = 0
+  for (const value of accepted) {
+    snapshotBytes += value.byteLength
+    t.alike(value, b4a.alloc(value.byteLength))
+  }
+  t.is(snapshotBytes, MAX_MESSAGE_DATA_BYTES)
+  t.is(snapshotBytes + output.byteLength, MAX_MESSAGE_DATA_BYTES * 2)
+})
+
 test('hostile, forged, revoked, and shadowed fragment buffers fail safely', (t) => {
   const forged = Object.create(Uint8Array.prototype)
   const revoked = Proxy.revocable(b4a.alloc(20), {})
@@ -1085,9 +1178,10 @@ test('hostile, forged, revoked, and shadowed fragment buffers fail safely', (t) 
   t.is(calls, 0)
 })
 
-test('test observer is deep-only and explicitly not an access-control boundary', (t) => {
+test('test seams are deep-only and explicitly not access-control boundaries', (t) => {
+  t.is(typeof TEST_ONLY_FRAGMENT_ALLOCATION_FAILURE, 'symbol')
   t.is(typeof TEST_ONLY_FRAGMENT_OBSERVER, 'symbol')
-  t.comment('deep test hook observes owned buffers; it is not an access-control boundary')
+  t.comment('the allocation seam can only fail; the observer can inspect owned buffers')
 })
 
 test('300 deterministic generated valid and malformed fragment cases stay bounded', (t) => {
