@@ -23,6 +23,7 @@ const {
   MAX_CAPABILITY_LIFETIME,
   RelayCapabilityVerifier,
   createActiveChallengeResponderAuthority,
+  createActiveChallengeSendAuthority,
   decodeCanonicalEndpoint,
   decodeRelayCapabilityAdvertisement,
   deriveM3DhtNodeId,
@@ -187,6 +188,22 @@ function acceptSafety(owner, fixture) {
   return owner.accept(fixture.encoded, {
     expectedRole: ROLE.SAFETY,
     expectedCapabilityMask: RELAY_CAPABILITY.CIRCUIT_RELAY_V1
+  })
+}
+
+function challengeAuthority(projection, send, overrides = {}) {
+  return createActiveChallengeSendAuthority({
+    capsBinding: {
+      advertisement: projection,
+      sourceEndpoint: endpoint(238),
+      queryNonce: seed(206),
+      cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+      returnRoutabilityCookie: seed(205),
+      advertisementDigest: projection.digest,
+      relayIdentity: projection.identity,
+      ...overrides
+    },
+    send
   })
 }
 
@@ -441,6 +458,74 @@ test('verifier poisons rather than evicting a seventeenth route key', (t) => {
   owner.destroy()
 })
 
+test('seventeenth route key poison atomically revokes live selection and challenge state', async (t) => {
+  const fake = clock()
+  const owner = verifier(fake)
+  let projection = acceptSafety(
+    owner,
+    signedAdvertisement({ expiresAtMs: NOW + 60_000n, routeSeed: 30 })
+  )
+  for (let index = 1; index < 16; index++) {
+    projection = acceptSafety(
+      owner,
+      signedAdvertisement({
+        epoch: 7n + BigInt(index),
+        routeSeed: 30 + index,
+        maxQueuedBytes: 262_144 + index,
+        expiresAtMs: NOW + 60_000n
+      })
+    )
+  }
+  const canonicalBytes = projection.canonicalBytes
+  const digest = projection.digest
+  const routePublicKey = projection.routePublicKey
+  let sentChallenge = null
+  const inFlightAuthority = challengeAuthority(projection, (challenge) => {
+    sentChallenge = challenge
+    return new Promise(() => {})
+  })
+  const unusedAuthority = challengeAuthority(projection, () => {
+    throw new Error('poisoned authority must not perform IO')
+  })
+  let settled = false
+  let code = null
+  const pending = owner.beginChallenge(projection, inFlightAuthority).catch((err) => {
+    settled = true
+    code = err && err.code
+  })
+  await Promise.resolve()
+  expectCode(
+    t,
+    () =>
+      acceptSafety(
+        owner,
+        signedAdvertisement({
+          epoch: 23n,
+          routeSeed: 99,
+          maxQueuedBytes: 262_199,
+          expiresAtMs: NOW + 60_000n
+        })
+      ),
+    'ERR_AUTHENTICATION'
+  )
+  t.alike(sentChallenge, b4a.alloc(sentChallenge.byteLength), 'poison clears IO bytes atomically')
+  for (let index = 0; index < 4; index++) await Promise.resolve()
+  t.ok(settled, 'poison rejects the in-flight challenge immediately')
+  t.is(code, 'ERR_AUTHENTICATION')
+  t.alike(canonicalBytes, b4a.alloc(canonicalBytes.byteLength))
+  t.alike(digest, b4a.alloc(32))
+  t.alike(routePublicKey, b4a.alloc(32))
+  t.alike(sentChallenge, b4a.alloc(sentChallenge.byteLength))
+  t.is(fake.pending(), 0, 'poison cancels record and challenge timers')
+  await expectCodeAsync(
+    t,
+    () => owner.beginChallenge(projection, unusedAuthority),
+    'ERR_AUTHENTICATION'
+  )
+  await pending
+  owner.destroy()
+})
+
 test('verifier invalidates atomically on clock rollback and forward expiry', async (t) => {
   const fake = clock()
   let invalidations = 0
@@ -451,10 +536,11 @@ test('verifier invalidates atomically on clock rollback and forward expiry', asy
   })
   const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
   const projection = acceptSafety(owner, fixture)
+  const rollbackAuthority = challengeAuthority(projection, async () => b4a.alloc(344))
   fake.jumpWall(-30_001)
   await expectCodeAsync(
     t,
-    () => owner.beginChallenge(projection, async () => b4a.alloc(344)),
+    () => owner.beginChallenge(projection, rollbackAuthority),
     'ERR_INCOMPATIBLE_RELAY'
   )
   t.is(invalidations, 1)
@@ -466,10 +552,11 @@ test('verifier invalidates atomically on clock rollback and forward expiry', asy
   const nextClock = clock()
   const next = verifier(nextClock)
   const nextProjection = acceptSafety(next, fixture)
+  const expiredAuthority = challengeAuthority(nextProjection, async () => b4a.alloc(344))
   nextClock.jumpWall(60_000)
   await expectCodeAsync(
     t,
-    () => next.beginChallenge(nextProjection, async () => b4a.alloc(344)),
+    () => next.beginChallenge(nextProjection, expiredAuthority),
     'ERR_INCOMPATIBLE_RELAY'
   )
   next.destroy()
@@ -479,6 +566,7 @@ test('verifier invalidates atomically on clock rollback and forward expiry', asy
 test('relay verification exposes no public discovery or dialing API', async (t) => {
   t.is(publicApi.RelayCapabilityVerifier, undefined)
   t.is(publicApi.createActiveChallengeResponderAuthority, undefined)
+  t.is(publicApi.createActiveChallengeSendAuthority, undefined)
   t.is(publicApi.decodeRelayCapabilityAdvertisement, undefined)
 
   const fake = clock()
@@ -593,6 +681,143 @@ test('CAPS cookie binds every query field and responder consumes one active resp
   responder.destroy()
 })
 
+test('verifier consumes one opaque CAPS-bound send authority with the exact challenge tail', async (t) => {
+  const fake = clock()
+  const owner = verifier(fake)
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
+  const projection = acceptSafety(owner, fixture)
+  const responder = createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+  })
+  const query = {
+    sourceEndpoint: endpoint(239),
+    requestedCapabilityMask: 1,
+    randomTarget: seed(207),
+    queryNonce: seed(208),
+    maximumResults: 1
+  }
+  const cookie = responder.issueCookie(query)
+  const responderBinding = responder.admitCapsRetry({
+    ...query,
+    ...cookie,
+    advertisement: fixture.encoded
+  })
+  let sends = 0
+  let sentChallenge = null
+  const sendAuthority = createActiveChallengeSendAuthority({
+    capsBinding: {
+      advertisement: projection,
+      sourceEndpoint: query.sourceEndpoint,
+      queryNonce: query.queryNonce,
+      cookieExpiresAtMs: cookie.cookieExpiresAtMs,
+      returnRoutabilityCookie: cookie.returnRoutabilityCookie,
+      advertisementDigest: projection.digest,
+      relayIdentity: projection.identity
+    },
+    send(challenge) {
+      sends++
+      sentChallenge = challenge
+      const body = challenge.subarray(8)
+      t.alike(body.subarray(104, 136), query.queryNonce)
+      t.is(body.readBigUInt64BE(136), cookie.cookieExpiresAtMs)
+      t.alike(body.subarray(144, 176), cookie.returnRoutabilityCookie)
+      return responder.respond(responderBinding, challenge, {
+        sourceEndpoint: query.sourceEndpoint,
+        advertisement: fixture.encoded,
+        identitySecretKey: fixture.signer.secretKey,
+        routeEncryptionSecretKey: fixture.route.secretKey
+      })
+    }
+  })
+  t.ok(Object.isFrozen(sendAuthority))
+  t.alike(Object.getOwnPropertyNames(sendAuthority), [])
+  const validated = await owner.beginChallenge(projection, sendAuthority)
+  t.is(sends, 1)
+  t.alike(validated.digest, projection.digest)
+  t.alike(
+    sentChallenge,
+    b4a.alloc(sentChallenge.byteLength),
+    'consumed challenge bytes are cleared'
+  )
+
+  await expectCodeAsync(t, () => owner.beginChallenge(projection, sendAuthority), 'ERR_REPLAY')
+  let forgedCalls = 0
+  await expectCodeAsync(
+    t,
+    () =>
+      owner.beginChallenge(projection, async () => {
+        forgedCalls++
+        return b4a.alloc(344)
+      }),
+    'ERR_AUTHENTICATION'
+  )
+  t.is(forgedCalls, 0)
+  responder.destroy()
+  owner.destroy()
+})
+
+test('completed CAPS tuple stays tombstoned and conflicting retry fails until cookie expiry', (t) => {
+  const fake = clock()
+  const responder = createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+  })
+  const fixture = signedAdvertisement()
+  const query = {
+    sourceEndpoint: endpoint(237),
+    requestedCapabilityMask: 1,
+    randomTarget: seed(203),
+    queryNonce: seed(204),
+    maximumResults: 1
+  }
+  const cookie = responder.issueCookie(query)
+  const retry = { ...query, ...cookie, advertisement: fixture.encoded }
+  const binding = responder.admitCapsRetry(retry)
+  const state = responder._bindings.get(binding)
+  const ownedNonce = state.query.queryNonce
+  const ownedCookie = state.query.returnRoutabilityCookie
+  const ownedDigest = state.advertisementDigest
+  const ephemeral = routeKey(64)
+  const body = b4a.alloc(176)
+  body.set(digestRelayCapabilityAdvertisement(fixture.encoded, { now: NOW }), 0)
+  body.set(seed(63), 32)
+  body.set(ephemeral.publicKey, 64)
+  body.writeBigUInt64BE(NOW + ACTIVE_CHALLENGE_TIMEOUT, 96)
+  body.set(query.queryNonce, 104)
+  body.writeBigUInt64BE(cookie.cookieExpiresAtMs, 136)
+  body.set(cookie.returnRoutabilityCookie, 144)
+  const challenge = encodeM3Object({ messageId: M3_MESSAGE_ID.ACTIVE_CHALLENGE_V1, body })
+  responder.respond(binding, challenge, {
+    sourceEndpoint: query.sourceEndpoint,
+    advertisement: fixture.encoded,
+    identitySecretKey: fixture.signer.secretKey,
+    routeEncryptionSecretKey: fixture.route.secretKey
+  })
+
+  t.unlike(ownedNonce, b4a.alloc(32), 'replay tombstone owns the canonical query')
+  t.unlike(ownedCookie, b4a.alloc(32), 'replay tombstone owns the canonical cookie')
+  t.unlike(ownedDigest, b4a.alloc(32), 'replay tombstone owns the advertisement digest')
+  expectCode(t, () => responder.admitCapsRetry(retry), 'ERR_REPLAY')
+  const conflicting = signedAdvertisement({ maxQueuedBytes: 262_145 })
+  expectCode(
+    t,
+    () => responder.admitCapsRetry({ ...query, ...cookie, advertisement: conflicting.encoded }),
+    'ERR_AUTHENTICATION'
+  )
+
+  fake.advance(5_001)
+  responder.issueCookie({ ...query, queryNonce: seed(202) })
+  t.alike(ownedNonce, b4a.alloc(32))
+  t.alike(ownedCookie, b4a.alloc(32))
+  t.alike(ownedDigest, b4a.alloc(32))
+  responder.destroy()
+})
+
 test('CAPS cookie survives only the live prior-secret overlap at exact rotation', (t) => {
   const fake = clock(0n)
   let generated = 0
@@ -700,50 +925,60 @@ test('active challenge uses exact vectors, monotonic deadline, possession proof,
   let calls = 0
   let completedResponse = null
 
-  const result = await owner.beginChallenge(projection, async (message) => {
-    calls++
-    t.is(message.byteLength, 184)
-    t.is(message.readUInt16BE(4), M3_MESSAGE_ID.ACTIVE_CHALLENGE_V1)
-    const body = message.subarray(8)
-    const shared = cryptoSuite.keyAgreement(fixture.route.secretKey, body.subarray(64, 96))
-    const responseBody = b4a.alloc(272)
-    responseBody.set(body.subarray(0, 32), 0)
-    responseBody.set(fixture.signer.publicKey, 32)
-    responseBody.set(body.subarray(32, 96), 64)
-    responseBody.set(responderNonce, 128)
-    responseBody.set(body.subarray(96, 176), 160)
-    const domain = b4a.from('hyperdht-private-routes/m3/active-challenge/route-key-proof/v1')
-    const proofInput = b4a.concat([
-      b4a.from([domain.byteLength >>> 8, domain.byteLength]),
-      domain,
-      responseBody.subarray(0, 240)
-    ])
-    sodium.crypto_generichash(responseBody.subarray(240), proofInput, shared)
-    const signatureDomain = b4a.from('hyperdht-private-routes/m3/active-challenge-response/v1')
-    const signatureInput = b4a.alloc(2 + signatureDomain.byteLength + 8 + responseBody.byteLength)
-    signatureInput.writeUInt16BE(signatureDomain.byteLength, 0)
-    signatureInput.set(signatureDomain, 2)
-    signatureInput.writeUInt32BE(1, 2 + signatureDomain.byteLength)
-    signatureInput.writeUInt16BE(
-      M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1,
-      6 + signatureDomain.byteLength
-    )
-    signatureInput.writeUInt16BE(responseBody.byteLength, 8 + signatureDomain.byteLength)
-    signatureInput.set(responseBody, 10 + signatureDomain.byteLength)
-    const signature = cryptoSuite.sign(signatureInput, fixture.signer.secretKey)
-    completedResponse = encodeM3Object({
-      messageId: M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1,
-      body: responseBody,
-      authSuffix: signature
+  const result = await owner.beginChallenge(
+    projection,
+    challengeAuthority(projection, async (message) => {
+      calls++
+      t.is(message.byteLength, 184)
+      t.is(message.readUInt16BE(4), M3_MESSAGE_ID.ACTIVE_CHALLENGE_V1)
+      const body = message.subarray(8)
+      const shared = cryptoSuite.keyAgreement(fixture.route.secretKey, body.subarray(64, 96))
+      const responseBody = b4a.alloc(272)
+      responseBody.set(body.subarray(0, 32), 0)
+      responseBody.set(fixture.signer.publicKey, 32)
+      responseBody.set(body.subarray(32, 96), 64)
+      responseBody.set(responderNonce, 128)
+      responseBody.set(body.subarray(96, 176), 160)
+      const domain = b4a.from('hyperdht-private-routes/m3/active-challenge/route-key-proof/v1')
+      const proofInput = b4a.concat([
+        b4a.from([domain.byteLength >>> 8, domain.byteLength]),
+        domain,
+        responseBody.subarray(0, 240)
+      ])
+      sodium.crypto_generichash(responseBody.subarray(240), proofInput, shared)
+      const signatureDomain = b4a.from('hyperdht-private-routes/m3/active-challenge-response/v1')
+      const signatureInput = b4a.alloc(2 + signatureDomain.byteLength + 8 + responseBody.byteLength)
+      signatureInput.writeUInt16BE(signatureDomain.byteLength, 0)
+      signatureInput.set(signatureDomain, 2)
+      signatureInput.writeUInt32BE(1, 2 + signatureDomain.byteLength)
+      signatureInput.writeUInt16BE(
+        M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1,
+        6 + signatureDomain.byteLength
+      )
+      signatureInput.writeUInt16BE(responseBody.byteLength, 8 + signatureDomain.byteLength)
+      signatureInput.set(responseBody, 10 + signatureDomain.byteLength)
+      const signature = cryptoSuite.sign(signatureInput, fixture.signer.secretKey)
+      completedResponse = encodeM3Object({
+        messageId: M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1,
+        body: responseBody,
+        authSuffix: signature
+      })
+      return completedResponse
     })
-    return completedResponse
-  })
+  )
   t.is(calls, 1)
   t.alike(result.digest, projection.digest)
 
   await expectCodeAsync(
     t,
-    () => owner.beginChallenge(projection, async () => completedResponse),
+    () =>
+      owner.beginChallenge(
+        projection,
+        challengeAuthority(projection, async () => completedResponse, {
+          queryNonce: seed(209),
+          returnRoutabilityCookie: seed(210)
+        })
+      ),
     'ERR_REPLAY'
   )
 
@@ -752,12 +987,59 @@ test('active challenge uses exact vectors, monotonic deadline, possession proof,
   await expectCodeAsync(
     t,
     () =>
-      owner.beginChallenge(slow, async () => {
-        fake.advance(Number(ACTIVE_CHALLENGE_TIMEOUT) + 1)
-        return b4a.alloc(344)
-      }),
+      owner.beginChallenge(
+        slow,
+        challengeAuthority(slow, async () => {
+          fake.advance(Number(ACTIVE_CHALLENGE_TIMEOUT) + 1)
+          return b4a.alloc(344)
+        })
+      ),
     'ERR_INCOMPATIBLE_RELAY'
   )
+  owner.destroy()
+})
+
+test('active challenge timer cannot outlive a shorter signed advertisement expiry', async (t) => {
+  const fake = clock()
+  const delays = []
+  const owner = new RelayCapabilityVerifier({
+    wallNow: fake.wallNow,
+    monotonicNow: fake.monotonicNow,
+    setTimer(callback, delay) {
+      delays.push(delay)
+      return fake.setTimer(callback, delay)
+    },
+    clearTimer: fake.clearTimer,
+    onInvalidated() {}
+  })
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 1_000n })
+  const projection = acceptSafety(owner, fixture)
+  let sentChallenge = null
+  let settled = false
+  let code = null
+  const operation = owner
+    .beginChallenge(
+      projection,
+      challengeAuthority(projection, (challenge) => {
+        sentChallenge = challenge
+        return new Promise(() => {})
+      })
+    )
+    .catch((err) => {
+      settled = true
+      code = err && err.code
+    })
+  await Promise.resolve()
+  t.alike(delays, [1_000, 1_000], 'record and challenge timers share the signed deadline')
+  t.is(sentChallenge.subarray(8).readBigUInt64BE(96), NOW + 1_000n)
+  fake.advance(1_000)
+  for (let index = 0; index < 4; index++) await Promise.resolve()
+  t.ok(settled)
+  t.is(code, 'ERR_INCOMPATIBLE_RELAY')
+  t.alike(sentChallenge, b4a.alloc(sentChallenge.byteLength))
+  t.alike(projection.canonicalBytes, b4a.alloc(projection.canonicalBytes.byteLength))
+  t.is(fake.pending(), 0)
+  await operation
   owner.destroy()
 })
 
@@ -782,7 +1064,10 @@ test('destroy aborts and erases an in-flight challenge', async (t) => {
   const owner = verifier(fake)
   const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
   const projection = acceptSafety(owner, fixture)
-  const operation = owner.beginChallenge(projection, () => new Promise(() => {}))
+  const operation = owner.beginChallenge(
+    projection,
+    challengeAuthority(projection, () => new Promise(() => {}))
+  )
   await Promise.resolve()
   owner.destroy()
   await expectCodeAsync(t, () => operation, 'ERR_DESTROYED')
