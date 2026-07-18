@@ -460,16 +460,29 @@ test('opaque destinations authenticate copied bytes, factories, and a fixed key 
   const second = fixture()
   const source = record(3)
   first.authority.lookup = [source]
+  first.authority.announce = [
+    { id: b4a.from(source.id), destinationRef: b4a.from(source.destinationRef) }
+  ]
   const [destination] = first.io.closest({
     target: bytes(1, 32),
     limit: 1,
     context: first.contexts.immutableGet.lookup
+  })
+  const [announceDestination] = await first.io.bootstrap({
+    target: bytes(1, 32),
+    limit: 1,
+    context: first.contexts.immutableGet.announce
   })
 
   t.is(
     first.io.key(destination),
     'bd06e16462ead79ae13d1c1f3dcaddebdf6cda8375079d89d8dad9cd68c878e6'
   )
+  t.is(
+    first.io.key(announceDestination),
+    'e091c3d669bba6614d75c7dc3870f6eee25b6e3c5b179eb22bde35bf6d9197b8'
+  )
+  t.not(first.io.key(destination), first.io.key(announceDestination))
   source.id.fill(0)
   source.destinationRef.fill(0)
   t.alike(first.io.id(destination), bytes(3, 32))
@@ -647,6 +660,17 @@ test('logical reply validation is exact, bounded, defensive, and branch preservi
       value: bytes(1, 4707)
     }
   ]
+  if (typeof SharedArrayBuffer === 'function') {
+    malformed.push({
+      rtt: 1,
+      from: record(40),
+      to: null,
+      token: null,
+      closerNodes: [],
+      error: 0,
+      value: new Uint8Array(new SharedArrayBuffer(32))
+    })
+  }
 
   for (const response of malformed) {
     const current = fixture()
@@ -909,4 +933,352 @@ test('random callback cannot redirect captured mutable intrinsics', async (t) =>
   }
   t.ok(poisoned)
   t.is((await operation.promise).error, 0)
+})
+
+test('lifecycle serializes a suspend requested during deferred resume', async (t) => {
+  const authority = new FakeRouteAuthority()
+  const order = []
+  let releaseResume = null
+  authority.suspend = () => {
+    authority.calls.suspend++
+    order.push('suspend')
+  }
+  authority.resume = () => {
+    authority.calls.resume++
+    order.push('resume')
+    return new Promise((resolve) => {
+      releaseResume = resolve
+    })
+  }
+  const current = fixture({ authority })
+  await current.io.suspend()
+  const resuming = current.io.resume()
+  while (releaseResume === null) await Promise.resolve()
+  const suspending = current.io.suspend()
+  releaseResume()
+  await resuming
+  await suspending
+  t.alike(order, ['suspend', 'resume', 'suspend'])
+  expectCode(
+    t,
+    () =>
+      current.io.closest({
+        target: bytes(1, 32),
+        limit: 0,
+        context: current.contexts.immutableGet.lookup
+      }),
+    'ERR_DESTROYED'
+  )
+})
+
+test('bootstrap epoch rejects results crossing suspend, resume, or destroy', async (t) => {
+  for (const terminal of ['resume', 'destroy']) {
+    const authority = new FakeRouteAuthority()
+    let resolveBootstrap = null
+    authority.bootstrap = () =>
+      new Promise((resolve) => {
+        resolveBootstrap = resolve
+      })
+    const current = fixture({ authority })
+    const pending = current.io.bootstrap({
+      target: bytes(1, 32),
+      limit: 1,
+      context: current.contexts.immutableGet.lookup
+    })
+    await current.io.suspend()
+    if (terminal === 'resume') await current.io.resume()
+    else await current.io.destroy()
+    resolveBootstrap([record(70)])
+    await expectRejectCode(t, pending, 'ERR_DESTROYED')
+  }
+})
+
+test('paused async bootstrap iterator closes once when lifecycle epoch changes', async (t) => {
+  const authority = new FakeRouteAuthority()
+  let release = null
+  let started = null
+  let markStarted = null
+  let closed = 0
+  started = new Promise((resolve) => {
+    markStarted = resolve
+  })
+  authority.bootstrap = () => ({
+    async *[Symbol.asyncIterator]() {
+      try {
+        markStarted()
+        yield await new Promise((resolve) => {
+          release = resolve
+        })
+      } finally {
+        closed++
+      }
+    }
+  })
+  const current = fixture({ authority })
+  const pending = current.io.bootstrap({
+    target: bytes(1, 32),
+    limit: 1,
+    context: current.contexts.immutableGet.lookup
+  })
+  await started
+  await current.io.suspend()
+  await current.io.resume()
+  release(record(71))
+  await expectRejectCode(t, pending, 'ERR_DESTROYED')
+  t.is(closed, 1)
+})
+
+test('candidate iterators close exactly once on synchronous and asynchronous limits', async (t) => {
+  const authority = new FakeRouteAuthority()
+  let syncClosed = 0
+  let asyncClosed = 0
+  authority.closest = () =>
+    (function* () {
+      try {
+        yield record(72)
+        yield record(73)
+      } finally {
+        syncClosed++
+      }
+    })()
+  authority.bootstrap = () =>
+    (async function* () {
+      try {
+        yield record(74)
+      } finally {
+        asyncClosed++
+      }
+    })()
+  const current = fixture({ authority })
+  expectCode(
+    t,
+    () =>
+      current.io.closest({
+        target: bytes(1, 32),
+        limit: 1,
+        context: current.contexts.immutableGet.lookup
+      }),
+    'INVALID_ROUTE'
+  )
+  await expectRejectCode(
+    t,
+    current.io.bootstrap({
+      target: bytes(1, 32),
+      limit: 0,
+      context: current.contexts.immutableGet.lookup
+    }),
+    'INVALID_ROUTE'
+  )
+  t.is(syncClosed, 1)
+  t.is(asyncClosed, 1)
+})
+
+test('response reflection reentry poisons the outer request before issuing capabilities', async (t) => {
+  const current = fixture()
+  const source = record(75)
+  current.authority.lookup = [source]
+  let transition = null
+  const logical = {
+    rtt: 1,
+    from: source,
+    to: null,
+    token: null,
+    closerNodes: [],
+    error: 0,
+    value: null
+  }
+  current.authority.response = new Proxy(logical, {
+    ownKeys(target) {
+      try {
+        transition = current.io.suspend()
+      } catch {}
+      return Reflect.ownKeys(target)
+    }
+  })
+  const [to] = current.io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: current.contexts.immutableGet.lookup
+  })
+  const operation = current.io.request(message(to, current.contexts.immutableGet.lookup))
+  await expectRejectCode(t, operation.promise, 'INVALID_ROUTE')
+  await transition
+  await current.io.resume()
+  t.is(current.authority.calls.request, 1)
+})
+
+test('operation reflection reentry cancels once and cannot publish active work', (t) => {
+  const authority = new FakeRouteAuthority()
+  const current = fixture({ authority })
+  authority.lookup = [record(76)]
+  const [to] = current.io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: current.contexts.immutableGet.lookup
+  })
+  let cancels = 0
+  const operation = {
+    promise: Promise.resolve(null),
+    cancel() {
+      cancels++
+    }
+  }
+  authority.requestHook = () =>
+    new Proxy(operation, {
+      getOwnPropertyDescriptor(target, name) {
+        if (name === 'promise') {
+          try {
+            current.io.ready()
+          } catch {}
+        }
+        return Reflect.getOwnPropertyDescriptor(target, name)
+      }
+    })
+  expectCode(
+    t,
+    () => current.io.request(message(to, current.contexts.immutableGet.lookup)),
+    'INVALID_ROUTE'
+  )
+  t.is(cancels, 1)
+})
+
+test('SAB-backed request targets reject before authority request IO', (t) => {
+  if (typeof SharedArrayBuffer !== 'function') {
+    t.pass('SharedArrayBuffer unavailable')
+    return
+  }
+  const current = fixture()
+  current.authority.lookup = [record(77)]
+  const [to] = current.io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: current.contexts.immutableGet.lookup
+  })
+  const target = new Uint8Array(new SharedArrayBuffer(32))
+  expectCode(
+    t,
+    () => current.io.request(message(to, current.contexts.immutableGet.lookup, { target })),
+    'INVALID_ROUTE'
+  )
+  t.is(current.authority.calls.request, 0)
+
+  const sharedId = new Uint8Array(new SharedArrayBuffer(32))
+  sharedId.fill(77)
+  const sharedRecord = record(77)
+  current.authority.lookup = [
+    { id: sharedId, destinationRef: b4a.from(sharedRecord.destinationRef) }
+  ]
+  expectCode(
+    t,
+    () =>
+      current.io.closest({
+        target: bytes(1, 32),
+        limit: 1,
+        context: current.contexts.immutableGet.lookup
+      }),
+    'INVALID_ROUTE'
+  )
+})
+
+test('authority request throws are opaque ROUTE_UNAVAILABLE and clear actual encoded bytes', (t) => {
+  const thrown = [
+    null,
+    undefined,
+    'route failed',
+    7,
+    new Error('route failed'),
+    require('../../lib/private/errors').PrivateRouteError.INVALID_ROUTE(),
+    Object.defineProperty({}, 'name', {
+      get() {
+        throw new Error('name accessor must not run')
+      }
+    })
+  ]
+  for (const cause of thrown) {
+    const authority = new FakeRouteAuthority()
+    let actual = null
+    authority.request = (options) => {
+      authority.calls.request++
+      b4a.from(options.encodedRequest)
+      actual = options.encodedRequest
+      throw cause
+    }
+    const current = fixture({ authority })
+    authority.lookup = [record(78)]
+    const [to] = current.io.closest({
+      target: bytes(1, 32),
+      limit: 1,
+      context: current.contexts.immutableGet.lookup
+    })
+    expectCode(
+      t,
+      () => current.io.request(message(to, current.contexts.immutableGet.lookup)),
+      'ROUTE_UNAVAILABLE'
+    )
+    t.ok(allZero(actual))
+    t.ok(current.retained.every(allZero))
+  }
+})
+
+test('actual encoded request argument is cleared immediately after successful authority return', async (t) => {
+  const authority = new FakeRouteAuthority()
+  const source = record(79)
+  let actual = null
+  authority.request = (options) => {
+    authority.calls.request++
+    b4a.from(options.encodedRequest)
+    actual = options.encodedRequest
+    return {
+      promise: Promise.resolve({
+        rtt: 1,
+        from: source,
+        to: null,
+        token: null,
+        closerNodes: [],
+        error: 0,
+        value: null
+      }),
+      cancel() {}
+    }
+  }
+  const current = fixture({ authority })
+  authority.lookup = [source]
+  const [to] = current.io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: current.contexts.immutableGet.lookup
+  })
+  const operation = current.io.request(message(to, current.contexts.immutableGet.lookup))
+  t.ok(allZero(actual))
+  t.is((await operation.promise).error, 0)
+})
+
+test('value is copied before later hostile closer-record reflection', async (t) => {
+  const current = fixture()
+  const source = record(80)
+  const value = bytes(0x5a, 32)
+  const closer = new Proxy(record(81), {
+    ownKeys(target) {
+      value.fill(0)
+      return Reflect.ownKeys(target)
+    }
+  })
+  current.authority.lookup = [source]
+  current.authority.response = {
+    rtt: 1,
+    from: source,
+    to: null,
+    token: null,
+    closerNodes: [closer],
+    error: 0,
+    value
+  }
+  const [to] = current.io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: current.contexts.immutableGet.lookup
+  })
+  const reply = await current.io.request(message(to, current.contexts.immutableGet.lookup)).promise
+  t.alike(reply.value, bytes(0x5a, 32))
+  t.alike(Object.keys(reply), ['rtt', 'from', 'to', 'token', 'closerNodes', 'error', 'value'])
 })
