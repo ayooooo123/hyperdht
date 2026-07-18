@@ -7,12 +7,8 @@ const { COMMANDS } = require('../../lib/constants')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const { createQueryContexts } = require('../../lib/private/query-context')
 const { RoutedDHTIO } = require('../../lib/private/routed-dht-io')
-const {
-  decodeDestinationRef,
-  decodeRoutedRequest,
-  encodeDestinationRef,
-  clearRoutedRequest
-} = require('../../lib/private/routed-dht')
+const { decodeDestinationRef, encodeDestinationRef } = require('../../lib/private/destination-ref')
+const { decodeRoutedRequest, clearRoutedRequest } = require('../../lib/private/routed-dht')
 const { BRANCH_CLASS, M3_MESSAGE_ID } = require('../../lib/private/protocol')
 const { FakeRouteAuthority } = require('./fake-route-authority')
 

@@ -5,16 +5,36 @@ const b4a = require('b4a')
 
 const {
   DESTINATION_REF_SIZE,
+  MAX_ROUTED_REPLY_BYTES,
+  ROUTED_REPLY_FIXED_BODY_SIZE,
   ROUTED_REQUEST_FIXED_BODY_SIZE,
+  abortRoutedReplyAdmission,
+  clearRoutedReply,
   clearRoutedRequest,
+  commitRoutedReplyAdmission,
   decodeDestinationRef,
+  decodeRoutedReply,
   decodeRoutedRequest,
   encodeDestinationRef,
+  encodeRoutedReply,
   encodeRoutedRequest,
+  validateRoutedReplyForRequest,
   validateRoutedRequestForExit
 } = require('../../lib/private/routed-dht')
 const { PrivateRouteError } = require('../../lib/private/errors')
-const { BRANCH_CLASS, M3_MESSAGE_ID } = require('../../lib/private/protocol')
+const {
+  BRANCH_CLASS,
+  DESTINATION_VALIDATION_CLASS,
+  M3_MESSAGE_ID,
+  ROUTED_ERROR
+} = require('../../lib/private/protocol')
+const {
+  createLiveOpaqueDestinations,
+  createRoutedReplyReferralAuthority,
+  destroyLiveOpaqueDestinations,
+  issueLiveOpaqueDestination,
+  revokeRoutedReplyReferralAuthority
+} = require('../../lib/private/opaque-destination')
 
 const COMMANDS = Object.freeze([
   [M3_MESSAGE_ID.IMMUTABLE_GET_V1, 32, 32, true, true],
@@ -104,6 +124,59 @@ function expectedRequest() {
     seed(0x22, 32)
   ])
   return m3(M3_MESSAGE_ID.ROUTED_REQUEST_V1, body)
+}
+
+function destinationRef(id, handleByte) {
+  return encodeDestinationRef({ id, handle: seed(handleByte, 130) })
+}
+
+function reply(overrides = {}) {
+  return encodeRoutedReply({
+    requestId: seed(0x21, 16),
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    commandVersion: 1,
+    operationClass: BRANCH_CLASS.LOOKUP,
+    from: expectedDestination(),
+    errorCode: 0,
+    token: b4a.alloc(0),
+    closerNodes: [],
+    encodedResponse: b4a.alloc(0),
+    ...overrides
+  })
+}
+
+function liveReplyAuthority(target = seed(0, 32)) {
+  const owner = createLiveOpaqueDestinations({
+    branch: BRANCH_CLASS.LOOKUP,
+    circuitId: seed(0x31, 16),
+    generation: 7n,
+    expiresAt: 5_000n,
+    wallNow: () => 1_000n
+  })
+  const seedDestination = issueLiveOpaqueDestination(owner, {
+    id: seed(0x11, 32),
+    destinationRef: expectedDestination()
+  })
+  const authority = createRoutedReplyReferralAuthority(owner, {
+    from: seedDestination,
+    target,
+    requestId: seed(0x21, 16),
+    deadline: 4_000n
+  })
+  return { owner, seedDestination, authority }
+}
+
+function replyOptions(authority, target = seed(0, 32), overrides = {}) {
+  return {
+    encodedRequest: request({ encodedBody: target }),
+    target,
+    branch: BRANCH_CLASS.LOOKUP,
+    circuitId: seed(0x31, 16),
+    generation: 7n,
+    now: 1_000n,
+    referralAuthority: authority,
+    ...overrides
+  }
 }
 
 function allZero(value) {
@@ -666,4 +739,300 @@ test('clearRoutedRequest is idempotent and ignores hostile arbitrary values', (t
   t.ok(allZero(decoded.destination.handle))
   t.ok(allZero(decoded.destinationEncoded))
   t.ok(allZero(decoded.encodedBody))
+})
+
+test('ROUTED_REPLY_V1 freezes exact minimum, maximum, and error vectors', (t) => {
+  const minimumBody = b4a.concat([
+    seed(0x21, 16),
+    u16(M3_MESSAGE_ID.IMMUTABLE_GET_V1),
+    u16(1),
+    b4a.from([BRANCH_CLASS.LOOKUP]),
+    expectedDestination(),
+    u16(0),
+    u16(0),
+    b4a.from([0]),
+    u16(0)
+  ])
+  const minimum = reply()
+  const errorBody = b4a.concat([
+    seed(0x21, 16),
+    u16(M3_MESSAGE_ID.IMMUTABLE_GET_V1),
+    u16(1),
+    b4a.from([BRANCH_CLASS.LOOKUP]),
+    expectedDestination(),
+    u16(ROUTED_ERROR.BUSY),
+    u16(0),
+    b4a.from([0]),
+    u16(0)
+  ])
+  const encodedError = reply({ errorCode: ROUTED_ERROR.BUSY })
+  const target = seed(0, 32)
+  const closerNodes = []
+  for (let index = 1; index <= 20; index++) {
+    const id = b4a.alloc(32)
+    id[31] = index
+    closerNodes.push(destinationRef(id, 0x40 + index))
+  }
+  const maximum = reply({
+    token: seed(0x51, 32),
+    closerNodes,
+    encodedResponse: seed(0x52, 1026)
+  })
+
+  t.is(ROUTED_REPLY_FIXED_BODY_SIZE, 200)
+  t.is(MAX_ROUTED_REPLY_BYTES, 4706)
+  t.is(minimumBody.byteLength, ROUTED_REPLY_FIXED_BODY_SIZE)
+  t.is(minimum.byteLength, 208)
+  t.alike(minimum, m3(M3_MESSAGE_ID.ROUTED_REPLY_V1, minimumBody))
+  t.alike(encodedError, m3(M3_MESSAGE_ID.ROUTED_REPLY_V1, errorBody))
+  for (const errorCode of Object.values(ROUTED_ERROR)) {
+    const known = decodeRoutedReply(reply({ errorCode }))
+    t.is(known.errorCode, errorCode)
+    t.is(known.token.byteLength, 0)
+    t.is(known.closerNodes.length, 0)
+    t.is(known.encodedResponse.byteLength, 0)
+    clearRoutedReply(known)
+  }
+  t.is(maximum.byteLength, MAX_ROUTED_REPLY_BYTES)
+  t.is(maximum.byteLength - request({ encodedBody: target }).byteLength, 4445)
+
+  const decoded = decodeRoutedReply(maximum)
+  t.alike(decoded.requestId, seed(0x21, 16))
+  t.is(decoded.commandId, M3_MESSAGE_ID.IMMUTABLE_GET_V1)
+  t.is(decoded.commandVersion, 1)
+  t.is(decoded.operationClass, BRANCH_CLASS.LOOKUP)
+  t.alike(decoded.fromEncoded, expectedDestination())
+  t.alike(decoded.from, destination())
+  t.is(decoded.errorCode, 0)
+  t.alike(decoded.token, seed(0x51, 32))
+  t.is(decoded.closerNodes.length, 20)
+  t.is(decoded.closerNodeEncoded.length, 20)
+  t.is(decoded.encodedResponse.byteLength, 1026)
+  t.ok(Object.isFrozen(decoded))
+  t.ok(Object.isFrozen(decoded.from))
+  t.ok(Object.isFrozen(decoded.closerNodes))
+  t.ok(Object.isFrozen(decoded.closerNodeEncoded))
+
+  maximum.fill(0)
+  t.alike(decoded.requestId, seed(0x21, 16))
+  t.alike(decoded.token, seed(0x51, 32))
+  t.alike(decoded.encodedResponse, seed(0x52, 1026))
+  clearRoutedReply(decoded)
+  t.ok(allZero(decoded.requestId))
+  t.ok(allZero(decoded.from.id))
+  t.ok(allZero(decoded.from.handle))
+  t.ok(allZero(decoded.fromEncoded))
+  t.ok(allZero(decoded.token))
+  t.ok(allZero(decoded.encodedResponse))
+})
+
+test('routed reply validation binds the request and atomically admits sorted referrals', (t) => {
+  const target = seed(0, 32)
+  const firstId = b4a.alloc(32)
+  const secondId = b4a.alloc(32)
+  firstId[31] = 1
+  secondId[31] = 2
+  const first = destinationRef(firstId, 0x61)
+  const second = destinationRef(secondId, 0x62)
+  const live = liveReplyAuthority(target)
+  const result = validateRoutedReplyForRequest(
+    reply({ closerNodes: [first, second], encodedResponse: seed(0x63, 1026) }),
+    replyOptions(live.authority, target)
+  )
+
+  t.ok(Object.isFrozen(live.owner))
+  t.ok(Object.isFrozen(live.seedDestination))
+  t.ok(Object.isFrozen(live.authority))
+  t.alike(Object.keys(live.owner), [])
+  t.alike(Object.keys(live.seedDestination), [])
+  t.alike(Object.keys(live.authority), [])
+  t.ok(Object.isFrozen(result))
+  t.ok(Object.isFrozen(result.admission))
+  t.alike(Object.keys(result.admission), [])
+  t.is(result.reply.closerNodes.length, 2)
+
+  const admitted = commitRoutedReplyAdmission(result.admission)
+  t.ok(Object.isFrozen(admitted))
+  t.is(admitted.length, 2)
+  t.ok(Object.isFrozen(admitted[0]))
+  t.alike(Object.keys(admitted[0]), [])
+  expectCode(t, () => commitRoutedReplyAdmission(result.admission), 'INVALID_ROUTE')
+  expectCode(
+    t,
+    () => issueLiveOpaqueDestination(live.owner, { id: firstId, destinationRef: first }),
+    'INVALID_ROUTE'
+  )
+
+  clearRoutedReply(result.reply)
+  revokeRoutedReplyReferralAuthority(live.authority)
+  destroyLiveOpaqueDestinations(live.owner)
+})
+
+test('routed reply rejects malformed bindings and referrals without retaining staged data', (t) => {
+  const target = seed(0, 32)
+  const firstId = b4a.alloc(32)
+  const secondId = b4a.alloc(32)
+  firstId[31] = 1
+  secondId[31] = 2
+  const first = destinationRef(firstId, 0x71)
+  const duplicateId = destinationRef(firstId, 0x72)
+  const second = destinationRef(secondId, 0x73)
+
+  expectCode(t, () => reply({ errorCode: 0x017f }), 'INVALID_ROUTE')
+  expectCode(t, () => reply({ errorCode: 0x018f }), 'INVALID_ROUTE')
+  expectCode(t, () => reply({ errorCode: ROUTED_ERROR.BUSY, token: seed(1, 32) }), 'INVALID_ROUTE')
+  expectCode(t, () => reply({ encodedResponse: seed(1, 1027) }), 'INVALID_ROUTE')
+
+  const unknownLow = reply()
+  unknownLow[8 + 193] = 0x01
+  unknownLow[8 + 194] = 0x7f
+  const unknownHigh = reply()
+  unknownHigh[8 + 193] = 0x01
+  unknownHigh[8 + 194] = 0x8f
+  const errorWithData = reply({ token: seed(1, 32) })
+  errorWithData[8 + 193] = ROUTED_ERROR.BUSY >>> 8
+  errorWithData[8 + 194] = ROUTED_ERROR.BUSY
+  const wrongCommand = reply()
+  wrongCommand[8 + 16] = M3_MESSAGE_ID.MUTABLE_GET_V1 >>> 8
+  wrongCommand[8 + 17] = M3_MESSAGE_ID.MUTABLE_GET_V1
+  const wrongVersion = reply()
+  wrongVersion[8 + 19] = 2
+  const wrongClass = reply()
+  wrongClass[8 + 20] = BRANCH_CLASS.ANNOUNCE
+
+  for (const invalid of [
+    unknownLow,
+    unknownHigh,
+    errorWithData,
+    reply({ requestId: seed(0x20, 16) }),
+    wrongCommand,
+    wrongVersion,
+    wrongClass,
+    reply({ from: destinationRef(seed(0x12, 32), 0x74) }),
+    reply({ from: destinationRef(seed(0x11, 32), 0x74) }),
+    reply({ closerNodes: [first, duplicateId] }),
+    reply({ closerNodes: [second, first] })
+  ]) {
+    const live = liveReplyAuthority(target)
+    expectCode(
+      t,
+      () => validateRoutedReplyForRequest(invalid, replyOptions(live.authority, target)),
+      'INVALID_ROUTE'
+    )
+    destroyLiveOpaqueDestinations(live.owner)
+  }
+
+  const trailing = b4a.concat([reply(), b4a.from([0])])
+  const truncated = reply().subarray(0, -1)
+  const wrongTokenLength = reply()
+  wrongTokenLength[8 + 196] = 1
+  const tooManyClosers = reply()
+  tooManyClosers[8 + 197] = 21
+  const tooLarge = m3(M3_MESSAGE_ID.ROUTED_REPLY_V1, b4a.alloc(MAX_ROUTED_REPLY_BYTES - 7))
+  for (const invalid of [trailing, truncated, wrongTokenLength, tooManyClosers, tooLarge]) {
+    const live = liveReplyAuthority(target)
+    expectCode(
+      t,
+      () => validateRoutedReplyForRequest(invalid, replyOptions(live.authority, target)),
+      'INVALID_ROUTE'
+    )
+    destroyLiveOpaqueDestinations(live.owner)
+  }
+
+  let live = liveReplyAuthority(target)
+  expectCode(
+    t,
+    () =>
+      validateRoutedReplyForRequest(reply(), {
+        ...replyOptions(live.authority, target),
+        generation: 8n
+      }),
+    'INVALID_ROUTE'
+  )
+  destroyLiveOpaqueDestinations(live.owner)
+
+  live = liveReplyAuthority(target)
+  const wrongClassRequest = request({ encodedBody: target })
+  wrongClassRequest[8 + 22] = DESTINATION_VALIDATION_CLASS.EXIT_LOCAL
+  expectCode(
+    t,
+    () =>
+      validateRoutedReplyForRequest(
+        reply(),
+        replyOptions(live.authority, target, { encodedRequest: wrongClassRequest })
+      ),
+    'ERR_AUTHENTICATION'
+  )
+  destroyLiveOpaqueDestinations(live.owner)
+
+  live = liveReplyAuthority(target)
+  const stagedThenOversized = m3(
+    M3_MESSAGE_ID.ROUTED_REPLY_V1,
+    b4a.concat([
+      seed(0x21, 16),
+      u16(M3_MESSAGE_ID.IMMUTABLE_GET_V1),
+      u16(1),
+      b4a.from([BRANCH_CLASS.LOOKUP]),
+      expectedDestination(),
+      u16(0),
+      u16(0),
+      b4a.from([1]),
+      first,
+      u16(1027),
+      seed(0x75, 1027)
+    ])
+  )
+  expectCode(
+    t,
+    () => validateRoutedReplyForRequest(stagedThenOversized, replyOptions(live.authority, target)),
+    'INVALID_ROUTE'
+  )
+  const retryAuthority = createRoutedReplyReferralAuthority(live.owner, {
+    from: live.seedDestination,
+    target,
+    requestId: seed(0x21, 16),
+    deadline: 4_000n
+  })
+  const retry = validateRoutedReplyForRequest(
+    reply({ closerNodes: [first] }),
+    replyOptions(retryAuthority, target)
+  )
+  abortRoutedReplyAdmission(retry.admission)
+  expectCode(t, () => abortRoutedReplyAdmission(retry.admission), 'INVALID_ROUTE')
+  destroyLiveOpaqueDestinations(live.owner)
+})
+
+test('routed reply rejects accessor-backed value and exact validation options before staging', (t) => {
+  const target = seed(0, 32)
+  const value = {
+    requestId: seed(0x21, 16),
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    commandVersion: 1,
+    operationClass: BRANCH_CLASS.LOOKUP,
+    from: expectedDestination(),
+    errorCode: 0,
+    token: b4a.alloc(0),
+    closerNodes: [],
+    encodedResponse: b4a.alloc(0)
+  }
+  for (const name of Object.keys(value)) {
+    expectCode(t, () => encodeRoutedReply(hostileOption(name, value)), 'INVALID_ROUTE')
+  }
+  expectCode(t, () => encodeRoutedReply({ ...value, extra: true }), 'INVALID_ROUTE')
+
+  const live = liveReplyAuthority(target)
+  const options = replyOptions(live.authority, target)
+  for (const name of Object.keys(options)) {
+    expectCode(
+      t,
+      () => validateRoutedReplyForRequest(reply(), hostileOption(name, options)),
+      'INVALID_ROUTE'
+    )
+  }
+  expectCode(
+    t,
+    () => validateRoutedReplyForRequest(reply(), { ...options, extra: true }),
+    'INVALID_ROUTE'
+  )
+  destroyLiveOpaqueDestinations(live.owner)
 })
