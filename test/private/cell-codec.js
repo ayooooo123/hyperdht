@@ -383,6 +383,154 @@ test('malformed authenticated body is cleared and rejected before receiver', (t)
   t.alike(plaintext, b4a.alloc(CELL_BODY_SIZE))
 })
 
+test('cell open rejects caller-packet plaintext aliases without clearing caller bytes', (t) => {
+  let packet = null
+  let calls = 0
+  const cell = codec({
+    crypto: {
+      ...cryptoSuite,
+      open() {
+        return packet.subarray(CELL_HEADER_SIZE, CELL_HEADER_SIZE + CELL_BODY_SIZE)
+      }
+    }
+  })
+  packet = codec().seal(sealOptions())
+  packet.fill(0, CELL_HEADER_SIZE, CELL_HEADER_SIZE + CELL_BODY_SIZE)
+  const snapshot = b4a.from(packet)
+
+  expectCode(
+    t,
+    () => cell.open(openOptions({ pushAuthenticated: () => calls++ }), packet),
+    'CELL_INVALID'
+  )
+  t.alike(packet, snapshot)
+  t.is(calls, 0)
+})
+
+test('cell open rejects plaintext overlapping caller key storage', (t) => {
+  const backing = b4a.allocUnsafeSlow(2048)
+  const key = backing.subarray(0, 32)
+  const noncePrefix = backing.subarray(1500, 1516)
+  key.fill(0x51)
+  noncePrefix.fill(0x52)
+  const candidate = backing.subarray(0, CELL_BODY_SIZE)
+  candidate.fill(0)
+  const snapshot = b4a.from(backing)
+  const packet = codec().seal(sealOptions())
+  const cell = codec({ crypto: { ...cryptoSuite, open: () => candidate } })
+
+  expectCode(
+    t,
+    () => cell.open(openOptions(orderedSpy(), { key, noncePrefix }), packet),
+    'CELL_INVALID'
+  )
+  t.alike(backing, snapshot)
+})
+
+test('cell crypto adapters receive disposable key and nonce snapshots', (t) => {
+  const key = b4a.from(KEY)
+  const noncePrefix = b4a.from(NONCE_PREFIX)
+  const keySnapshot = b4a.from(key)
+  const prefixSnapshot = b4a.from(noncePrefix)
+  let sealKey = null
+  let sealPrefix = null
+  let openKey = null
+  let openPrefix = null
+  const sealing = codec({
+    crypto: {
+      ...cryptoSuite,
+      seal(options) {
+        sealKey = options.key
+        sealPrefix = options.noncePrefix
+        const ciphertext = cryptoSuite.seal(options)
+        options.key.fill(0)
+        options.noncePrefix.fill(0)
+        return ciphertext
+      }
+    }
+  })
+  const packet = sealing.seal(sealOptions({ key, noncePrefix }))
+  t.alike(key, keySnapshot)
+  t.alike(noncePrefix, prefixSnapshot)
+
+  const opening = codec({
+    crypto: {
+      ...cryptoSuite,
+      open(options) {
+        openKey = options.key
+        openPrefix = options.noncePrefix
+        const plaintext = cryptoSuite.open(options)
+        options.key.fill(0)
+        options.noncePrefix.fill(0)
+        return plaintext
+      }
+    }
+  })
+  t.alike(opening.open(openOptions(orderedSpy(), { key, noncePrefix }), packet), b4a.from('hello'))
+  t.alike(key, keySnapshot)
+  t.alike(noncePrefix, prefixSnapshot)
+  for (const snapshot of [sealKey, sealPrefix, openKey, openPrefix]) {
+    t.alike(snapshot, b4a.alloc(snapshot.byteLength))
+  }
+})
+
+test('cell key snapshot allocation is transactional before counter or crypto', (t) => {
+  const original = b4a.allocUnsafeSlow
+  let sealCalls = 0
+  const cell = codec({
+    crypto: {
+      ...cryptoSuite,
+      seal(options) {
+        sealCalls++
+        return cryptoSuite.seal(options)
+      }
+    }
+  })
+  const sender = new SenderCounter()
+  let partial = null
+  let firstSnapshot = null
+  b4a.allocUnsafeSlow = (size) => {
+    if (size === 32) {
+      firstSnapshot = original(size)
+      return firstSnapshot
+    }
+    if (size === 16) {
+      partial = original(15)
+      partial.fill(0xaa)
+      return partial
+    }
+    return original(size)
+  }
+  try {
+    expectCode(t, () => cell.seal(sealOptions({ senderCounter: sender })), 'CELL_INVALID')
+  } finally {
+    b4a.allocUnsafeSlow = original
+  }
+  t.is(sealCalls, 0)
+  t.is(sender.value, 0n)
+  t.alike(firstSnapshot, b4a.alloc(32))
+  t.alike(partial, b4a.alloc(15))
+
+  const valid = codec().seal(sealOptions())
+  let openCalls = 0
+  const opening = codec({
+    crypto: {
+      ...cryptoSuite,
+      open(options) {
+        openCalls++
+        return cryptoSuite.open(options)
+      }
+    }
+  })
+  b4a.allocUnsafeSlow = (size) => (size === 16 ? original(15) : original(size))
+  try {
+    expectCode(t, () => opening.open(openOptions(orderedSpy()), valid), 'CELL_INVALID')
+  } finally {
+    b4a.allocUnsafeSlow = original
+  }
+  t.is(openCalls, 0)
+})
+
 test('receiver failures expose only counter codes and clear rejected payloads', (t) => {
   const packet = codec().seal(sealOptions())
   for (const [failure, code] of [
