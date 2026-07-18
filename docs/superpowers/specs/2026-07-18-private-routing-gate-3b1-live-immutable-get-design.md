@@ -340,11 +340,17 @@ The directory is scoped to the pinned guard lease, retains no more than sixteen
 identities, revalidates signed expiry/epoch on every selection, and quarantines
 equivocation as specified above. `RouteManager` may consume a candidate once
 per branch generation. Extension requests carry the complete signed
-advertisement through the pinned guard using the adopted in-route
-`RELAY_DISCOVER_V1`/link-extension formats; the endpoint itself never dials the
-candidate tuple. Gate 3B1 performs no post-pinning discovery. Initial build or
-rotation fails closed when the retained set cannot satisfy diversity. Guard
-loss, suspend, network change, or controller destroy clears the directory.
+advertisement evidence through the pinned guard using only the adopted in-route
+`EXTEND_REQUEST_V1`/`EXTENDED_V1`/`TAIL_READY_V1` extension path; no
+`RELAY_DISCOVER_V1` message is emitted after guard pinning. The endpoint itself
+never dials the candidate tuple. Gate 3B1 performs no post-pinning discovery.
+Initial build or rotation fails closed when the retained set cannot satisfy
+diversity. Ordinary suspend retains the sealed non-dialing directory and
+revalidates every advertisement's signature, epoch, capability, and expiry
+before resume can rebuild; it retains no associated send authority. Guard loss,
+network change, or controller destroy clears the directory. If resume lacks
+four still-valid diverse middle/exit candidates, it enters `UNAVAILABLE`
+without discovery or fallback.
 
 ### `GuardLease`
 
