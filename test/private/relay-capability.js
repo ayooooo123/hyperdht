@@ -65,6 +65,54 @@ async function expectCodeAsync(t, fn, code) {
   t.is(error && error.code, code)
 }
 
+function trackedRelayCapability() {
+  const modulePath = require.resolve('../../lib/private/relay-capability')
+  const cached = require.cache[modulePath]
+  const BufferConstructor = b4a.alloc(0).constructor
+  const originalB4a = b4a.allocUnsafeSlow
+  const originalBuffer = BufferConstructor.allocUnsafeSlow
+  const allocations = []
+  let tracking = false
+  const allocate = (size) => {
+    const value = Reflect.apply(originalBuffer, BufferConstructor, [size])
+    if (tracking) allocations.push(value)
+    return value
+  }
+  b4a.allocUnsafeSlow = allocate
+  BufferConstructor.allocUnsafeSlow = allocate
+  let fresh
+  try {
+    delete require.cache[modulePath]
+    fresh = require(modulePath)
+  } catch (err) {
+    b4a.allocUnsafeSlow = originalB4a
+    BufferConstructor.allocUnsafeSlow = originalBuffer
+    throw err
+  } finally {
+    delete require.cache[modulePath]
+    if (cached) require.cache[modulePath] = cached
+  }
+  let restored = false
+  return {
+    fresh,
+    start() {
+      allocations.length = 0
+      tracking = true
+    },
+    take() {
+      tracking = false
+      return allocations.splice(0)
+    },
+    restore() {
+      if (restored) return
+      restored = true
+      tracking = false
+      b4a.allocUnsafeSlow = originalB4a
+      BufferConstructor.allocUnsafeSlow = originalBuffer
+    }
+  }
+}
+
 function seed(value) {
   return b4a.alloc(32, value)
 }
@@ -678,6 +726,134 @@ test('CAPS cookie binds every query field and responder consumes one active resp
       }),
     'ERR_AUTHENTICATION'
   )
+  responder.destroy()
+})
+
+test('CAPS query late failures clear every earlier owned field copy', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fake = clock()
+  const responder = tracked.fresh.createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+  })
+  const fixture = signedAdvertisement()
+  const query = {
+    sourceEndpoint: endpoint(235),
+    requestedCapabilityMask: 1,
+    randomTarget: b4a.alloc(32, 0xa1),
+    queryNonce: b4a.alloc(32, 0xb2),
+    maximumResults: 1
+  }
+  const snapshots = {
+    sourceEndpoint: b4a.from(query.sourceEndpoint),
+    randomTarget: b4a.from(query.randomTarget),
+    queryNonce: b4a.from(query.queryNonce)
+  }
+  const cookie = responder.issueCookie(query)
+  const retry = { ...query, ...cookie, advertisement: fixture.encoded }
+
+  tracked.start()
+  expectCode(
+    t,
+    () => responder.admitCapsRetry({ ...retry, queryNonce: b4a.alloc(31, 0xc3) }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  const invalidFieldAllocations = tracked.take()
+  t.alike(
+    invalidFieldAllocations.map((value) => value.byteLength),
+    [19, 32]
+  )
+  for (const value of invalidFieldAllocations) t.alike(value, b4a.alloc(value.byteLength))
+
+  const descriptorReads = new Map()
+  const hostile = new Proxy(retry, {
+    getOwnPropertyDescriptor(target, name) {
+      const reads = (descriptorReads.get(name) || 0) + 1
+      descriptorReads.set(name, reads)
+      if (name === 'maximumResults' && reads === 2) throw new Error('late descriptor trap')
+      return Reflect.getOwnPropertyDescriptor(target, name)
+    }
+  })
+  tracked.start()
+  expectCode(t, () => responder.admitCapsRetry(hostile), 'ERR_INCOMPATIBLE_RELAY')
+  const proxyAllocations = tracked.take()
+  t.alike(
+    proxyAllocations.map((value) => value.byteLength),
+    [19, 32, 32]
+  )
+  for (const value of proxyAllocations) t.alike(value, b4a.alloc(value.byteLength))
+  t.alike(query.sourceEndpoint, snapshots.sourceEndpoint)
+  t.alike(query.randomTarget, snapshots.randomTarget)
+  t.alike(query.queryNonce, snapshots.queryNonce)
+  responder.destroy()
+})
+
+test('responder pre-validation failures clear source and advertisement copies', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fake = clock()
+  const responder = tracked.fresh.createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+  })
+  const fixture = signedAdvertisement()
+  const query = {
+    sourceEndpoint: endpoint(234),
+    requestedCapabilityMask: 1,
+    randomTarget: seed(198),
+    queryNonce: seed(199),
+    maximumResults: 1
+  }
+  const sourceSnapshot = b4a.from(query.sourceEndpoint)
+  const advertisementSnapshot = b4a.from(fixture.encoded)
+  const cookie = responder.issueCookie(query)
+  const retry = { ...query, ...cookie, advertisement: fixture.encoded }
+  const binding = responder.admitCapsRetry(retry)
+  const responseOptions = {
+    sourceEndpoint: query.sourceEndpoint,
+    advertisement: fixture.encoded,
+    identitySecretKey: fixture.signer.secretKey,
+    routeEncryptionSecretKey: fixture.route.secretKey
+  }
+
+  tracked.start()
+  expectCode(
+    t,
+    () => responder.respond(binding, b4a.alloc(0), { ...responseOptions, advertisement: {} }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  const invalidAdvertisementAllocations = tracked.take()
+  t.alike(
+    invalidAdvertisementAllocations.map((value) => value.byteLength),
+    [19]
+  )
+  for (const value of invalidAdvertisementAllocations) {
+    t.alike(value, b4a.alloc(value.byteLength))
+  }
+  t.is(responder.admitCapsRetry(retry), binding, 'pre-validation failure does not consume binding')
+
+  tracked.start()
+  expectCode(
+    t,
+    () => responder.respond(binding, b4a.alloc(0), responseOptions),
+    'ERR_AUTHENTICATION'
+  )
+  const malformedChallengeAllocations = tracked.take()
+  t.alike(
+    malformedChallengeAllocations.map((value) => value.byteLength),
+    [19, fixture.encoded.byteLength]
+  )
+  for (const value of malformedChallengeAllocations) {
+    t.alike(value, b4a.alloc(value.byteLength))
+  }
+  t.is(responder.admitCapsRetry(retry), binding, 'malformed challenge does not consume binding')
+  t.alike(query.sourceEndpoint, sourceSnapshot)
+  t.alike(fixture.encoded, advertisementSnapshot)
   responder.destroy()
 })
 
