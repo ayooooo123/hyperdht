@@ -27,7 +27,9 @@ class FakeRouteAuthority {
   }
 
   installTopology(branch, topology) {
-    this.topologies.set(branch, topology)
+    const referrals = new Map()
+    for (const seed of topology.seeds) referrals.set(seed, seed)
+    this.topologies.set(branch, { topology, referrals })
   }
 
   ready() {
@@ -86,7 +88,14 @@ class FakeRouteAuthority {
       }
     }
 
-    if (this.topologies.has(options.branch)) return this.#topologyRequest(state)
+    if (this.topologies.has(options.branch)) {
+      try {
+        return this.#topologyRequest(state)
+      } catch (error) {
+        revoke(state)
+        throw error
+      }
+    }
 
     const response = this.response
     return {
@@ -105,8 +114,9 @@ class FakeRouteAuthority {
   }
 
   #records(options) {
-    const topology = this.topologies.get(options.branch)
-    if (topology !== undefined) {
+    const installed = this.topologies.get(options.branch)
+    if (installed !== undefined) {
+      const topology = installed.topology
       return topology.seeds.slice(0, options.limit).map((index) => topology.records[index])
     }
     const records = options.branch === BRANCH_CLASS.LOOKUP ? this.lookup : this.announce
@@ -117,13 +127,15 @@ class FakeRouteAuthority {
     let routed = null
     try {
       routed = decodeRoutedRequest(state.encodedRequest)
-      const topology = this.topologies.get(state.branch)
+      const installed = this.topologies.get(state.branch)
+      const topology = installed.topology
       const index = topology.records.findIndex((record) =>
         b4a.equals(record.destinationRef, state.destinationRef)
       )
       if (index === -1) throw new Error('destination is outside the selected branch')
 
-      const parent = topology.parents[index]
+      const parent = installed.referrals.get(index)
+      if (parent === undefined) throw new Error('destination was not referred by the topology')
       this.semanticEdges.push({
         branch: state.branch,
         fromId: b4a.from(topology.records[parent].id),
@@ -139,12 +151,16 @@ class FakeRouteAuthority {
         return operation(Promise.reject(new Error('deterministic retry')), state, this)
       }
 
+      const closer = topology.closer[index].map((closer) => topology.records[closer])
+      for (const closerIndex of topology.closer[index]) {
+        if (!installed.referrals.has(closerIndex)) installed.referrals.set(closerIndex, index)
+      }
       const response = {
         rtt: index + 1,
         from: topology.records[index],
         to: null,
         token: null,
-        closerNodes: topology.closer[index].map((closer) => topology.records[closer]),
+        closerNodes: closer,
         error: 0,
         value: topology.values[index]
       }

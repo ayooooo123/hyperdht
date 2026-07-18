@@ -44,7 +44,6 @@ function topology(branch) {
     records,
     seeds: [4],
     closer: [[], [0], [0], [1], [2, 3]],
-    parents: [2, 3, 4, 4, 4],
     values: records.map((_, index) => bytes(offset + 0x10 + index, 8))
   }
 }
@@ -222,12 +221,63 @@ test('iterative immutable get traverses independent lookup and announce branches
   )
   t.is(authority.semanticEdges.filter((edge) => edge.branch === BRANCH_CLASS.LOOKUP).length, 6)
   t.is(authority.semanticEdges.filter((edge) => edge.branch === BRANCH_CLASS.ANNOUNCE).length, 5)
+  t.alike(
+    authority.semanticEdges.map(({ branch, fromId, toId, commandId, attempt }) => ({
+      branch,
+      from: fromId[0],
+      to: toId[0],
+      commandId,
+      attempt
+    })),
+    [
+      { branch: 0, from: 5, to: 5, commandId: 0x120, attempt: 1 },
+      { branch: 0, from: 5, to: 5, commandId: 0x120, attempt: 2 },
+      { branch: 0, from: 5, to: 4, commandId: 0x120, attempt: 1 },
+      { branch: 0, from: 4, to: 2, commandId: 0x120, attempt: 1 },
+      { branch: 0, from: 2, to: 1, commandId: 0x120, attempt: 1 },
+      { branch: 0, from: 5, to: 3, commandId: 0x120, attempt: 1 },
+      { branch: 1, from: 5, to: 5, commandId: 0x120, attempt: 1 },
+      { branch: 1, from: 5, to: 4, commandId: 0x120, attempt: 1 },
+      { branch: 1, from: 4, to: 2, commandId: 0x120, attempt: 1 },
+      { branch: 1, from: 2, to: 1, commandId: 0x120, attempt: 1 },
+      { branch: 1, from: 5, to: 3, commandId: 0x120, attempt: 1 }
+    ]
+  )
   t.not(lookup.records[0].destinationRef, announce.records[0].destinationRef)
   t.not(
     lookup.records[0].destinationRef.toString('hex'),
     announce.records[0].destinationRef.toString('hex')
   )
   t.absent(containsDirectField(authority))
+})
+
+test('synchronous topology failures revoke fake request state', (t) => {
+  const { authority, contexts, routedDHTIO } = createHarness(t)
+  const lookup = topology(BRANCH_CLASS.LOOKUP)
+  lookup.closer[4] = null
+  authority.installTopology(BRANCH_CLASS.LOOKUP, lookup)
+  const [destination] = routedDHTIO.closest({
+    target: bytes(0, 32),
+    limit: 1,
+    context: contexts.immutableGet.lookup
+  })
+
+  const error = thrown(() =>
+    routedDHTIO.request({
+      context: contexts.immutableGet.lookup,
+      command: COMMANDS.IMMUTABLE_GET,
+      to: destination,
+      token: null,
+      internal: false,
+      target: bytes(0, 32),
+      value: null,
+      attempt: 1
+    })
+  )
+
+  t.is(error && error.code, 'ROUTE_UNAVAILABLE')
+  t.ok(authority.requests[0].encodedRequest.every((byte) => byte === 0))
+  t.ok(authority.requests[0].destinationRef.every((byte) => byte === 0))
 })
 
 test('traversal cancellation revokes the active routed operation', async (t) => {
