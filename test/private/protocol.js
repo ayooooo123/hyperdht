@@ -249,6 +249,23 @@ test('roleForIdentity assigns deterministically and rejects every invalid shape'
   for (const value of invalid) expectCode(t, () => roleForIdentity(value), 'INVALID_IDENTITY')
 })
 
+test('roleForIdentity matches independent hardcoded role vectors', (t) => {
+  const vectors = [
+    ['0000000000000000000000000000000000000000000000000000000000000000', ROLE.SAFETY],
+    ['0101010101010101010101010101010101010101010101010101010101010101', ROLE.SAFETY],
+    ['0202020202020202020202020202020202020202020202020202020202020202', ROLE.PRIVATE],
+    ['0303030303030303030303030303030303030303030303030303030303030303', ROLE.PRIVATE],
+    ['1111111111111111111111111111111111111111111111111111111111111111', ROLE.PRIVATE],
+    ['2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a', ROLE.SAFETY],
+    ['7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f', ROLE.PRIVATE],
+    ['ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff', ROLE.SAFETY]
+  ]
+
+  for (const [identity, expectedRole] of vectors) {
+    t.is(roleForIdentity(b4a.from(identity, 'hex')), expectedRole)
+  }
+})
+
 test('roleForIdentity fails closed on forged and hostile buffer shapes', (t) => {
   const sentinel = new Error('hostile identity accessor')
   const hostileProxy = new Proxy(b4a.alloc(32), {
@@ -363,6 +380,73 @@ test('canonical M3 object envelope round trips exact unsigned and signed layouts
   t.alike(decodedSigned.authSuffix, b4a.alloc(64, 0x52))
 })
 
+test('canonical M3 object envelope requires own data properties without invoking accessors', (t) => {
+  const messageId = M3_MESSAGE_ID.DHT_EXIT_READY_ACK_V1
+  const body = b4a.alloc(105)
+  const inherited = Object.create({ messageId, body })
+
+  expectCode(t, () => encodeM3Object(inherited), 'INVALID_ROUTE')
+
+  let messageIdReads = 0
+  const accessorMessageId = { body }
+  Object.defineProperty(accessorMessageId, 'messageId', {
+    get() {
+      messageIdReads++
+      return messageId
+    }
+  })
+  expectCode(t, () => encodeM3Object(accessorMessageId), 'INVALID_ROUTE')
+  t.is(messageIdReads, 0)
+
+  let bodyReads = 0
+  const accessorBody = { messageId }
+  Object.defineProperty(accessorBody, 'body', {
+    get() {
+      bodyReads++
+      return body
+    }
+  })
+  expectCode(t, () => encodeM3Object(accessorBody), 'INVALID_ROUTE')
+  t.is(bodyReads, 0)
+
+  let authSuffixReads = 0
+  const accessorAuthSuffix = { messageId, body }
+  Object.defineProperty(accessorAuthSuffix, 'authSuffix', {
+    get() {
+      authSuffixReads++
+      if (authSuffixReads > 1) throw new Error('time-varying auth suffix')
+      return b4a.alloc(0)
+    }
+  })
+  expectCode(t, () => encodeM3Object(accessorAuthSuffix), 'INVALID_ROUTE')
+  t.is(authSuffixReads, 0)
+
+  const nullPrototype = Object.assign(Object.create(null), { messageId, body })
+  const decoded = decodeM3Object(encodeM3Object(nullPrototype))
+  t.is(decoded.messageId, messageId)
+  t.alike(decoded.body, body)
+})
+
+test('canonical M3 object envelope normalizes proxy descriptor traps', (t) => {
+  const sentinel = new Error('hostile descriptor trap')
+  let descriptorTraps = 0
+  const hostile = new Proxy(
+    {
+      messageId: M3_MESSAGE_ID.DHT_EXIT_READY_ACK_V1,
+      body: b4a.alloc(105)
+    },
+    {
+      getOwnPropertyDescriptor() {
+        descriptorTraps++
+        throw sentinel
+      }
+    }
+  )
+
+  expectCode(t, () => encodeM3Object(hostile), 'INVALID_ROUTE')
+  t.is(descriptorTraps, 1)
+})
+
 test('canonical M3 object envelope enforces every standalone layout boundary', (t) => {
   const fixtures = [
     [0x0001, 188, 476, 64],
@@ -414,6 +498,16 @@ test('canonical M3 object envelope enforces every standalone layout boundary', (
       t.is(decoded.authSuffix.byteLength, authBytes)
     }
 
+    expectCode(
+      t,
+      () =>
+        encodeM3Object({
+          messageId,
+          body: b4a.alloc(minimumBodyBytes - 1),
+          authSuffix: b4a.alloc(authBytes)
+        }),
+      'INVALID_ROUTE'
+    )
     expectCode(
       t,
       () =>
