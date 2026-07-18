@@ -818,6 +818,167 @@ test('completed CAPS tuple stays tombstoned and conflicting retry fails until co
   responder.destroy()
 })
 
+test('responder consumes a binding before every injected crypto hook can reenter', (t) => {
+  for (const hook of ['randomBytes', 'keyAgreement', 'sign']) {
+    let responder = null
+    let binding = null
+    let challenge = null
+    let responseOptions = null
+    let armed = false
+    let reentered = false
+    let innerResponse = null
+    let innerError = null
+    let hookCalls = 0
+    const temporary = []
+    const reenter = () => {
+      if (reentered) return
+      reentered = true
+      try {
+        innerResponse = responder.respond(binding, challenge, responseOptions)
+      } catch (err) {
+        innerError = err
+      }
+    }
+    const crypto = {
+      randomBytes(size) {
+        const output = b4a.alloc(size, 0x6a)
+        if (armed) temporary.push(output)
+        if (armed && hook === 'randomBytes') {
+          hookCalls++
+          reenter()
+        }
+        return output
+      },
+      keyAgreement(secretKey, publicKey) {
+        const output = cryptoSuite.keyAgreement(secretKey, publicKey)
+        if (armed) temporary.push(secretKey, output)
+        if (armed && hook === 'keyAgreement') {
+          hookCalls++
+          reenter()
+        }
+        return output
+      },
+      sign(message, secretKey) {
+        const output = cryptoSuite.sign(message, secretKey)
+        if (armed) temporary.push(message, secretKey, output)
+        if (armed && hook === 'sign') {
+          hookCalls++
+          reenter()
+        }
+        return output
+      }
+    }
+    const fake = clock()
+    responder = createActiveChallengeResponderAuthority({
+      now: fake.wallNow,
+      setTimeout: fake.setTimer,
+      clearTimeout: fake.clearTimer,
+      crypto
+    })
+    const fixture = signedAdvertisement()
+    const query = {
+      sourceEndpoint: endpoint(236),
+      requestedCapabilityMask: 1,
+      randomTarget: seed(200),
+      queryNonce: seed(201),
+      maximumResults: 1
+    }
+    const cookie = responder.issueCookie(query)
+    binding = responder.admitCapsRetry({ ...query, ...cookie, advertisement: fixture.encoded })
+    const ephemeral = routeKey(62)
+    const body = b4a.alloc(176)
+    body.set(digestRelayCapabilityAdvertisement(fixture.encoded, { now: NOW }), 0)
+    body.set(seed(61), 32)
+    body.set(ephemeral.publicKey, 64)
+    body.writeBigUInt64BE(NOW + ACTIVE_CHALLENGE_TIMEOUT, 96)
+    body.set(query.queryNonce, 104)
+    body.writeBigUInt64BE(cookie.cookieExpiresAtMs, 136)
+    body.set(cookie.returnRoutabilityCookie, 144)
+    challenge = encodeM3Object({ messageId: M3_MESSAGE_ID.ACTIVE_CHALLENGE_V1, body })
+    responseOptions = {
+      sourceEndpoint: query.sourceEndpoint,
+      advertisement: fixture.encoded,
+      identitySecretKey: fixture.signer.secretKey,
+      routeEncryptionSecretKey: fixture.route.secretKey
+    }
+    armed = true
+    const outerResponse = responder.respond(binding, challenge, responseOptions)
+    armed = false
+
+    t.is(outerResponse.readUInt16BE(4), M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1, hook)
+    t.is(hookCalls, 1, `${hook} executes for exactly one consume attempt`)
+    t.is(innerResponse, null, `${hook} cannot complete a second response`)
+    t.ok(innerError instanceof PrivateRouteError, hook)
+    t.is(innerError && innerError.code, 'ERR_REPLAY', hook)
+    expectCode(
+      t,
+      () => responder.admitCapsRetry({ ...query, ...cookie, advertisement: fixture.encoded }),
+      'ERR_REPLAY'
+    )
+    for (const bytes of temporary) t.alike(bytes, b4a.alloc(bytes.byteLength), hook)
+    responder.destroy()
+  }
+})
+
+test('responder constructor accepts only plain or null-prototype own-data options', (t) => {
+  const timers = {
+    setTimeout() {
+      return 1
+    },
+    clearTimeout() {}
+  }
+  let inheritedReads = 0
+  const inheritedPrototype = {}
+  Object.defineProperty(inheritedPrototype, 'unknown', {
+    get() {
+      inheritedReads++
+      throw new Error('inherited getter must not run')
+    }
+  })
+  const inherited = Object.assign(Object.create(inheritedPrototype), {
+    now: () => NOW,
+    ...timers
+  })
+  expectCode(t, () => createActiveChallengeResponderAuthority(inherited), 'ERR_INCOMPATIBLE_RELAY')
+  t.is(inheritedReads, 0)
+
+  let accessorReads = 0
+  const accessor = { ...timers }
+  Object.defineProperty(accessor, 'now', {
+    enumerable: true,
+    get() {
+      accessorReads++
+      return () => NOW
+    }
+  })
+  expectCode(t, () => createActiveChallengeResponderAuthority(accessor), 'ERR_INCOMPATIBLE_RELAY')
+  t.is(accessorReads, 0)
+
+  let proxyGets = 0
+  const hostile = new Proxy(
+    { now: () => NOW, ...timers },
+    {
+      ownKeys() {
+        throw new Error('hostile ownKeys')
+      },
+      get() {
+        proxyGets++
+        throw new Error('hostile get')
+      }
+    }
+  )
+  expectCode(t, () => createActiveChallengeResponderAuthority(hostile), 'ERR_INCOMPATIBLE_RELAY')
+  t.is(proxyGets, 0)
+
+  const nullPrototype = Object.assign(Object.create(null), {
+    now: () => NOW,
+    ...timers
+  })
+  const responder = createActiveChallengeResponderAuthority(nullPrototype)
+  t.ok(responder)
+  responder.destroy()
+})
+
 test('CAPS cookie survives only the live prior-secret overlap at exact rotation', (t) => {
   const fake = clock(0n)
   let generated = 0
