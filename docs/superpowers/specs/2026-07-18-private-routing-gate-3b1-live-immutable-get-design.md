@@ -142,19 +142,21 @@ differs from canonical v1, canonical v1 wins.
 Gate 3B1 adopts the following exact formats from prototype commit
 `0305df915b6a767093f9e75e6c06bc0a35da6169`:
 
-| Format                                     | Exact source symbol(s)                                                                                    | Gate 3B1 rule                                                                                                                                          |
-| ------------------------------------------ | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| M3 object header and ID/size registry      | `lib/protocol.js`: `encodeM3Object`, `decodeM3Object`, `M3_MESSAGE_ID`, `M3_OBJECT_LAYOUT`                | Adopt. Header is `u32be protocolVersion=1`, `u16be messageId`, `u16be bodyBytes`, body, then the registered fixed auth suffix.                         |
-| Relay advertisements and CAPS discovery    | `lib/relay-capability.js`: advertisement, CAPS cookie/query/response, active-challenge codecs and domains | Adopt, with the capability and freshness restrictions below.                                                                                           |
-| Adjacent bootstrap envelope and link setup | `lib/bootstrap-envelope.js`, `lib/link-setup.js`, `lib/guard-link.js`                                     | Adopt. Every bootstrap datagram is exactly 1,200 bytes and signed under `hyperdht-private-routes/udx-bootstrap/v0`.                                    |
-| Tail/extension control and M3 contexts     | `lib/tail-control.js`, `lib/m3-context.js`, `lib/extension-*`, `lib/branch-*-authority.js`                | Adopt only the safety guard/middle/exit path used by this spec.                                                                                        |
-| Terminal DHT-exit finalization             | `lib/final-exit.js`, `lib/final-exit-activation.js`                                                       | Adopt `DHT_EXIT_ACTIVATE/READY/READY_ACK/OPEN`, final-exit transcript, policy/parameter digests, and all twelve final-exit KDF labels.                 |
-| Destination reference and routed request   | local `lib/private/routed-dht.js`                                                                         | Retain Gate 3A bytes: 172-byte `DESTINATION_REF_V1` and fixed 221-byte `ROUTED_REQUEST_V1` body.                                                       |
-| Routed reply                               | exact registry Section 10.3                                                                               | Implement unchanged as specified below; this is the Gate 3A deferred codec.                                                                            |
-| DHT exit seed delivery                     | registry Section 6.5 `DHT_EXIT_SEEDS_V1`                                                                  | Gate 3B1 amendment: `storageSeedCount` is exactly zero; body is `139 + 172*dhtSeedCount`, `dhtSeedCount` is 1..3, body range 311..655, auth suffix 64. |
-| Fixed cells, route payload, fragmentation  | local Gate 3A `cell-codec.js`, `route-payload.js`, `fragments.js`                                         | Retain reviewed Gate 3A bytes and ceilings.                                                                                                            |
+| Format                                     | Exact source symbol(s)                                                                                    | Gate 3B1 rule                                                                                                                          |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| M3 object header and ID/size registry      | `lib/protocol.js`: `encodeM3Object`, `decodeM3Object`, `M3_MESSAGE_ID`, `M3_OBJECT_LAYOUT`                | Adopt. Header is `u32be protocolVersion=1`, `u16be messageId`, `u16be bodyBytes`, body, then the registered fixed auth suffix.         |
+| Relay advertisements and CAPS discovery    | `lib/relay-capability.js`: advertisement, CAPS cookie/query/response, active-challenge codecs and domains | Adopt, with the capability and freshness restrictions below.                                                                           |
+| Adjacent bootstrap envelope and link setup | `lib/bootstrap-envelope.js`, `lib/link-setup.js`, `lib/guard-link.js`                                     | Adopt. Every bootstrap datagram is exactly 1,200 bytes and signed under `hyperdht-private-routes/udx-bootstrap/v0`.                    |
+| Tail/extension control and M3 contexts     | `lib/tail-control.js`, `lib/m3-context.js`, `lib/extension-*`, `lib/branch-*-authority.js`                | Adopt only the safety guard/middle/exit path used by this spec.                                                                        |
+| Terminal DHT-exit finalization             | `lib/final-exit.js`, `lib/final-exit-activation.js`                                                       | Adopt `DHT_EXIT_ACTIVATE/READY/READY_ACK/OPEN`, final-exit transcript, policy/parameter digests, and all twelve final-exit KDF labels. |
+| Destination reference and routed request   | local `lib/private/routed-dht.js`                                                                         | Retain Gate 3A bytes: 172-byte `DESTINATION_REF_V1` and fixed 221-byte `ROUTED_REQUEST_V1` body.                                       |
+| Routed reply                               | exact registry Section 10.3                                                                               | Implement unchanged as specified below; this is the Gate 3A deferred codec.                                                            |
+| DHT exit seed delivery                     | new `DHT_EXIT_DHT_SEEDS_V1 = 0x0045`                                                                      | Gate 3B1 DHT-only object defined below. Registered `DHT_EXIT_SEEDS_V1 = 0x0044` is unchanged and unused.                               |
+| Fixed cells, route payload, fragmentation  | local Gate 3A `cell-codec.js`, `route-payload.js`, `fragments.js`                                         | Retain reviewed Gate 3A bytes and ceilings.                                                                                            |
 
-The Gate 3B1 `DHT_EXIT_SEEDS_V1` amended body is exact:
+Gate 3B1 adds one previously unassigned M3 message without changing an existing
+layout: `DHT_EXIT_DHT_SEEDS_V1 = 0x0045`. Its M3 registry entry is body range
+310..654 with a 64-byte auth suffix. Its exact body is:
 
 ```text
 u8   branchClass
@@ -165,17 +167,21 @@ u64  generation
 32B  seedSetNonce
 u8   dhtSeedCount                  // 1..3
 dhtSeedCount * 172B DESTINATION_REF_V1
-u8   storageSeedCount              // exactly 0
 32B  seedSetDigest
 64B  exit Ed25519 signature suffix
 ```
 
-The set digest uses the adopted
-`hyperdht-private-routes/m3/dht-exit-seeds/set/v1` domain over the count and
-complete DHT-reference bytes followed by the zero storage count. References are
-unique and sorted by destination ID, then complete handle bytes. Signature,
+The fixed body is 138 bytes before references, so total body length is
+`138 + 172*dhtSeedCount`. The signature domain is
+`hyperdht-private-routes/m3/dht-exit-dht-seeds/v1`. The set digest domain is
+`hyperdht-private-routes/m3/dht-exit-dht-seeds/set/v1` over the one-byte count
+and complete DHT-reference bytes. References are unique and sorted by
+destination ID, then complete handle bytes. Signature,
 branch/circuit/generation/exit equality, set digest, count, order, handle class,
 and table-backed liveness are checked before any reference enters client state.
+Both domains and one exact minimum/maximum vector are frozen before the object
+is used. Registered `DHT_EXIT_SEEDS_V1 = 0x0044`, its 905..4,265-byte body, and
+its existing domains remain byte-for-byte unchanged.
 
 The adopted signature/KDF domains used by this slice are frozen UTF-8 strings:
 
@@ -193,8 +199,8 @@ hyperdht-private-routes/m3/final-exit/transcript-digest/v1
 hyperdht-private-routes/m3/dht-exit-ready/v1
 hyperdht-private-routes/m3/dht-exit-ready-digest/v1
 hyperdht-private-routes/m3/dht-exit-ready-ack-digest/v1
-hyperdht-private-routes/m3/dht-exit-seeds/v1
-hyperdht-private-routes/m3/dht-exit-seeds/set/v1
+hyperdht-private-routes/m3/dht-exit-dht-seeds/v1
+hyperdht-private-routes/m3/dht-exit-dht-seeds/set/v1
 hyperdht-private-routes/m3/destination/server-binding/v1
 hyperdht-private-routes/m3/destination/handle-auth/v1
 ```
@@ -315,6 +321,31 @@ phase, contact category, a keyed/redacted endpoint digest, first and last
 attempt times, attempt count, and allowlisted outcome. It never records a raw
 endpoint, route key, topic, descriptor, or stable cross-generation identifier.
 
+Before guard pinning, `BootstrapIO` may collect at most sixteen unique,
+signature-verified, unexpired relay advertisements across its bounded CAPS
+responses. It never contacts a middle or exit candidate. Immediately before
+revoking bootstrap authority it transfers owned canonical advertisement bytes
+and digests into one `RelayCandidateDirectory`; it transfers no socket,
+callback, address-to-send function, routing entry, or referral authority.
+
+### `RelayCandidateDirectory`
+
+Owns the bounded post-bootstrap advertisement evidence used for initial branch
+selection and rotation. It is an immutable-by-default, non-dialing directory:
+lookups accept only branch role/capability/diversity predicates and return
+defensive advertisement/digest projections. It exposes no host/port lookup,
+socket, arbitrary enumeration to public code, refresh method, or network IO.
+
+The directory is scoped to the pinned guard lease, retains no more than sixteen
+identities, revalidates signed expiry/epoch on every selection, and quarantines
+equivocation as specified above. `RouteManager` may consume a candidate once
+per branch generation. Extension requests carry the complete signed
+advertisement through the pinned guard using the adopted in-route
+`RELAY_DISCOVER_V1`/link-extension formats; the endpoint itself never dials the
+candidate tuple. Gate 3B1 performs no post-pinning discovery. Initial build or
+rotation fails closed when the retained set cannot satisfy diversity. Guard
+loss, suspend, network change, or controller destroy clears the directory.
+
 ### `GuardLease`
 
 Owns one verified guard identity, advertisement digest, adjacent-link
@@ -322,10 +353,13 @@ capability, lease epoch, expiry, and liveness state. Pinning is atomic:
 
 1. authenticate the guard link and bind its exact transcript;
 2. freeze the selected guard identity and endpoint;
-3. revoke and destroy bootstrap sockets, callbacks, candidate tables, routing
-   scratch state, and generic send capabilities;
-4. verify those resources are absent;
-5. publish `GUARD_PINNED` to the internal controller.
+3. atomically seal and transfer the verified non-dialing
+   `RelayCandidateDirectory`;
+4. revoke and destroy bootstrap sockets, callbacks, unsealed candidate tables,
+   routing scratch state, and generic send capabilities;
+5. verify those resources are absent and the sealed directory exposes no send
+   authority;
+6. publish `GUARD_PINNED` to the internal controller.
 
 Post-pinning revalidation may contact only the pinned guard through its existing
 authority. It cannot follow a referral, resolve another endpoint, or substitute
@@ -449,6 +483,15 @@ concurrently, one admitted destination may cause at most eight probes per
 probes and 64 live table entries. Duplicate tuples/IDs consume no new probe but
 cannot refresh expiry. Exhausting a bound omits the excess candidates rather
 than expanding authority.
+
+Before sending the ping, the exit installs one non-public
+`EXIT_VALIDATION_PROBE` audit record containing branch/circuit/generation,
+issuing admitted-reference digest or configured-bootstrap index, candidate
+tuple and derived ID, DHT transaction correlation, monotonic deadline, and
+charged budget slot. The record authorizes exactly that one ping and matching
+reply edge; it is removed on reply, timeout, cancellation, rotation, or
+teardown. It is validation evidence only and cannot authorize an immutable-get
+or mint a destination reference.
 
 The production path rejects special-use, private, loopback, link-local,
 multicast, documentation, benchmark, carrier-grade NAT, and invalid mapped
@@ -719,6 +762,8 @@ Node and Bare run identical focused suites for:
   defensive ownership, and hostile shapes;
 - exact role/branch/link/circuit/generation transcript and KDF vectors;
 - bootstrap endpoint/challenge/deadline bounds and exposure redaction;
+- sealed non-dialing candidate-directory transfer, consumption, expiry, and
+  destruction;
 - guard pinning atomicity and direct-authority revocation;
 - branch diversity, independent generations, the global construction deadline,
   rotation, and teardown;
@@ -728,12 +773,16 @@ Node and Bare run identical focused suites for:
 - relay quotas, fair queueing, expiry, cancellation, and tombstones;
 - immutable-get request/reply bytes, exact `from` equality, routed-error rules,
   trailing-data rejection, and hash checks;
+- new `DHT_EXIT_DHT_SEEDS_V1 = 0x0045` minimum/maximum vectors, signature/digest
+  domains, ordering, and strict rejection by legacy `0x0044` decoders;
 - destination provenance, DHT transaction/source correlation, special-use
   rejection, single-packet probe deadlines/rate bounds, capability binding,
   generation invalidation, and table bounds;
 - logical and encoded-byte amplification accounting;
 - one-shot guard reconnect restriction/revocation, phase-owned authority, and
   phase-permitted packet edges;
+- validation-probe audit-record creation/removal and rejection of unrecorded
+  probes or ordinary requests to probed-but-unadmitted tuples;
 - sanitized exact errors, metrics, logs, and zero owned state after destruction.
 
 Property/adversarial cases cover mutation, truncation, extension, cross-branch
@@ -785,7 +834,10 @@ prospective-guard edges are allowed. Starting with the packet that commits
   old/new middles and each middle only its adjacent guard/exit candidates;
 - during READY, the guard contacts only the two selected middles for route
   traffic and each middle only its guard and branch exit;
-- each exit contacts only its middle and provenance-qualified DHT destinations;
+- an exit may emit one `EXIT_VALIDATION_PROBE` ping and receive its correlated
+  reply only while the exact bounded audit record above is live;
+- ordinary exit requests may contact only fully admitted,
+  provenance-qualified DHT destinations with live table entries;
 - during suspend there is no endpoint packet; resume may contact only the exact
   pinned guard under the one-shot reconnect authority;
 - UNAVAILABLE emits no packet, and teardown permits only the authenticated
@@ -796,8 +848,10 @@ prospective-guard edges are allowed. Starting with the packet that commits
 - teardown produces no later packet.
 
 A separately isolated negative-control packet must be captured and rejected by
-the oracle, proving that forbidden-capability traffic is observable. Missing or
-malformed capture evidence fails the job.
+the oracle, proving that forbidden-capability traffic is observable. Separate
+negative controls attempt an unrecorded validation ping and an immutable-get to
+a probed-but-unadmitted tuple; both must fail the oracle and authority trap.
+Missing or malformed capture evidence fails the job.
 
 ### Semantic leak oracle
 
