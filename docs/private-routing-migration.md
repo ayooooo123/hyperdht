@@ -56,7 +56,16 @@ Until those pieces pass the next reviewed gate, no Gate 3A internal module may b
 
 ## Gate 3B entry criteria
 
-The next separately reviewed plan must implement and verify all of the following:
+Gate 3B is an aggregate delivery gate, not a requirement that one implementation
+plan change every private-routing subsystem at once. It may be completed through
+numbered, separately designed and reviewed vertical sub-gates such as Gate 3B1,
+3B2, and later slices. Each sub-gate must state exactly which criteria it
+advances, keep incomplete criteria fail-closed and non-public, and preserve the
+experimental/no-anonymity boundary. No sub-gate may expose public required mode
+or claim Delivery Gate 3 complete until all ten aggregate criteria below pass
+together in fork-native CI.
+
+The complete Gate 3B series must implement and verify all of the following:
 
 1. Signed relay advertisements and numeric-only bounded bootstrap.
 2. Stable guard pinning and separate lookup/announce middle/exit branches.
@@ -70,3 +79,14 @@ The next separately reviewed plan must implement and verify all of the following
 10. Privileged Linux namespace capture plus a semantic leak oracle proving endpoint-to-guard-only traffic after readiness.
 
 Delivery Gate 3 remains open until every one of these ten items passes fork-native CI. Gate 3A completion alone does not authorize a public private-routing mode or an anonymity claim.
+
+[Gate 3B1](superpowers/specs/2026-07-18-private-routing-gate-3b1-live-immutable-get-design.md)
+is authorized as the first live vertical slice. It covers signed relay
+advertisements, bounded numeric bootstrap, stable guard pinning, separate live
+lookup/announce branches, adjacent authenticated links, endpoint-to-exit
+authentication, immutable-get request/reply codecs, provenance-qualified DHT
+destinations, generation invalidation, Node/Bare multi-process integration, and
+the privileged packet/semantic leak oracles. The announce branch is constructed
+but carries no DHT mutation in that slice. Remaining DHT commands, private
+presence, public required mode, peer streams, Hyperswarm, and mobile device
+evidence remain disabled for later separately reviewed sub-gates.
