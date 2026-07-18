@@ -199,6 +199,34 @@ function hostileOption(name, value) {
   return options
 }
 
+function observeBufferRegions(operation, regions) {
+  const isBuffer = Buffer.isBuffer
+  const observed = new Array(regions.length).fill(0)
+  let checks = 0
+  let error = null
+
+  Buffer.isBuffer = function (value) {
+    const result = isBuffer.call(Buffer, value)
+    if (result) {
+      checks++
+      for (let index = 0; index < regions.length; index++) {
+        if (regions[index](value)) observed[index]++
+      }
+    }
+    return result
+  }
+
+  try {
+    operation()
+  } catch (err) {
+    error = err
+  } finally {
+    Buffer.isBuffer = isBuffer
+  }
+
+  return { error, checks, observed }
+}
+
 test('DESTINATION_REF_V1 has exact bytes and transfers immutable owned values', (t) => {
   const value = destination()
   const encoded = encodeDestinationRef(value)
@@ -865,6 +893,94 @@ test('routed reply validation binds the request and atomically admits sorted ref
 
   clearRoutedReply(result.reply)
   revokeRoutedReplyReferralAuthority(live.authority)
+  destroyLiveOpaqueDestinations(live.owner)
+})
+
+test('routed reply rejects options and bindings before owning variable reply regions', (t) => {
+  const target = seed(0, 32)
+  const token = seed(0xa1, 32)
+  const closer = destinationRef(seed(0xb1, 32), 0xb2)
+  const response = seed(0xc1, 1025)
+  const encoded = reply({ token, closerNodes: [closer], encodedResponse: response })
+  const regions = [
+    (value) => value.byteLength === 32 && value[0] === 0xa1 && value[31] === 0xa1,
+    (value) => value.byteLength === DESTINATION_REF_SIZE && value[8] === 0xb1,
+    (value) => value.byteLength === 1025 && value[0] === 0xc1 && value[1024] === 0xc1
+  ]
+
+  let live = liveReplyAuthority(target)
+  const invalidOptions = { ...replyOptions(live.authority, target), extra: true }
+  let observed = observeBufferRegions(
+    () => validateRoutedReplyForRequest(encoded, invalidOptions),
+    regions
+  )
+  t.ok(observed.error instanceof PrivateRouteError)
+  t.is(observed.error && observed.error.code, 'INVALID_ROUTE')
+  t.is(observed.checks, 0)
+  t.alike(observed.observed, [0, 0, 0])
+  destroyLiveOpaqueDestinations(live.owner)
+
+  for (const invalid of [
+    reply({
+      requestId: seed(0x20, 16),
+      token,
+      closerNodes: [closer],
+      encodedResponse: response
+    }),
+    reply({
+      from: destinationRef(seed(0x11, 32), 0x99),
+      token,
+      closerNodes: [closer],
+      encodedResponse: response
+    })
+  ]) {
+    live = liveReplyAuthority(target)
+    observed = observeBufferRegions(
+      () => validateRoutedReplyForRequest(invalid, replyOptions(live.authority, target)),
+      regions
+    )
+    t.ok(observed.error instanceof PrivateRouteError)
+    t.is(observed.error && observed.error.code, 'INVALID_ROUTE')
+    t.alike(observed.observed, [0, 0, 0])
+    destroyLiveOpaqueDestinations(live.owner)
+  }
+})
+
+test('routed reply enforces immutable response bound before owning variable reply regions', (t) => {
+  const target = seed(0, 32)
+  const token = seed(0xa2, 32)
+  const closer = destinationRef(seed(0xb3, 32), 0xb4)
+  const response = seed(0xc2, 1027)
+  const oversized = m3(
+    M3_MESSAGE_ID.ROUTED_REPLY_V1,
+    b4a.concat([
+      seed(0x21, 16),
+      u16(M3_MESSAGE_ID.IMMUTABLE_GET_V1),
+      u16(1),
+      b4a.from([BRANCH_CLASS.LOOKUP]),
+      expectedDestination(),
+      u16(0),
+      u16(32),
+      token,
+      b4a.from([1]),
+      closer,
+      u16(response.byteLength),
+      response
+    ])
+  )
+  const live = liveReplyAuthority(target)
+  const observed = observeBufferRegions(
+    () => validateRoutedReplyForRequest(oversized, replyOptions(live.authority, target)),
+    [
+      (value) => value.byteLength === 32 && value[0] === 0xa2 && value[31] === 0xa2,
+      (value) => value.byteLength === DESTINATION_REF_SIZE && value[8] === 0xb3,
+      (value) => value.byteLength === 1027 && value[0] === 0xc2 && value[1026] === 0xc2
+    ]
+  )
+
+  t.ok(observed.error instanceof PrivateRouteError)
+  t.is(observed.error && observed.error.code, 'INVALID_ROUTE')
+  t.alike(observed.observed, [0, 0, 0])
   destroyLiveOpaqueDestinations(live.owner)
 })
 
