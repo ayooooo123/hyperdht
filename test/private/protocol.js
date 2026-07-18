@@ -40,7 +40,7 @@ function expectCode(t, fn, code) {
   }
 
   t.ok(error instanceof PrivateRouteError)
-  t.is(error.code, code)
+  t.is(error && error.code, code)
 }
 
 function forgedByteLength(value, byteLength) {
@@ -50,6 +50,15 @@ function forgedByteLength(value, byteLength) {
 
 function overriddenSubarray(value) {
   value.subarray = () => b4a.alloc(0)
+  return value
+}
+
+function throwingByteLength(value, error) {
+  Object.defineProperty(value, 'byteLength', {
+    get() {
+      throw error
+    }
+  })
   return value
 }
 
@@ -240,6 +249,23 @@ test('roleForIdentity assigns deterministically and rejects every invalid shape'
   for (const value of invalid) expectCode(t, () => roleForIdentity(value), 'INVALID_IDENTITY')
 })
 
+test('roleForIdentity fails closed on forged and hostile buffer shapes', (t) => {
+  const sentinel = new Error('hostile identity accessor')
+  const hostileProxy = new Proxy(b4a.alloc(32), {
+    getPrototypeOf() {
+      throw sentinel
+    }
+  })
+  const invalid = [
+    forgedByteLength(b4a.alloc(31), 32),
+    forgedByteLength(b4a.alloc(33), 32),
+    throwingByteLength(b4a.alloc(32), sentinel),
+    hostileProxy
+  ]
+
+  for (const value of invalid) expectCode(t, () => roleForIdentity(value), 'INVALID_IDENTITY')
+})
+
 test('private route errors have exact frozen registries, constructors, and sanitized messages', (t) => {
   const expectedMessages = {
     INVALID_IDENTITY: 'Identity must be a 32-byte buffer',
@@ -337,54 +363,67 @@ test('canonical M3 object envelope round trips exact unsigned and signed layouts
   t.alike(decodedSigned.authSuffix, b4a.alloc(64, 0x52))
 })
 
-test('canonical M3 object envelope recognizes every standalone ID with exact minimum auth', (t) => {
+test('canonical M3 object envelope enforces every standalone layout boundary', (t) => {
   const fixtures = [
-    [0x0001, 188, 64],
-    [0x0002, 110, 0],
-    [0x0003, 335, 64],
-    [0x0004, 176, 0],
-    [0x0005, 272, 64],
-    [0x0006, 69, 0],
-    [0x0007, 41, 0],
-    [0x0008, 48, 0],
-    [0x0009, 72, 0],
-    [0x0020, 302, 64],
-    [0x0021, 213, 64],
-    [0x0022, 306, 64],
-    [0x0023, 486, 0],
-    [0x0024, 210, 64],
-    [0x0025, 458, 0],
-    [0x0040, 96, 0],
-    [0x0041, 233, 64],
-    [0x0042, 105, 0],
-    [0x0043, 169, 0],
-    [0x0044, 905, 64],
-    [0x0050, 578, 64],
-    [0x0051, 124, 16],
-    [0x0052, 27, 16],
-    [0x0053, 30, 0],
-    [0x0054, 20, 0],
-    [0x0100, 164, 0],
-    [0x0101, 221, 0],
-    [0x0102, 200, 0],
-    [0x0201, 141, 64],
-    [0x0280, 132, 64],
-    [0x0281, 131, 64],
-    [0x0282, 206, 64],
-    [0x0283, 72, 0],
-    [0x0284, 301, 64]
+    [0x0001, 188, 476, 64],
+    [0x0002, 110, 110, 0],
+    [0x0003, 335, 4473, 64],
+    [0x0004, 176, 176, 0],
+    [0x0005, 272, 272, 64],
+    [0x0006, 69, 69, 0],
+    [0x0007, 41, 4441, 0],
+    [0x0008, 48, 1192, 0],
+    [0x0009, 72, 72, 0],
+    [0x0020, 302, 302, 64],
+    [0x0021, 213, 213, 64],
+    [0x0022, 306, 306, 64],
+    [0x0023, 486, 486, 0],
+    [0x0024, 210, 210, 64],
+    [0x0025, 458, 746, 0],
+    [0x0040, 96, 96, 0],
+    [0x0041, 233, 233, 64],
+    [0x0042, 105, 105, 0],
+    [0x0043, 169, 169, 0],
+    [0x0044, 905, 4265, 64],
+    [0x0050, 578, 738, 64],
+    [0x0051, 124, 124, 16],
+    [0x0052, 27, 1176, 16],
+    [0x0053, 30, 1191, 0],
+    [0x0054, 20, 8082, 0],
+    [0x0100, 164, 164, 0],
+    [0x0101, 221, 1382, 0],
+    [0x0102, 200, 8262, 0],
+    [0x0201, 141, 2891, 64],
+    [0x0280, 132, 899, 64],
+    [0x0281, 131, 131, 64],
+    [0x0282, 206, 7990, 64],
+    [0x0283, 72, 72, 0],
+    [0x0284, 301, 301, 64]
   ]
 
-  for (const [messageId, bodyBytes, authBytes] of fixtures) {
-    const encoded = encodeM3Object({
-      messageId,
-      body: b4a.alloc(bodyBytes),
-      authSuffix: b4a.alloc(authBytes)
-    })
-    const decoded = decodeM3Object(encoded)
-    t.is(decoded.messageId, messageId)
-    t.is(decoded.body.byteLength, bodyBytes)
-    t.is(decoded.authSuffix.byteLength, authBytes)
+  for (const [messageId, minimumBodyBytes, maximumBodyBytes, authBytes] of fixtures) {
+    for (const bodyBytes of new Set([minimumBodyBytes, maximumBodyBytes])) {
+      const encoded = encodeM3Object({
+        messageId,
+        body: b4a.alloc(bodyBytes),
+        authSuffix: b4a.alloc(authBytes)
+      })
+      const decoded = decodeM3Object(encoded)
+      t.is(decoded.messageId, messageId)
+      t.is(decoded.body.byteLength, bodyBytes)
+      t.is(decoded.authSuffix.byteLength, authBytes)
+    }
+
+    expectCode(
+      t,
+      () =>
+        encodeM3Object({
+          messageId,
+          body: b4a.alloc(maximumBodyBytes + 1),
+          authSuffix: b4a.alloc(authBytes)
+        }),
+      'INVALID_ROUTE'
+    )
   }
 })
 
