@@ -22,6 +22,8 @@ const {
   ROUTE_PLAINTEXT_SIZE,
   RoutePayloadCodec,
   TEST_ONLY_RECEIVERS,
+  TEST_ONLY_NONCE_REGISTRY,
+  createTestNonceRegistry,
   destroyCreatedRoutePayloadContext,
   mintCreatedRoutePayloadContext
 } = require('../../lib/private/route-payload')
@@ -58,6 +60,10 @@ function rawContext(overrides = {}) {
     ...keys(),
     ...overrides
   }
+}
+
+function rawContextForRegistry(registry, overrides = {}) {
+  return rawContext({ [TEST_ONLY_NONCE_REGISTRY]: registry, ...overrides })
 }
 
 function route(overrides = {}) {
@@ -192,6 +198,58 @@ test('nonce-domain claims are unique before use and remain spent after destroy',
   expectCode(t, () => mintCreatedRoutePayloadContext(raw), 'INVALID_ROUTE')
   active.destroy()
   expectCode(t, () => mintCreatedRoutePayloadContext(raw), 'INVALID_ROUTE')
+})
+
+test('isolated nonce registry has a stable fail-closed capacity contract', (t) => {
+  const registry = createTestNonceRegistry({ capacity: 2 })
+  const firstRaw = rawContextForRegistry(registry)
+  const secondRaw = rawContextForRegistry(registry)
+  const overflowRaw = rawContextForRegistry(registry)
+  const first = mintCreatedRoutePayloadContext(firstRaw)
+  const second = mintCreatedRoutePayloadContext(secondRaw)
+
+  t.ok(first)
+  t.ok(second, 'the last in-capacity claim is admitted')
+  expectCode(t, () => mintCreatedRoutePayloadContext(firstRaw), 'INVALID_ROUTE')
+  expectCode(t, () => mintCreatedRoutePayloadContext(overflowRaw), 'CIRCUIT_LIMIT')
+
+  destroyCreatedRoutePayloadContext(second)
+  const replacement = mintCreatedRoutePayloadContext(overflowRaw)
+  t.ok(replacement, 'releasing a pending claim restores capacity')
+  destroyCreatedRoutePayloadContext(replacement)
+  destroyCreatedRoutePayloadContext(first)
+
+  const spentRegistry = createTestNonceRegistry({ capacity: 1 })
+  const spentRaw = rawContextForRegistry(spentRegistry)
+  const active = route({ context: mintCreatedRoutePayloadContext(spentRaw) })
+  active.destroy()
+  expectCode(
+    t,
+    () => mintCreatedRoutePayloadContext(rawContextForRegistry(spentRegistry)),
+    'CIRCUIT_LIMIT'
+  )
+})
+
+test('test nonce registry configuration is own-data-only and deep-import-only', (t) => {
+  const publicHyperDHT = require('../../index')
+  t.is(typeof TEST_ONLY_NONCE_REGISTRY, 'symbol')
+  t.is(typeof createTestNonceRegistry, 'function')
+  t.is('TEST_ONLY_NONCE_REGISTRY' in publicHyperDHT, false)
+  t.is('createTestNonceRegistry' in publicHyperDHT, false)
+  for (const capacity of [0, -1, 1.5, 4097, 1n]) {
+    expectCode(t, () => createTestNonceRegistry({ capacity }), 'INVALID_ROUTE')
+  }
+  let accesses = 0
+  const accessor = {}
+  Object.defineProperty(accessor, 'capacity', {
+    get() {
+      accesses++
+      return 1
+    }
+  })
+  expectCode(t, () => createTestNonceRegistry(accessor), 'INVALID_ROUTE')
+  t.is(accesses, 0)
+  expectCode(t, () => createTestNonceRegistry(Object.create({ capacity: 1 })), 'INVALID_ROUTE')
 })
 
 test('complementary roles own opposite direction domains', (t) => {
@@ -445,7 +503,12 @@ test('temporary plaintext and encoded deliveries are zeroed on success and failu
       }
     },
     receivers: {
-      forwardOrdered: { pushAuthenticated: () => calls++ },
+      forwardOrdered: {
+        next: 0n,
+        buffered: 0,
+        needsRotation: false,
+        pushAuthenticated: () => calls++
+      },
       forwardDatagram: new DatagramReplayWindow({ window: 8 }),
       reverseOrdered: new OrderedReceiver({ window: 8, gapTimeout: 100, now: () => 0 }),
       reverseDatagram: new DatagramReplayWindow({ window: 8 })
@@ -454,6 +517,233 @@ test('temporary plaintext and encoded deliveries are zeroed on success and failu
   expectCode(t, () => open(destination, b4a.alloc(ROUTE_FRAME_SIZE)), 'INVALID_ROUTE')
   t.is(calls, 0)
   t.alike(malformed, b4a.alloc(ROUTE_PLAINTEXT_SIZE))
+})
+
+test('route open rejects caller-frame plaintext aliases without clearing caller bytes', (t) => {
+  let calls = 0
+  let frame = null
+  const destination = route({
+    endpointRole: ROUTE_ENDPOINT.DESTINATION,
+    crypto: {
+      ...cryptoSuite,
+      open() {
+        return frame.subarray(24)
+      }
+    },
+    receivers: {
+      forwardOrdered: {
+        next: 0n,
+        buffered: 0,
+        needsRotation: false,
+        pushAuthenticated: () => calls++
+      },
+      forwardDatagram: new DatagramReplayWindow({ window: 8 }),
+      reverseOrdered: new OrderedReceiver({ window: 8, gapTimeout: 100, now: () => 0 }),
+      reverseDatagram: new DatagramReplayWindow({ window: 8 })
+    }
+  })
+  frame = b4a.alloc(ROUTE_FRAME_SIZE, 0x7a)
+  frame.fill(0, 0, 8)
+  frame[24] = CELL_CLASS.STREAM
+  frame[25] = 0
+  frame[26] = 0
+  const snapshot = b4a.from(frame)
+
+  expectCode(t, () => open(destination, frame), 'INVALID_ROUTE')
+  t.alike(frame, snapshot)
+  t.is(calls, 0)
+  t.is(destination.stats.forward.orderedNext, 0n)
+})
+
+test('route open rejects plaintext overlapping long-lived owned context', (t) => {
+  const raw = rawContext({ endpointRole: ROUTE_ENDPOINT.DESTINATION })
+  const backing = b4a.allocUnsafeSlow(2048)
+  const sizes = [32, 16, 32, 16, 32, 16]
+  const original = b4a.allocUnsafeSlow
+  let offset = 0
+  let allocation = 0
+  b4a.allocUnsafeSlow = (size) => {
+    if (allocation < sizes.length) {
+      t.is(size, sizes[allocation++])
+      const value = backing.subarray(offset, offset + size)
+      offset += size
+      return value
+    }
+    return original(size)
+  }
+  let context
+  try {
+    context = mintCreatedRoutePayloadContext(raw)
+  } finally {
+    b4a.allocUnsafeSlow = original
+  }
+  t.is(allocation, sizes.length)
+  const candidate = backing.subarray(0, ROUTE_PLAINTEXT_SIZE)
+  candidate.fill(0)
+  candidate[0] = CELL_CLASS.STREAM
+  const snapshot = b4a.from(backing)
+  const destination = route({
+    context,
+    crypto: { ...cryptoSuite, open: () => candidate }
+  })
+
+  expectCode(t, () => open(destination, b4a.alloc(ROUTE_FRAME_SIZE)), 'INVALID_ROUTE')
+  t.alike(backing, snapshot)
+  t.is(destination.stats.forward.orderedNext, 0n)
+})
+
+test('route crypto adapters receive disposable key and nonce snapshots', (t) => {
+  let sealKey = null
+  let sealPrefix = null
+  let openKey = null
+  let openPrefix = null
+  const routeKeys = keys()
+  const source = route({
+    routeKeys,
+    crypto: {
+      ...cryptoSuite,
+      seal(options) {
+        sealKey = options.key
+        sealPrefix = options.noncePrefix
+        const ciphertext = cryptoSuite.seal(options)
+        options.key.fill(0)
+        options.noncePrefix.fill(0)
+        return ciphertext
+      }
+    }
+  })
+  const destination = route({
+    routeKeys,
+    endpointRole: ROUTE_ENDPOINT.DESTINATION,
+    crypto: {
+      ...cryptoSuite,
+      open(options) {
+        openKey = options.key
+        openPrefix = options.noncePrefix
+        const plaintext = cryptoSuite.open(options)
+        options.key.fill(0)
+        options.noncePrefix.fill(0)
+        return plaintext
+      }
+    }
+  })
+  const first = seal(source, { payload: b4a.from('first') })
+  t.alike(open(destination, first)[0].payload, b4a.from('first'))
+  const second = seal(source, { payload: b4a.from('second') })
+  t.alike(open(destination, second)[0].payload, b4a.from('second'))
+  for (const snapshot of [sealKey, sealPrefix, openKey, openPrefix]) {
+    t.alike(snapshot, b4a.alloc(snapshot.byteLength))
+  }
+})
+
+test('route key snapshot allocation is transactional before counter and receiver state', (t) => {
+  const original = b4a.allocUnsafeSlow
+  const source = route()
+  let partial = null
+  let firstSnapshot = null
+  b4a.allocUnsafeSlow = (size) => {
+    if (size === 32) {
+      firstSnapshot = original(size)
+      return firstSnapshot
+    }
+    if (size === 16) {
+      partial = original(15)
+      partial.fill(0xaa)
+      return partial
+    }
+    return original(size)
+  }
+  try {
+    expectCode(t, () => seal(source), 'INVALID_ROUTE')
+  } finally {
+    b4a.allocUnsafeSlow = original
+  }
+  t.is(source.stats.forward.senderNext, 0n)
+  t.alike(firstSnapshot, b4a.alloc(32))
+  t.alike(partial, b4a.alloc(15))
+
+  const pairValue = pair()
+  const frame = seal(pairValue.source)
+  b4a.allocUnsafeSlow = (size) => {
+    if (size === 16) return original(15)
+    return original(size)
+  }
+  try {
+    expectCode(t, () => open(pairValue.destination, frame), 'INVALID_ROUTE')
+  } finally {
+    b4a.allocUnsafeSlow = original
+  }
+  t.is(pairValue.destination.stats.forward.orderedNext, 0n)
+})
+
+test('reentrant destroy during route crypto snapshots prevents adapter entry', (t) => {
+  const original = b4a.allocUnsafeSlow
+  let sealCalls = 0
+  let source = null
+  source = route({
+    crypto: {
+      ...cryptoSuite,
+      seal: (options) => {
+        sealCalls++
+        return cryptoSuite.seal(options)
+      }
+    }
+  })
+  let triggered = false
+  let sealSnapshot = null
+  b4a.allocUnsafeSlow = (size) => {
+    const value = original(size)
+    if (!triggered && size === 32) {
+      sealSnapshot = value
+      triggered = true
+      source.destroy()
+    }
+    return value
+  }
+  try {
+    expectCode(t, () => seal(source), 'CIRCUIT_STATE')
+  } finally {
+    b4a.allocUnsafeSlow = original
+  }
+  t.is(sealCalls, 0)
+  t.is(source.stats.destroyed, true)
+  t.alike(sealSnapshot, b4a.alloc(32))
+
+  let openCalls = 0
+  let destination = null
+  const pairValue = pair(
+    {},
+    {
+      crypto: {
+        ...cryptoSuite,
+        open: (options) => {
+          openCalls++
+          return cryptoSuite.open(options)
+        }
+      }
+    }
+  )
+  destination = pairValue.destination
+  const frame = seal(pairValue.source)
+  triggered = false
+  let openSnapshot = null
+  b4a.allocUnsafeSlow = (size) => {
+    const value = original(size)
+    if (!triggered && size === 32) {
+      openSnapshot = value
+      triggered = true
+      destination.destroy()
+    }
+    return value
+  }
+  try {
+    expectCode(t, () => open(destination, frame), 'CIRCUIT_STATE')
+  } finally {
+    b4a.allocUnsafeSlow = original
+  }
+  t.is(openCalls, 0)
+  t.is(destination.stats.destroyed, true)
+  t.alike(openSnapshot, b4a.alloc(32))
 })
 
 test('receiver failures expose only counter codes', (t) => {
@@ -639,6 +929,60 @@ test('destroy clears bindings, keys, counters, and replay state', (t) => {
   expectCode(t, () => codec[ROUTE_PAYLOAD_BINDING](), 'CIRCUIT_STATE')
   binding.descriptorId.fill(0)
   binding.circuitId.fill(0)
+})
+
+test('binding copy is transactional on allocation failure', (t) => {
+  const original = b4a.allocUnsafeSlow
+  const codec = route()
+  const owned = []
+  b4a.allocUnsafeSlow = (size) => {
+    if (size === 32) {
+      const value = original(size)
+      owned.push(value)
+      return value
+    }
+    if (size === 16) {
+      const value = original(15)
+      value.fill(0xaa)
+      owned.push(value)
+      return value
+    }
+    return original(size)
+  }
+  try {
+    expectCode(t, () => codec[ROUTE_PAYLOAD_BINDING](), 'INVALID_ROUTE')
+  } finally {
+    b4a.allocUnsafeSlow = original
+  }
+  t.is(codec.stats.destroyed, false)
+  t.is(owned.length, 2)
+  for (const value of owned) t.alike(value, b4a.alloc(value.byteLength))
+})
+
+test('binding copy fails closed on reentrant destroy during either allocation', (t) => {
+  for (const triggerSize of [32, 16]) {
+    const original = b4a.allocUnsafeSlow
+    const codec = route()
+    const owned = []
+    let triggered = false
+    b4a.allocUnsafeSlow = (size) => {
+      const value = original(size)
+      if (size === 32 || size === 16) owned.push(value)
+      if (!triggered && size === triggerSize) {
+        triggered = true
+        codec.destroy()
+      }
+      return value
+    }
+    try {
+      expectCode(t, () => codec[ROUTE_PAYLOAD_BINDING](), 'CIRCUIT_STATE')
+    } finally {
+      b4a.allocUnsafeSlow = original
+    }
+    t.is(codec.stats.destroyed, true)
+    t.ok(owned.length >= 1)
+    for (const value of owned) t.alike(value, b4a.alloc(value.byteLength))
+  }
 })
 
 test('100 generated route frames preserve bytes and reject bit substitution', (t) => {
