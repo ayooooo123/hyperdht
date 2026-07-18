@@ -13,6 +13,8 @@ Built on top of [dht-rpc](https://github.com/mafintosh/dht-rpc).
 The Hyperswarm DHT uses a series of holepunching techniques to make sure connectivity works on most networks,
 and is mainly used to facilitate finding and connecting to peers using end to end encrypted Noise streams.
 
+> **Experimental fork note:** This branch contains the Gate 2 request-transport seam and the Gate 3A deterministic private-route substrate described in the [v1 design](docs/private-routing-v1.md) and [migration record](docs/private-routing-migration.md). These internals are not a production anonymity surface. Direct mode remains the only public behavior.
+
 ## Usage
 
 To try it out, first instantiate a DHT instance

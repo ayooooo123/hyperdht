@@ -1,0 +1,72 @@
+# Private Routing Gate 3A Migration Record
+
+## Status and scope
+
+This record describes the experimental, internal Gate 3A private-route substrate in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology.
+
+Direct mode remains the only public behavior. Gate 3A has no live route authority, routed-reply wire codec, public required-mode controller, post-readiness packet-capture proof, or anonymity claim. Its deterministic tests establish semantic and byte-vector conformance only; they do not establish a live route, resistance to traffic analysis, or suitability for protecting users.
+
+The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
+
+## Reviewed prototype source
+
+Every migrated module below came from the reviewed private-routes prototype at exact commit `0305df915b6a767093f9e75e6c06bc0a35da6169`. The migration changed ESM imports and exports to HyperDHT's CommonJS module style, changed local import paths, and retained the listed focused/vector coverage. Subsequent fork review added defensive ownership, hostile-shape handling, intrinsic capture, bounded allocation, and clearing checks without intentionally changing the listed normative protocol bytes.
+
+| Gate 3A file                   | Exact prototype source and commit                                                                                                                                                                   | CommonJS adaptation and retained focused/vector coverage                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lib/private/errors.js`        | `packages/private-routes/lib/errors.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                               | ESM exports became a frozen CommonJS export. `test/private/protocol.js` retains the error assertions adapted from prototype `test/protocol.test.js` and `test/m3-protocol.test.js`.                                                                                                                                                                                                                                                                            |
+| `lib/private/protocol.js`      | `packages/private-routes/lib/protocol.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                             | ESM imports/exports became local `require()` calls and a frozen CommonJS export. `test/private/protocol.js` retains the protocol, message-ID, domain, role, strict-shape, and hostile-buffer vectors adapted from prototype `test/protocol.test.js` and `test/m3-protocol.test.js`.                                                                                                                                                                            |
+| `lib/private/crypto-suite.js`  | `packages/private-routes/lib/crypto-suite.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                         | ESM imports/exports became CommonJS using HyperDHT's existing `sodium-universal`, `hypercore-crypto`, and `b4a` dependencies. `test/private/crypto-suite.js` retains generic transcript/KDF, X25519, nonce, substitution, and clearing vectors adapted from prototype `test/crypto-suite.test.js` and relevant `test/adversarial.test.js` cases. Exact M3 transcript construction is intentionally absent.                                                     |
+| `lib/private/counters.js`      | `packages/private-routes/lib/counters.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                             | ESM exports became CommonJS; counter semantics and bounds remain covered by `test/private/counters.js`, adapted from prototype `test/counters.test.js` and the counter cases in `test/adversarial.test.js`.                                                                                                                                                                                                                                                    |
+| `lib/private/cell-codec.js`    | `packages/private-routes/lib/cell-codec.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                           | ESM imports/exports became CommonJS with local private-module paths. `test/private/cell-codec.js` retains exact layout/hash, padding, authentication, substitution, allocation, hostile-buffer, and clearing coverage adapted from prototype `test/cell-codec.test.js`, `test/property.test.js`, and `test/adversarial.test.js`.                                                                                                                               |
+| `lib/private/route-payload.js` | `packages/private-routes/lib/route-payload.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                        | ESM imports/exports became CommonJS with local private-module paths. `test/private/route-payload.js` retains exact payload, direction/class/generation substitution, replay, ownership, nonce, and clearing coverage adapted from prototype `test/route-payload.test.js`, `test/property.test.js`, and `test/adversarial.test.js`. Gate 3A retains a fail-closed process-local ceiling of 4,096 nonce-domain claims; durable generation ownership is deferred. |
+| `lib/private/fragments.js`     | `packages/private-routes/lib/fragments.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                            | ESM imports/exports became CommonJS and the reviewed Gate 3A resource ceilings were reduced and made explicit. `test/private/fragments.js` retains and extends prototype `test/fragments.test.js` and fragmentation cases from `test/property.test.js`, including ceilings, expiry, allocation order, conflict handling, ownership, and clearing.                                                                                                              |
+| `lib/private/exit-policy.js`   | `policyEntry`, the nine `EXIT_ORIGIN_SERVICE_POLICY` entries, and policy encode/decode/digest pieces from `packages/private-routes/lib/final-exit.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169` | Only the immutable policy pieces were extracted into CommonJS; live exit state, socket ownership, and activation were not migrated. `test/private/exit-policy.js` retains the exact policy bytes/digest and immutability assertions adapted from prototype `test/final-exit-activation.test.js`.                                                                                                                                                               |
+| `lib/private/routed-dht.js`    | `packages/private-routes/lib/routed-dht.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                           | ESM imports/exports became CommonJS and the policy import points to the extracted local module. `test/private/routed-dht.js` retains exact destination/request bytes, policy equality, branch, deadline, size, hostile-shape, and clearing coverage adapted from prototype `test/routed-dht.test.js` and the policy assertions in `test/final-exit-activation.test.js`. The prototype supplies no routed-reply wire codec, so none is claimed here.            |
+
+### Gate 3A resource bounds
+
+Fragmentation is limited to eight fragments, eight concurrent messages, eight buffered fragments, and a five-second message deadline. Eight full fragments carry at most 8,424 bytes of application data. Including the twenty-byte header in each of eight route payloads produces at most 8,584 encoded bytes; 8,584 is not an application-data limit. Public duplex segmentation across multiple internal messages is intentionally absent.
+
+The route-payload nonce-domain registry is also deliberately process-local and capped at 4,096 claims. It never evicts an activated claim and fails closed at capacity. It is deterministic Gate 3A scaffolding, not the durable circuit/generation freshness mechanism required for live or mobile routing.
+
+## Newly authored Gate 3A modules
+
+The following files were authored in this fork and were not migrated from the prototype commit:
+
+- `lib/private/dht-command-policy.js` defines the fail-closed immutable-get-only command mapping. `test/private/dht-command-policy.js` proves exact request encoding and rejection of every unsupported command before authority IO.
+- `lib/private/query-context.js` creates per-instance, unforgeable lookup/announce capabilities for that one command. Its focused coverage is in `test/private/dht-command-policy.js`.
+- `lib/private/opaque-destination.js` owns address-free, branch-bound destination capabilities for one adapter instance. Its focused coverage is in `test/private/routed-dht-io.js`.
+- `lib/private/routed-dht-io.js` implements the internal nine-method DHT-RPC request-transport contract against a trusted in-process authority. It supports only the reviewed immutable-get request body and normalizes a trusted logical response; it is not a live or remote authority interface. Its focused coverage is in `test/private/routed-dht-io.js`.
+
+`test/private/fake-route-authority.js` and `test/private/routed-dht-traversal.js` are also newly authored, test-only conformance scaffolding. They exercise deterministic five-node lookup and announce traversal through base DHT-RPC without hosts, ports, sockets, UDX, or network traffic. They do not model a live three-position route and are not an anonymity test.
+
+## Intentionally not migrated into Gate 3A
+
+Prototype implementations outside this reviewed slice are intentionally not migrated or accepted as production-ready merely because they exist in the prototype:
+
+- `m3-context.js`, `tail-control.js`, and the live route-state portions of `final-exit.js`;
+- `test/m3-vectors.test.js`, pending exact v1 role/branch/circuit/generation transcript constructors;
+- live adjacent-link authentication, relay discovery, guard pinning, route construction, quotas, rotation, teardown, and DHT exit socket ownership;
+- routed-reply wire encoding and the remaining exact per-command request/reply body codecs;
+- live provenance-qualified destination tables, generation expiry and rotation invalidation, public duplex segmentation, multi-process integration, and the packet-capture leak oracle;
+- public required-mode, Hyperswarm, mobile, and PearTube integration.
+
+Until those pieces pass the next reviewed gate, no Gate 3A internal module may be connected to an untrusted, remote, or live route authority.
+
+## Gate 3B entry criteria
+
+The next separately reviewed plan must implement and verify all of the following:
+
+1. Signed relay advertisements and numeric-only bounded bootstrap.
+2. Stable guard pinning and separate lookup/announce middle/exit branches.
+3. Adjacent authenticated links, three-position live routes, quotas, rotation, and teardown.
+4. Exact reviewed request and reply body codecs, encoded-byte amplification accounting, and adversarial vectors for private presence, mutable/immutable get/put, and exit referrals.
+5. Exact v1 role/branch/circuit/generation transcript constructors and the deferred M3 derivation vectors.
+6. Provenance-qualified DHT exit destination tables and live allowlisted UDP operations.
+7. Trusted route-generation expiry and rotation invalidation for every issued destination capability.
+8. A public required-mode controller only after direct authority is removed at readiness.
+9. Multi-process Node/Bare integration.
+10. Privileged Linux namespace capture plus a semantic leak oracle proving endpoint-to-guard-only traffic after readiness.
+
+Delivery Gate 3 remains open until every one of these ten items passes fork-native CI. Gate 3A completion alone does not authorize a public private-routing mode or an anonymity claim.
