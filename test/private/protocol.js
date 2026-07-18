@@ -114,7 +114,7 @@ test('private route protocol versions and core enums are exact and frozen', (t) 
   }
 })
 
-test('private route message and routed-error IDs form the exact sorted 58-ID registry', (t) => {
+test('private route message and routed-error IDs form the exact sorted 59-ID registry', (t) => {
   const messages = {
     CAPABILITY_ADVERTISEMENT_V1: 0x0001,
     CAPS_QUERY_V1: 0x0002,
@@ -136,6 +136,7 @@ test('private route message and routed-error IDs form the exact sorted 58-ID reg
     DHT_EXIT_READY_ACK_V1: 0x0042,
     DHT_EXIT_OPEN_V1: 0x0043,
     DHT_EXIT_SEEDS_V1: 0x0044,
+    DHT_EXIT_DHT_SEEDS_V1: 0x0045,
     EXIT_RPC_OPEN_V1: 0x0050,
     EXIT_RPC_ACCEPT_V1: 0x0051,
     EXIT_RPC_FRAGMENT_V1: 0x0052,
@@ -184,8 +185,11 @@ test('private route message and routed-error IDs form the exact sorted 58-ID reg
   t.ok(Object.isFrozen(ROUTED_ERROR))
 
   const assigned = [...Object.values(M3_MESSAGE_ID), ...Object.values(ROUTED_ERROR)]
-  t.is(assigned.length, 58)
-  t.is(new Set(assigned).size, 58)
+  t.is(M3_MESSAGE_ID.DHT_EXIT_SEEDS_V1, 0x0044)
+  t.is(M3_MESSAGE_ID.DHT_EXIT_DHT_SEEDS_V1, 0x0045)
+  t.is(M3_ID_REGISTRY.filter((id) => id === 0x0045).length, 1)
+  t.is(assigned.length, 59)
+  t.is(new Set(assigned).size, 59)
   t.alike(
     M3_ID_REGISTRY,
     assigned.slice().sort((left, right) => left - right)
@@ -216,7 +220,9 @@ test('private route protocol domains are exact defensive buffers in a frozen map
     ACTIVATE_CHALLENGE: 'hyperdht-private-routes/activate/challenge/v0',
     ACTIVATE_PARAMETERS: 'hyperdht-private-routes/activate/parameters/v0',
     CELL_HEADER: 'hyperdht-private-routes/cell/header/v0',
-    ROUTE_PAYLOAD: 'hyperdht-private-routes/route-payload/v0'
+    ROUTE_PAYLOAD: 'hyperdht-private-routes/route-payload/v0',
+    DHT_EXIT_DHT_SEEDS: 'hyperdht-private-routes/m3/dht-exit-dht-seeds/v1',
+    DHT_EXIT_DHT_SEEDS_SET: 'hyperdht-private-routes/m3/dht-exit-dht-seeds/set/v1'
   }
 
   t.alike(Object.keys(DOMAIN), Object.keys(expected))
@@ -308,6 +314,7 @@ test('private route errors have exact frozen registries, constructors, and sanit
     ERR_BUSY: 'Private routing is busy',
     ERR_QUOTA_EXCEEDED: 'Private routing quota was exceeded',
     ERR_PRIVATE_RECORDS_UNAVAILABLE: 'Private records are unavailable',
+    ERR_PRIVATE_GUARD_UNAVAILABLE: 'Private guard is unavailable',
     ERR_DESTROYED: 'Private routing state is destroyed'
   }
   const expected = Object.keys(expectedMessages).slice(0, 15)
@@ -317,6 +324,7 @@ test('private route errors have exact frozen registries, constructors, and sanit
   t.alike(M3_ERROR_CODES, m3Expected)
   t.ok(Object.isFrozen(ERROR_CODES))
   t.ok(Object.isFrozen(M3_ERROR_CODES))
+  t.is(PrivateRouteError.ERR_PRIVATE_GUARD_UNAVAILABLE().code, 'ERR_PRIVATE_GUARD_UNAVAILABLE')
 
   const sensitive = 'secret 0123456789abcdef0123456789abcdef at 192.168.100.200'
 
@@ -469,6 +477,7 @@ test('canonical M3 object envelope enforces every standalone layout boundary', (
     [0x0042, 105, 105, 0],
     [0x0043, 169, 169, 0],
     [0x0044, 905, 4265, 64],
+    [0x0045, 310, 654, 64],
     [0x0050, 578, 738, 64],
     [0x0051, 124, 124, 16],
     [0x0052, 27, 1176, 16],
@@ -484,6 +493,27 @@ test('canonical M3 object envelope enforces every standalone layout boundary', (
     [0x0283, 72, 72, 0],
     [0x0284, 301, 301, 64]
   ]
+
+  t.is(
+    encodeM3Object({ messageId: 0x0044, body: b4a.alloc(905), authSuffix: b4a.alloc(64) })
+      .byteLength,
+    977
+  )
+  t.is(
+    encodeM3Object({ messageId: 0x0044, body: b4a.alloc(4265), authSuffix: b4a.alloc(64) })
+      .byteLength,
+    4337
+  )
+  t.is(
+    encodeM3Object({ messageId: 0x0045, body: b4a.alloc(310), authSuffix: b4a.alloc(64) })
+      .byteLength,
+    382
+  )
+  t.is(
+    encodeM3Object({ messageId: 0x0045, body: b4a.alloc(654), authSuffix: b4a.alloc(64) })
+      .byteLength,
+    726
+  )
 
   for (const [messageId, minimumBodyBytes, maximumBodyBytes, authBytes] of fixtures) {
     for (const bodyBytes of new Set([minimumBodyBytes, maximumBodyBytes])) {
