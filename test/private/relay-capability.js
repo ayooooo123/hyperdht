@@ -74,7 +74,14 @@ function trackedRelayCapability() {
   const allocations = []
   let tracking = false
   let failingSize = null
+  let failingAllocation = null
+  let allocationCount = 0
   const allocate = (size) => {
+    if (tracking) allocationCount++
+    if (tracking && allocationCount === failingAllocation) {
+      failingAllocation = null
+      throw new Error('injected allocation failure')
+    }
     if (tracking && size === failingSize) {
       failingSize = null
       throw new Error('injected allocation failure')
@@ -103,7 +110,12 @@ function trackedRelayCapability() {
     start() {
       allocations.length = 0
       failingSize = null
+      failingAllocation = null
+      allocationCount = 0
       tracking = true
+    },
+    failAllocationAt(position) {
+      failingAllocation = position
     },
     failAllocationOfSize(size) {
       failingSize = size
@@ -111,6 +123,8 @@ function trackedRelayCapability() {
     take() {
       tracking = false
       failingSize = null
+      failingAllocation = null
+      allocationCount = 0
       return allocations.splice(0)
     },
     restore() {
@@ -118,6 +132,8 @@ function trackedRelayCapability() {
       restored = true
       tracking = false
       failingSize = null
+      failingAllocation = null
+      allocationCount = 0
       b4a.allocUnsafeSlow = originalB4a
       BufferConstructor.allocUnsafeSlow = originalBuffer
     }
@@ -519,6 +535,87 @@ test('verifier owns epochs, idempotence, equivocation quarantine, and projection
   const original = signedAdvertisement()
   expectCode(t, () => acceptSafety(owner, original), 'ERR_AUTHENTICATION')
   owner.destroy()
+})
+
+test('projection copy failures clear partial ownership without publishing state', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fixture = signedAdvertisement({ routeSeed: 95, expiresAtMs: NOW + 60_000n })
+  const callerSnapshot = b4a.from(fixture.encoded)
+  const createOwner = (fake, onInvalidated = () => {}) =>
+    new tracked.fresh.RelayCapabilityVerifier({
+      wallNow: fake.wallNow,
+      monotonicNow: fake.monotonicNow,
+      setTimer: fake.setTimer,
+      clearTimer: fake.clearTimer,
+      onInvalidated
+    })
+
+  const profileClock = clock()
+  const profileOwner = createOwner(profileClock)
+  acceptSafety(profileOwner, fixture)
+  tracked.start()
+  const profiledProjection = acceptSafety(profileOwner, fixture)
+  const profiledAllocations = tracked.take()
+  const projectionBuffers = [
+    profiledProjection.canonicalBytes,
+    profiledProjection.digest,
+    profiledProjection.identity,
+    profiledProjection.canonicalEndpointBytes,
+    profiledProjection.routePublicKey
+  ]
+  const projectionAllocationPositions = projectionBuffers.map(
+    (buffer) => profiledAllocations.indexOf(buffer) + 1
+  )
+  t.ok(projectionAllocationPositions.every((position) => position > 0))
+  for (let index = 1; index < projectionAllocationPositions.length; index++) {
+    t.is(
+      projectionAllocationPositions[index],
+      projectionAllocationPositions[index - 1] + 1,
+      'projection copies are the expected sequential allocation boundary'
+    )
+  }
+  profileOwner.destroy()
+
+  for (let copyPosition = 2; copyPosition <= 5; copyPosition++) {
+    const fake = clock()
+    let invalidations = 0
+    const owner = createOwner(fake, () => invalidations++)
+    const source = acceptSafety(owner, fixture)
+    const sourceBuffers = [
+      source.canonicalBytes,
+      source.digest,
+      source.identity,
+      source.canonicalEndpointBytes,
+      source.routePublicKey
+    ]
+    const sourceSnapshots = sourceBuffers.map((buffer) => b4a.from(buffer))
+
+    tracked.start()
+    tracked.failAllocationAt(projectionAllocationPositions[copyPosition - 1])
+    expectCode(t, () => acceptSafety(owner, fixture), 'ERR_AUTHENTICATION')
+    const failedAllocations = tracked.take()
+    t.ok(failedAllocations.length > 0, `copy ${copyPosition} fails after owned allocation`)
+    for (const buffer of failedAllocations) {
+      t.alike(buffer, b4a.alloc(buffer.byteLength), `copy ${copyPosition} clears owned bytes`)
+    }
+    for (let index = 0; index < sourceBuffers.length; index++) {
+      t.alike(
+        sourceBuffers[index],
+        sourceSnapshots[index],
+        `copy ${copyPosition} leaves source state untouched`
+      )
+    }
+    t.is(fake.pending(), 1, `copy ${copyPosition} publishes no timer or replacement record`)
+    t.is(invalidations, 0, `copy ${copyPosition} does not invalidate the verifier`)
+    t.alike(fixture.encoded, callerSnapshot, `copy ${copyPosition} leaves caller bytes untouched`)
+
+    const retry = acceptSafety(owner, fixture)
+    t.alike(retry.digest, source.digest, `copy ${copyPosition} leaves the live record selectable`)
+    t.is(fake.pending(), 1, `copy ${copyPosition} publishes no hidden record on retry`)
+    owner.destroy()
+    t.is(fake.pending(), 0)
+  }
 })
 
 test('verifier accept publishes nothing when expiry timer setup reenters and throws', (t) => {
