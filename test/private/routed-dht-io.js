@@ -4,6 +4,7 @@ const test = require('brittle')
 const b4a = require('b4a')
 
 const { COMMANDS } = require('../../lib/constants')
+const { PrivateRouteError } = require('../../lib/private/errors')
 const { createQueryContexts } = require('../../lib/private/query-context')
 const { RoutedDHTIO } = require('../../lib/private/routed-dht-io')
 const {
@@ -350,7 +351,16 @@ test('request cancellation and settlement clear ownership exactly once', async (
 test('request fails closed on sync throw, malformed operation, rejection, malformed reply, and expiry', async (t) => {
   for (const mode of ['throw', 'operation', 'reject', 'reply', 'expired']) {
     let time = 1_000
-    const current = fixture({ now: () => time })
+    let actualEncodedRequest = null
+    const authority = new FakeRouteAuthority()
+    if (mode === 'operation') {
+      authority.request = (options) => {
+        authority.calls.request++
+        actualEncodedRequest = options.encodedRequest
+        return { promise: Promise.resolve() }
+      }
+    }
+    const current = fixture({ authority, now: () => time })
     current.authority.lookup = [record(14)]
     const [to] = current.io.closest({
       target: bytes(1, 32),
@@ -361,7 +371,6 @@ test('request fails closed on sync throw, malformed operation, rejection, malfor
       current.authority.requestHook = () => {
         throw new Error('route failed')
       }
-    if (mode === 'operation') current.authority.requestHook = () => ({ promise: Promise.resolve() })
     if (mode === 'reject') {
       current.authority.requestHook = () => ({
         promise: Promise.reject(new Error('route rejected')),
@@ -382,10 +391,17 @@ test('request fails closed on sync throw, malformed operation, rejection, malfor
     }
 
     let operation = null
+    let requestError = null
     try {
       operation = current.io.request(message(to, current.contexts.immutableGet.lookup))
     } catch (error) {
-      t.ok(mode === 'throw' || mode === 'operation')
+      requestError = error
+    }
+    if (mode === 'throw' || mode === 'operation') {
+      t.is(
+        requestError && requestError.code,
+        mode === 'throw' ? 'ROUTE_UNAVAILABLE' : 'INVALID_ROUTE'
+      )
     }
     if (mode === 'expired') time = 4_001
     if (operation !== null) {
@@ -397,7 +413,157 @@ test('request fails closed on sync throw, malformed operation, rejection, malfor
             : 'ERR_AUTHENTICATION'
       await expectRejectCode(t, operation.promise, expected)
     }
+    if (mode === 'operation') t.ok(allZero(actualEncodedRequest))
     t.ok(current.retained.every((buffer) => buffer.every((byte) => byte === 0)))
+  }
+})
+
+test('authority Promise is subscribed once through an adapter-owned bridge', async (t) => {
+  const current = fixture()
+  const source = record(80)
+  current.authority.lookup = [source]
+  current.authority.response = {
+    rtt: 1,
+    from: source,
+    to: null,
+    token: null,
+    closerNodes: [],
+    error: 0,
+    value: null
+  }
+  const authorityPromise = Promise.resolve(current.authority.response)
+  let constructorReads = 0
+  let cancels = 0
+  Object.defineProperty(authorityPromise, 'constructor', {
+    get() {
+      constructorReads++
+      if (constructorReads === 1) return Promise
+      throw new Error('authority Promise was subscribed twice')
+    }
+  })
+  current.authority.requestHook = () => ({
+    promise: authorityPromise,
+    cancel() {
+      cancels++
+    }
+  })
+  const [to] = current.io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: current.contexts.immutableGet.lookup
+  })
+
+  const operation = current.io.request(message(to, current.contexts.immutableGet.lookup))
+  t.is((await operation.promise).error, 0)
+  t.is(constructorReads, 1)
+  t.is(cancels, 0)
+  t.ok(current.retained.every(allZero))
+
+  const failing = fixture()
+  failing.authority.lookup = [record(82)]
+  const rejectedPromise = Promise.resolve(null)
+  Object.defineProperty(rejectedPromise, 'constructor', {
+    get() {
+      throw PrivateRouteError.ROUTE_UNAVAILABLE()
+    }
+  })
+  let rejectedCancels = 0
+  failing.authority.requestHook = () => ({
+    promise: rejectedPromise,
+    cancel() {
+      rejectedCancels++
+    }
+  })
+  const [failingTo] = failing.io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: failing.contexts.immutableGet.lookup
+  })
+  expectCode(
+    t,
+    () => failing.io.request(message(failingTo, failing.contexts.immutableGet.lookup)),
+    'INVALID_ROUTE'
+  )
+  t.is(rejectedCancels, 1)
+  t.ok(failing.retained.every(allZero))
+})
+
+test('authority operation reflection cannot select adapter error identity', (t) => {
+  const vectors = [
+    {
+      cancels: 0,
+      operation(state) {
+        const value = { promise: Promise.resolve() }
+        Object.defineProperty(value, 'cancel', {
+          get() {
+            state.getters++
+            throw PrivateRouteError.ROUTE_UNAVAILABLE()
+          }
+        })
+        return value
+      }
+    },
+    {
+      cancels: 1,
+      operation(state) {
+        const value = {
+          promise: Promise.resolve(),
+          cancel() {
+            state.cancels++
+          }
+        }
+        return new Proxy(value, {
+          getOwnPropertyDescriptor(target, name) {
+            if (name === 'promise') throw PrivateRouteError.ROUTE_UNAVAILABLE()
+            return Reflect.getOwnPropertyDescriptor(target, name)
+          }
+        })
+      }
+    },
+    {
+      cancels: 0,
+      operation() {
+        return new Proxy(Object.create(null), {
+          getOwnPropertyDescriptor() {
+            return undefined
+          },
+          getPrototypeOf() {
+            throw PrivateRouteError.ROUTE_UNAVAILABLE()
+          }
+        })
+      }
+    }
+  ]
+
+  for (const vector of vectors) {
+    const authority = new FakeRouteAuthority()
+    const state = { actualEncodedRequest: null, cancels: 0, getters: 0 }
+    authority.request = (options) => {
+      authority.calls.request++
+      state.actualEncodedRequest = options.encodedRequest
+      return vector.operation(state)
+    }
+    const current = fixture({ authority })
+    authority.lookup = [record(81)]
+    const [to] = current.io.closest({
+      target: bytes(1, 32),
+      limit: 1,
+      context: current.contexts.immutableGet.lookup
+    })
+    let error = null
+    try {
+      current.io.request(message(to, current.contexts.immutableGet.lookup))
+    } catch (cause) {
+      error = cause
+    }
+    t.ok(error instanceof PrivateRouteError)
+    t.is(error && error.name, 'PrivateRouteError')
+    t.is(error && error.code, 'INVALID_ROUTE')
+    t.is(error && error.message, 'Route is invalid')
+    t.ok(allZero(state.actualEncodedRequest))
+    t.ok(current.retained.every(allZero))
+    t.is(state.getters, 0)
+    t.is(state.cancels, vector.cancels)
   }
 })
 
