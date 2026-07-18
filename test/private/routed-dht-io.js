@@ -27,6 +27,19 @@ function allZero(value) {
   return true
 }
 
+function reenteringPromise(value, reenter) {
+  const promise = Promise.resolve(value)
+  Object.defineProperty(promise, 'constructor', {
+    get() {
+      try {
+        reenter()
+      } catch {}
+      return Promise
+    }
+  })
+  return promise
+}
+
 function record(byte) {
   const id = bytes(byte, 32)
   return { id, destinationRef: encodeDestinationRef({ id, handle: bytes(byte + 1, 130) }) }
@@ -486,6 +499,120 @@ test('authority Promise is subscribed once through an adapter-owned bridge', asy
   )
   t.is(rejectedCancels, 1)
   t.ok(failing.retained.every(allZero))
+})
+
+test('bootstrap Promise species reentry fails closed before nested delegation', async (t) => {
+  const authority = new FakeRouteAuthority()
+  let current = null
+  let transition = null
+  authority.bootstrap = () => {
+    authority.calls.bootstrap++
+    return reenteringPromise([], () => {
+      transition = current.io.ready()
+    })
+  }
+  current = fixture({ authority })
+  let error = null
+  try {
+    await current.io.bootstrap({
+      target: bytes(1, 32),
+      limit: 0,
+      context: current.contexts.immutableGet.lookup
+    })
+  } catch (cause) {
+    error = cause
+  }
+  if (transition !== null) await transition
+  t.is(error && error.code, 'INVALID_ROUTE')
+  t.is(authority.calls.ready, 0)
+})
+
+test('lifecycle Promise species reentry fails closed before nested transition', async (t) => {
+  const authority = new FakeRouteAuthority()
+  let current = null
+  let transition = null
+  authority.ready = () => {
+    authority.calls.ready++
+    return reenteringPromise(undefined, () => {
+      transition = current.io.suspend()
+    })
+  }
+  current = fixture({ authority })
+  let error = null
+  try {
+    await current.io.ready()
+  } catch (cause) {
+    error = cause
+  }
+  if (transition !== null) await transition
+  t.is(error && error.code, 'INVALID_ROUTE')
+  t.is(authority.calls.suspend, 0)
+})
+
+test('async iterator next Promise species reentry fails closed', async (t) => {
+  const authority = new FakeRouteAuthority()
+  let current = null
+  let transition = null
+  authority.bootstrap = () => ({
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return reenteringPromise({ done: true }, () => {
+            transition = current.io.ready()
+          })
+        }
+      }
+    }
+  })
+  current = fixture({ authority })
+  let error = null
+  try {
+    await current.io.bootstrap({
+      target: bytes(1, 32),
+      limit: 0,
+      context: current.contexts.immutableGet.lookup
+    })
+  } catch (cause) {
+    error = cause
+  }
+  if (transition !== null) await transition
+  t.is(error && error.code, 'INVALID_ROUTE')
+  t.is(authority.calls.ready, 0)
+})
+
+test('async iterator close Promise species reentry cannot escape cleanup guard', async (t) => {
+  const authority = new FakeRouteAuthority()
+  let current = null
+  let transition = null
+  let closes = 0
+  authority.bootstrap = () => ({
+    [Symbol.asyncIterator]() {
+      return {
+        next() {
+          return Promise.resolve({ done: false, value: record(83) })
+        },
+        return() {
+          closes++
+          return reenteringPromise({ done: true }, () => {
+            transition = current.io.ready()
+          })
+        }
+      }
+    }
+  })
+  current = fixture({ authority })
+  await expectRejectCode(
+    t,
+    current.io.bootstrap({
+      target: bytes(1, 32),
+      limit: 0,
+      context: current.contexts.immutableGet.lookup
+    }),
+    'INVALID_ROUTE'
+  )
+  if (transition !== null) await transition
+  t.is(closes, 1)
+  t.is(authority.calls.ready, 0)
 })
 
 test('authority operation reflection cannot select adapter error identity', (t) => {
