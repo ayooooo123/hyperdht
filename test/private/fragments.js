@@ -63,6 +63,62 @@ function totalEncoded(frames) {
   return total
 }
 
+function replace(object, name, descriptor, saved) {
+  saved.push([object, name, Object.getOwnPropertyDescriptor(object, name)])
+  Object.defineProperty(object, name, descriptor)
+}
+
+function poisonCollections() {
+  const saved = []
+  const iteratorPrototype = Object.getPrototypeOf(new Map().values())
+  const throwing = {
+    configurable: true,
+    writable: true,
+    value() {
+      throw new Error('mutable collection intrinsic ran')
+    }
+  }
+  for (const name of ['get', 'has', 'set', 'delete', 'clear', 'values']) {
+    replace(Map.prototype, name, throwing, saved)
+  }
+  replace(
+    Map.prototype,
+    'size',
+    {
+      configurable: true,
+      get() {
+        throw new Error('mutable map size getter ran')
+      }
+    },
+    saved
+  )
+  for (const name of ['has', 'add', 'delete', 'clear', 'values']) {
+    replace(Set.prototype, name, throwing, saved)
+  }
+  replace(
+    Set.prototype,
+    'size',
+    {
+      configurable: true,
+      get() {
+        throw new Error('mutable set size getter ran')
+      }
+    },
+    saved
+  )
+  replace(iteratorPrototype, 'next', throwing, saved)
+  replace(globalThis, 'Map', throwing, saved)
+  replace(globalThis, 'Set', throwing, saved)
+  replace(Reflect, 'apply', throwing, saved)
+
+  return function restore() {
+    for (let index = saved.length - 1; index >= 0; index--) {
+      const [object, name, descriptor] = saved[index]
+      Object.defineProperty(object, name, descriptor)
+    }
+  }
+}
+
 test('fragment constants lock the reviewed Gate 3A ceilings', (t) => {
   t.is(FRAGMENT_HEADER_SIZE, 20)
   t.is(MAX_FRAGMENT_DATA, 1053)
@@ -136,6 +192,38 @@ test('8,425 data bytes fail before ID generation or allocation', (t) => {
   }
   t.is(randomCalls, 0)
   t.is(allocations, 0)
+})
+
+test('random callback cannot mutate fragmentation arithmetic or buffer validation', (t) => {
+  const ceil = Math.ceil
+  const min = Math.min
+  const max = Math.max
+  const safeInteger = Number.isSafeInteger
+  const isBuffer = b4a.isBuffer
+  let frames
+  try {
+    frames = fragment(b4a.alloc(MAX_MESSAGE_DATA_BYTES, 0x5d), {
+      randomBytes() {
+        Math.ceil = () => 1
+        Math.min = () => 0
+        Math.max = () => 65_535
+        Number.isSafeInteger = () => false
+        b4a.isBuffer = () => false
+        return id(37)
+      }
+    })
+  } finally {
+    Math.ceil = ceil
+    Math.min = min
+    Math.max = max
+    Number.isSafeInteger = safeInteger
+    b4a.isBuffer = isBuffer
+  }
+  t.is(frames.length, MAX_FRAGMENTS)
+  t.is(totalEncoded(frames), MAX_ENCODED_MESSAGE_BYTES)
+  for (const value of frames) {
+    t.is(value.byteLength, FRAGMENT_HEADER_SIZE + MAX_FRAGMENT_DATA)
+  }
 })
 
 test('fragment copies the message and identifier and supports empty data', (t) => {
@@ -784,6 +872,195 @@ test('observer and clock operation reentrancy fail closed', (t) => {
   t.is(clocked.stats.destroyed, true)
 })
 
+test('caught observer and clock reentrancy still destroy and clear state', (t) => {
+  let observedOwned = null
+  let observed = null
+  observed = receiver({
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      observedOwned = value
+      try {
+        observed.expire(0)
+      } catch {
+        // The outer operation must notice the caught nested call.
+      }
+    }
+  })
+  expectCode(
+    t,
+    () => observed.pushAuthenticated(frame(id(97), 0, 1, b4a.from('outer'))),
+    'INVALID_ROUTE'
+  )
+  t.is(observed.stats.destroyed, true)
+  t.alike(observedOwned, b4a.alloc(observedOwned.byteLength))
+
+  let clocked = null
+  clocked = receiver({
+    now() {
+      try {
+        clocked.pushAuthenticated(frame(id(98), 0, 1, b4a.from('nested')))
+      } catch {
+        // The outer operation must notice the caught nested call.
+      }
+      return 0
+    }
+  })
+  expectCode(
+    t,
+    () => clocked.pushAuthenticated(frame(id(99), 0, 1, b4a.from('outer'))),
+    'INVALID_ROUTE'
+  )
+  t.is(clocked.stats.destroyed, true)
+  t.is(clocked.stats.messages, 0)
+})
+
+test('clock replacing Map.prototype.set cannot orphan an accepted fragment', (t) => {
+  let poison = true
+  let originalSet = null
+  const owned = []
+  const reassembler = receiver({
+    now() {
+      if (poison) {
+        originalSet = Map.prototype.set
+        Map.prototype.set = function () {
+          return this
+        }
+      }
+      return 0
+    },
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      owned.push(value)
+    }
+  })
+  const frames = fragment(b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x61), {
+    messageId: id(100)
+  })
+  let first
+  try {
+    first = reassembler.pushAuthenticated(frames[0])
+  } finally {
+    Map.prototype.set = originalSet
+  }
+  t.is(first, null)
+  t.is(reassembler.stats.messages, 1)
+  t.is(reassembler.stats.bufferedFragments, 1)
+  poison = false
+  t.alike(reassembler.pushAuthenticated(frames[1]), b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x61))
+  t.alike(owned[0], b4a.alloc(owned[0].byteLength))
+})
+
+test('collection prototype mutation across clock and observer callbacks stays transactional', (t) => {
+  const frames = fragment(b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x62), {
+    messageId: id(101)
+  })
+  let poisonClock = false
+  let restore = null
+  const owned = []
+  const reassembler = receiver({
+    now() {
+      if (poisonClock) restore = poisonCollections()
+      return 0
+    },
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      owned.push(value)
+    }
+  })
+  reassembler.pushAuthenticated(frames[0])
+  poisonClock = true
+  let output
+  try {
+    output = reassembler.pushAuthenticated(frames[1])
+  } finally {
+    restore()
+  }
+  t.alike(output, b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x62))
+  for (const value of owned) t.alike(value, b4a.alloc(value.byteLength))
+
+  let poisonObserver = false
+  restore = null
+  const observed = receiver({
+    [TEST_ONLY_FRAGMENT_OBSERVER]() {
+      if (poisonObserver) restore = poisonCollections()
+    }
+  })
+  const observedFrames = fragment(b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x63), {
+    messageId: id(102)
+  })
+  observed.pushAuthenticated(observedFrames[0])
+  poisonObserver = true
+  try {
+    output = observed.pushAuthenticated(observedFrames[1])
+  } finally {
+    restore()
+  }
+  t.alike(output, b4a.alloc(MAX_FRAGMENT_DATA + 1, 0x63))
+})
+
+test('collection prototype mutation cannot break replay, expiry, or destroy cleanup', (t) => {
+  let mutate = false
+  let restore = null
+  let now = 0
+  const expiredOwned = []
+  const expiring = receiver({
+    now() {
+      if (mutate) restore = poisonCollections()
+      return now
+    },
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      expiredOwned.push(value)
+    }
+  })
+  const pending = fragment(b4a.alloc(MAX_FRAGMENT_DATA + 1), { messageId: id(103) })
+  expiring.pushAuthenticated(pending[0])
+  mutate = true
+  now = MESSAGE_TIMEOUT
+  let expired
+  try {
+    expired = expiring.expire()
+  } finally {
+    restore()
+  }
+  t.is(expired, 1)
+  t.alike(expiredOwned[0], b4a.alloc(expiredOwned[0].byteLength))
+
+  mutate = false
+  const completed = receiver({
+    now() {
+      if (mutate) restore = poisonCollections()
+      return 0
+    }
+  })
+  const complete = fragment(b4a.from('done'), { messageId: id(104) })[0]
+  completed.pushAuthenticated(complete)
+  mutate = true
+  let secondOutput
+  try {
+    secondOutput = completed.pushAuthenticated(
+      fragment(b4a.from('second'), { messageId: id(106) })[0]
+    )
+  } finally {
+    restore()
+  }
+  t.alike(secondOutput, b4a.from('second'))
+  mutate = false
+  expectCode(t, () => completed.pushAuthenticated(complete), 'REPLAY')
+
+  const destroyedOwned = []
+  const destroyed = receiver({
+    [TEST_ONLY_FRAGMENT_OBSERVER](value) {
+      destroyedOwned.push(value)
+    }
+  })
+  destroyed.pushAuthenticated(fragment(b4a.alloc(MAX_FRAGMENT_DATA + 1), { messageId: id(105) })[0])
+  restore = poisonCollections()
+  try {
+    destroyed.destroy()
+  } finally {
+    restore()
+  }
+  t.is(destroyed.stats.destroyed, true)
+  t.alike(destroyedOwned[0], b4a.alloc(destroyedOwned[0].byteLength))
+})
+
 test('hostile, forged, revoked, and shadowed fragment buffers fail safely', (t) => {
   const forged = Object.create(Uint8Array.prototype)
   const revoked = Proxy.revocable(b4a.alloc(20), {})
@@ -813,8 +1090,10 @@ test('test observer is deep-only and explicitly not an access-control boundary',
   t.comment('deep test hook observes owned buffers; it is not an access-control boundary')
 })
 
-test('256 deterministic generated fragment cases preserve bytes and bounds', (t) => {
-  let state = 0x6d2b79f5
+test('300 deterministic generated valid and malformed fragment cases stay bounded', (t) => {
+  const seed = 0x6d2b79f5
+  const cases = 300
+  let state = seed
   function random() {
     state ^= state << 13
     state ^= state >>> 17
@@ -822,34 +1101,109 @@ test('256 deterministic generated fragment cases preserve bytes and bounds', (t)
     return state >>> 0
   }
 
-  for (let caseIndex = 0; caseIndex < 256; caseIndex++) {
-    const length = random() % (MAX_MESSAGE_DATA_BYTES + 1)
-    const message = b4a.alloc(length)
-    for (let i = 0; i < message.length; i++) message[i] = random()
-    const messageId = b4a.alloc(16)
-    messageId[14] = caseIndex >>> 8
-    messageId[15] = caseIndex
-    const frames = fragment(message, { messageId })
-    const order = Array.from({ length: frames.length }, (_, index) => index)
-    for (let i = order.length - 1; i > 0; i--) {
-      const at = random() % (i + 1)
-      const swap = order[i]
-      order[i] = order[at]
-      order[at] = swap
+  function generatedId(caseIndex, salt = 0) {
+    const value = b4a.alloc(16)
+    value[12] = caseIndex >>> 8
+    value[13] = caseIndex
+    value[14] = salt >>> 8
+    value[15] = salt
+    return value
+  }
+
+  t.comment(`base seed=${seed} generated cases=${cases}`)
+  for (let caseIndex = 0; caseIndex < cases; caseIndex++) {
+    const mode = caseIndex % 6
+    const message = b4a.alloc(MAX_FRAGMENT_DATA + 1)
+    for (let index = 0; index < message.length; index++) message[index] = random()
+    const frames = fragment(message, { messageId: generatedId(caseIndex) })
+    const reassembler = mode === 5 ? receiver({ maxMessageBytes: MAX_FRAGMENT_DATA }) : receiver()
+
+    if (mode === 0) {
+      const length = random() % (MAX_MESSAGE_DATA_BYTES + 1)
+      const valid = b4a.alloc(length)
+      for (let index = 0; index < valid.length; index++) valid[index] = random()
+      const validFrames = fragment(valid, { messageId: generatedId(caseIndex, 1) })
+      const order = Array.from({ length: validFrames.length }, (_, index) => index)
+      for (let index = order.length - 1; index > 0; index--) {
+        const at = random() % (index + 1)
+        const swap = order[index]
+        order[index] = order[at]
+        order[at] = swap
+      }
+      let output = null
+      let completions = 0
+      for (const index of order) {
+        const value = reassembler.pushAuthenticated(validFrames[index])
+        if (value === null) continue
+        output = value
+        completions++
+      }
+      t.is(completions, 1, `case=${caseIndex} shuffled completion`)
+      t.alike(output, valid, `case=${caseIndex} shuffled bytes`)
+      t.ok(validFrames.length <= MAX_FRAGMENTS, `case=${caseIndex} fragment bound`)
+      t.ok(
+        totalEncoded(validFrames) <= MAX_ENCODED_MESSAGE_BYTES,
+        `case=${caseIndex} encoded bound`
+      )
+    } else if (mode === 1) {
+      reassembler.pushAuthenticated(frames[0])
+      expectCode(t, () => reassembler.pushAuthenticated(b4a.from(frames[0])), 'REPLAY')
+      t.is(reassembler.stats.messages, 1, `case=${caseIndex} duplicate preserves state`)
+      t.alike(
+        reassembler.pushAuthenticated(frames[1]),
+        message,
+        `case=${caseIndex} duplicate still completes`
+      )
+    } else if (mode === 2) {
+      const other = fragment(message, { messageId: generatedId(caseIndex, 2) })
+      reassembler.pushAuthenticated(frames[0])
+      reassembler.pushAuthenticated(other[0])
+      const conflict = b4a.from(frames[0])
+      conflict[20] ^= 1
+      expectCode(t, () => reassembler.pushAuthenticated(conflict), 'INVALID_ROUTE')
+      t.is(reassembler.stats.messages, 1, `case=${caseIndex} conflict clears affected only`)
+      t.alike(
+        reassembler.pushAuthenticated(other[1]),
+        message,
+        `case=${caseIndex} unrelated conflict state completes`
+      )
+    } else if (mode === 3) {
+      const outOfRange = b4a.from(frames[0])
+      outOfRange[16] = outOfRange[18]
+      outOfRange[17] = outOfRange[19]
+      expectCode(t, () => reassembler.pushAuthenticated(outOfRange), 'INVALID_ROUTE')
+      t.is(reassembler.stats.messages, 0, `case=${caseIndex} out-of-range retains nothing`)
+    } else if (mode === 4) {
+      const other = fragment(message, { messageId: generatedId(caseIndex, 3) })
+      reassembler.pushAuthenticated(frames[0])
+      reassembler.pushAuthenticated(other[0])
+      const inconsistent = frame(generatedId(caseIndex), 1, 3, b4a.alloc(MAX_FRAGMENT_DATA))
+      expectCode(t, () => reassembler.pushAuthenticated(inconsistent), 'INVALID_ROUTE')
+      t.is(
+        reassembler.stats.messages,
+        1,
+        `case=${caseIndex} inconsistent total clears affected only`
+      )
+      t.alike(
+        reassembler.pushAuthenticated(other[1]),
+        message,
+        `case=${caseIndex} unrelated total state completes`
+      )
+    } else {
+      expectCode(t, () => reassembler.pushAuthenticated(frames[0]), 'CIRCUIT_LIMIT')
+      t.is(reassembler.stats.messages, 0, `case=${caseIndex} over-limit retains nothing`)
     }
-    const reassembler = receiver()
-    let output = null
-    let completions = 0
-    for (const index of order) {
-      const value = reassembler.pushAuthenticated(frames[index])
-      if (value === null) continue
-      output = value
-      completions++
-    }
-    t.is(completions, 1, `case=${caseIndex} completes once`)
-    t.alike(output, message, `case=${caseIndex} preserves bytes`)
-    t.ok(frames.length <= MAX_FRAGMENTS, `case=${caseIndex} fragment bound`)
-    t.ok(totalEncoded(frames) <= MAX_ENCODED_MESSAGE_BYTES, `case=${caseIndex} encoded bound`)
-    expectCode(t, () => reassembler.pushAuthenticated(frames[0]), 'REPLAY')
+
+    t.ok(
+      reassembler.stats.bufferedFragments <= MAX_BUFFERED_FRAGMENTS,
+      `case=${caseIndex} buffered fragment bound`
+    )
+    t.ok(
+      reassembler.stats.bufferedEncodedBytes <= MAX_BUFFERED_ENCODED_BYTES,
+      `case=${caseIndex} buffered byte bound`
+    )
+    reassembler.destroy()
+    t.is(reassembler.stats.messages, 0, `case=${caseIndex} teardown messages`)
+    t.is(reassembler.stats.bufferedEncodedBytes, 0, `case=${caseIndex} teardown bytes`)
   }
 })
