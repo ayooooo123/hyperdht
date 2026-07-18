@@ -31,7 +31,7 @@
     "blind-relay": "^1.3.0",
     "bogon": "^1.0.0",
     "compact-encoding": "^3.0.0",
-    "dht-rpc": "github:ayooooo123/dht-rpc#8eea32f93fd83eb8de6bbddf9bb263720decb4af",
+    "dht-rpc": "github:ayooooo123/dht-rpc#42f954661994811ad9c187ace8e173e9146fc1ef",
     "hypercore-crypto": "^3.3.0",
     "hypercore-id-encoding": "^1.2.0",
     "hyperdht-address": "^1.0.1",
