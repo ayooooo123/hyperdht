@@ -134,6 +134,11 @@ function containsDirectField(root) {
   function visit(value) {
     if (value === null || typeof value !== 'object' || seen.has(value)) return false
     seen.add(value)
+    if (value instanceof Map) {
+      for (const [key, entry] of value) {
+        if (visit(key) || visit(entry)) return true
+      }
+    }
     for (const key of Reflect.ownKeys(value)) {
       if (typeof key === 'string' && /host|port/i.test(key)) return true
       const descriptor = Object.getOwnPropertyDescriptor(value, key)
@@ -144,6 +149,15 @@ function containsDirectField(root) {
     return false
   }
 }
+
+test('direct field audit traverses nested Map data without reading inherited traps', (t) => {
+  const trapped = Object.create(trappedPrototype())
+  trapped.id = bytes(1, 32)
+
+  t.ok(containsDirectField({ nested: new Map([['branch', new Map([[trapped, { host: 1 }]])]]) }))
+  t.ok(containsDirectField({ nested: new Map([[{ port: 1 }, trapped]]) }))
+  t.absent(containsDirectField({ nested: new Map([[trapped, { id: bytes(2, 32) }]]) }))
+})
 
 test('iterative immutable get traverses independent lookup and announce branches', async (t) => {
   const { authority, contexts, dht, requested, routedDHTIO } = createHarness(t)
