@@ -49,7 +49,9 @@ function topology(branch) {
 }
 
 function queryOptions(context, overrides = {}) {
-  const options = Object.create(trappedPrototype(['udx', 'socket', 'host', 'port', 'bootstrap']))
+  const options = Object.create(
+    trappedPrototype(['udx', 'socket', 'host', 'port', 'bootstrap', 'nodes'])
+  )
   options.transportContext = context
   options.concurrency = 1
   options.retries = 2
