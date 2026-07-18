@@ -205,6 +205,171 @@ test('immutable get snapshots each semantic own-data field once', (t) => {
   t.alike(fields, { command: 1, target: 1, token: 1, value: 1 })
 })
 
+test('immutable get snapshots scalar fields before copying the target', (t) => {
+  const policy = IMMUTABLE_GET_POLICIES.lookup
+  const target = b4a.alloc(32, 4)
+  const order = []
+  const message = new Proxy(
+    {
+      command: COMMANDS.IMMUTABLE_GET,
+      target,
+      token: null,
+      value: null
+    },
+    {
+      getOwnPropertyDescriptor(object, name) {
+        order.push(name)
+        if (name === 'value') target.fill(9)
+        if (name === 'target') target.fill(1)
+        return Object.getOwnPropertyDescriptor(object, name)
+      }
+    }
+  )
+
+  const encoded = encodeDHTRequest(policy, message)
+  t.alike(order, ['command', 'token', 'value', 'target'])
+  t.alike(encoded, b4a.alloc(32, 1))
+
+  let targetReads = 0
+  expectUnsupported(t, () =>
+    encodeDHTRequest(
+      policy,
+      new Proxy(
+        {
+          command: COMMANDS.IMMUTABLE_GET,
+          target,
+          token: null,
+          value: null
+        },
+        {
+          getOwnPropertyDescriptor(object, name) {
+            if (name === 'target') targetReads++
+            if (name === 'value') throw new Error('late scalar snapshot failed')
+            return Object.getOwnPropertyDescriptor(object, name)
+          }
+        }
+      )
+    )
+  )
+  t.is(targetReads, 0)
+})
+
+test('immutable get uses intrinsic Uint8Array branding', (t) => {
+  const policy = IMMUTABLE_GET_POLICIES.lookup
+  const valid = [b4a.alloc(32, 2), new Uint8Array(32)]
+  if (typeof SharedArrayBuffer === 'function') {
+    valid.push(new Uint8Array(new SharedArrayBuffer(32)))
+  }
+
+  for (const target of valid) {
+    t.alike(Array.from(encodeDHTRequest(policy, request(target))), Array.from(target))
+  }
+
+  const forged = new Uint16Array(16)
+  Object.setPrototypeOf(forged, Uint8Array.prototype)
+  const invalid = [
+    new Uint16Array(16),
+    new Int8Array(32),
+    new Uint8ClampedArray(32),
+    new DataView(new ArrayBuffer(32)),
+    new ArrayBuffer(32),
+    new Proxy(new Uint8Array(32), {}),
+    Object.create(Uint8Array.prototype),
+    forged
+  ]
+
+  for (const target of invalid) {
+    expectUnsupported(t, () => encodeDHTRequest(policy, request(target)))
+  }
+})
+
+test('immutable get branding ignores poisoned constructors and prototypes', (t) => {
+  const policy = IMMUTABLE_GET_POLICIES.announce
+  const target = b4a.alloc(32, 3)
+  const invalid = new Uint16Array(16)
+  const BufferConstructor = b4a.alloc(0).constructor
+  const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype)
+  const saved = [
+    [globalThis, 'Uint8Array', Object.getOwnPropertyDescriptor(globalThis, 'Uint8Array')],
+    [
+      Uint8Array,
+      Symbol.hasInstance,
+      Object.getOwnPropertyDescriptor(Uint8Array, Symbol.hasInstance)
+    ],
+    [
+      Uint8Array.prototype,
+      'constructor',
+      Object.getOwnPropertyDescriptor(Uint8Array.prototype, 'constructor')
+    ],
+    [Uint8Array, Symbol.species, Object.getOwnPropertyDescriptor(Uint8Array, Symbol.species)],
+    [
+      typedArrayPrototype,
+      Symbol.toStringTag,
+      Object.getOwnPropertyDescriptor(typedArrayPrototype, Symbol.toStringTag)
+    ],
+    [BufferConstructor, 'isBuffer', Object.getOwnPropertyDescriptor(BufferConstructor, 'isBuffer')]
+  ]
+  let encoded = null
+  let invalidError = null
+
+  try {
+    Object.defineProperty(Uint8Array, Symbol.hasInstance, {
+      configurable: true,
+      value: () => true
+    })
+    Object.defineProperty(Uint8Array.prototype, 'constructor', {
+      configurable: true,
+      value: Uint16Array
+    })
+    Object.defineProperty(Uint8Array, Symbol.species, {
+      configurable: true,
+      value: Uint16Array
+    })
+    Object.defineProperty(typedArrayPrototype, Symbol.toStringTag, {
+      configurable: true,
+      get() {
+        throw new Error('mutable typed-array tag getter ran')
+      }
+    })
+    Object.defineProperty(BufferConstructor, 'isBuffer', {
+      configurable: true,
+      value: () => true
+    })
+    Object.defineProperty(globalThis, 'Uint8Array', {
+      configurable: true,
+      writable: true,
+      value: function PoisonedUint8Array() {
+        throw new Error('mutable Uint8Array constructor ran')
+      }
+    })
+
+    encoded = encodeDHTRequest(policy, {
+      command: 9,
+      target,
+      value: null
+    })
+    try {
+      encodeDHTRequest(policy, {
+        command: 9,
+        target: invalid,
+        value: null
+      })
+    } catch (err) {
+      invalidError = err
+    }
+  } finally {
+    for (let index = saved.length - 1; index >= 0; index--) {
+      const [object, name, descriptor] = saved[index]
+      if (descriptor === undefined) delete object[name]
+      else Object.defineProperty(object, name, descriptor)
+    }
+  }
+
+  t.ok(b4a.isBuffer(encoded))
+  t.alike(encoded, b4a.alloc(32, 3))
+  t.is(invalidError && invalidError.code, 'ERR_PRIVATE_COMMAND_UNSUPPORTED')
+})
+
 test('unsupported commands and descriptors fail before authority IO', (t) => {
   const contexts = createQueryContexts()
   const policy = contexts.classify(contexts.immutableGet.lookup)
