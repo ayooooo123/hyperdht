@@ -53,6 +53,17 @@ HyperDHT [run 29627213694](https://github.com/ayooooo123/hyperdht/actions/runs/2
 
 Final HyperDHT commit `5753a5b98a1e3dd5caabfcbd682df26b1111266f` completed [exact-head workflow run 29628278979](https://github.com/ayooooo123/hyperdht/actions/runs/29628278979) successfully. macOS, Ubuntu, and Windows each passed `npm install`, `npm test`, `npm run integration`, Bare installation, and `npm run test:bare`; the tag-only canary was skipped as expected. This is compatibility and regression evidence only. It does not establish anonymity or demonstrate a live private route.
 
+### Gate 3A deterministic private-route cell core
+
+The reviewed deterministic route-core head is `85d7b574496b7a6fda4b23290dd375ee4f0a1a43`. Its [exact-head workflow run 29635463646](https://github.com/ayooooo123/hyperdht/actions/runs/29635463646) completed successfully:
+
+- [Ubuntu job 88056910166](https://github.com/ayooooo123/hyperdht/actions/runs/29635463646/job/88056910166): PASS for `npm test`, `npm run integration`, and `npm run test:bare`
+- [macOS job 88056910151](https://github.com/ayooooo123/hyperdht/actions/runs/29635463646/job/88056910151): PASS for `npm test`, `npm run integration`, and `npm run test:bare`
+- [Windows job 88056910117](https://github.com/ayooooo123/hyperdht/actions/runs/29635463646/job/88056910117): PASS for `npm test`, `npm run integration`, and `npm run test:bare`
+- `trigger_canary`: SKIPPED as expected because this was not a tag build
+
+The focused fragmentation suite passed 43/43 tests and 2,843/2,843 assertions independently in Node and Bare. The aggregate deterministic private-routing suite passed 175/175 tests and 5,620/5,620 assertions independently in Node and Bare. The reviewed core includes protocol errors and constants, cryptographic vectors and counters, fixed cells and authenticated route payloads, and bounded fragmentation/reassembly. This is deterministic protocol-core, resource-bound, compatibility, and regression evidence only. It does not establish a live route, anonymity, resistance to traffic analysis, or production readiness.
+
 ### DHT-RPC Gate 2
 
 DHT-RPC Gate 2 is pinned to commit `49fea12c6c7677e50b114de64226b1856e308f3c` and is available for review in [fork-local PR #1](https://github.com/ayooooo123/dht-rpc/pull/1). The authoritative pull-request workflow [run 29621682832](https://github.com/ayooooo123/dht-rpc/actions/runs/29621682832) completed successfully with these job results:
