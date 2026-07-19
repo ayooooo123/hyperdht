@@ -1,6 +1,6 @@
 # Gate 3B1 Task 6: Private Tail Responder Authority
 
-**Status:** Approved design amendment pending document review
+**Status:** Revised design amendment pending independent re-review
 
 **Date:** 2026-07-19
 
@@ -44,17 +44,21 @@ readTailControlDeadline(session)
 
 Pure codec, digest, and test-vector exports named by Task 6 remain available.
 No responder receive, dial, or completion method is added to the session
-object. Responder operations live behind a package-private authority in a
-separate `tail-control-responder.js` module. That module is internal to
-`lib/private/`, is not re-exported from HyperDHT, and cannot be reached through
-a public constructor.
+object. Responder transitions are co-located with the `SESSIONS` WeakMap in
+`tail-control.js`; moving them to another module would require exporting raw
+session-state mutation. They are package-private CommonJS functions and are
+never re-exported from HyperDHT's package entry point.
 
 The authority is an empty frozen capability backed by a `WeakMap`. It is issued
-only while the relay role constructs its authenticated tail runtime. The
-issuer binds it to exactly one responder `TailControlSession`, its current
-adjacent-link owner, its `M3AdjacencyAuthority`, its
-`TailExtensionCommitter`, and its inherited deadline. Endpoint-side session
-construction cannot request, synthesize, or receive this authority.
+only when `createTailControlResponderAuthority` consumes a one-shot
+`TailResponderToken` capability issued by `m3-adjacency-runtime.js` alongside
+an authenticated responder tail. The token is cryptographically bound to the
+same tail transcript and local relay identity. The relay runtime separately
+supplies its one-shot M3 responder adopter, tail-extension committer,
+adjacent-link factory, TAIL_READY signer, local clocks, and randomness owner.
+Endpoint-side M3 tail adoption does not mint a responder token, so an initiator
+session cannot request, synthesize, or receive the authority. Deep-importing
+the private factory without that unforgeable paired token grants nothing.
 
 ## Security invariants
 
@@ -75,11 +79,13 @@ The implementation must preserve all of these invariants:
    final-exit handoff is one-shot and WeakMap-backed.
 7. A new tail is not endpoint-usable and its directory reservation is not
    committed until a valid `TAIL_READY_V1` is opened.
-8. No timer, retry, callback, or nested session can extend the inherited
-   absolute deadline.
+8. No timer, retry, callback, or nested session can extend an actor's local
+   monotonic deadline or an authenticated wire wall-clock expiry.
 9. Authentication, replay, expiry, cancellation, reentrancy, or setup failure
-   destroys all new adjacency and pending-tail state. It does not create a
-   direct fallback and does not replace the already-pinned guard.
+   destroys locally owned new adjacency and pending-tail state immediately.
+   Already-installed remote relay state is destroyed on authenticated transport
+   close or its bounded local expiry. No failure creates direct fallback or
+   replaces the already-pinned guard.
 10. Extension index 1 must select a safety relay; extension index 2 must select
     a DHT exit. No third extension is valid.
 
@@ -89,109 +95,228 @@ The implementation must preserve all of these invariants:
 control AEAD, transcript derivation, initiator state, and final-exit handoff.
 Its session object exposes only the consumer methods listed above.
 
-`tail-control-responder.js` owns the package-private responder authority and
-the responder state transition functions:
+`tail-control.js` also owns these package-private responder transition
+functions because they must mutate its ordered AEAD counters and transcript
+state atomically:
 
 ```js
-createTailControlResponderAuthority(session, options)
+createTailControlResponderAuthority(session, responderToken, options)
 admitTailExtend(authority, envelope)
+openTailAdjacentLink(authority, admitted)
 completeTailExtend(authority, completion)
 abortTailExtend(authority)
 sealTailReady(authority)
 destroyTailControlResponderAuthority(authority)
 ```
 
-These names are an internal contract, not package exports. Tests may require
-the private file directly. `createTailControlResponderAuthority` is callable
-only by the relay-role setup owner and accepts exact own data:
+These names are an internal contract and not public package exports. Tests may
+require the private file directly. `createTailControlResponderAuthority`
+atomically consumes `responderToken`; the token's hidden binding must equal the
+responder session's tail binding. Mismatch destroys both inputs and every
+capability supplied in `options`.
+
+`m3-adjacency-runtime.js` owns the token and provides only
+`consumeTailResponderToken`, `revokeTailResponderToken`, and its internal
+issuer. Responder adoption returns an opaque bundle containing `{ runtime,
+tail, responderToken }`; initiator adoption returns no token. Authority options
+are exact own data. Every index requires `tailReadySigner`, `wallNow`,
+`monotonicNow`, and `randomBytes`. Indices 0 and 1 additionally require
+`adjacencyAdopter`, `extensionCommitter`, and `adjacentLinkFactory`. At terminal
+index 2 those extension keys are forbidden and EXTEND admission is invalid.
 
 ```js
+// Transcript indices 0 and 1
 {
-  adjacencyAuthority,
+  adjacencyAdopter,
   extensionCommitter,
   adjacentLinkFactory,
   tailReadySigner,
-  absoluteDeadline,
-  now,
+  wallNow,
+  monotonicNow,
+  randomBytes
+}
+
+// Terminal transcript index 2
+{
+  tailReadySigner,
+  wallNow,
+  monotonicNow,
   randomBytes
 }
 ```
 
-`tailReadySigner`, `absoluteDeadline`, `now`, and `randomBytes` are mandatory
-for every responder index. For current-tail indices 0 and 1, the three
-extension resources are mandatory as well. At terminal index 2 those three
-keys are forbidden because that role can become a final exit but cannot extend
-again. Construction validates the variant against the consumed tail transcript
-before retaining any capability.
+The runtime stores one internal frozen binding object in both WeakMap records.
+It binds the exact tail transcript digest, local relay identity, role, and wire
+expiry. `takeM3TailCapability` moves that object into the responder session
+state without exporting it; consuming the token succeeds only on object
+identity and repeated field validation. The token is one-shot and revocation or
+session destruction clears its copied binding bytes.
 
-`tailReadySigner` and `adjacentLinkFactory` are empty, WeakMap-backed relay
-capabilities. The signer accepts only the exact TAIL_READY signature input for
-the bound local relay identity; it never returns or transfers the identity
-secret key.
+`guard-link.js` owns `ExtensionAdjacentLinkFactory` through this exact internal
+surface:
 
-`adjacentLinkFactory` is itself an empty, WeakMap-backed relay capability. It
-does not expose a callback property. Its private consumer accepts one admitted
-request capability and internally decodes the already-verified advertisement
-to create exactly one adjacent link. Its result is an
-`ExtensionLinkCompletion`; it never returns a socket or tuple.
+```js
+createExtensionAdjacentLinkFactory(options)
+openExtensionAdjacentLink(factory, admitted) // Promise<ExtensionLinkCompletion>
+abortExtensionAdjacentLink(factory)
+destroyExtensionAdjacentLinkFactory(factory)
+```
+
+The factory options are exact own data with no accessors or extra keys:
+
+```js
+{
+  dialAuthority,
+  linkOfferSigner,
+  wallNow,
+  monotonicNow,
+  randomBytes,
+  schedule,
+  cancelScheduled,
+  destroy
+}
+```
+
+They are relay-owned capabilities: a domain-limited LINK_OFFER signer, an
+advertisement-bound dial authority, separate wall and monotonic clocks,
+randomness, scheduler/canceller, and destroy owner. `open` permits one
+live operation, consumes `admitted` through `takeAdmittedExtendRequest`, decodes
+the canonical endpoint internally, and asks the dial authority to contact only
+that endpoint. It owns LINK_OFFER/LINK_ACCEPT/proof exchange and resolves only
+an `ExtensionLinkCompletion`; no tuple, socket, physical channel, or raw key is
+returned. `abort` cancels the live operation even after admission has moved.
+
+`relay-identity-signer.js` owns separate empty, WeakMap-backed LINK_OFFER and
+TAIL_READY signer capabilities. Its private issuer receives the relay identity
+owner; consumers accept only the exact registered message ID, signature domain,
+body length, and expected public identity. A signer can be consumed for its one
+semantic message or destroyed, and no operation returns the secret key.
+
+```js
+createRelayIdentitySigningAuthority({ identitySecretKey })
+createLinkOfferSigner(identityOwner)
+signLinkOffer(signer, body, expectedIdentity)
+destroyLinkOfferSigner(signer)
+createExtensionResponderSigner(identityOwner)
+signLinkAccept(signer, body, expectedIdentity)
+signRedactedResponderProof(signer, body, expectedIdentity)
+destroyExtensionResponderSigner(signer)
+createTailReadySigner(identityOwner)
+signTailReady(signer, body, expectedIdentity)
+destroyTailReadySigner(signer)
+destroyRelayIdentitySigningAuthority(identityOwner)
+```
+
+The owner copies and validates the secret key once during relay startup, derives
+its public identity internally, and zeroizes the copy on destroy. Child signers
+are bound to that identity and message domain; no child can mint another child.
+Each signing function returns one owned 64-byte signature only after verifying
+it against the bound identity. The LINK_OFFER and TAIL_READY signers are spent
+after one semantic object. The extension-responder signer has an exact
+LINK_ACCEPT-then-redacted-proof two-phase lifecycle and is spent after the
+second signature. Signing retries reuse cached semantic objects; they do not
+spend a second signer.
+`guard-link.js` is refactored so neither `createExtensionLinkOffer` nor the
+extension responder receives `initiatorIdentitySecretKey` or
+`responderIdentitySecretKey`; both receive domain-limited identity signers. The
+responder route-encryption secret remains relay-owned inside its existing
+one-shot responder factory and is never returned or passed to an endpoint.
 
 `extension-setup-channel.js` remains the owner of LINK_OFFER/LINK_ACCEPT and
 the physical setup channel. `extension-link-completion.js` remains the owner of
 the completed link plus redacted proof. `m3-adjacency-adopter.js` adopts that
-link. `tail-extension-committer.js` stages `EXTENDED_V1` and the next relay
+link through `adoptM3ResponderLink`; `tail-control.js` never calls the
+`M3AdjacencyAuthority.adopt` method directly. On the current tail's initiating
+side, `takeM3ResponderLink` transfers `{ runtime, tail }`; the local initiator
+tail capability is revoked after its material has been staged because the
+endpoint derives its matching next-tail session from `EXTENDED_V1`. On the
+successor relay's independently accepted side, adoption transfers `{ runtime,
+tail, responderToken }`; that relay consumes the tail and paired token to build
+the responder session/authority that seals `TAIL_READY_V1`.
+`tail-extension-committer.js` stages `EXTENDED_V1` and installs the next relay
 runtime. None of these modules learns the full route.
 
-The private responder authority may invoke imported module functions, but it
-must not store endpoint-provided callbacks. Its clock and randomness functions
-are supplied by the relay runtime owner and use the same hardened contracts as
-the adjacent setup modules. It must remove
-its live WeakMap state before invoking destruction or transport operations so
-reentrant calls see a tombstone.
+The private responder authority stores no endpoint-provided callback. Its
+clocks, randomness, signer, dialer, scheduler, and cleanup owners arrive only
+through the paired responder setup. It enters a non-reentrant mutation phase
+before invoking them and tombstones or advances its generation before any
+destruction, transport, or installation callback so reentry cannot publish
+state.
 
 ## Construction and deadline
 
 `createTailControlSession(capability, options)` consumes one M3 tail capability.
-Its exact common options are `absoluteDeadline`, `now`, and optional `crypto`
-for deterministic vectors. `absoluteDeadline` is a `u64` monotonic deadline
-inherited from the `GUARD_PINNED` route construction attempt; it is mandatory
-for both roles.
+Its exact common options are `wallNow`, `monotonicNow`, and optional `crypto`
+for deterministic vectors. An initiator additionally requires the
+RouteManager-owned `absoluteDeadline`, expressed only in that endpoint
+process's monotonic clock. A responder does not receive or compare that value;
+its M3 tail capability carries an authenticated wall-clock `expiresAtMs`, and
+its paired responder setup supplies only relay-local clocks and timer owners.
 
-The effective session deadline is:
+Wall-clock expiries appear in signed advertisements, requested limits, link
+offers/proofs, tail capabilities, and other wire transcripts. Monotonic
+deadlines are process-local scheduling values and are never encoded, signed,
+or compared across machines. At each actor, a positive wall-clock interval is
+projected into that actor's monotonic clock exactly once:
 
 ```text
-min(tail capability expiry, absoluteDeadline)
+remaining(wireExpiresAt) = max(0, wireExpiresAt - wallNow())
+projected = monotonicNow() + remaining(wireExpiresAt)
 ```
 
-The effective initiator deadline for one selected extension is:
+Overflow, backward wall time, non-monotonic `monotonicNow`, or a non-positive
+interval fails closed. The endpoint initiator's local deadline is:
 
 ```text
 min(
-  session effective deadline,
-  extension start + 5,000 ms,
-  signed advertisement expiry,
-  requested-limits expiry,
-  selected-evidence expiry
+  RouteManager absoluteDeadline,
+  extensionStartMonotonic + 5,000 ms,
+  project(current tail wire expiry),
+  project(manager signedExpiry),
+  project(selected advertisement expiry)
 )
 ```
 
-The responder cannot independently observe the endpoint's selection lifetime.
-The initiator therefore clamps `requested-limits expiry` to the selected
-evidence and signed expiry before encoding the request. The responder's
-effective deadline is `min(session effective deadline, start + 5,000 ms,
-signed advertisement expiry, requested-limits expiry)`.
+`signedExpiry` is the manager-owned authenticated current-branch wall-clock
+upper bound already present in the Task 6 request. It is not returned by Task 3
+and is not treated as selected-evidence metadata. `RouteExtensionSession`
+permits it only to shorten the tail capability's authenticated wire expiry;
+`sealExtend` rejects requested limits later than either bound.
 
-Every nested link offer, accept, proof, retry, timer, and completion receives
-that same effective deadline. The deadline is checked before and after every
-external or reentrant operation. A later session, retry, duplicate, or callback
-may only preserve or reduce it.
+The initiator encodes `requestedLimits.expiresAtMs` as a wall-clock value no
+later than the minimum authenticated wire expiry and no later than the wall
+time corresponding to its remaining local budget. On receipt, the responder
+computes its own local deadline:
+
+```text
+min(
+  responderStartMonotonic + 5,000 ms,
+  project(responder tail wire expiry),
+  project(selected advertisement expiry),
+  project(requestedLimits.expiresAtMs)
+)
+```
+
+The responder never reconstructs or compares the endpoint's monotonic epoch.
+Each nested link offer, accept, proof, retry, timer, and completion carries the
+minimum wall-clock wire expiry and is scheduled against only the current
+actor's projected local monotonic deadline. Both values are checked before and
+after external or reentrant operations. A later session, retry, duplicate, or
+callback may only preserve or reduce them.
+
+`readTailControlDeadline(session)` returns only that session's local monotonic
+deadline. It never returns a wire expiry or a value meaningful in another
+process. RouteExtension compares it only with its endpoint-local
+`monotonicNow()` and stored RouteManager deadline.
 
 ## Initiator flow
 
 `RouteExtensionSession` first consumes Task 3 selected evidence using the exact
 transaction, branch class, position, generation, and extension-index bindings.
 The resulting owned material contains the complete canonical advertisement,
-its digest, role/index metadata, and selection expiry. It contains no dial
-authority.
+its digest, role/index metadata, and no independent expiry field. The signed
+advertisement itself contains the selected peer's authenticated wall-clock
+expiry. The evidence contains no dial authority.
 
 It calls `session.sealExtend(options)` with exact own data:
 
@@ -211,7 +336,9 @@ Branch class, position, and generation are not caller-repeatable inputs here:
 the session owns branch, circuit, generation, current-tail identity, and
 current-tail advertisement digest in its authenticated transcript. The session
 verifies those owned bindings, next index, required role, advertisement
-signature, advertisement digest, payload parameters, and all expiries. It then generates
+signature, advertisement digest, payload parameters, and both clock-domain
+bounds. The repeated `absoluteDeadline` must equal the session's already-owned
+endpoint-local deadline; it cannot replace or extend it. The session then generates
 fresh client-tail ephemeral and extension nonces, stores one pending client
 extension, encodes the prototype-exact `EXTEND_REQUEST_V1`, and seals it in the
 forward ordered tail-control AEAD. A second pending request is rejected.
@@ -258,10 +385,12 @@ request, current-tail identity, current-tail advertisement digest, and deadline
 once. It does not separately return a host or port.
 
 Only the relay-owned adjacent-link factory may consume the admitted capability.
-It decodes the canonical endpoint internally from the verified signed
-advertisement, opens LINK_OFFER/LINK_ACCEPT against exactly that endpoint, and
-produces one `ExtensionLinkCompletion`. It may neither enumerate alternatives
-nor retry a different tuple.
+`openTailAdjacentLink(authority, admitted)` transfers it into the authority's
+bound factory, records the single live factory operation before awaiting, and
+resolves to one `ExtensionLinkCompletion`. The factory decodes the canonical
+endpoint internally from the verified signed advertisement and opens
+LINK_OFFER/LINK_ACCEPT against exactly that endpoint. It may neither enumerate
+alternatives nor retry a different tuple.
 
 Taking the admitted request moves its full owned request bytes to the adjacent
 link owner but leaves only digests, nonces, indices, and the effective deadline
@@ -274,15 +403,30 @@ verifies the redacted responder proof and all retained expected bindings,
 adopts the established M3 adjacency, seals prototype-exact
 `EXTENDED_V1`, and passes the envelope plus staged next runtime to the
 `TailExtensionCommitter`. The committer makes the current relay a forwarder
-between its predecessor and new successor, but keeps the new tail context
-unavailable to endpoint application traffic until the authenticated
-`TAIL_READY_V1` transition completes.
+between its predecessor and new successor. Relay-owned link, forwarding, and
+tail-control contexts must exist at this point so `TAIL_READY_V1` can traverse
+the new adjacency, but they are staged for control traffic only. No endpoint
+next-tail session, endpoint application-send authority, final-exit activation,
+or directory commit exists yet.
+
+Before invoking the committer's external installation owner, completion changes
+the old responder session and authority to an irreversible `INSTALLING`
+generation so reentry cannot admit, abort, or publish again. Success tombstones
+the old session/authority and returns exactly one opaque `TailForwardingOwner`
+from `TailExtensionCommitter.install()`. The relay runtime registry must consume
+that owner before the event handler returns; failure to transfer it destroys
+the forwarder and next adjacency. Destroying the owner tears down both sides of
+the installed pair.
 
 The new tail relay calls `sealTailReady` only after it owns the adopted link and
 is ready to process authenticated tail control. The responder authority uses
 its bound signing capability and randomness source; the responder session does
-not expose `sealReady` or raw secret-key input. The endpoint initiator validates
-the result inside `completeClientExtension`. The exact reverse direction,
+not expose `sealReady` or raw secret-key input. `sealTailReady(authority)`
+returns one owned exact M3 context envelope, consumes the signer for that
+semantic message, and advances the authority from `WAITING_READY` to `ACTIVE`.
+At indices 0 and 1 the active authority may later admit exactly one extension;
+at index 2 it may only create the final-exit handoff. The endpoint initiator
+validates the envelope inside `completeClientExtension`. The exact reverse direction,
 counter-zero rule, signature input, and transcript digest remain those of the
 prototype. This amendment changes ownership, not message ordering or bytes:
 
@@ -309,25 +453,56 @@ extra-keyed option objects before retaining data. Owned buffers are copied on
 admission and cleared on transfer, abort, or destroy. A capability is removed
 from its live WeakMap and added to its spent set before any external operation.
 
-Duplicate authenticated datagrams may receive only the already-authorized
-cached semantic response under a fresh datagram counter. Conflicting duplicates
-are authentication failures. They never allocate a second adjacency, advance a
-counter twice, extend a timer, or revive a capability.
+Tail-control replay and link-setup retransmission are distinct:
 
-On cancellation or failure, teardown order is:
+- replaying the same sealed ordered-tail frame reuses its counter and is
+  rejected before allocation; the fail-closed session is destroyed as in the
+  reviewed prototype;
+- a freshly sealed second EXTEND with the same semantic nonce is rejected as a
+  replay because one live extension already exists; it is not answered from a
+  cache by the retired current-tail session;
+- conflicting reuse of an extension or client nonce is an authentication
+  failure; and
+- only the lower LINK_OFFER/LINK_ACCEPT setup owner may resend its already
+  authorized cached semantic response under a fresh datagram counter. Its
+  bounded replay cache moves into the installed forwarding owner or expires at
+  the operation deadline; it never allocates a second adjacency.
 
-1. tombstone the session/authority mutation and consume manager cancellation;
-2. cancel every opaque timer handle and prohibit later callbacks;
-3. revoke pending admission, completion, adopter, and committer capabilities;
-4. destroy the half-built next runtime, physical setup channel, and adjacent
-   socket owner;
-5. abort the selected-evidence reservation; and
-6. zeroize nonces, shared secrets, transcript copies, advertisements, proofs,
-   and cached semantic bytes.
+Cleanup is actor-local because the fixed four-message protocol has no final
+ACK or authenticated remote cancel. The design therefore does not claim
+synchronous remote erasure after an endpoint rejects `TAIL_READY_V1`.
 
-The already-established predecessor link remains owned by its relay. At the
-endpoint, failure of either extension leaves only the pinned guard link; it
-does not bootstrap, discover, or dial another peer.
+Endpoint-local cancellation or failure performs this order:
+
+1. tombstone the RouteExtension/session mutation and consume manager cancel;
+2. cancel every endpoint-local opaque timer;
+3. abort the client completion and destroy an uncommitted next-tail session;
+4. close the current-tail transport so the relay observes predecessor loss;
+5. leave Task 9's transaction owner to abort the path reservation; and
+6. zeroize endpoint-owned nonces, secrets, transcript copies, advertisements,
+   proofs, and semantic bytes.
+
+Relay-local failure before forwarding installation performs this order:
+
+1. tombstone the responder authority and abort its one live adjacent factory;
+2. cancel relay-local timers;
+3. revoke admission, completion, adopter, committer, signer, and setup caps;
+4. destroy the half-built runtime, physical channel, and adjacent socket owner;
+   and
+5. zeroize relay-owned request, proof, transcript, and cache bytes.
+
+After forwarding installation, predecessor transport close destroys the
+`TailForwardingOwner`, both installed relay contexts, and the successor link.
+If that signal is lost or delayed, each relay independently destroys the same
+state no later than its projected local monotonic deadline derived from the
+authenticated wire expiry. Tests require immediate local cleanup and bounded
+eventual remote cleanup by that deadline, not impossible cross-machine
+synchronous cleanup.
+
+The already-established predecessor link remains owned by its relay until its
+local close/expiry rule fires. At the endpoint, failure leaves only the pinned
+guard link and no application-usable next tail; it does not bootstrap,
+discover, or dial another peer.
 
 ## Verification contract
 
@@ -347,18 +522,23 @@ Task 6 is not complete until Node and Bare tests prove:
 - a semantic trap rejects `RELAY_DISCOVER_V1`,
   `RELAY_DISCOVER_RESPONSE_V1`, random discovery targets, DNS, arbitrary
   enumeration, and Task 9 `BranchPathAuthority` dependencies;
-- no next context or directory reservation is active before valid
-  `TAIL_READY_V1`;
-- duplicate cached responses, conflicts, wrong bindings, wrong roles, malicious
+- before valid `TAIL_READY_V1`, relay-owned link/forwarding contexts may be
+  staged solely to carry tail-control traffic, but no endpoint next-tail
+  session, endpoint application-send authority, final-exit activation, or
+  directory commit is published;
+- same-counter tail replay, semantic EXTEND replay, lower-link duplicate cached
+  responses, conflicts, wrong bindings, wrong roles, malicious
   proofs, expired advertisements, deadline races, a dropped setup packet,
   cancellation, quota rejection, throwing/reentrant clocks and schedulers, and
   half-built second extensions fail closed; and
-- every failure leaves zero new live adjacency, timer, callback, capability,
-  transport, semantic cache, or secret, while preserving only the already
-  pinned guard where the Task 6 plan requires it.
+- every failure leaves zero locally owned uncommitted timer, callback,
+  capability, transport, semantic cache, or secret immediately; installed
+  remote forwarding/adjacency state is then destroyed on observed transport
+  close and in all cases by its authenticated expiry, while the endpoint
+  preserves only the already pinned guard where the Task 6 plan requires it.
 
 The aggregate discovery-edge scan must find no discovery symbols or imports in
-`route-extension.js`, `tail-control.js`, or `tail-control-responder.js`. The
+`route-extension.js`, `tail-control.js`, or `guard-link.js`. The
 focused tests must be registered in `test/private-routing.js`, generated into
 `test/all.js`, and pass independently under `brittle-node` and Bare.
 
@@ -375,7 +555,13 @@ approved Gate 3B1 boundary.
 
 Task 6 Step 4 is amended to add the package-private responder authority and to
 replace prototype discovery-cache and `BranchPathAuthority` admission with the
-selected-evidence flow above. Steps 1-3 and 5-7 remain in force. The Task 6
-implementation plan must add `lib/private/tail-control-responder.js` and its
-focused test before implementation resumes. No later task is otherwise
-renumbered or broadened.
+selected-evidence flow above. The Task 6 file list additionally creates
+`lib/private/relay-identity-signer.js` and
+`test/private/relay-identity-signer.js`; responder transitions remain in
+`tail-control.js` beside its private session state. Task 6 also modifies
+`m3-adjacency-runtime.js` to mint/revoke the paired `TailResponderSetup`,
+refactors `guard-link.js` around the exact adjacent-link factory and signing
+capabilities above, and replaces RouteExtension's single `now` dependency with
+separate `wallNow` and `monotonicNow` functions. Task 3 evidence is unchanged,
+and no `selectedEvidenceExpiry` field is added. Steps 1-3 and 5-7 otherwise
+remain in force; no later task is renumbered or broadened.
