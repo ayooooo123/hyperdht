@@ -272,7 +272,13 @@ function fixture(options = {}) {
     expiresAt: NOW + 20_000n,
     localIdentity: local.publicKey,
     localSecretKey: local.secretKey,
-    reconnectDatagrams: datagrams,
+    reconnectDatagrams: options.transportFactory
+      ? function exactTupleReconnectFactory() {
+          if (arguments.length !== 0) throw new Error('factory arguments exposed')
+          options.transportFactory.calls++
+          return datagrams
+        }
+      : datagrams,
     wallNow: clock.wallNow,
     monotonicNow: clock.monotonicNow,
     setTimer: clock.setTimer,
@@ -307,6 +313,24 @@ function fixture(options = {}) {
     }
   }
 }
+
+test('reconnect obtains its exact-tuple transport from a zero-argument one-shot factory', async (t) => {
+  const transportFactory = { calls: 0 }
+  const f = fixture({ transportFactory })
+  t.is(transportFactory.calls, 0)
+  const established = await f.authority.reconnect()
+  t.ok(established)
+  t.is(transportFactory.calls, 1)
+  let error = null
+  try {
+    await f.authority.reconnect()
+  } catch (err) {
+    error = err
+  }
+  t.is(error && error.code, 'ERR_REPLAY')
+  t.is(transportFactory.calls, 1)
+  f.cleanup(established)
+})
 
 test('guard reconnect capability is opaque, zero-argument, and one-shot before first IO', async (t) => {
   const f = fixture()
