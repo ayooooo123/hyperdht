@@ -195,8 +195,8 @@ The factory options are exact own data with no accessors or extra keys:
 }
 ```
 
-They are relay-owned capabilities: a domain-limited LINK_OFFER signer, an
-advertisement-bound dial authority, separate wall and monotonic clocks,
+They are relay-owned capabilities: a domain-limited LINK_OFFER signer, a
+request-bound-on-first-use dial authority, separate wall and monotonic clocks,
 randomness, scheduler/canceller, and destroy owner. `open` permits one
 live operation, consumes `admitted` through `takeAdmittedExtendRequest`, decodes
 the canonical endpoint internally, and asks the dial authority to contact only
@@ -212,21 +212,67 @@ dialRelayAdvertisement(authority, options)
 destroyRelayAdjacentDialAuthority(authority)
 ```
 
-`dialRelayAdvertisement` accepts exact owned canonical advertisement bytes,
-their expected digest, required role, and wire expiry. It re-verifies all four,
-decodes the tuple internally, permits one live dial, and returns only an opaque
-extension setup transport to the adjacent factory. The authority is not bound
-to a candidate when the factory is created; it becomes request-bound at this
-one invocation and cannot dial an alternate tuple. `dial` and `socketOwner`
-remain relay-runtime capabilities and are never exposed to endpoint code.
-
-On the successor side, `takeExtensionResponderAdjacency` is narrowed to return
-an opaque transfer containing the adopted adjacency plus an
-`AcceptedExtensionAdjacencyOwner`. The private cache-owner surface is:
+`dialRelayAdvertisement` accepts this exact own-data options object with no
+accessors or extra keys:
 
 ```js
+{
+  advertisement,
+  advertisementDigest,
+  requiredRole,
+  wireExpiresAt,
+  localDeadline
+}
+```
+
+Before invoking verification, clock, or dial code, the authority moves from
+`UNUSED` to `DIALING` and tombstones its reusable state. It re-verifies the
+canonical advertisement, expected digest, required role, and that the signed
+advertisement expiry is no later than `wireExpiresAt` and remains live under
+`localDeadline`. It decodes the tuple internally, permits one live dial, and
+returns only an opaque extension setup transport to the adjacent factory. The
+authority is not bound to a candidate when the factory is created; it becomes
+request-bound at this one invocation and cannot dial an alternate tuple. Before
+returning, the live setup transport is either transferred into the factory's
+operation record or destroyed; throwing/reentrant completion cannot orphan it.
+`dial` and `socketOwner` remain relay-runtime capabilities and are never
+exposed to endpoint code.
+
+On the successor side, `takeExtensionResponderAdjacency` is narrowed to return
+an opaque accepted-adjacency transfer. The private transfer/cache-owner surface
+is:
+
+```js
+takeAcceptedExtensionAdjacencyTransfer(transfer)
+revokeAcceptedExtensionAdjacencyTransfer(transfer)
 answerAcceptedExtensionReplay(owner, offerReceiver)
 destroyAcceptedExtensionAdjacencyOwner(owner)
+```
+
+The taken material is exactly frozen `{ adjacency, replayOwner }`; both move
+atomically. Before take, revoke destroys both. After take, a failure before
+successor runtime-registry publication destroys the adjacency and replay owner
+in `finally`; publication is the ownership boundary.
+
+The exact successor extension-responder factory replaces `now` with `wallNow`
+and adds `monotonicNow`, `schedule`, and `cancelScheduled` alongside its
+advertisement, adopter, extension-responder signer, responder route-encryption
+secret, offer receiver, and randomness inputs. These clock and scheduler
+identities must match the successor M3 runtime owner.
+
+```js
+{
+  advertisement,
+  adjacencyAdopter,
+  extensionResponderSigner,
+  responderRouteEncryptionSecretKey,
+  wallNow,
+  monotonicNow,
+  schedule,
+  cancelScheduled,
+  offerReceiver,
+  randomBytes
+}
 ```
 
 `answerAcceptedExtensionReplay` accepts only an authenticated duplicate of the
@@ -305,8 +351,9 @@ before invoking them and tombstones or advances its generation before any
 destruction, transport, or installation callback so reentry cannot publish
 state.
 
-`M3AdjacencyAuthority` is extended with exact `monotonicNow`, `schedule`, and
-`cancelScheduled` constructor capabilities. Every adopted runtime arms one
+`M3AdjacencyAuthority` replaces its ambiguous `now` option with `wallNow` and
+adds exact `monotonicNow`, `schedule`, and `cancelScheduled` constructor
+capabilities. Every adopted runtime arms one
 proactive expiry handle before the runtime or tail capability is published.
 The timer record is stored in the runtime reservation. Before installation its
 callback tombstones and destroys that runtime; after `commitM3Install` both
@@ -324,8 +371,9 @@ Its exact common options are `wallNow`, `monotonicNow`, and optional `crypto`
 for deterministic vectors. An initiator additionally requires the
 RouteManager-owned `absoluteDeadline`, expressed only in that endpoint
 process's monotonic clock. A responder does not receive or compare that value;
-its M3 tail capability carries an authenticated wall-clock `expiresAtMs`, and
-its paired responder setup supplies only relay-local clocks and timer owners.
+every M3 tail capability carries an already-owned `{ wireExpiresAt,
+localDeadline, clockIdentity }`, and its paired responder token supplies only
+the authority binding.
 
 Wall-clock expiries appear in signed advertisements, requested limits, link
 offers/proofs, tail capabilities, and other wire transcripts. Monotonic
@@ -339,10 +387,14 @@ projected = monotonicNow() + remaining(wireExpiresAt)
 ```
 
 Overflow, backward wall time, non-monotonic `monotonicNow`, or a non-positive
-interval fails closed. Session construction projects its tail capability's
-wire expiry exactly once and stores `session.localDeadline`; on an initiator it
-also clamps that value to the RouteManager `absoluteDeadline`. The endpoint
-initiator's local extension deadline is:
+interval fails closed. `M3AdjacencyAuthority.adopt` performs the tail wire-expiry
+projection exactly once before publishing the runtime, tail capability, or
+responder token. `createTailControlSession` verifies the supplied clock
+functions against `clockIdentity` and moves `wireExpiresAt` and `localDeadline`
+without projecting again. On an initiator it further clamps, but never resets,
+the moved deadline to the RouteManager `absoluteDeadline`. Every later bound is
+calculated as `min(previousLocalDeadline, newlyProjectedShorterBounds)`. The
+endpoint initiator's local extension deadline is:
 
 ```text
 min(
@@ -502,11 +554,13 @@ the old session/authority. `TailExtensionCommitter.install()` obtains the
 existing frozen forwarding facade and wraps it in exactly one opaque
 `TailForwardingTransfer`; `completeTailExtend` returns that transfer. The relay
 runtime registry calls `takeTailForwardingTransfer` before the event handler
-returns. If the handler throws, cancellation wins, or the transfer is abandoned,
-`revokeTailForwardingTransfer` destroys the facade and next adjacency.
-Destroying a successfully taken facade tears down both sides of the installed
-pair. The separate internal `M3ForwardingOwner` never leaves
-`m3-adjacency-runtime.js`.
+returns. Before take, cancellation or abandonment calls
+`revokeTailForwardingTransfer`. After take but before registry publication, the
+handler owns the facade in a tracked local and calls `facade.destroy()` in
+`finally` on every failure. Registry publication is the failure-atomic
+ownership boundary; afterward registry removal calls the same destroy method.
+Destroying the facade tears down both sides of the installed pair. The separate
+internal `M3ForwardingOwner` never leaves `m3-adjacency-runtime.js`.
 
 The new tail relay calls `sealTailReady` only after it owns the adopted link and
 is ready to process authenticated tail control. The responder authority uses
@@ -622,7 +676,7 @@ Task 6 is not complete until Node and Bare tests prove:
   KDF labels, and redacted responder proof;
 - initiator sessions cannot obtain or invoke responder authority, and responder
   sessions do not expose responder methods;
-- the authority, admission, link completion, adopter, committer, client
+- the authority, admission, link completion, one-shot adoption, committer, client
   completion, and final-exit handoff are opaque and one-shot;
 - a real in-memory guard -> middle -> DHT-exit trace emits only the four
   specified semantic control stages after pinning;
