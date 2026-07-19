@@ -165,6 +165,8 @@ function fakeFactory(network, hold = null, observer = {}) {
         createSocket() {
           const socket = new FakeSocket(network, hold)
           observer.socket = socket
+          if (!observer.sockets) observer.sockets = []
+          observer.sockets.push(socket)
           return socket
         }
       }
@@ -245,9 +247,11 @@ test('UDX test adapter authority is opaque, one-shot, and exact constructor reje
   t.is(typeof issuer.createTestUdxAdapterAuthority, 'function')
   t.is(typeof issuer.createUdxCellEndpointForTest, 'function')
   t.is(typeof issuer.sendBootstrapForTest, 'function')
+  t.is(typeof issuer.sendBootstrapWithOptionsForTest, 'function')
   t.is(typeof issuer.sendEstablishedForTest, 'function')
   t.is(typeof issuer.inspectGuardLeaseMaterial, 'function')
   t.is(typeof endpointModule.bindBootstrapUdxOperation, 'function')
+  t.is('createBootstrapGuardLeaseMaterial' in endpointModule, false)
   const authority = issuer.createTestUdxAdapterAuthority(fakeFactory(new Map()))
   t.is(Object.keys(authority).length, 0)
   const endpoint = issuer.createUdxCellEndpointForTest(options('127.0.0.1', 47101, []), authority)
@@ -381,6 +385,7 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
   const network = new Map()
   const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
   const links = linkPair('127.0.0.1', 47131, '127.0.0.2', 47132)
+  const leftObserver = {}
   let leftSession = null
   let rightSession = null
   const left = issuer.createUdxCellEndpointForTest(
@@ -390,7 +395,7 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
         if (leftSession) void leftSession.receive(packet)
       }
     },
-    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network, null, leftObserver))
   )
   const right = issuer.createUdxCellEndpointForTest(
     {
@@ -421,6 +426,9 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
     host: '127.0.0.2',
     port: 47132
   })
+  t.exception(() =>
+    issuer.createTestBootstrapUdxLinkReservation(authority, admission, async () => true)
+  )
   const probe = b4a.alloc(BOOTSTRAP_SIZE)
   probe[1] = BOOTSTRAP_CLASS
   t.is(await sendConfigured(authority, 0, probe), true)
@@ -527,6 +535,9 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
   const lease = issuer.inspectGuardLeaseMaterial(material)
   t.is(lease.reconnectTransportFactory.length, 0)
   t.exception(() => lease.reconnectTransportFactory('127.0.0.2'))
+  const originalSocket = leftObserver.sockets[0]
+  await left.close()
+  t.is(originalSocket.closed, true)
   let reconnectTransport = null
   let reconnectError = null
   try {
@@ -537,8 +548,13 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
   t.is(reconnectError, null)
   if (reconnectTransport) {
     t.is(await reconnectTransport.send('127.0.0.2', 47132, probe), true)
+    t.is(leftObserver.sockets.length, 2)
+    t.is(leftObserver.sockets[1] === originalSocket, false)
+    t.is(leftObserver.sockets[1].closed, false)
     await t.exception(reconnectTransport.send('127.0.0.2', 47139, probe))
     reconnectTransport.destroy()
+    await settles()
+    t.is(leftObserver.sockets[1].closed, true)
     await t.exception(reconnectTransport.send('127.0.0.2', 47132, probe))
     t.exception(() => lease.reconnectTransportFactory())
   }
@@ -629,6 +645,50 @@ test('outbound capacity reserves before allocation and close waits native owners
   t.is(firstError && firstError.code, 'ROUTE_UNAVAILABLE')
   await closing
   t.is(observer.socket.closed, true)
+  links.left.directory.destroy()
+  links.right.directory.destroy()
+})
+
+test('outbound option getter close releases reservation before copy or native send', async (t) => {
+  const observer = {}
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const endpoint = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.1', 47145, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(new Map(), null, observer))
+  )
+  await endpoint.bind()
+  const links = linkPair('127.0.0.1', 47145, '127.0.0.2', 47146)
+  const session = endpoint.openLink(links.left.handle, linkSessionOptions(links, 'left'))
+  const packet = b4a.alloc(BOOTSTRAP_SIZE)
+  packet[1] = BOOTSTRAP_CLASS
+  let nativeSends = 0
+  observer.socket.send = () => {
+    nativeSends++
+    return true
+  }
+  let closing = null
+  let copies = 0
+  const originalFrom = b4a.from
+  b4a.from = (...args) => {
+    if (args[0] === packet) copies++
+    return originalFrom(...args)
+  }
+  try {
+    await t.exception(
+      issuer.sendBootstrapWithOptionsForTest(endpoint, session, packet, {
+        get signal() {
+          closing = endpoint.close()
+          return undefined
+        }
+      })
+    )
+  } finally {
+    b4a.from = originalFrom
+  }
+  await closing
+  t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), { packets: 0, bytes: 0 })
+  t.is(copies, 0)
+  t.is(nativeSends, 0)
   links.left.directory.destroy()
   links.right.directory.destroy()
 })

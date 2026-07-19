@@ -6,10 +6,6 @@ const b4a = require('b4a')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const {
-  createIndexZeroGuardLinkResponder,
-  destroyM3EstablishedLink
-} = require('../../lib/private/guard-link')
-const {
   CAPACITY_CLASS,
   RELAY_CAPABILITY,
   ROLE,
@@ -158,6 +154,7 @@ function fakeClock() {
 }
 
 function fixture(options = {}) {
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
   const clock = options.clock || fakeClock()
   const local = identityFor(ROLE.SAFETY, 2)
   const configured = [
@@ -199,17 +196,17 @@ function fixture(options = {}) {
   }
   const calls = []
   let destroyed = false
-  let responder = null
-  let responderEstablished = null
   let replayedChallengeResponse = null
   const capsResponders = new Map()
   const capsBindings = new Map()
-  let physicalDestroys = 0
+  let linkOpenCount = 0
+  let openedLinkOptions = null
   let inFlight = 0
   let maximumInFlight = 0
   let sendInvocations = 0
+  let datagramAuthority = null
   const datagrams = {
-    async send(host, port, request) {
+    async send(host, port, request, admission) {
       sendInvocations++
       if (destroyed) throw new Error('generic send authority revoked')
       inFlight++
@@ -339,28 +336,17 @@ function fixture(options = {}) {
               roleForIdentity(entry.signer.publicKey) === ROLE.SAFETY
           )
           if (!selectedGuard) throw new Error('link attempted for non-guard')
-          const responderPhysical = Object.freeze({ destroy() {} })
-          responder = createIndexZeroGuardLinkResponder({
-            advertisement: selectedGuard.bytes,
-            responderIdentitySecretKey: selectedGuard.signer.secretKey,
-            responderRouteEncryptionSecretKey: selectedGuard.route.secretKey,
-            now: () => NOW,
-            receiveOffer: () => ({
-              offer: request.bytes,
-              observedPredecessorEndpoint: endpointBytes('10.0.0.2', 44000),
-              physicalChannel: responderPhysical
-            }),
-            randomBytes: (size) => b4a.alloc(size, 0x55)
-          })
-          const accepted = responder.accept()
-          responderEstablished = accepted.established
           return {
-            accept: accepted.accept,
-            physicalChannel: Object.freeze({
-              destroy() {
-                physicalDestroys++
+            reservation: issuer.createTestBootstrapUdxLinkReservation(
+              datagramAuthority,
+              admission,
+              async (sessionOptions) => {
+                linkOpenCount++
+                openedLinkOptions = sessionOptions
+                if (options.failLinkOpen) throw new Error('link open rejected')
+                return true
               }
-            })
+            )
           }
         }
         throw new Error('unexpected request')
@@ -374,8 +360,7 @@ function fixture(options = {}) {
     }
   }
   let io = null
-  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
-  const datagramAuthority = issuer.createTestBootstrapUdxAuthority({
+  datagramAuthority = issuer.createTestBootstrapUdxAuthority({
     configuredEndpoints: configured,
     localIdentity: local.publicKey,
     localSecretKey: local.secretKey,
@@ -425,8 +410,14 @@ function fixture(options = {}) {
     get maximumInFlight() {
       return maximumInFlight
     },
+    get linkOpenCount() {
+      return linkOpenCount
+    },
+    get openedLinkOptions() {
+      return openedLinkOptions
+    },
     get physicalDestroys() {
-      return physicalDestroys
+      return linkOpenCount
     },
     get sendInvocations() {
       return sendInvocations
@@ -434,8 +425,6 @@ function fixture(options = {}) {
     io,
     cleanup() {
       for (const capsResponder of capsResponders.values()) capsResponder.destroy()
-      if (responderEstablished) destroyM3EstablishedLink(responderEstablished)
-      if (responder) responder.destroy()
     }
   }
 }
@@ -482,6 +471,7 @@ test('BootstrapIO rejects a generic datagram send and destroy object', (t) => {
 test('Task4 fake transport is admitted only through the nonforgeable authority issuer', (t) => {
   const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
   t.is(typeof issuer.createTestBootstrapUdxAuthority, 'function')
+  t.is(typeof issuer.createTestBootstrapUdxLinkReservation, 'function')
 })
 
 test('numeric configured endpoints are owned, deduplicated, and bounded to three', (t) => {
@@ -535,6 +525,29 @@ test('cold start contacts sequentially, pins one guard, revokes generic send bef
     'identity index releases every candidate record before resolution'
   )
   t.is(f.maximumInFlight, 1)
+  t.is(f.linkOpenCount, 1, 'one opaque reservation is opened before pin')
+  t.alike(Object.keys(f.openedLinkOptions).sort(), [
+    'absoluteDeadline',
+    'cancel',
+    'circuitId',
+    'epoch',
+    'expiresAt',
+    'initiatorLocalId',
+    'now',
+    'randomBytes',
+    'responderLocalId',
+    'responderStaticKey',
+    'schedule',
+    'signedExpiry'
+  ])
+  t.is(f.openedLinkOptions.absoluteDeadline, 10_000)
+  t.is(f.openedLinkOptions.signedExpiry, 20_000)
+  t.is(f.openedLinkOptions.expiresAt, 20_000n)
+  t.is(f.openedLinkOptions.epoch, 1n)
+  t.is(f.openedLinkOptions.circuitId.byteLength, 16)
+  t.is(f.openedLinkOptions.initiatorLocalId.byteLength, 16)
+  t.is(f.openedLinkOptions.responderLocalId.byteLength, 16)
+  t.alike(f.openedLinkOptions.responderStaticKey, f.guards[0].route.publicKey)
   t.alike(
     f.calls.map((call) => call[2] || call[0]),
     ['caps-query', 'caps-query', 'caps-retry', 'active-challenge', 'link', 'destroy']
