@@ -331,6 +331,41 @@ function challengeAuthority(projection, send, overrides = {}) {
   })
 }
 
+function activeChallengeResponse(fixture, message, responderNonce = seed(99)) {
+  const challenge = message.subarray(8)
+  const shared = cryptoSuite.keyAgreement(fixture.route.secretKey, challenge.subarray(64, 96))
+  const responseBody = b4a.alloc(272)
+  responseBody.set(challenge.subarray(0, 32), 0)
+  responseBody.set(fixture.signer.publicKey, 32)
+  responseBody.set(challenge.subarray(32, 96), 64)
+  responseBody.set(responderNonce, 128)
+  responseBody.set(challenge.subarray(96, 176), 160)
+  const domain = b4a.from('hyperdht-private-routes/m3/active-challenge/route-key-proof/v1')
+  const proofInput = b4a.concat([
+    b4a.from([domain.byteLength >>> 8, domain.byteLength]),
+    domain,
+    responseBody.subarray(0, 240)
+  ])
+  sodium.crypto_generichash(responseBody.subarray(240), proofInput, shared)
+  const signatureDomain = b4a.from('hyperdht-private-routes/m3/active-challenge-response/v1')
+  const signatureInput = b4a.alloc(2 + signatureDomain.byteLength + 8 + responseBody.byteLength)
+  signatureInput.writeUInt16BE(signatureDomain.byteLength, 0)
+  signatureInput.set(signatureDomain, 2)
+  signatureInput.writeUInt32BE(1, 2 + signatureDomain.byteLength)
+  signatureInput.writeUInt16BE(
+    M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1,
+    6 + signatureDomain.byteLength
+  )
+  signatureInput.writeUInt16BE(responseBody.byteLength, 8 + signatureDomain.byteLength)
+  signatureInput.set(responseBody, 10 + signatureDomain.byteLength)
+  const signature = cryptoSuite.sign(signatureInput, fixture.signer.secretKey)
+  return encodeM3Object({
+    messageId: M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1,
+    body: responseBody,
+    authSuffix: signature
+  })
+}
+
 test('M3 relay advertisement is canonical, signed, exact-sized, and defensively copied', (t) => {
   const fixture = signedAdvertisement()
   t.is(CAPABILITY_ADVERTISEMENT_FIXED_BODY, 188)
@@ -2194,6 +2229,253 @@ test('verifier clears raw RNG outputs before challenge publication on every path
   t.alike(fixture.encoded, encodedSnapshot, 'all paths leave caller advertisement unchanged')
   responder.destroy()
   successOwner.destroy()
+})
+
+test('active challenge rechecks expiry after response crypto before publishing', async (t) => {
+  const fake = clock()
+  let armed = false
+  let advanced = false
+  const tracked = trackedRelayCapability({
+    keyAgreement(secretKey, publicKey) {
+      const shared = cryptoSuite.keyAgreement(secretKey, publicKey)
+      if (armed && !advanced) {
+        advanced = true
+        fake.advance(Number(ACTIVE_CHALLENGE_TIMEOUT))
+      }
+      return shared
+    }
+  })
+  t.teardown(tracked.restore)
+  const owner = new tracked.fresh.RelayCapabilityVerifier({
+    wallNow: fake.wallNow,
+    monotonicNow: fake.monotonicNow,
+    setTimer: fake.setTimer,
+    clearTimer: fake.clearTimer,
+    onInvalidated() {}
+  })
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT })
+  const projection = acceptSafety(owner, fixture)
+  let challenge = null
+  armed = true
+  await expectCodeAsync(
+    t,
+    () =>
+      owner.beginChallenge(
+        projection,
+        tracked.fresh.createActiveChallengeSendAuthority({
+          capsBinding: {
+            advertisement: projection,
+            sourceEndpoint: endpoint(225),
+            queryNonce: seed(151),
+            cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+            returnRoutabilityCookie: seed(152),
+            advertisementDigest: projection.digest,
+            relayIdentity: projection.identity
+          },
+          send(message) {
+            challenge = message
+            return activeChallengeResponse(fixture, message)
+          }
+        })
+      ),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.ok(advanced)
+  t.alike(projection.canonicalBytes, b4a.alloc(projection.canonicalBytes.byteLength))
+  t.alike(challenge, b4a.alloc(challenge.byteLength), 'late completion clears challenge bytes')
+  t.is(fake.pending(), 0, 'late completion leaves no timer')
+  owner.destroy()
+})
+
+test('active challenge rejects a source record replaced during response crypto', async (t) => {
+  const fake = clock()
+  let owner = null
+  let replacement = null
+  let armed = false
+  let replacementProjection = null
+  const tracked = trackedRelayCapability({
+    keyAgreement(secretKey, publicKey) {
+      const shared = cryptoSuite.keyAgreement(secretKey, publicKey)
+      if (armed) {
+        armed = false
+        replacementProjection = acceptSafety(owner, replacement)
+      }
+      return shared
+    }
+  })
+  t.teardown(tracked.restore)
+  owner = new tracked.fresh.RelayCapabilityVerifier({
+    wallNow: fake.wallNow,
+    monotonicNow: fake.monotonicNow,
+    setTimer: fake.setTimer,
+    clearTimer: fake.clearTimer,
+    onInvalidated() {}
+  })
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
+  replacement = signedAdvertisement({
+    epoch: 8n,
+    routeSeed: 97,
+    expiresAtMs: NOW + 60_000n
+  })
+  const projection = acceptSafety(owner, fixture)
+  let challenge = null
+  armed = true
+  await expectCodeAsync(
+    t,
+    () =>
+      owner.beginChallenge(
+        projection,
+        tracked.fresh.createActiveChallengeSendAuthority({
+          capsBinding: {
+            advertisement: projection,
+            sourceEndpoint: endpoint(226),
+            queryNonce: seed(153),
+            cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+            returnRoutabilityCookie: seed(154),
+            advertisementDigest: projection.digest,
+            relayIdentity: projection.identity
+          },
+          send(message) {
+            challenge = message
+            return activeChallengeResponse(fixture, message)
+          }
+        })
+      ),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.ok(replacementProjection)
+  t.alike(projection.canonicalBytes, b4a.alloc(projection.canonicalBytes.byteLength))
+  t.unlike(
+    replacementProjection.canonicalBytes,
+    b4a.alloc(replacementProjection.canonicalBytes.byteLength)
+  )
+  t.alike(challenge, b4a.alloc(challenge.byteLength), 'stale completion clears challenge bytes')
+  t.is(fake.pending(), 1, 'only the replacement record timer remains')
+  owner.destroy()
+})
+
+test('active challenge preserves destruction reentered during final response crypto', async (t) => {
+  const fake = clock()
+  let owner = null
+  let armed = false
+  const tracked = trackedRelayCapability({
+    keyAgreement(secretKey, publicKey) {
+      const shared = cryptoSuite.keyAgreement(secretKey, publicKey)
+      if (armed) {
+        armed = false
+        owner.destroy()
+      }
+      return shared
+    }
+  })
+  t.teardown(tracked.restore)
+  owner = new tracked.fresh.RelayCapabilityVerifier({
+    wallNow: fake.wallNow,
+    monotonicNow: fake.monotonicNow,
+    setTimer: fake.setTimer,
+    clearTimer: fake.clearTimer,
+    onInvalidated() {}
+  })
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
+  const projection = acceptSafety(owner, fixture)
+  let challenge = null
+  let result = null
+  let error = null
+  armed = true
+  try {
+    result = await owner.beginChallenge(
+      projection,
+      tracked.fresh.createActiveChallengeSendAuthority({
+        capsBinding: {
+          advertisement: projection,
+          sourceEndpoint: endpoint(227),
+          queryNonce: seed(161),
+          cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+          returnRoutabilityCookie: seed(162),
+          advertisementDigest: projection.digest,
+          relayIdentity: projection.identity
+        },
+        send(message) {
+          challenge = message
+          return activeChallengeResponse(fixture, message)
+        }
+      })
+    )
+  } catch (err) {
+    error = err
+  }
+  t.is(result, null, 'destroyed completion publishes no projection')
+  t.ok(error instanceof PrivateRouteError)
+  t.is(error && error.code, 'ERR_DESTROYED')
+  t.alike(projection.canonicalBytes, b4a.alloc(projection.canonicalBytes.byteLength))
+  t.alike(challenge, b4a.alloc(challenge.byteLength), 'destroy clears challenge-owned bytes')
+  t.is(fake.pending(), 0, 'destroy leaves no timer')
+})
+
+test('active response replay tombstones expire without evicting live claims', async (t) => {
+  const fake = clock()
+  const owner = verifier(fake)
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
+  let projection = acceptSafety(owner, fixture)
+  let oldestResponse = null
+  let completions = 0
+
+  for (let index = 0; index < 4_096; index++) {
+    projection = await owner.beginChallenge(
+      projection,
+      challengeAuthority(projection, (message) => {
+        const response = activeChallengeResponse(fixture, message, seed(index & 0xff))
+        if (index === 0) oldestResponse = response
+        return response
+      })
+    )
+    completions++
+  }
+  t.is(completions, 4_096, 'exactly 4,096 live response claims complete')
+
+  await expectCodeAsync(
+    t,
+    () =>
+      owner.beginChallenge(
+        projection,
+        challengeAuthority(
+          projection,
+          (message) => activeChallengeResponse(fixture, message, seed(1)),
+          { queryNonce: seed(155), returnRoutabilityCookie: seed(156) }
+        )
+      ),
+    'ERR_BUSY'
+  )
+  await expectCodeAsync(
+    t,
+    () =>
+      owner.beginChallenge(
+        projection,
+        challengeAuthority(projection, () => oldestResponse, {
+          queryNonce: seed(157),
+          returnRoutabilityCookie: seed(158)
+        })
+      ),
+    'ERR_REPLAY'
+  )
+
+  fake.advance(Number(ACTIVE_CHALLENGE_TIMEOUT))
+  const afterExpiry = await owner.beginChallenge(
+    projection,
+    challengeAuthority(
+      projection,
+      (message) => activeChallengeResponse(fixture, message, seed(2)),
+      {
+        queryNonce: seed(159),
+        cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT * 2n,
+        returnRoutabilityCookie: seed(160)
+      }
+    )
+  )
+  t.alike(afterExpiry.digest, projection.digest)
+  t.is(fake.pending(), 1, 'replay cleanup adds no per-entry timers')
+  owner.destroy()
+  t.is(fake.pending(), 0)
 })
 
 test('active challenge uses exact vectors, monotonic deadline, possession proof, and single completion', async (t) => {
