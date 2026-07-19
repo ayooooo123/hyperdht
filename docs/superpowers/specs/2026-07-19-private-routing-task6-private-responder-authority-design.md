@@ -218,10 +218,12 @@ accessors or extra keys:
 
 Before invoking verification, clock, or dial code, the authority moves from
 `UNUSED` to `DIALING` and tombstones its reusable state. It re-verifies the
-canonical advertisement, expected digest, required role, and that the signed
-advertisement expiry is no later than `wireExpiresAt` and remains live under
-`localDeadline`. It decodes the tuple internally, permits one live dial, and
-returns only an opaque extension setup transport to the adjacent factory. The
+canonical advertisement, expected digest, and required role; requires
+`wallNow() < wireExpiresAt <= decodedAdvertisement.expiresAtMs`; and requires
+`localDeadline` to equal the factory operation's already-retained local
+deadline and remain greater than `monotonicNow()`. It decodes the tuple
+internally, permits one live dial, and returns only an opaque extension setup
+transport to the adjacent factory. The
 authority is not bound to a candidate when the factory is created; it becomes
 request-bound at this one invocation and cannot dial an alternate tuple. Before
 returning, the live setup transport is either transferred into the factory's
