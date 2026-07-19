@@ -204,8 +204,10 @@ function fixture(options = {}) {
   let physicalDestroys = 0
   let inFlight = 0
   let maximumInFlight = 0
+  let sendInvocations = 0
   const datagrams = {
     async send(host, port, request) {
+      sendInvocations++
       if (destroyed) throw new Error('generic send authority revoked')
       inFlight++
       maximumInFlight = Math.max(maximumInFlight, inFlight)
@@ -386,11 +388,18 @@ function fixture(options = {}) {
     datagrams,
     wallNow: clock.wallNow,
     monotonicNow: clock.monotonicNow,
-    randomBytes: (size) => b4a.alloc(size, 0x44),
+    randomBytes(size) {
+      if (options.onRandomBytes) options.onRandomBytes({ io, clock, size })
+      return b4a.alloc(size, 0x44)
+    },
     candidateDirectorySink: sink
   })
   if (options.bootstrapTimers) {
-    io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER](options.bootstrapTimers)
+    io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER]({
+      setTimeout: options.bootstrapTimers.setTimeout,
+      clearTimeout: options.bootstrapTimers.clearTimeout,
+      deferDispatch: options.deferDispatch || ((callback) => Promise.resolve().then(callback))
+    })
   }
   return {
     advertisements,
@@ -407,6 +416,9 @@ function fixture(options = {}) {
     },
     get physicalDestroys() {
       return physicalDestroys
+    },
+    get sendInvocations() {
+      return sendInvocations
     },
     io,
     cleanup() {
@@ -770,6 +782,66 @@ test('cancel during a pending datagram emits no later packet', async (t) => {
     f.calls.map((call) => call[2] || call[0]),
     ['caps-query', 'destroy']
   )
+  f.cleanup()
+})
+
+test('cancel and destroy before deferred dispatch emit no datagram', async (t) => {
+  for (const method of ['cancel', 'destroy']) {
+    let scheduled = false
+    const f = fixture({
+      onRandomBytes({ io }) {
+        if (scheduled) return
+        scheduled = true
+        Promise.resolve().then(() => io[method]())
+      }
+    })
+    await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+    t.is(scheduled, true)
+    t.is(f.sendInvocations, 0, `${method} prevents adapter invocation`)
+    t.is(f.calls.filter((call) => call[2]).length, 0, `${method} wins before dispatch`)
+    t.alike(f.calls, [['destroy']])
+    t.ok(f.destroyed)
+    f.cleanup()
+  }
+})
+
+test('a stale failed-endpoint dispatch cannot run during the next attempt', async (t) => {
+  const clock = fakeClock()
+  let deferredCount = 0
+  let staleDispatch = null
+  let staleError = null
+  const f = fixture({
+    clock,
+    bootstrapTimers: {
+      setTimeout: clock.setTimer,
+      clearTimeout: clock.clearTimer
+    },
+    deferDispatch(callback) {
+      deferredCount++
+      if (deferredCount === 1) {
+        staleDispatch = callback
+        return Promise.reject(new Error('first endpoint dispatch failed'))
+      }
+      if (deferredCount === 2) {
+        try {
+          staleDispatch()
+        } catch (err) {
+          staleError = err
+        }
+      }
+      return Promise.resolve().then(callback)
+    }
+  })
+  const transfer = await f.io.start()
+  t.ok(staleError instanceof PrivateRouteError)
+  t.is(staleError && staleError.code, 'ERR_DESTROYED')
+  t.is(
+    f.calls.some((call) => call[0] === f.configured[0].host),
+    false,
+    'stale first-endpoint closure never reaches the adapter'
+  )
+  t.is(f.sendInvocations, f.calls.filter((call) => call[2]).length)
+  t.ok(revokeBootstrapGuardPin(transfer))
   f.cleanup()
 })
 
