@@ -114,7 +114,8 @@ function fakeClock() {
   let monotonic = 0n
   let next = 0
   const timers = new Map()
-  return {
+  const clock = {
+    onClearTimer: null,
     wallNow: () => wall,
     monotonicNow: () => monotonic,
     setTimer(callback, delay) {
@@ -124,6 +125,7 @@ function fakeClock() {
     },
     clearTimer(id) {
       timers.delete(id)
+      if (clock.onClearTimer) clock.onClearTimer(id)
     },
     advance(value) {
       wall += BigInt(value)
@@ -136,6 +138,7 @@ function fakeClock() {
     },
     timers
   }
+  return clock
 }
 
 function fixture(options = {}) {
@@ -146,6 +149,11 @@ function fixture(options = {}) {
   let destroyed = false
   let responder = null
   let responderEstablished = null
+  let linkEstablished = false
+  let clientPhysicalDestroyed = false
+  let cleanupReentryCount = 0
+  let cleanupReentryResult = null
+  let cleanupReentryError = null
   const capsResponder = createActiveChallengeResponderAuthority({
     now: clock.wallNow,
     setTimeout,
@@ -155,6 +163,17 @@ function fixture(options = {}) {
   let capsBinding = null
   let sourceEndpoint = null
   let authority = null
+  const reenterCleanup = () => {
+    cleanupReentryCount++
+    try {
+      cleanupReentryResult = revokeGuardReconnectAuthority(authority, 'cleanup-reentry')
+    } catch (err) {
+      cleanupReentryError = err
+    }
+  }
+  clock.onClearTimer = () => {
+    if (options.revokeAfterLinkAt === 'clearTimer' && linkEstablished) reenterCleanup()
+  }
   const datagrams = {
     async send(host, port, request, signal) {
       if (destroyed) throw new Error('revoked transport')
@@ -225,15 +244,23 @@ function fixture(options = {}) {
         })
         const accepted = responder.accept()
         responderEstablished = accepted.established
+        linkEstablished = true
         return {
           accept: accepted.accept,
-          physicalChannel: Object.freeze({ destroy() {} })
+          physicalChannel: Object.freeze({
+            destroy() {
+              clientPhysicalDestroyed = true
+            }
+          })
         }
       }
       throw new Error('unexpected request')
     },
     destroy() {
       destroyed = true
+      if (options.revokeAfterLinkAt === 'datagram-destroy' && linkEstablished) {
+        reenterCleanup()
+      }
     }
   }
   authority = createGuardReconnectAuthority({
@@ -259,6 +286,18 @@ function fixture(options = {}) {
     guard,
     get destroyed() {
       return destroyed
+    },
+    get clientPhysicalDestroyed() {
+      return clientPhysicalDestroyed
+    },
+    get cleanupReentryCount() {
+      return cleanupReentryCount
+    },
+    get cleanupReentryResult() {
+      return cleanupReentryResult
+    },
+    get cleanupReentryError() {
+      return cleanupReentryError
     },
     cleanup(established = null) {
       capsResponder.destroy()
@@ -394,6 +433,28 @@ test('hung reconnect expires, aborts the exact in-flight record, and emits no la
     f.calls.map((call) => call.kind),
     ['caps-query']
   )
+  t.ok(f.destroyed)
+  f.cleanup()
+})
+
+test('clearTimer cleanup reentry revokes before an established link can be published', async (t) => {
+  const f = fixture({ revokeAfterLinkAt: 'clearTimer' })
+  await expectCodeAsync(t, () => f.authority.reconnect(), 'ERR_DESTROYED')
+  t.is(f.cleanupReentryCount, 1)
+  t.is(f.cleanupReentryResult, true)
+  t.is(f.cleanupReentryError, null)
+  t.ok(f.clientPhysicalDestroyed)
+  t.ok(f.destroyed)
+  f.cleanup()
+})
+
+test('datagram destroy cleanup reentry revokes before an established link can be published', async (t) => {
+  const f = fixture({ revokeAfterLinkAt: 'datagram-destroy' })
+  await expectCodeAsync(t, () => f.authority.reconnect(), 'ERR_DESTROYED')
+  t.is(f.cleanupReentryCount, 1)
+  t.is(f.cleanupReentryResult, true)
+  t.is(f.cleanupReentryError, null)
+  t.ok(f.clientPhysicalDestroyed)
   t.ok(f.destroyed)
   f.cleanup()
 })
