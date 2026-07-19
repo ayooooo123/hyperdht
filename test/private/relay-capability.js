@@ -779,6 +779,45 @@ test('verifier owns epochs, idempotence, equivocation quarantine, and projection
   owner.destroy()
 })
 
+test('verifier retains only record and projection canonical advertisement ownership', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fake = clock()
+  const owner = new tracked.fresh.RelayCapabilityVerifier({
+    wallNow: fake.wallNow,
+    monotonicNow: fake.monotonicNow,
+    setTimer: fake.setTimer,
+    clearTimer: fake.clearTimer,
+    onInvalidated() {}
+  })
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
+  const callerSnapshot = b4a.from(fixture.encoded)
+
+  tracked.start()
+  const projection = acceptSafety(owner, fixture)
+  const allocations = tracked.take()
+  const retainedCanonicalCopies = allocations.filter(
+    (buffer) =>
+      buffer.byteLength === callerSnapshot.byteLength && b4a.equals(buffer, callerSnapshot)
+  )
+
+  t.is(
+    retainedCanonicalCopies.length,
+    2,
+    'only the live record and returned projection retain full canonical bytes'
+  )
+  t.ok(
+    retainedCanonicalCopies.includes(projection.canonicalBytes),
+    'the returned defensive projection is one required retained copy'
+  )
+  t.alike(fixture.encoded, callerSnapshot, 'acceptance leaves caller bytes unchanged')
+
+  owner.destroy()
+  for (const buffer of retainedCanonicalCopies) {
+    t.alike(buffer, b4a.alloc(buffer.byteLength), 'destroy clears retained canonical ownership')
+  }
+})
+
 test('verifier bounds same-record projection leases without disturbing independent records', async (t) => {
   const fake = clock()
   const owner = verifier(fake)
