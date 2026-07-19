@@ -895,7 +895,7 @@ test('same-epoch equivocation stays revoked and quarantined when timer cleanup r
   owner.destroy()
 })
 
-test('same-epoch history-key copy failure revokes before allocation and preserves quarantine', (t) => {
+test('same-epoch history-key copy failure durably poisons the relay identity', (t) => {
   const tracked = trackedRelayCapability()
   t.teardown(tracked.restore)
   const fake = clock()
@@ -911,9 +911,16 @@ test('same-epoch history-key copy failure revokes before allocation and preserve
     issuedAtMs: NOW,
     expiresAtMs: NOW + 120_000n
   })
+  const later = signedAdvertisement({
+    epoch: fixture.signed.epoch + 2n,
+    routeSeed: 106,
+    issuedAtMs: NOW,
+    expiresAtMs: NOW + 120_000n
+  })
   const fixtureSnapshot = b4a.from(fixture.encoded)
   const conflictSnapshot = b4a.from(conflict.encoded)
   const successorSnapshot = b4a.from(successor.encoded)
+  const laterSnapshot = b4a.from(later.encoded)
   const createOwner = (timer, onInvalidated = () => {}) =>
     new tracked.fresh.RelayCapabilityVerifier({
       wallNow: timer.wallNow,
@@ -992,15 +999,14 @@ test('same-epoch history-key copy failure revokes before allocation and preserve
     'ERR_AUTHENTICATION'
   )
 
-  fake.jumpWall(89_999)
+  fake.jumpWall(90_000)
   expectCode(t, () => acceptSafety(owner, successor), 'ERR_AUTHENTICATION')
-  fake.jumpWall(1)
-  const replacement = acceptSafety(owner, successor)
-  t.is(replacement.epoch, successor.signed.epoch)
-  t.is(fake.pending(), 1, 'no partial history blocks the first post-quarantine replacement')
+  expectCode(t, () => acceptSafety(owner, later), 'ERR_AUTHENTICATION')
+  t.is(fake.pending(), 0, 'poison outlives quarantine without publishing replacement state')
   t.alike(fixture.encoded, fixtureSnapshot)
   t.alike(conflict.encoded, conflictSnapshot)
   t.alike(successor.encoded, successorSnapshot)
+  t.alike(later.encoded, laterSnapshot)
   owner.destroy()
   t.is(fake.pending(), 0)
 })
