@@ -293,6 +293,35 @@ function longFixture(expiresAt, extraSafety = 2, extraExits = 1, clock = fakeClo
   }
 }
 
+function replacementExpiryFixture(expiredBranch) {
+  const clock = fakeClock()
+  const short = { expiresAtMs: NOW + 30_000n }
+  const long = { expiresAtMs: NOW + 60_000n }
+  const lookupExpiry = expiredBranch === BRANCH_CLASS.LOOKUP ? short : long
+  const announceExpiry = expiredBranch === BRANCH_CLASS.ANNOUNCE ? short : long
+  const guard = candidate(ROLE.SAFETY, 0, 1, long)
+  const records = [
+    candidate(ROLE.SAFETY, 1, 2, lookupExpiry),
+    candidate(ROLE.SAFETY, 2, 3, announceExpiry),
+    candidate(ROLE.SAFETY, 3, 4, long),
+    candidate(ROLE.PRIVATE, 0, 40, lookupExpiry),
+    candidate(ROLE.PRIVATE, 1, 41, announceExpiry),
+    candidate(ROLE.PRIVATE, 2, 42, long)
+  ]
+  return {
+    clock,
+    guard,
+    records,
+    scope: {
+      guardIdentity: guard.identity,
+      guardEndpoint: guard.canonicalEndpointBytes,
+      guardAdvertisementDigest: guard.digest,
+      guardEpoch: guard.epoch,
+      guardExpiresAt: guard.expiresAt
+    }
+  }
+}
+
 function install(input) {
   const sink = createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
@@ -566,6 +595,68 @@ test('commit requires every evidence capability and replacement excludes both li
     'ERR_REPLAY'
   )
   directory.destroy()
+})
+
+test('replacement can rotate an expired target branch', (t) => {
+  const expiringTarget = replacementExpiryFixture(BRANCH_CLASS.LOOKUP)
+  const directory = install(expiringTarget)
+  installInitial(directory)
+  expiringTarget.clock.advance(30_000)
+
+  let replacement = null
+  let error = null
+  try {
+    replacement = takeRelayPathReservation(
+      directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n })
+    )
+  } catch (err) {
+    error = err
+  }
+  t.is(error, null, 'expired target can be replaced')
+  if (replacement === null) {
+    directory.destroy()
+    return
+  }
+  const selected = splitRelayPathReservation(replacement)
+  consumeSelectedRelayEvidence(selected.middle, {
+    transaction: replacement,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    position: 'middle',
+    generation: 2n
+  })
+  consumeSelectedRelayEvidence(selected.exit, {
+    transaction: replacement,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    position: 'exit',
+    generation: 2n
+  })
+  commitRelayPathReservation(replacement)
+  const observed = directory[kInspectRelayCandidateDirectory]()
+  t.absent(observed.destroyed)
+  t.is(observed.identityCount, 4)
+  t.is(observed.generationRecordCount, 2)
+  expectCode(
+    t,
+    () => directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n }),
+    'ERR_REPLAY'
+  )
+  directory.destroy()
+})
+
+test('replacement requires the opposite committed branch to remain live', (t) => {
+  const expiringOpposite = replacementExpiryFixture(BRANCH_CLASS.ANNOUNCE)
+  const rejected = install(expiringOpposite)
+  installInitial(rejected)
+  expiringOpposite.clock.advance(30_000)
+  expectCode(
+    t,
+    () => rejected.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  const rejectedState = rejected[kInspectRelayCandidateDirectory]()
+  t.absent(rejectedState.destroyed)
+  t.is(rejectedState.pendingCount, 0)
+  rejected.destroy()
 })
 
 test('identity, endpoint /24, role, capability, and cross-branch diversity fail closed', (t) => {
