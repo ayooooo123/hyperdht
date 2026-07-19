@@ -711,11 +711,11 @@ test('request table owns nonzero per-peer IDs, exact response correlation, and d
 
   const transferred = f.initiator.publicKey
   t.is(table.acceptResponse(transferred, decoded, created), false)
-  clock.advance(5_000)
+  clock.advance(BOOTSTRAP_DEADLINE)
   t.is(clock.pending(), 1)
   t.is(observations.at(-1).pending, 0)
   t.is(observations.at(-1).tombstones, 1)
-  clock.advance(5_000)
+  clock.advance(BOOTSTRAP_DEADLINE)
   t.is(clock.pending(), 0)
   table.destroy()
 })
@@ -1042,7 +1042,7 @@ test('monotonic deadlines reject late responses even when a scheduler never fire
     requestPacket: pending.packet
   })
   const decoded = f.leftCodec.decode(response, f.rightSource)
-  clock.advance(5_001)
+  clock.advance(BOOTSTRAP_DEADLINE + 1)
   t.is(table.acceptResponse(f.responder.publicKey, decoded, response), false)
   t.is(callbacks, 0)
   table.destroy()

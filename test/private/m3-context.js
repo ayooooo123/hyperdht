@@ -89,6 +89,46 @@ test('M3 context envelope freezes 1,101 bytes and owns decoded frame', (t) => {
   t.alike(decoded.frame, b4a.alloc(1100, 0x5a))
 })
 
+test('M3 context freezes an authenticated known-answer vector and binds padding bytes', (t) => {
+  const key = sequence(0x21, 32)
+  const noncePrefix = sequence(0x41, 16)
+  const associatedData = encodeM3ContextAD(CONTEXT)
+  const plaintext = b4a.from('m3-context-binding:padding=00000000')
+  const ciphertext = cryptoSuite.seal({
+    key,
+    noncePrefix,
+    counter: CONTEXT.innerCounter,
+    associatedData,
+    plaintext
+  })
+  t.is(
+    b4a.toString(ciphertext, 'hex'),
+    'e24ed5914b4c95fd95880598e0a273fa54ff36ef89ffc16e7c0d85816bbdb2906a2381c201567a8ee41ccee12beba74ca4430f'
+  )
+  t.alike(
+    cryptoSuite.open({
+      key,
+      noncePrefix,
+      counter: CONTEXT.innerCounter,
+      associatedData,
+      ciphertext
+    }),
+    plaintext
+  )
+  const substitutedPadding = b4a.from(ciphertext)
+  substitutedPadding[plaintext.byteLength - 1] ^= 1
+  t.is(
+    cryptoSuite.open({
+      key,
+      noncePrefix,
+      counter: CONTEXT.innerCounter,
+      associatedData,
+      ciphertext: substitutedPadding
+    }),
+    null
+  )
+})
+
 test('M3 context fields, widths, classes, and trailing bytes fail closed', (t) => {
   const baseline = encodeM3ContextAD(CONTEXT)
   const substitutions = [0, 5, 21, 37, 45, 46]

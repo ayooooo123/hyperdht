@@ -16,6 +16,7 @@ const {
   roleForIdentity
 } = require('../../lib/private/protocol')
 const { LinkDirectory, signTopologyGrant } = require('../../lib/private/topology-grant')
+const { UDX_ENDPOINT_RESERVATION_STATS } = require('../../lib/private/udx-adapter')
 const {
   DEFAULT_MAX_UDX_INBOUND_BYTES,
   DEFAULT_MAX_UDX_INBOUND_PACKETS,
@@ -24,10 +25,13 @@ const {
   TEST_ONLY_UDX_ADAPTER_ISSUER,
   UdxCellEndpoint,
   admitBootstrapUdxGuard,
+  bindBootstrapUdxOperation,
   createBootstrapUdxAuthority,
   createLocalIdentitySecretCapability,
+  destroyBootstrapUdxAuthority,
   destroyGuardLeaseMaterial,
   isGuardLeaseMaterial,
+  openBootstrapUdxGuard,
   pinBootstrapUdxGuard,
   sendConfigured,
   sendProspectiveGuard
@@ -186,10 +190,64 @@ async function settles() {
   await Promise.resolve()
 }
 
+function sequence(first) {
+  let value = first
+  return (size) => b4a.alloc(size, value++)
+}
+
+function linkSessionOptions(links, side, deadline = 10_000) {
+  const now = () => 1
+  const responderStatic = cryptoSuite.encryptionKeyPair(seed(98))
+  const common = {
+    circuitId: b4a.alloc(16, 0x51),
+    epoch: 7n,
+    initiatorIdentity: links.a.publicKey,
+    responderIdentity: links.b.publicKey,
+    initiatorLocalId: b4a.alloc(16, 0x52),
+    responderLocalId: b4a.alloc(16, 0x53),
+    expiresAt: 60_000n
+  }
+  const initiate = side === 'left'
+  const linkHandle = initiate ? links.left.handle : links.right.handle
+  return {
+    mode: initiate ? 'initiate' : 'accept',
+    codec: new BootstrapEnvelopeCodec({
+      linkHandle,
+      localIdentitySecretKey: initiate ? links.a.secretKey : links.b.secretKey,
+      padding: sequence(initiate ? 0x81 : 0x91)
+    }),
+    linkSetup: createLinkSetupAuthority({
+      now,
+      randomBytes: sequence(initiate ? 0x61 : 0x71)
+    }),
+    setup: initiate
+      ? {
+          ...common,
+          responderStaticKey: responderStatic.publicKey,
+          initiatorIdentitySecretKey: links.a.secretKey
+        }
+      : {
+          ...common,
+          responderStaticSecretKey: responderStatic.secretKey,
+          responderIdentitySecretKey: links.b.secretKey
+        },
+    now,
+    schedule: setTimeout,
+    cancel: clearTimeout,
+    randomBytes: sequence(initiate ? 1 : 11),
+    absoluteDeadline: deadline,
+    signedExpiry: 60_000
+  }
+}
+
 test('UDX test adapter authority is opaque, one-shot, and exact constructor rejects injection', async (t) => {
   const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
   t.is(typeof issuer.createTestUdxAdapterAuthority, 'function')
   t.is(typeof issuer.createUdxCellEndpointForTest, 'function')
+  t.is(typeof issuer.sendBootstrapForTest, 'function')
+  t.is(typeof issuer.sendEstablishedForTest, 'function')
+  t.is(typeof issuer.inspectGuardLeaseMaterial, 'function')
+  t.is(typeof endpointModule.bindBootstrapUdxOperation, 'function')
   const authority = issuer.createTestUdxAdapterAuthority(fakeFactory(new Map()))
   t.is(Object.keys(authority).length, 0)
   const endpoint = issuer.createUdxCellEndpointForTest(options('127.0.0.1', 47101, []), authority)
@@ -224,11 +282,11 @@ test('fake UDX endpoint binds exact tuple, drops spoofing, and revokes post-clos
   await left.bind()
   await right.bind()
   const links = linkPair('127.0.0.1', 47111, '127.0.0.2', 47112)
-  const leftSend = left.openLink(links.left.handle)
-  right.openLink(links.right.handle)
+  const leftSession = left.openLink(links.left.handle, linkSessionOptions(links, 'left'))
+  const rightSession = right.openLink(links.right.handle, linkSessionOptions(links, 'right'))
   const packet = b4a.alloc(BOOTSTRAP_SIZE)
   packet[1] = BOOTSTRAP_CLASS
-  t.is(await left.send(leftSend, packet), true)
+  t.is(await issuer.sendBootstrapForTest(left, leftSession, packet), true)
   await settles()
   t.is(rightReceived.length, 1)
   t.alike(rightReceived[0].packet, packet)
@@ -238,7 +296,8 @@ test('fake UDX endpoint binds exact tuple, drops spoofing, and revokes post-clos
   t.is(rightReceived.length, 1)
   await left.close()
   t.is(leftObserver.socket.closed, true)
-  await t.exception(left.send(leftSend, packet))
+  await t.exception(issuer.sendBootstrapForTest(left, leftSession, packet))
+  await rightSession.close()
   await right.close()
   links.left.directory.destroy()
   links.right.directory.destroy()
@@ -249,6 +308,33 @@ test('UDX endpoint freezes 64-packet and 76,800-byte queue/inbound defaults', (t
   t.is(DEFAULT_MAX_UDX_QUEUED_BYTES, 76_800)
   t.is(DEFAULT_MAX_UDX_INBOUND_PACKETS, 64)
   t.is(DEFAULT_MAX_UDX_INBOUND_BYTES, 76_800)
+})
+
+test('openLink consumes the topology handle and never returns a raw send handle', async (t) => {
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const endpoint = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.1', 47118, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(new Map()))
+  )
+  await endpoint.bind()
+  const links = linkPair('127.0.0.1', 47118, '127.0.0.2', 47119)
+  let first = null
+  let second = null
+  try {
+    endpoint.openLink(links.left.handle)
+  } catch (err) {
+    first = err
+  }
+  try {
+    endpoint.openLink(links.left.handle, {})
+  } catch (err) {
+    second = err
+  }
+  t.is(first && first.code, 'INVALID_ROUTE')
+  t.is(second && second.code, 'UNAUTHORIZED')
+  await endpoint.close()
+  links.left.directory.destroy()
+  links.right.directory.destroy()
 })
 
 test('failed bootstrap authority creation consumes and clears its local-secret capability', async (t) => {
@@ -328,6 +414,8 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
     maxProspectiveGuards: 3,
     monotonicDeadline: 10_000
   })
+  await t.exception(sendConfigured(authority, 0, b4a.alloc(BOOTSTRAP_SIZE)))
+  bindBootstrapUdxOperation(authority, 10_000, Object.freeze({}))
   const admission = admitBootstrapUdxGuard(authority, {
     identity: links.b.publicKey,
     host: '127.0.0.2',
@@ -352,7 +440,7 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
     responderLocalId: b4a.alloc(16, 0x53),
     expiresAt: 60_000n
   }
-  leftSession = left.openLink(links.left.handle, {
+  leftSession = openBootstrapUdxGuard(authority, admission, links.left.handle, {
     mode: 'initiate',
     codec: new BootstrapEnvelopeCodec({
       linkHandle: links.left.handle,
@@ -393,10 +481,69 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
     absoluteDeadline: 10_000,
     signedExpiry: 60_000
   })
+  const otherLinks = linkPair('127.0.0.1', 47131, '127.0.0.4', 47134)
+  const otherSession = left.openLink(otherLinks.left.handle, linkSessionOptions(otherLinks, 'left'))
   const established = await leftSession.open()
+  const substitutedEndpoint = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.3', 47133, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
+  )
+  await substitutedEndpoint.bind()
+  const substitutedSecret = createLocalIdentitySecretCapability({
+    localIdentity: links.a.publicKey,
+    localSecretKey: links.a.secretKey
+  })
+  const substitutedAuthority = createBootstrapUdxAuthority({
+    endpoint: substitutedEndpoint,
+    configuredEndpoints: [{ host: '127.0.0.2', port: 47139 }],
+    localSecretCapability: substitutedSecret,
+    maxProspectiveGuards: 3,
+    monotonicDeadline: 10_000
+  })
+  bindBootstrapUdxOperation(substitutedAuthority, 10_000, Object.freeze({}))
+  const substitutedAdmission = admitBootstrapUdxGuard(substitutedAuthority, {
+    identity: links.b.publicKey,
+    host: '127.0.0.2',
+    port: 47139
+  })
+  let substitutedMaterial = null
+  let substitutionError = null
+  try {
+    substitutedMaterial = pinBootstrapUdxGuard(
+      substitutedAuthority,
+      substitutedAdmission,
+      established
+    )
+  } catch (err) {
+    substitutionError = err
+  }
+  t.is(substitutionError && substitutionError.code, 'UNAUTHORIZED')
+  if (substitutedMaterial) destroyGuardLeaseMaterial(substitutedMaterial)
+  destroyBootstrapUdxAuthority(substitutedAuthority)
+  await substitutedEndpoint.close()
   const material = pinBootstrapUdxGuard(authority, admission, established)
   t.is(Object.keys(material).length, 0)
   t.is(isGuardLeaseMaterial(material), true)
+  const lease = issuer.inspectGuardLeaseMaterial(material)
+  t.is(lease.reconnectTransportFactory.length, 0)
+  t.exception(() => lease.reconnectTransportFactory('127.0.0.2'))
+  let reconnectTransport = null
+  let reconnectError = null
+  try {
+    reconnectTransport = lease.reconnectTransportFactory()
+  } catch (err) {
+    reconnectError = err
+  }
+  t.is(reconnectError, null)
+  if (reconnectTransport) {
+    t.is(await reconnectTransport.send('127.0.0.2', 47132, probe), true)
+    await t.exception(reconnectTransport.send('127.0.0.2', 47139, probe))
+    reconnectTransport.destroy()
+    await t.exception(reconnectTransport.send('127.0.0.2', 47132, probe))
+    t.exception(() => lease.reconnectTransportFactory())
+  }
+  t.is(otherSession.state, 'TOMBSTONE')
+  await t.exception(issuer.sendBootstrapForTest(left, otherSession, probe))
   await t.exception(sendConfigured(authority, 0, probe))
   await t.exception(sendProspectiveGuard(authority, admission, probe))
   t.is(destroyGuardLeaseMaterial(material), true)
@@ -405,6 +552,8 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
   await right.close()
   links.left.directory.destroy()
   links.right.directory.destroy()
+  otherLinks.left.directory.destroy()
+  otherLinks.right.directory.destroy()
 })
 
 test('outbound capacity reserves before allocation and close waits native ownership', async (t) => {
@@ -421,10 +570,35 @@ test('outbound capacity reserves before allocation and close waits native owners
   )
   await endpoint.bind()
   const links = linkPair('127.0.0.1', 47141, '127.0.0.2', 47142)
-  const handle = endpoint.openLink(links.left.handle)
+  const session = endpoint.openLink(links.left.handle, linkSessionOptions(links, 'left'))
   const packet = b4a.alloc(BOOTSTRAP_SIZE)
   packet[1] = BOOTSTRAP_CLASS
-  const first = endpoint.send(handle, packet)
+  const failedFrom = b4a.from
+  b4a.from = (...args) => {
+    if (args[0] === packet) throw new Error('allocation failed')
+    return failedFrom(...args)
+  }
+  try {
+    await t.exception(issuer.sendBootstrapForTest(endpoint, session, packet))
+  } finally {
+    b4a.from = failedFrom
+  }
+  t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), { packets: 0, bytes: 0 })
+  let acceptedReservation = null
+  const acceptedFrom = b4a.from
+  b4a.from = (...args) => {
+    if (args[0] === packet && acceptedReservation === null) {
+      acceptedReservation = endpoint[UDX_ENDPOINT_RESERVATION_STATS]()
+    }
+    return acceptedFrom(...args)
+  }
+  let first
+  try {
+    first = issuer.sendBootstrapForTest(endpoint, session, packet)
+  } finally {
+    b4a.from = acceptedFrom
+  }
+  t.alike(acceptedReservation, { packets: 1, bytes: BOOTSTRAP_SIZE })
   await Promise.resolve()
   let allocations = 0
   const originalFrom = b4a.from
@@ -434,7 +608,7 @@ test('outbound capacity reserves before allocation and close waits native owners
   }
   let secondError = null
   try {
-    await endpoint.send(handle, packet)
+    await issuer.sendBootstrapForTest(endpoint, session, packet)
   } catch (err) {
     secondError = err
   } finally {
@@ -488,13 +662,27 @@ test('inbound global/per-peer ownership drops excess, late, address-changed, and
   await left.bind()
   await right.bind()
   const links = linkPair('127.0.0.1', 47151, '127.0.0.2', 47152)
-  const send = left.openLink(links.left.handle)
-  right.openLink(links.right.handle)
+  const leftSession = left.openLink(links.left.handle, linkSessionOptions(links, 'left'))
+  const rightSession = right.openLink(links.right.handle, linkSessionOptions(links, 'right'))
   const packet = b4a.alloc(BOOTSTRAP_SIZE)
   packet[1] = BOOTSTRAP_CLASS
-  await left.send(send, packet)
+  let reentered = false
+  const reentrantFrom = b4a.from
+  b4a.from = (...args) => {
+    if (args[0] === packet && !reentered) {
+      reentered = true
+      rightObserver.socket.emit('message', packet, { host: '127.0.0.1', port: 47151 })
+    }
+    return reentrantFrom(...args)
+  }
+  try {
+    rightObserver.socket.emit('message', packet, { host: '127.0.0.1', port: 47151 })
+  } finally {
+    b4a.from = reentrantFrom
+  }
   await settles()
-  await left.send(send, packet)
+  t.is(received.length, 1, 'reserved receive capacity is visible before packet allocation re-entry')
+  await issuer.sendBootstrapForTest(left, leftSession, packet)
   await settles()
   t.is(received.length, 1, 'inbound owner drops excess while first callback owns bytes')
   rightObserver.socket.emit('message', packet, { host: '127.0.0.9', port: 47151 })
@@ -503,7 +691,19 @@ test('inbound global/per-peer ownership drops excess, late, address-changed, and
   t.is(received.length, 1, 'address changes and unreserved tuples are dropped')
   releaseFirst(true)
   await settles()
-  await left.send(send, packet)
+  const failedFrom = b4a.from
+  b4a.from = (...args) => {
+    if (args[0] === packet) throw new Error('allocation failed')
+    return failedFrom(...args)
+  }
+  try {
+    rightObserver.socket.emit('message', packet, { host: '127.0.0.1', port: 47151 })
+  } finally {
+    b4a.from = failedFrom
+  }
+  await settles()
+  t.is(received.length, 1, 'failed allocation rolls back reserved receive capacity')
+  await issuer.sendBootstrapForTest(left, leftSession, packet)
   await settles()
   t.is(received.length, 2, 'capacity returns only after callback settlement')
   await right.close()
@@ -511,6 +711,80 @@ test('inbound global/per-peer ownership drops excess, late, address-changed, and
   await settles()
   t.is(received.length, 2, 'late receive after close is inert')
   await left.close()
+  await rightSession.close()
   links.left.directory.destroy()
   links.right.directory.destroy()
+})
+
+test('direct bootstrap receive reserves before allocation re-entry and rolls back failure', async (t) => {
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const observer = {}
+  let received = 0
+  let releaseFirst
+  const held = new Promise((resolve) => {
+    releaseFirst = resolve
+  })
+  const endpoint = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.2', 47162, [], {
+      maxInboundPackets: 1,
+      maxInboundBytes: BOOTSTRAP_SIZE,
+      maxInboundPacketsPerPeer: 1,
+      maxInboundBytesPerPeer: BOOTSTRAP_SIZE,
+      onBootstrap() {
+        received++
+        if (received === 1) return held
+      }
+    }),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(new Map(), null, observer))
+  )
+  await endpoint.bind()
+  const identity = cryptoSuite.keyPair(seed(110))
+  const authority = createBootstrapUdxAuthority({
+    endpoint,
+    configuredEndpoints: [{ host: '127.0.0.1', port: 47161 }],
+    localSecretCapability: createLocalIdentitySecretCapability({
+      localIdentity: identity.publicKey,
+      localSecretKey: identity.secretKey
+    }),
+    maxProspectiveGuards: 3,
+    monotonicDeadline: 10_000
+  })
+  bindBootstrapUdxOperation(authority, 10_000, Object.freeze({}))
+  const packet = b4a.alloc(BOOTSTRAP_SIZE)
+  packet[1] = BOOTSTRAP_CLASS
+  const source = { host: '127.0.0.1', port: 47161 }
+  let reentered = false
+  const reentrantFrom = b4a.from
+  b4a.from = (...args) => {
+    if (args[0] === packet && !reentered) {
+      reentered = true
+      observer.socket.emit('message', packet, source)
+    }
+    return reentrantFrom(...args)
+  }
+  try {
+    observer.socket.emit('message', packet, source)
+  } finally {
+    b4a.from = reentrantFrom
+  }
+  await settles()
+  t.is(received, 1, 'direct receive capacity is visible before packet allocation re-entry')
+  releaseFirst(true)
+  await settles()
+  const failedFrom = b4a.from
+  b4a.from = (...args) => {
+    if (args[0] === packet) throw new Error('allocation failed')
+    return failedFrom(...args)
+  }
+  try {
+    observer.socket.emit('message', packet, source)
+  } finally {
+    b4a.from = failedFrom
+  }
+  await settles()
+  observer.socket.emit('message', packet, source)
+  await settles()
+  t.is(received, 2, 'direct allocation failure releases capacity for the next packet')
+  destroyBootstrapUdxAuthority(authority)
+  await endpoint.close()
 })
