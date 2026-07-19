@@ -148,6 +148,12 @@ class FakeSocket {
     return true
   }
   send(packet, port, host) {
+    if (
+      this.observer &&
+      this.observer.holdSendAt === this.observer.sockets.length &&
+      this.observer.sendHold
+    )
+      return this.observer.sendHold
     if (this.hold) return this.hold
     const peer = this.network.get(`${host}:${port}`)
     if (!peer) return false
@@ -344,6 +350,30 @@ test('UDX test adapter authority is opaque, one-shot, and exact constructor reje
   await endpoint.close()
 })
 
+test('malformed created socket is closed once before endpoint construction fails', (t) => {
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  let closeCalls = 0
+  const authority = issuer.createTestUdxAdapterAuthority(() => ({
+    create() {
+      return {
+        createSocket() {
+          return {
+            bind() {},
+            close() {
+              closeCalls++
+            },
+            on() {}
+          }
+        }
+      }
+    }
+  }))
+  t.exception(() => issuer.createUdxCellEndpointForTest(options('127.0.0.1', 47104, []), authority))
+  t.is(closeCalls, 1)
+  t.exception(() => issuer.createUdxCellEndpointForTest(options('127.0.0.1', 47105, []), authority))
+  t.is(closeCalls, 1)
+})
+
 test('fake UDX endpoint binds exact tuple, drops spoofing, and revokes post-close sends', async (t) => {
   const network = new Map()
   const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
@@ -475,6 +505,47 @@ test('destroying an unconsumed production guard lease closes its original owner 
   fixture.links.right.directory.destroy()
 })
 
+test('bootstrap authority destroy waits held native direct ownership before socket close', async (t) => {
+  let releaseNative = null
+  const heldNative = new Promise((resolve) => {
+    releaseNative = resolve
+  })
+  const observer = {}
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const endpoint = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.1', 47123, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(new Map(), heldNative, observer))
+  )
+  await endpoint.bind()
+  const identity = cryptoSuite.keyPair(seed(96))
+  const authority = createBootstrapUdxAuthority({
+    endpoint,
+    configuredEndpoints: [{ host: '127.0.0.2', port: 47124 }],
+    localSecretCapability: createLocalIdentitySecretCapability({
+      localIdentity: identity.publicKey,
+      localSecretKey: identity.secretKey
+    }),
+    maxProspectiveGuards: 3,
+    monotonicDeadline: 10_000
+  })
+  bindBootstrapUdxOperation(authority, 10_000, Object.freeze({}))
+  const sending = sendConfigured(authority, 0, b4a.alloc(BOOTSTRAP_SIZE))
+  await settles()
+  t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), {
+    packets: 1,
+    bytes: BOOTSTRAP_SIZE
+  })
+  t.is(destroyBootstrapUdxAuthority(authority), true)
+  const closing = endpoint.close()
+  await settles()
+  t.is(observer.socket.closed, false)
+  releaseNative(true)
+  await t.exception(sending)
+  await closing
+  t.is(observer.socket.closed, true)
+  t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), { packets: 0, bytes: 0 })
+})
+
 test('reconnect destroy during owner close and bind failure leave no live socket owner', async (t) => {
   let releaseClose = null
   const closeHold = new Promise((resolve) => {
@@ -510,6 +581,36 @@ test('reconnect destroy during owner close and bind failure leave no live socket
   await failing.right.close()
   failing.links.left.directory.destroy()
   failing.links.right.directory.destroy()
+})
+
+test('reconnect destroy waits held fresh native ownership before closing its socket', async (t) => {
+  let releaseNative = null
+  const sendHold = new Promise((resolve) => {
+    releaseNative = resolve
+  })
+  const fixture = await pinnedMaterialFixture(47135, 47136, {
+    holdSendAt: 2,
+    sendHold
+  })
+  const lease = fixture.issuer.inspectGuardLeaseMaterial(fixture.material)
+  const transport = lease.reconnectTransportFactory()
+  const sending = transport.send('127.0.0.2', 47136, b4a.alloc(BOOTSTRAP_SIZE))
+  while (fixture.leftObserver.sockets.length < 2) await settles()
+  await settles()
+  const freshSocket = fixture.leftObserver.sockets[1]
+  t.is(transport.destroy(), true)
+  t.is(destroyGuardLeaseMaterial(fixture.material), true)
+  await settles()
+  t.is(freshSocket.closed, false)
+  releaseNative(true)
+  await t.exception(sending)
+  await settles()
+  t.is(freshSocket.closed, true)
+  t.is(freshSocket.closeCalls, 1)
+  await fixture.rightSession.close()
+  await fixture.right.close()
+  fixture.links.left.directory.destroy()
+  fixture.links.right.directory.destroy()
 })
 
 test('bootstrap UDX authority consumes identity secret and revokes every direct send before pin', async (t) => {

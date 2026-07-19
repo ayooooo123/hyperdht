@@ -15,6 +15,7 @@ const {
   createOpenCircuitDirectionCapability,
   createLinkControlBoundary,
   readLinkControlStreamProgress,
+  TEST_ONLY_LINK_CIRCUIT_TEARDOWN_OBSERVER,
   TEST_ONLY_LINK_CONTROL_SESSION_OBSERVER
 } = require('../../lib/private/link-control-session')
 
@@ -299,11 +300,100 @@ test('control session fails closed at counter exhaustion and arms exact five-sec
   })
   t.is(teardown.add(capability), true)
   t.is(teardown.fail(destroying.link, DIRECTION.FORWARD), true)
+  t.is(teardown.fail(destroying.link, DIRECTION.FORWARD), true)
+  t.is(
+    destroying.time.scheduled.filter((delay) => delay === LINK_CIRCUIT_TEARDOWN_TIMEOUT).length,
+    1,
+    'repeat fail does not replace the armed teardown timer'
+  )
   t.ok(destroying.time.scheduled.includes(LINK_CIRCUIT_TEARDOWN_TIMEOUT))
   t.is(LINK_CIRCUIT_TEARDOWN_TIMEOUT, 5000)
   settleDestroy(true)
   await Promise.resolve()
   await teardown.close()
+  t.alike(teardown[TEST_ONLY_LINK_CIRCUIT_TEARDOWN_OBSERVER](), {
+    records: 0,
+    timers: 0,
+    retainedCallbacks: 0,
+    closed: true
+  })
+  destroying.boundary.destroy()
+})
+
+test('throwing timer cancellation cannot retain ACK or circuit teardown state', async (t) => {
+  let ackTime = null
+  const acknowledging = fixture({
+    cancel(id) {
+      ackTime.cancel(id)
+      throw new Error('injected ACK cancel failure')
+    }
+  })
+  ackTime = acknowledging.time
+  acknowledging.session.trackStream(DIRECTION.FORWARD, 1n, 0n, 4)
+  t.is(
+    acknowledging.session.receiveAuthenticated(
+      acknowledging.event({
+        class: CELL_CLASS.CONTROL,
+        direction: DIRECTION.REVERSE,
+        generation: 0n,
+        counter: 0n,
+        payload: ackPacket(acknowledging.circuitId, 1n, 0n)
+      })
+    ),
+    true
+  )
+  t.alike(readLinkControlStreamProgress(acknowledging.session, DIRECTION.FORWARD, 1n), {
+    highestSent: 0n,
+    highestAck: 0n,
+    pendingStreams: 0,
+    pendingBytes: 0
+  })
+  acknowledging.session.close()
+  t.is(acknowledging.time.pending(), 0)
+  t.alike(acknowledging.session[TEST_ONLY_LINK_CONTROL_SESSION_OBSERVER](), {
+    retainedReferences: 0,
+    streams: 0,
+    inboundStreams: 0,
+    pendingSends: 0,
+    closed: true
+  })
+  acknowledging.boundary.destroy()
+
+  let settleDestroy = null
+  const destroying = fixture({
+    sendControl() {
+      return new Promise((resolve) => {
+        settleDestroy = resolve
+      })
+    }
+  })
+  const teardown = new LinkCircuitTeardown({
+    now: destroying.time.now,
+    schedule: destroying.time.schedule,
+    cancel(id) {
+      destroying.time.cancel(id)
+      throw new Error('injected teardown cancel failure')
+    }
+  })
+  teardown.add(
+    createOpenCircuitDirectionCapability({
+      link: destroying.link,
+      direction: DIRECTION.FORWARD,
+      session: destroying.session
+    })
+  )
+  teardown.fail(destroying.link, DIRECTION.FORWARD)
+  settleDestroy(true)
+  await Promise.resolve()
+  await Promise.resolve()
+  await teardown.close()
+  t.is(destroying.time.pending(), 0)
+  t.alike(teardown[TEST_ONLY_LINK_CIRCUIT_TEARDOWN_OBSERVER](), {
+    records: 0,
+    timers: 0,
+    retainedCallbacks: 0,
+    closed: true
+  })
   destroying.boundary.destroy()
 })
 
