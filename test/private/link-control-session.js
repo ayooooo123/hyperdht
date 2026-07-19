@@ -4,7 +4,7 @@ const test = require('brittle')
 const b4a = require('b4a')
 
 const { PrivateRouteError } = require('../../lib/private/errors')
-const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
+const { CELL_CLASS, DIRECTION, PROTOCOL_VERSION } = require('../../lib/private/protocol')
 const {
   LINK_PING_AFTER,
   LINK_CIRCUIT_TEARDOWN_TIMEOUT,
@@ -14,7 +14,8 @@ const {
   LinkControlSession,
   createOpenCircuitDirectionCapability,
   createLinkControlBoundary,
-  readLinkControlStreamProgress
+  readLinkControlStreamProgress,
+  TEST_ONLY_LINK_CONTROL_SESSION_OBSERVER
 } = require('../../lib/private/link-control-session')
 
 // Adapted from the reviewed private-routes prototype at commit
@@ -111,6 +112,26 @@ function expectCode(t, operation, expected) {
   t.is(error && error.code, expected)
 }
 
+function writeU64(buffer, value, offset) {
+  for (let index = offset + 7; index >= offset; index--) {
+    buffer[index] = Number(value & 0xffn)
+    value >>= 8n
+  }
+}
+
+function ackPacket(circuitId, generation, counter) {
+  const packet = b4a.alloc(45)
+  packet[0] = 0
+  packet[1] = PROTOCOL_VERSION
+  packet[2] = 2
+  packet[3] = 0
+  packet[4] = DIRECTION.REVERSE
+  b4a.copy(circuitId, packet, 5)
+  writeU64(packet, generation, 21)
+  writeU64(packet, counter, 29)
+  return packet
+}
+
 test('control session enforces STREAM order and drops authenticated DATAGRAM replay', (t) => {
   const f = fixture()
   const streams = []
@@ -162,6 +183,67 @@ test('control session bounds ACK state and exposes generation progress', (t) => 
   t.ok(f.session.closed)
 })
 
+test('control session accepts exact cumulative ACK once and rejects replay or malformed padding', (t) => {
+  const accepted = fixture()
+  accepted.session.trackStream(DIRECTION.FORWARD, 1n, 0n, 4)
+  accepted.session.trackStream(DIRECTION.FORWARD, 1n, 1n, 6)
+  t.is(
+    accepted.session.receiveAuthenticated(
+      accepted.event({
+        class: CELL_CLASS.CONTROL,
+        direction: DIRECTION.REVERSE,
+        generation: 0n,
+        counter: 0n,
+        payload: ackPacket(accepted.circuitId, 1n, 1n)
+      })
+    ),
+    true
+  )
+  t.alike(readLinkControlStreamProgress(accepted.session, DIRECTION.FORWARD, 1n), {
+    highestSent: 1n,
+    highestAck: 1n,
+    pendingStreams: 0,
+    pendingBytes: 0
+  })
+  expectCode(
+    t,
+    () =>
+      accepted.session.receiveAuthenticated(
+        accepted.event({
+          class: CELL_CLASS.CONTROL,
+          direction: DIRECTION.REVERSE,
+          generation: 0n,
+          counter: 1n,
+          payload: ackPacket(accepted.circuitId, 1n, 1n)
+        })
+      ),
+    'ROUTE_UNAVAILABLE'
+  )
+  t.is(accepted.session.closed, true)
+  accepted.boundary.destroy()
+
+  const malformed = fixture()
+  malformed.session.trackStream(DIRECTION.FORWARD, 1n, 0n, 1)
+  const packet = ackPacket(malformed.circuitId, 1n, 0n)
+  packet[37] = 1
+  expectCode(
+    t,
+    () =>
+      malformed.session.receiveAuthenticated(
+        malformed.event({
+          class: CELL_CLASS.CONTROL,
+          direction: DIRECTION.REVERSE,
+          generation: 0n,
+          counter: 0n,
+          payload: packet
+        })
+      ),
+    'INVALID_ROUTE'
+  )
+  t.is(malformed.session.closed, true)
+  malformed.boundary.destroy()
+})
+
 test('control session pings at 500ms, closes at 1500ms, and clears timers', async (t) => {
   const f = fixture()
   t.is(LINK_PING_AFTER, 500)
@@ -177,6 +259,13 @@ test('control session pings at 500ms, closes at 1500ms, and clears timers', asyn
   t.is(f.session.closed, true)
   t.is(f.closed(), 1)
   t.is(f.time.pending(), 0)
+  t.alike(f.session[TEST_ONLY_LINK_CONTROL_SESSION_OBSERVER](), {
+    retainedReferences: 0,
+    streams: 0,
+    inboundStreams: 0,
+    pendingSends: 0,
+    closed: true
+  })
   f.boundary.destroy()
 })
 
@@ -216,4 +305,36 @@ test('control session fails closed at counter exhaustion and arms exact five-sec
   await Promise.resolve()
   await teardown.close()
   destroying.boundary.destroy()
+})
+
+test('control close rejects and clears a pending authenticated send before releasing callbacks', async (t) => {
+  let settle
+  let owned = null
+  const pending = new Promise((resolve) => {
+    settle = resolve
+  })
+  const f = fixture({
+    sendControl(packet) {
+      owned = packet
+      return pending
+    }
+  })
+  const destroying = f.session.destroy()
+  t.is(f.session.pendingSends, 1)
+  t.is(f.session.close(), true)
+  t.is(f.session.pendingSends, 0)
+  t.ok(
+    owned.every((byte) => byte === 0),
+    'pending authenticated control bytes are zeroed'
+  )
+  t.alike(f.session[TEST_ONLY_LINK_CONTROL_SESSION_OBSERVER](), {
+    retainedReferences: 0,
+    streams: 0,
+    inboundStreams: 0,
+    pendingSends: 0,
+    closed: true
+  })
+  settle(true)
+  await t.exception(destroying)
+  f.boundary.destroy()
 })

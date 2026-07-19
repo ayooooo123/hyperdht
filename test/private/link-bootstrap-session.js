@@ -8,7 +8,8 @@ const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { createLinkSetupAuthority } = require('../../lib/private/link-setup')
 const {
   LinkBootstrapSession,
-  readEstablishedLink
+  readEstablishedLink,
+  TEST_ONLY_LINK_BOOTSTRAP_SESSION_OBSERVER
 } = require('../../lib/private/link-bootstrap-session')
 const {
   LINK_OPERATION,
@@ -40,6 +41,27 @@ function roleIdentity(role, start) {
 function sequence(first) {
   let value = first
   return (size) => b4a.alloc(size, value++)
+}
+
+function abortController() {
+  const listeners = new Set()
+  const signal = {
+    aborted: false,
+    addEventListener(name, listener) {
+      if (name === 'abort') listeners.add(listener)
+    },
+    removeEventListener(name, listener) {
+      if (name === 'abort') listeners.delete(listener)
+    }
+  }
+  return {
+    signal,
+    abort() {
+      if (signal.aborted) return
+      signal.aborted = true
+      for (const listener of Array.from(listeners)) listener()
+    }
+  }
 }
 
 function clock(start) {
@@ -105,7 +127,13 @@ function directory({ local, peer, localRole, peerRole, operation, authority, gra
   }
 }
 
-function fixture({ start = 0, absoluteDeadline = 10_000, drop = false } = {}) {
+function fixture({
+  start = 0,
+  absoluteDeadline = 10_000,
+  signedExpiry = 60_000,
+  drop = false,
+  dropFirstRight = false
+} = {}) {
   const time = clock(start)
   const authority = cryptoSuite.keyPair(seed(250))
   const initiator = cryptoSuite.keyPair(seed(251))
@@ -168,6 +196,8 @@ function fixture({ start = 0, absoluteDeadline = 10_000, drop = false } = {}) {
     expiresAt
   }
   const leftPackets = []
+  const rightPackets = []
+  let rightSends = 0
   let leftSession = null
   let rightSession = null
   const leftHandle = Object.freeze({})
@@ -176,9 +206,15 @@ function fixture({ start = 0, absoluteDeadline = 10_000, drop = false } = {}) {
     send(handle, packet, options = {}) {
       if (options[UDX_SEND_DISPATCH]) options[UDX_SEND_DISPATCH]()
       if (side === 'left') leftPackets.push(b4a.from(packet))
-      if (!drop) {
+      else {
+        rightPackets.push(b4a.from(packet))
+        rightSends++
+      }
+      const selectedDrop = drop || (side === 'right' && dropFirstRight && rightSends === 1)
+      if (!selectedDrop) {
         const peer = side === 'left' ? rightSession : leftSession
-        queueMicrotask(() => void peer.receive(b4a.from(packet)))
+        const owned = b4a.from(packet)
+        queueMicrotask(() => void peer.receive(owned))
       }
       return Promise.resolve(true)
     },
@@ -190,7 +226,7 @@ function fixture({ start = 0, absoluteDeadline = 10_000, drop = false } = {}) {
     schedule: time.schedule,
     cancel: time.cancel,
     absoluteDeadline,
-    signedExpiry: Number(expiresAt)
+    signedExpiry
   }
   leftSession = new LinkBootstrapSession({
     ...sessionOptions,
@@ -230,7 +266,7 @@ function fixture({ start = 0, absoluteDeadline = 10_000, drop = false } = {}) {
     },
     randomBytes: sequence(11)
   })
-  return { time, leftSession, rightSession, leftPackets, left, right }
+  return { time, leftSession, rightSession, leftPackets, rightPackets, left, right }
 }
 
 test('link bootstrap opens once and installs an opaque established link', async (t) => {
@@ -243,6 +279,18 @@ test('link bootstrap opens once and installs an opaque established link', async 
   t.ok(readEstablishedLink(established))
   await f.leftSession.close()
   await f.rightSession.close()
+  t.alike(f.leftSession[TEST_ONLY_LINK_BOOTSTRAP_SESSION_OBSERVER](), {
+    retainedReferences: 0,
+    cancelSends: 0,
+    closed: true,
+    state: 'TOMBSTONE'
+  })
+  t.alike(f.rightSession[TEST_ONLY_LINK_BOOTSTRAP_SESSION_OBSERVER](), {
+    retainedReferences: 0,
+    cancelSends: 0,
+    closed: true,
+    state: 'TOMBSTONE'
+  })
   f.left.value.destroy()
   f.right.value.destroy()
 })
@@ -269,6 +317,69 @@ test('link CREATE retries semantic bytes within inherited remaining deadline', a
   t.is(f.time.pending(), 1)
   await f.leftSession.close()
   t.is(f.time.pending(), 0)
+  await f.rightSession.close()
+  f.left.value.destroy()
+  f.right.value.destroy()
+})
+
+test('link CREATED is cached byte-for-byte and recovered by an exact CREATE retry', async (t) => {
+  const f = fixture({ dropFirstRight: true })
+  const opening = f.leftSession.open()
+  await Promise.resolve()
+  await Promise.resolve()
+  t.is(f.rightSession.state, 'OPEN')
+  t.is(f.leftSession.state, 'CREATING')
+  t.is(f.rightPackets.length, 1)
+  f.time.advance(250)
+  const established = await opening
+  t.ok(readEstablishedLink(established))
+  t.is(f.leftSession.state, 'OPEN')
+  t.is(f.rightPackets.length, 2)
+  t.alike(f.rightPackets[1], f.rightPackets[0])
+  await f.leftSession.close()
+  await f.rightSession.close()
+  f.left.value.destroy()
+  f.right.value.destroy()
+})
+
+test('link bootstrap takes the earliest signed expiry and exact ten-second deadline', async (t) => {
+  for (const [name, options, remaining] of [
+    ['signed expiry', { start: 3_500, absoluteDeadline: 20_000, signedExpiry: 4_000 }, 500],
+    ['ten-second cap', { start: 0, absoluteDeadline: 20_000, signedExpiry: 60_000 }, 10_000]
+  ]) {
+    const f = fixture({ ...options, drop: true })
+    const opening = f.leftSession.open()
+    await Promise.resolve()
+    f.time.advance(remaining - 1)
+    t.is(f.leftSession.state, 'CREATING', `${name} remains live one millisecond before expiry`)
+    f.time.advance(1)
+    let error = null
+    try {
+      await opening
+    } catch (err) {
+      error = err
+    }
+    t.is(error && error.code, 'ROUTE_UNAVAILABLE', `${name} fails at its exact bound`)
+    t.is(f.leftSession.state, 'TOMBSTONE')
+    await f.leftSession.close()
+    await f.rightSession.close()
+    f.left.value.destroy()
+    f.right.value.destroy()
+  }
+})
+
+test('abort after CREATE dispatch sends authenticated cancellation and tombstones both sides', async (t) => {
+  const f = fixture()
+  const controller = abortController()
+  const opening = f.leftSession.open({ signal: controller.signal })
+  controller.abort()
+  await t.exception(opening)
+  await Promise.resolve()
+  await Promise.resolve()
+  t.is(f.leftSession.state, 'TOMBSTONE')
+  t.is(f.rightSession.state, 'TOMBSTONE')
+  t.ok(f.leftPackets.length >= 2, 'CREATE and LINK_CANCEL crossed the endpoint')
+  await f.leftSession.close()
   await f.rightSession.close()
   f.left.value.destroy()
   f.right.value.destroy()

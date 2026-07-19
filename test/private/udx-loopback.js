@@ -3,9 +3,12 @@
 const test = require('brittle')
 const b4a = require('b4a')
 
-const { BOOTSTRAP_CLASS, BOOTSTRAP_SIZE } = require('../../lib/private/bootstrap-envelope')
+const { BootstrapEnvelopeCodec } = require('../../lib/private/bootstrap-envelope')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
+const { createLinkSetupAuthority } = require('../../lib/private/link-setup')
 const {
+  CELL_CLASS,
+  DIRECTION,
   LINK_OPERATION,
   PROTOCOL_VERSION,
   ROLE,
@@ -14,7 +17,8 @@ const {
 } = require('../../lib/private/protocol')
 const { LinkDirectory, signTopologyGrant } = require('../../lib/private/topology-grant')
 const { selectUdxLoopbackHosts } = require('../../lib/private/udx-adapter')
-const { UdxCellEndpoint } = require('../../lib/private/udx-cell-endpoint')
+const endpointModule = require('../../lib/private/udx-cell-endpoint')
+const { TEST_ONLY_UDX_ADAPTER_ISSUER, UdxCellEndpoint } = endpointModule
 
 // Adapted from the reviewed private-routes prototype at commit
 // 0305df915b6a767093f9e75e6c06bc0a35da6169 and narrowed to Gate 3B1.
@@ -89,25 +93,37 @@ function handles(hostA, portA, hostB, portB) {
   }
   return {
     left: make(a, b, TOPOLOGY_ROLE.SOURCE, TOPOLOGY_ROLE.SAFETY_GUARD, LINK_OPERATION.INITIATE),
-    right: make(b, a, TOPOLOGY_ROLE.SAFETY_GUARD, TOPOLOGY_ROLE.SOURCE, LINK_OPERATION.ACCEPT)
+    right: make(b, a, TOPOLOGY_ROLE.SAFETY_GUARD, TOPOLOGY_ROLE.SOURCE, LINK_OPERATION.ACCEPT),
+    a,
+    b
   }
 }
 
-test('default UdxAdapter sends one reserved native bootstrap packet on loopback', async (t) => {
+function sequence(first) {
+  let value = first
+  return (size) => b4a.alloc(size, value++)
+}
+
+test('default UdxAdapter completes link bootstrap and established cells on loopback', async (t) => {
   const platform = global.Bare ? Bare.platform : process.platform
   const [leftHost, rightHost] = selectUdxLoopbackHosts({ platform })
   const processId = global.Bare ? 211 : process.pid
   const leftPort = 48_000 + (processId % 1_000) * 2
   const rightPort = leftPort + 1
   const pair = handles(leftHost, leftPort, rightHost, rightPort)
-  let resolveReceived
-  const received = new Promise((resolve) => {
-    resolveReceived = resolve
+  let leftSession = null
+  let rightSession = null
+  const received = []
+  let resolveCells
+  const cells = new Promise((resolve) => {
+    resolveCells = resolve
   })
   const left = new UdxCellEndpoint({
     host: leftHost,
     port: leftPort,
-    onBootstrap() {},
+    onBootstrap(packet) {
+      if (leftSession) void leftSession.receive(packet)
+    },
     onCell() {},
     onLinkFailure() {}
   })
@@ -115,9 +131,13 @@ test('default UdxAdapter sends one reserved native bootstrap packet on loopback'
     host: rightHost,
     port: rightPort,
     onBootstrap(packet) {
-      resolveReceived(b4a.from(packet))
+      if (rightSession) void rightSession.receive(packet)
     },
-    onCell() {},
+    onCell(packet, handle, metadata) {
+      received.push({ packet: b4a.from(packet), metadata })
+      if (received.length === 2) resolveCells(true)
+      return true
+    },
     onLinkFailure() {}
   })
   t.teardown(async () => {
@@ -128,12 +148,87 @@ test('default UdxAdapter sends one reserved native bootstrap packet on loopback'
   })
   await left.bind()
   await right.bind()
-  const send = left.openLink(pair.left.handle)
-  right.openLink(pair.right.handle)
-  const packet = b4a.alloc(BOOTSTRAP_SIZE, 0x5a)
-  packet[0] = 0
-  packet[1] = BOOTSTRAP_CLASS
-  t.is(await left.send(send, packet), true)
+  const started = Date.now()
+  const now = () => Date.now() - started
+  const responderStatic = cryptoSuite.encryptionKeyPair(seed(124))
+  const common = {
+    circuitId: b4a.alloc(16, 0x51),
+    epoch: 8n,
+    initiatorIdentity: pair.a.publicKey,
+    responderIdentity: pair.b.publicKey,
+    initiatorLocalId: b4a.alloc(16, 0x52),
+    responderLocalId: b4a.alloc(16, 0x53),
+    expiresAt: 60_000n
+  }
+  leftSession = left.openLink(pair.left.handle, {
+    mode: 'initiate',
+    codec: new BootstrapEnvelopeCodec({
+      linkHandle: pair.left.handle,
+      localIdentitySecretKey: pair.a.secretKey,
+      padding: sequence(0x81)
+    }),
+    linkSetup: createLinkSetupAuthority({ now, randomBytes: sequence(0x61) }),
+    setup: {
+      ...common,
+      responderStaticKey: responderStatic.publicKey,
+      initiatorIdentitySecretKey: pair.a.secretKey
+    },
+    now,
+    schedule: setTimeout,
+    cancel: clearTimeout,
+    randomBytes: sequence(1),
+    absoluteDeadline: 10_000,
+    signedExpiry: 60_000
+  })
+  rightSession = right.openLink(pair.right.handle, {
+    mode: 'accept',
+    codec: new BootstrapEnvelopeCodec({
+      linkHandle: pair.right.handle,
+      localIdentitySecretKey: pair.b.secretKey,
+      padding: sequence(0x91)
+    }),
+    linkSetup: createLinkSetupAuthority({ now, randomBytes: sequence(0x71) }),
+    setup: {
+      ...common,
+      responderStaticSecretKey: responderStatic.secretKey,
+      responderIdentitySecretKey: pair.b.secretKey
+    },
+    now,
+    schedule: setTimeout,
+    cancel: clearTimeout,
+    randomBytes: sequence(11),
+    absoluteDeadline: 10_000,
+    signedExpiry: 60_000
+  })
+  const established = await leftSession.open()
+  t.is(leftSession.state, 'OPEN')
+  t.is(rightSession.state, 'OPEN')
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  t.is(
+    await issuer.sendEstablishedForTest(left, established, {
+      class: CELL_CLASS.STREAM,
+      direction: DIRECTION.FORWARD,
+      generation: 1n,
+      payload: b4a.from('native-stream')
+    }),
+    true
+  )
+  t.is(
+    await issuer.sendEstablishedForTest(left, established, {
+      class: CELL_CLASS.DATAGRAM,
+      direction: DIRECTION.FORWARD,
+      generation: 1n,
+      payload: b4a.from('native-datagram')
+    }),
+    true
+  )
   const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 2_000))
-  t.alike(await Promise.race([received, timeout]), packet)
+  t.is(await Promise.race([cells, timeout]), true)
+  t.alike(
+    received.map((value) => [value.metadata.class, b4a.toString(value.packet)]),
+    [
+      [CELL_CLASS.STREAM, 'native-stream'],
+      [CELL_CLASS.DATAGRAM, 'native-datagram']
+    ]
+  )
 })

@@ -26,7 +26,8 @@ const {
 } = require('../../lib/private/relay-capability')
 const {
   createRelayCandidateDirectorySink,
-  kInspectRelayCandidateDirectory
+  kInspectRelayCandidateDirectory,
+  revokeRelayCandidateDirectorySink
 } = require('../../lib/private/relay-candidate-directory')
 const {
   TEST_ONLY_BOOTSTRAP_IO_OBSERVER,
@@ -34,6 +35,8 @@ const {
   consumeBootstrapGuardPin,
   revokeBootstrapGuardPin
 } = require('../../lib/private/bootstrap-io')
+const endpointModule = require('../../lib/private/udx-cell-endpoint')
+const { TEST_ONLY_UDX_ADAPTER_ISSUER } = endpointModule
 
 const NOW = 1_000n
 const seed = (value) => b4a.alloc(32, value)
@@ -371,6 +374,14 @@ function fixture(options = {}) {
     }
   }
   let io = null
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const datagramAuthority = issuer.createTestBootstrapUdxAuthority({
+    configuredEndpoints: configured,
+    localIdentity: local.publicKey,
+    localSecretKey: local.secretKey,
+    send: datagrams.send.bind(datagrams),
+    destroy: datagrams.destroy.bind(datagrams)
+  })
   const sink = createRelayCandidateDirectorySink({
     wallNow() {
       if (options.onSinkWall) options.onSinkWall({ io, clock })
@@ -385,7 +396,7 @@ function fixture(options = {}) {
     endpoints: configured,
     localIdentity: local.publicKey,
     localSecretKey: local.secretKey,
-    datagrams,
+    datagrams: datagramAuthority,
     wallNow: clock.wallNow,
     monotonicNow: clock.monotonicNow,
     randomBytes(size) {
@@ -442,6 +453,35 @@ test('BootstrapIO exposes only the narrowed cold-start lifecycle', (t) => {
     'destroy',
     'start'
   ])
+})
+
+test('BootstrapIO rejects a generic datagram send and destroy object', (t) => {
+  const local = cryptoSuite.keyPair(seed(201))
+  const sink = createRelayCandidateDirectorySink({
+    wallNow: () => NOW,
+    monotonicNow: () => 0n
+  })
+  expectCode(
+    t,
+    () =>
+      new BootstrapIO({
+        endpoints: [endpoint('192.0.2.41', 49731)],
+        localIdentity: local.publicKey,
+        localSecretKey: local.secretKey,
+        datagrams: { send() {}, destroy() {} },
+        wallNow: () => NOW,
+        monotonicNow: () => 0n,
+        randomBytes: (size) => b4a.alloc(size),
+        candidateDirectorySink: sink
+      }),
+    'INVALID_ROUTE'
+  )
+  revokeRelayCandidateDirectorySink(sink)
+})
+
+test('Task4 fake transport is admitted only through the nonforgeable authority issuer', (t) => {
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  t.is(typeof issuer.createTestBootstrapUdxAuthority, 'function')
 })
 
 test('numeric configured endpoints are owned, deduplicated, and bounded to three', (t) => {
