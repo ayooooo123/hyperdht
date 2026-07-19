@@ -85,12 +85,16 @@ function trackedRelayCapability(cryptoOverrides = null) {
   let tracking = false
   let failingSize = null
   let failingAllocation = null
+  let failingAllocationHook = null
   let allocationCount = 0
   let failAfterConcat = false
   const allocate = (size) => {
     if (tracking) allocationCount++
     if (tracking && allocationCount === failingAllocation) {
       failingAllocation = null
+      const hook = failingAllocationHook
+      failingAllocationHook = null
+      if (hook !== null) hook()
       throw new Error('injected allocation failure')
     }
     if (tracking && size === failingSize) {
@@ -143,12 +147,14 @@ function trackedRelayCapability(cryptoOverrides = null) {
       allocations.length = 0
       failingSize = null
       failingAllocation = null
+      failingAllocationHook = null
       allocationCount = 0
       failAfterConcat = false
       tracking = true
     },
-    failAllocationAt(position) {
+    failAllocationAt(position, hook = null) {
       failingAllocation = position
+      failingAllocationHook = hook
     },
     failNextAllocation() {
       failingAllocation = allocationCount + 1
@@ -163,6 +169,7 @@ function trackedRelayCapability(cryptoOverrides = null) {
       tracking = false
       failingSize = null
       failingAllocation = null
+      failingAllocationHook = null
       allocationCount = 0
       failAfterConcat = false
       return allocations.splice(0)
@@ -173,6 +180,7 @@ function trackedRelayCapability(cryptoOverrides = null) {
       tracking = false
       failingSize = null
       failingAllocation = null
+      failingAllocationHook = null
       allocationCount = 0
       failAfterConcat = false
       b4a.allocUnsafeSlow = originalB4a
@@ -885,6 +893,116 @@ test('same-epoch equivocation stays revoked and quarantined when timer cleanup r
   t.alike(fixture.encoded, fixtureSnapshot)
   t.alike(conflict.encoded, conflictSnapshot)
   owner.destroy()
+})
+
+test('same-epoch history-key copy failure revokes before allocation and preserves quarantine', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fake = clock()
+  const fixture = signedAdvertisement({ routeSeed: 104, expiresAtMs: NOW + 60_000n })
+  const conflict = signedAdvertisement({
+    routeSeed: 105,
+    maxQueuedBytes: 262_145,
+    expiresAtMs: NOW + 90_000n
+  })
+  const successor = signedAdvertisement({
+    epoch: fixture.signed.epoch + 1n,
+    routeSeed: 105,
+    issuedAtMs: NOW,
+    expiresAtMs: NOW + 120_000n
+  })
+  const fixtureSnapshot = b4a.from(fixture.encoded)
+  const conflictSnapshot = b4a.from(conflict.encoded)
+  const successorSnapshot = b4a.from(successor.encoded)
+  const createOwner = (timer, onInvalidated = () => {}) =>
+    new tracked.fresh.RelayCapabilityVerifier({
+      wallNow: timer.wallNow,
+      monotonicNow: timer.monotonicNow,
+      setTimer: timer.setTimer,
+      clearTimer: timer.clearTimer,
+      onInvalidated
+    })
+
+  const profileClock = clock()
+  const profileOwner = createOwner(profileClock)
+  acceptSafety(profileOwner, fixture)
+  tracked.start()
+  expectCode(t, () => acceptSafety(profileOwner, conflict), 'ERR_AUTHENTICATION')
+  const profiledAllocations = tracked.take()
+  const historyKeyAllocations = profiledAllocations.filter((allocation) =>
+    b4a.equals(allocation, conflict.route.publicKey)
+  )
+  t.is(historyKeyAllocations.length, 1, 'profile isolates the retained history-key copy')
+  const historyKeyAllocation = profiledAllocations.indexOf(historyKeyAllocations[0]) + 1
+  t.ok(historyKeyAllocation > 0)
+  profileOwner.destroy()
+
+  let invalidations = 0
+  const owner = createOwner(fake, () => invalidations++)
+  const prior = acceptSafety(owner, fixture)
+  const priorDigest = b4a.from(prior.digest)
+  const priorIdentity = b4a.from(prior.identity)
+  const sensitive = [
+    prior.canonicalBytes,
+    prior.digest,
+    prior.identity,
+    prior.canonicalEndpointBytes,
+    prior.routePublicKey
+  ]
+  let reentrantProjection = null
+  let reentrantError = null
+  tracked.start()
+  tracked.failAllocationAt(historyKeyAllocation, () => {
+    try {
+      reentrantProjection = acceptSafety(owner, fixture)
+    } catch (err) {
+      reentrantError = err
+    }
+  })
+  expectCode(t, () => acceptSafety(owner, conflict), 'ERR_AUTHENTICATION')
+  const failedAllocations = tracked.take()
+
+  t.is(reentrantProjection, null, 'allocation reentry cannot select the revoked record')
+  t.ok(reentrantError instanceof PrivateRouteError)
+  t.is(reentrantError && reentrantError.code, 'ERR_AUTHENTICATION')
+  for (const buffer of sensitive) t.alike(buffer, b4a.alloc(buffer.byteLength))
+  for (const buffer of failedAllocations) {
+    t.alike(buffer, b4a.alloc(buffer.byteLength), 'failed equivocation clears owned bytes')
+  }
+  t.is(fake.pending(), 0, 'failed equivocation retains no record or replacement timer')
+  t.is(invalidations, 0)
+  expectCode(t, () => acceptSafety(owner, fixture), 'ERR_AUTHENTICATION')
+  expectCode(
+    t,
+    () =>
+      tracked.fresh.createActiveChallengeSendAuthority({
+        capsBinding: {
+          advertisement: prior,
+          sourceEndpoint: endpoint(227),
+          queryNonce: seed(150),
+          cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+          returnRoutabilityCookie: seed(151),
+          advertisementDigest: priorDigest,
+          relayIdentity: priorIdentity
+        },
+        send() {
+          throw new Error('revoked projection must not send')
+        }
+      }),
+    'ERR_AUTHENTICATION'
+  )
+
+  fake.jumpWall(89_999)
+  expectCode(t, () => acceptSafety(owner, successor), 'ERR_AUTHENTICATION')
+  fake.jumpWall(1)
+  const replacement = acceptSafety(owner, successor)
+  t.is(replacement.epoch, successor.signed.epoch)
+  t.is(fake.pending(), 1, 'no partial history blocks the first post-quarantine replacement')
+  t.alike(fixture.encoded, fixtureSnapshot)
+  t.alike(conflict.encoded, conflictSnapshot)
+  t.alike(successor.encoded, successorSnapshot)
+  owner.destroy()
+  t.is(fake.pending(), 0)
 })
 
 test('newer relay epochs replace prior state when timer cleanup reenters and throws', (t) => {
