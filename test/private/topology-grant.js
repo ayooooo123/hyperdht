@@ -39,6 +39,46 @@ function expectCode(t, fn, code) {
   if (error) t.is(error.code, code)
 }
 
+function captureCopies(operation) {
+  const original = b4a.from
+  const allocations = []
+  let result = null
+  let error = null
+  b4a.from = (...arguments_) => {
+    const value = original(...arguments_)
+    allocations.push(value)
+    return value
+  }
+  try {
+    result = operation()
+  } catch (err) {
+    error = err
+  } finally {
+    b4a.from = original
+  }
+  return { allocations, error, result }
+}
+
+function retainedGrantCopies(allocations, encodingSize) {
+  let encodingIndex = -1
+  for (let index = allocations.length - 1; index >= 0; index--) {
+    if (allocations[index].byteLength === encodingSize) {
+      encodingIndex = index
+      break
+    }
+  }
+  if (encodingIndex < 1) return []
+  return [
+    allocations[encodingIndex - 1],
+    allocations[encodingIndex],
+    ...allocations.slice(encodingIndex + 1, encodingIndex + 5)
+  ]
+}
+
+function allZero(buffers) {
+  return buffers.every((buffer) => buffer.every((byte) => byte === 0))
+}
+
 function privateRoleIdentity(start = 1) {
   for (let value = start; value < 256; value++) {
     const pair = cryptoSuite.keyPair(seed(value))
@@ -949,6 +989,154 @@ test('a synchronous schedule failure rolls add back and returns a sanitized rout
     timers: 1,
     destroyed: false
   })
+  directory.destroy()
+})
+
+test('expiry arming cannot publish after a synchronous callback, revoke, destroy, or throw', (t) => {
+  for (const mode of ['callback', 'revoke', 'destroy', 'throw']) {
+    const fixture = signedFixture()
+    let now = 100n
+    let directory = null
+    const cancelled = []
+    const digest32 = cryptoSuite.hash(fixture.signed)
+    const clock = {
+      now: () => now,
+      schedule(callback) {
+        if (mode === 'callback') {
+          now = 200n
+          callback()
+        } else if (mode === 'revoke') {
+          directory.revoke({
+            digest32,
+            epoch: fixture.grant.epoch,
+            runId32: fixture.grant.runId32
+          })
+        } else if (mode === 'destroy') {
+          directory.destroy()
+        } else {
+          throw new Error('sensitive scheduler failure')
+        }
+        return 41
+      },
+      cancel(id) {
+        cancelled.push(id)
+      }
+    }
+    directory = new LinkDirectory(directoryOptions(fixture, clock))
+
+    const captured = captureCopies(() => directory.add(fixture.signed))
+    t.ok(captured.error instanceof routes.PrivateRouteError, mode)
+    if (captured.error) {
+      t.is(captured.error.code, 'ROUTE_UNAVAILABLE', mode)
+      t.is(captured.error.message.includes('sensitive'), false, mode)
+    }
+    const retained = retainedGrantCopies(captured.allocations, fixture.signed.byteLength)
+    t.is(retained.length, 6, `${mode} captures every retained grant buffer`)
+    t.ok(allZero(retained), `${mode} clears every retained grant buffer`)
+    if (mode !== 'destroy') directory.destroy()
+    t.alike(cancelled, mode === 'throw' ? [] : [41], `${mode} disposes its staged timer once`)
+  }
+})
+
+test('revoke, expiry, and destroy clear every retained grant and link-handle buffer', (t) => {
+  for (const mode of ['revoke', 'expiry', 'destroy']) {
+    const fixture = signedFixture()
+    const clock = fakeClock()
+    const directory = new LinkDirectory(directoryOptions(fixture, clock))
+    const added = captureCopies(() => directory.add(fixture.signed))
+    t.absent(added.error, mode)
+    const grantCopies = retainedGrantCopies(added.allocations, fixture.signed.byteLength)
+    t.is(grantCopies.length, 6, `${mode} captures every retained grant buffer`)
+
+    const authorized = captureCopies(() =>
+      directory.authorize(authorization(fixture, added.result))
+    )
+    t.absent(authorized.error, mode)
+    t.is(authorized.allocations.length, 4, `${mode} captures every retained handle buffer`)
+
+    if (mode === 'revoke') {
+      directory.revoke({
+        digest32: added.result,
+        epoch: fixture.grant.epoch,
+        runId32: fixture.grant.runId32
+      })
+    } else if (mode === 'expiry') {
+      clock.advance(100)
+    } else {
+      directory.destroy()
+    }
+
+    t.ok(allZero(grantCopies), `${mode} clears the retained grant`)
+    t.ok(allZero(authorized.allocations), `${mode} clears the retained handle`)
+    t.not(grantCopies.includes(added.result), `${mode} does not clear the caller digest copy`)
+    if (mode !== 'destroy') directory.destroy()
+  }
+})
+
+test('partial handle construction clears allocations and preserves a retryable grant', (t) => {
+  for (const failureAt of [2, 3, 4]) {
+    const fixture = signedFixture()
+    const clock = fakeClock()
+    const directory = new LinkDirectory(directoryOptions(fixture, clock))
+    const digest32 = directory.add(fixture.signed)
+    const original = b4a.from
+    const allocations = []
+    let position = 0
+    b4a.from = (...arguments_) => {
+      if (++position === failureAt) throw new Error('sensitive allocation failure')
+      const value = original(...arguments_)
+      allocations.push(value)
+      return value
+    }
+    let error = null
+    try {
+      directory.authorize(authorization(fixture, digest32))
+    } catch (err) {
+      error = err
+    } finally {
+      b4a.from = original
+    }
+
+    t.ok(error instanceof routes.PrivateRouteError, `${failureAt}`)
+    if (error) {
+      t.is(error.code, 'ROUTE_UNAVAILABLE', `${failureAt}`)
+      t.is(error.message.includes('sensitive'), false, `${failureAt}`)
+    }
+    t.ok(allocations.length > 0, `${failureAt}`)
+    t.ok(allZero(allocations), `${failureAt}`)
+    const handle = directory.authorize(authorization(fixture, digest32))
+    t.ok(handle, `${failureAt} remains retryable`)
+    directory.destroy()
+  }
+})
+
+test('observer revocation clears and prevents publication of the staged handle', (t) => {
+  const fixture = signedFixture()
+  const clock = fakeClock()
+  let directory = null
+  let digest32 = null
+  let armed = false
+  directory = new LinkDirectory(
+    directoryOptions(fixture, clock, {
+      [TEST_ONLY_LINK_DIRECTORY_OBSERVER](snapshot) {
+        if (!armed || snapshot.handles !== 1) return
+        directory.revoke({
+          digest32,
+          epoch: fixture.grant.epoch,
+          runId32: fixture.grant.runId32
+        })
+      }
+    })
+  )
+  digest32 = directory.add(fixture.signed)
+  armed = true
+
+  const captured = captureCopies(() => directory.authorize(authorization(fixture, digest32)))
+  t.ok(captured.error instanceof routes.PrivateRouteError)
+  if (captured.error) t.is(captured.error.code, 'ROUTE_UNAVAILABLE')
+  t.is(captured.allocations.length, 4)
+  t.ok(allZero(captured.allocations))
+  expectCode(t, () => directory.authorize(authorization(fixture, digest32)), 'UNAUTHORIZED')
   directory.destroy()
 })
 
