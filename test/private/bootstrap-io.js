@@ -159,7 +159,16 @@ function fixture(options = {}) {
     endpoint('198.51.100.42', 49738),
     endpoint('203.0.113.43', 49739)
   ].slice(0, options.configuredCount || 2)
-  const guards = configured.map((value, index) =>
+  const candidateEndpoints = options.singleEndpointGuardCandidates
+    ? [
+        endpoint('198.18.11.51', 49851),
+        endpoint('198.19.12.52', 49852),
+        endpoint('203.0.120.53', 49853)
+      ]
+    : options.incrementalDuplicateEvidence
+      ? [...configured, endpoint('198.18.13.53', 49853)]
+      : configured
+  const guards = candidateEndpoints.map((value, index) =>
     advertisement(ROLE.SAFETY, index + 1, value.host, value.port)
   )
   for (const guard of guards) {
@@ -206,6 +215,16 @@ function fixture(options = {}) {
         ) {
           throw new Error(`injected ${request.kind} failure`)
         }
+        const candidateIndex = guards.findIndex((entry) =>
+          b4a.equals(entry.endpoint, endpointBytes(host, port))
+        )
+        if (
+          request.kind === options.failCandidateAt &&
+          candidateIndex >= 0 &&
+          candidateIndex < options.failCandidateCount
+        ) {
+          throw new Error(`injected candidate ${candidateIndex + 1} ${request.kind} failure`)
+        }
         if (options.strictTask2Caps !== false) {
           const endpointKey = `${host}:${port}`
           let capsResponder = capsResponders.get(endpointKey)
@@ -228,11 +247,15 @@ function fixture(options = {}) {
             }
             const cookie = capsResponder.issueCookie(query)
             if (options.onCapsQueryResponse) options.onCapsQueryResponse()
+            const responseAdvertisements =
+              options.incrementalDuplicateEvidence && host === configured[0].host
+                ? [guards[0]]
+                : advertisements
             let response = Object.freeze({
               sourceEndpoint: query.sourceEndpoint,
               cookieExpiresAtMs: cookie.cookieExpiresAtMs,
               returnRoutabilityCookie: cookie.returnRoutabilityCookie,
-              advertisements: advertisements.map((entry) => entry.bytes)
+              advertisements: responseAdvertisements.map((entry) => entry.bytes)
             })
             if (options.forgeCapsSource) {
               response = Object.freeze({
@@ -368,6 +391,7 @@ function fixture(options = {}) {
     calls,
     clock,
     configured,
+    guards,
     datagrams,
     get destroyed() {
       return destroyed
@@ -548,6 +572,95 @@ test('each failed configured endpoint boundary is cleared before the next endpoi
       if (transfer) revokeBootstrapGuardPin(transfer)
       f.cleanup()
     }
+  }
+})
+
+test('one configured bootstrap exhausts three distinct advertised guards sequentially before pinning', async (t) => {
+  for (const failedKind of ['caps-query', 'caps-retry', 'active-challenge', 'link']) {
+    const f = fixture({
+      configuredCount: 1,
+      singleEndpointGuardCandidates: true,
+      failCandidateAt: failedKind,
+      failCandidateCount: 2
+    })
+    let transfer = null
+    try {
+      transfer = await f.io.start()
+      t.is(f.maximumInFlight, 1, `${failedKind} guard attempts never overlap`)
+      let attempted = f.calls
+        .filter((call) => call[2] === failedKind)
+        .map((call) => `${call[0]}:${call[1]}`)
+      if (failedKind === 'caps-query') attempted = attempted.slice(-3)
+      t.alike(
+        attempted,
+        f.guards.map((guard) => {
+          const host = Array.from(guard.endpoint.subarray(13, 17)).join('.')
+          const port = guard.endpoint[17] * 0x100 + guard.endpoint[18]
+          return `${host}:${port}`
+        }),
+        `${failedKind} advances across all three advertised guard tuples`
+      )
+      const moved = consumeBootstrapGuardPin(transfer)
+      transfer = null
+      t.alike(moved.pinnedGuard.canonicalEndpoint, f.guards[2].endpoint)
+      t.is(moved.candidateDirectory[kInspectRelayCandidateDirectory]().identityCount, 5)
+      moved.candidateDirectory.destroy()
+      t.is(
+        f.calls.some((call) => call[2] === 'fallback' || call[2] === 'dns'),
+        false
+      )
+    } finally {
+      if (transfer) revokeBootstrapGuardPin(transfer)
+      f.cleanup()
+    }
+  }
+})
+
+test('one configured bootstrap stops after three distinct failed active challenges', async (t) => {
+  const f = fixture({
+    configuredCount: 1,
+    singleEndpointGuardCandidates: true,
+    failCandidateAt: 'active-challenge',
+    failCandidateCount: 3
+  })
+  await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+  const challenged = f.calls
+    .filter((call) => call[2] === 'active-challenge')
+    .map((call) => `${call[0]}:${call[1]}`)
+  t.is(challenged.length, 3)
+  t.is(new Set(challenged).size, 3)
+  t.is(f.maximumInFlight, 1)
+  t.is(
+    f.calls.some((call) => call[2] === 'link'),
+    false
+  )
+  t.ok(f.destroyed)
+  f.cleanup()
+})
+
+test('duplicate candidate evidence across configured endpoints is attempted only once per identity and tuple', async (t) => {
+  const f = fixture({
+    configuredCount: 2,
+    incrementalDuplicateEvidence: true,
+    failCandidateAt: 'active-challenge',
+    failCandidateCount: 2
+  })
+  let transfer = null
+  try {
+    transfer = await f.io.start()
+    const challenged = f.calls
+      .filter((call) => call[2] === 'active-challenge')
+      .map((call) => `${call[0]}:${call[1]}`)
+    t.is(challenged.length, 3)
+    t.is(new Set(challenged).size, 3)
+    t.is(f.maximumInFlight, 1)
+    const moved = consumeBootstrapGuardPin(transfer)
+    transfer = null
+    t.is(moved.candidateDirectory[kInspectRelayCandidateDirectory]().identityCount, 5)
+    moved.candidateDirectory.destroy()
+  } finally {
+    if (transfer) revokeBootstrapGuardPin(transfer)
+    f.cleanup()
   }
 })
 
