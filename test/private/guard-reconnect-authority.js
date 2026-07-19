@@ -11,6 +11,7 @@ const {
 } = require('../../lib/private/guard-link')
 const { CAPACITY_CLASS, ROLE, roleForIdentity } = require('../../lib/private/protocol')
 const {
+  createActiveChallengeResponderAuthority,
   deriveM3DhtNodeId,
   digestRelayCapabilityAdvertisement,
   encodeCanonicalEndpoint,
@@ -145,17 +146,69 @@ function fixture(options = {}) {
   let destroyed = false
   let responder = null
   let responderEstablished = null
+  const capsResponder = createActiveChallengeResponderAuthority({
+    now: clock.wallNow,
+    setTimeout,
+    clearTimeout,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+  })
+  let capsBinding = null
+  let sourceEndpoint = null
+  let authority = null
   const datagrams = {
     async send(host, port, request, signal) {
       if (destroyed) throw new Error('revoked transport')
       calls.push({ host, port, kind: request.kind, signal })
       if (options.onSend) await options.onSend({ host, port, request, signal, clock })
-      if (request.kind === 'caps') {
-        if (options.capsResponse) return options.capsResponse(guard)
-        return { advertisement: b4a.from(guard.advertisement) }
+      if (request.kind === 'caps-query') {
+        sourceEndpoint = endpointBytes('10.0.0.2', 44000)
+        const query = {
+          sourceEndpoint,
+          requestedCapabilityMask: request.requestedCapabilityMask,
+          randomTarget: request.randomTarget,
+          queryNonce: request.queryNonce,
+          maximumResults: request.maximumResults
+        }
+        const cookie = capsResponder.issueCookie(query)
+        const response = Object.freeze({
+          sourceEndpoint,
+          cookieExpiresAtMs: cookie.cookieExpiresAtMs,
+          returnRoutabilityCookie: cookie.returnRoutabilityCookie,
+          advertisements: [b4a.from(guard.advertisement)]
+        })
+        return options.capsQueryResponse ? options.capsQueryResponse(response, guard) : response
       }
-      if (request.kind === 'challenge') {
-        return { advertisementDigest: b4a.from(guard.advertisementDigest) }
+      if (request.kind === 'caps-retry') {
+        capsBinding = capsResponder.admitCapsRetry({
+          sourceEndpoint: request.sourceEndpoint,
+          requestedCapabilityMask: request.requestedCapabilityMask,
+          randomTarget: request.randomTarget,
+          queryNonce: request.queryNonce,
+          maximumResults: request.maximumResults,
+          cookieExpiresAtMs: request.cookieExpiresAtMs,
+          returnRoutabilityCookie: request.returnRoutabilityCookie,
+          advertisement: request.advertisement
+        })
+        return Object.freeze({})
+      }
+      if (request.kind === 'active-challenge') {
+        let bytes = capsResponder.respond(capsBinding, request.bytes, {
+          sourceEndpoint,
+          advertisement: guard.advertisement,
+          identitySecretKey: guard.signer.secretKey,
+          routeEncryptionSecretKey: guard.route.secretKey
+        })
+        if (options.forgeActiveChallenge) {
+          bytes = b4a.from(bytes)
+          bytes[bytes.byteLength - 1] ^= 1
+        }
+        if (options.expireActiveChallenge) clock.advance(5_001)
+        if (options.revokeAtActiveChallenge) {
+          revokeGuardReconnectAuthority(authority, 'reentrant-challenge')
+        }
+        return Object.freeze({
+          bytes
+        })
       }
       if (request.kind === 'link') {
         responder = createIndexZeroGuardLinkResponder({
@@ -183,7 +236,7 @@ function fixture(options = {}) {
       destroyed = true
     }
   }
-  const authority = createGuardReconnectAuthority({
+  authority = createGuardReconnectAuthority({
     guardIdentity: guard.signer.publicKey,
     guardEndpoint: guard.endpoint,
     advertisement: guard.advertisement,
@@ -208,6 +261,7 @@ function fixture(options = {}) {
       return destroyed
     },
     cleanup(established = null) {
+      capsResponder.destroy()
       if (established) destroyM3EstablishedLink(established)
       if (responderEstablished) destroyM3EstablishedLink(responderEstablished)
       if (responder) responder.destroy()
@@ -228,7 +282,7 @@ test('guard reconnect capability is opaque, zero-argument, and one-shot before f
   const established = await f.authority.reconnect()
   t.alike(
     f.calls.map((call) => call.kind),
-    ['caps', 'challenge', 'link']
+    ['caps-query', 'caps-retry', 'active-challenge', 'link']
   )
   for (const call of f.calls) {
     t.is(call.host, '192.0.2.41')
@@ -241,9 +295,9 @@ test('guard reconnect capability is opaque, zero-argument, and one-shot before f
 
 test('CAPS substitution and referral-shaped responses cannot alter the bound tuple', async (t) => {
   const f = fixture({
-    capsResponse(guard) {
+    capsQueryResponse(response) {
       return {
-        advertisement: b4a.from(guard.advertisement),
+        ...response,
         referral: { host: '203.0.113.9', port: 1 }
       }
     }
@@ -251,10 +305,27 @@ test('CAPS substitution and referral-shaped responses cannot alter the bound tup
   await expectCodeAsync(t, () => f.authority.reconnect(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
   t.alike(
     f.calls.map((call) => [call.host, call.port, call.kind]),
-    [['192.0.2.41', 49737, 'caps']]
+    [['192.0.2.41', 49737, 'caps-query']]
   )
   t.ok(f.destroyed)
   f.cleanup()
+})
+
+test('reconnect active challenge rejects forgery, expiry, and revocation reentry', async (t) => {
+  for (const [options, code] of [
+    [{ forgeActiveChallenge: true }, 'ERR_PRIVATE_GUARD_UNAVAILABLE'],
+    [{ expireActiveChallenge: true }, 'ERR_PRIVATE_GUARD_UNAVAILABLE'],
+    [{ revokeAtActiveChallenge: true }, 'ERR_DESTROYED']
+  ]) {
+    const f = fixture(options)
+    await expectCodeAsync(t, () => f.authority.reconnect(), code)
+    t.is(
+      f.calls.some((call) => call.kind === 'link'),
+      false
+    )
+    t.ok(f.destroyed)
+    f.cleanup()
+  }
 })
 
 test('revoke before reconnect sends no packet and never restores READY', (t) => {
@@ -283,7 +354,7 @@ test('revoke during flight aborts the exact operation and emits no later packet'
   await expectCodeAsync(t, () => operation, 'ERR_DESTROYED')
   t.alike(
     f.calls.map((call) => call.kind),
-    ['caps']
+    ['caps-query']
   )
   t.ok(f.calls[0].signal.aborted)
   f.cleanup()
@@ -299,4 +370,55 @@ test('reconnect uses one 5000ms timer and a spent authority cannot start a secon
   const established = await operation
   t.is(f.clock.timers.size, 0)
   f.cleanup(established)
+})
+
+test('hung reconnect expires, aborts the exact in-flight record, and emits no later packet', async (t) => {
+  let release = null
+  const f = fixture({
+    onSend() {
+      return new Promise((resolve) => {
+        release = resolve
+      })
+    }
+  })
+  const operation = f.authority.reconnect()
+  while (release === null) await Promise.resolve()
+  t.is(f.clock.timers.size, 1)
+  f.clock.advance(5_000)
+  for (const id of [...f.clock.timers.keys()]) f.clock.fire(id)
+  await expectCodeAsync(t, () => operation, 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+  t.ok(f.calls[0].signal.aborted)
+  release()
+  await Promise.resolve()
+  t.alike(
+    f.calls.map((call) => call.kind),
+    ['caps-query']
+  )
+  t.ok(f.destroyed)
+  f.cleanup()
+})
+
+test('in-flight reconnect copies are atomic after the public authority becomes spent', (t) => {
+  for (let failurePosition = 1; failurePosition <= 6; failurePosition++) {
+    const f = fixture()
+    const original = b4a.allocUnsafeSlow
+    const allocations = []
+    let count = 0
+    b4a.allocUnsafeSlow = (size) => {
+      if (++count === failurePosition) throw new Error(`in-flight copy ${failurePosition}`)
+      const value = original(size)
+      allocations.push(value)
+      return value
+    }
+    try {
+      t.exception(() => f.authority.reconnect())
+    } finally {
+      b4a.allocUnsafeSlow = original
+    }
+    t.is(f.calls.length, 0)
+    t.is(allocations.length, failurePosition - 1)
+    for (const value of allocations) t.alike(value, b4a.alloc(value.byteLength))
+    expectCode(t, () => f.authority.reconnect(), 'ERR_DESTROYED')
+    f.cleanup()
+  }
 })
