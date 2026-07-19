@@ -30,6 +30,7 @@ const {
   digestRelayCapabilityAdvertisement,
   encodeCanonicalEndpoint,
   encodeRelayCapabilityAdvertisement,
+  observeActiveChallengeResponderForTests,
   providerServicePolicyForCapabilities,
   signRelayCapabilityAdvertisement
 } = require('../../lib/private/relay-capability')
@@ -304,6 +305,66 @@ function clock(start = NOW) {
       wall += BigInt(delay)
     },
     pending: () => timers.size
+  }
+}
+
+function hostileTimerClock(start = 0n) {
+  let wall = start
+  let monotonic = 0n
+  let next = 0
+  let calls = 0
+  let fault = null
+  let clearThrows = false
+  const timers = new Map()
+  return {
+    wallNow: () => wall,
+    setTimer(callback, delay) {
+      const id = ++next
+      calls++
+      timers.set(id, { at: monotonic + BigInt(delay), callback })
+      if (fault && fault.call === calls) {
+        const selected = fault
+        fault = null
+        if (selected.mode === 'throw') throw new Error('injected setTimeout failure')
+        if (selected.mode === 'sync') callback()
+        if (selected.mode === 'reenter') selected.action()
+        if (selected.mode === 'fire-existing') {
+          for (const [existingId, timer] of timers) {
+            if (existingId === id) continue
+            timers.delete(existingId)
+            timer.callback()
+            break
+          }
+        }
+      }
+      return id
+    },
+    clearTimer(id) {
+      if (clearThrows) throw new Error('injected clearTimeout failure')
+      timers.delete(id)
+    },
+    failSet(call, mode, action = null) {
+      fault = { call, mode, action }
+    },
+    throwOnClear(value = true) {
+      clearThrows = value
+    },
+    advance(delay) {
+      wall += BigInt(delay)
+      monotonic += BigInt(delay)
+      for (const [id, timer] of timers) {
+        if (timer.at > monotonic) continue
+        timers.delete(id)
+        timer.callback()
+      }
+    },
+    fireAll() {
+      const pending = [...timers.values()]
+      timers.clear()
+      for (const timer of pending) timer.callback()
+    },
+    pending: () => timers.size,
+    calls: () => calls
   }
 }
 
@@ -1573,6 +1634,7 @@ test('relay verification exposes no public discovery or dialing API', async (t) 
   t.is(publicApi.createActiveChallengeResponderAuthority, undefined)
   t.is(publicApi.createActiveChallengeSendAuthority, undefined)
   t.is(publicApi.decodeRelayCapabilityAdvertisement, undefined)
+  t.is(publicApi.observeActiveChallengeResponderForTests, undefined)
 
   const fake = clock()
   const owner = verifier(fake)
@@ -1978,10 +2040,9 @@ test('completed CAPS tuple stays tombstoned and conflicting retry fails until co
   const cookie = responder.issueCookie(query)
   const retry = { ...query, ...cookie, advertisement: fixture.encoded }
   const binding = responder.admitCapsRetry(retry)
-  const state = responder._bindings.get(binding)
-  const ownedNonce = state.query.queryNonce
-  const ownedCookie = state.query.returnRoutabilityCookie
-  const ownedDigest = state.advertisementDigest
+  let observed = observeActiveChallengeResponderForTests(responder)
+  t.is(observed.bindingCount, 1)
+  t.alike(observed.events, [])
   const ephemeral = routeKey(64)
   const body = b4a.alloc(176)
   body.set(digestRelayCapabilityAdvertisement(fixture.encoded, { now: NOW }), 0)
@@ -1999,9 +2060,9 @@ test('completed CAPS tuple stays tombstoned and conflicting retry fails until co
     routeEncryptionSecretKey: fixture.route.secretKey
   })
 
-  t.unlike(ownedNonce, b4a.alloc(32), 'replay tombstone owns the canonical query')
-  t.unlike(ownedCookie, b4a.alloc(32), 'replay tombstone owns the canonical cookie')
-  t.unlike(ownedDigest, b4a.alloc(32), 'replay tombstone owns the advertisement digest')
+  observed = observeActiveChallengeResponderForTests(responder)
+  t.is(observed.bindingCount, 1, 'replay tombstone retains one canonical binding')
+  t.alike(observed.events, [])
   expectCode(t, () => responder.admitCapsRetry(retry), 'ERR_REPLAY')
   const conflicting = signedAdvertisement({ maxQueuedBytes: 262_145 })
   expectCode(
@@ -2012,9 +2073,14 @@ test('completed CAPS tuple stays tombstoned and conflicting retry fails until co
 
   fake.advance(5_001)
   responder.issueCookie({ ...query, queryNonce: seed(202) })
-  t.alike(ownedNonce, b4a.alloc(32))
-  t.alike(ownedCookie, b4a.alloc(32))
-  t.alike(ownedDigest, b4a.alloc(32))
+  observed = observeActiveChallengeResponderForTests(responder)
+  t.is(observed.bindingCount, 0)
+  const bindingClear = observed.events.find((event) => event.type === 'binding-cleared')
+  t.ok(bindingClear)
+  t.ok(Object.isFrozen(bindingClear))
+  t.ok(Object.isFrozen(bindingClear.buffers))
+  t.is(bindingClear.buffers.length, 6)
+  for (const bytes of bindingClear.buffers) t.alike(bytes, b4a.alloc(bytes.byteLength))
   responder.destroy()
 })
 
@@ -2179,6 +2245,273 @@ test('responder constructor accepts only plain or null-prototype own-data option
   responder.destroy()
 })
 
+test('CAPS responder exposes a frozen authority immune to hostile legacy fields', (t) => {
+  const fake = clock()
+  const responder = createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+  })
+  const query = {
+    sourceEndpoint: endpoint(243),
+    requestedCapabilityMask: 1,
+    randomTarget: seed(218),
+    queryNonce: seed(219),
+    maximumResults: 1
+  }
+  const before = responder.issueCookie(query)
+
+  t.ok(Object.isFrozen(responder))
+  t.alike(Object.getOwnPropertyNames(responder), [])
+  t.alike(Object.getOwnPropertySymbols(responder), [])
+  t.alike(Object.getOwnPropertyNames(Object.getPrototypeOf(responder)).sort(), [
+    'admitCapsRetry',
+    'constructor',
+    'destroy',
+    'issueCookie',
+    'respond'
+  ])
+  for (const name of [
+    '_currentSecret',
+    '_priorSecret',
+    '_bindings',
+    '_cache',
+    '_completed',
+    '_crypto',
+    '_maxBindings',
+    '_now',
+    '_setTimer',
+    '_clearTimer',
+    '_destroyed',
+    '_rotationTimer',
+    '_priorEraseTimer',
+    '_rotationDeadline'
+  ]) {
+    t.is(Reflect.set(responder, name, name === '_now' ? () => 0n : {}), false, name)
+    let defineFailed = false
+    try {
+      Object.defineProperty(responder, name, { value: {}, configurable: true })
+    } catch {
+      defineFailed = true
+    }
+    t.is(defineFailed, true, name)
+  }
+  const after = responder.issueCookie(query)
+  t.is(after.cookieExpiresAtMs, before.cookieExpiresAtMs)
+  t.alike(after.returnRoutabilityCookie, before.returnRoutabilityCookie)
+  const fixture = signedAdvertisement()
+  const binding = responder.admitCapsRetry({
+    ...query,
+    ...after,
+    advertisement: fixture.encoded
+  })
+  const ephemeral = routeKey(67)
+  const body = b4a.alloc(176)
+  body.set(digestRelayCapabilityAdvertisement(fixture.encoded, { now: NOW }), 0)
+  body.set(seed(68), 32)
+  body.set(ephemeral.publicKey, 64)
+  body.writeBigUInt64BE(NOW + ACTIVE_CHALLENGE_TIMEOUT, 96)
+  body.set(query.queryNonce, 104)
+  body.writeBigUInt64BE(after.cookieExpiresAtMs, 136)
+  body.set(after.returnRoutabilityCookie, 144)
+  const response = responder.respond(
+    binding,
+    encodeM3Object({ messageId: M3_MESSAGE_ID.ACTIVE_CHALLENGE_V1, body }),
+    {
+      sourceEndpoint: query.sourceEndpoint,
+      advertisement: fixture.encoded,
+      identitySecretKey: fixture.signer.secretKey,
+      routeEncryptionSecretKey: fixture.route.secretKey
+    }
+  )
+  t.is(response.readUInt16BE(4), M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1)
+  let observed = observeActiveChallengeResponderForTests(responder)
+  t.is(observed.destroyed, false)
+  t.is(observed.rotationScheduled, true)
+  t.is(observed.staging, false)
+  t.ok(Object.isFrozen(observed))
+  t.ok(Object.isFrozen(observed.events))
+  fake.advance(300_000)
+  observed = observeActiveChallengeResponderForTests(responder)
+  t.is(observed.destroyed, false)
+  t.is(observed.rotationScheduled, true)
+  t.is(observed.priorEraseScheduled, true)
+  responder.destroy()
+  observed = observeActiveChallengeResponderForTests(responder)
+  t.is(observed.destroyed, true)
+  t.is(observed.rotationScheduled, false)
+  expectCode(t, () => responder.issueCookie(query), 'ERR_DESTROYED')
+})
+
+test('CAPS responder prototype is immutable across authorities', (t) => {
+  const fake = clock()
+  const options = {
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x76) }
+  }
+  const first = createActiveChallengeResponderAuthority(options)
+  const second = createActiveChallengeResponderAuthority(options)
+  const prototype = Object.getPrototypeOf(first)
+  const query = {
+    sourceEndpoint: endpoint(245),
+    requestedCapabilityMask: 1,
+    randomTarget: seed(222),
+    queryNonce: seed(223),
+    maximumResults: 1
+  }
+  const baseline = second.issueCookie(query)
+
+  t.ok(Object.isFrozen(prototype))
+  t.is(Reflect.setPrototypeOf(first, {}), false)
+  const prototypeParent = Object.getPrototypeOf(prototype)
+  const prototypeChanged = Reflect.setPrototypeOf(prototype, {})
+  t.is(prototypeChanged, false)
+  if (prototypeChanged) Reflect.setPrototypeOf(prototype, prototypeParent)
+  const issueDescriptor = Object.getOwnPropertyDescriptor(prototype, 'issueCookie')
+  const issueChanged = Reflect.set(prototype, 'issueCookie', () => ({ hostile: true }))
+  const changedCookie = second.issueCookie(query)
+  t.is(issueChanged, false)
+  t.is(changedCookie.hostile, undefined)
+  t.alike(changedCookie.returnRoutabilityCookie, baseline.returnRoutabilityCookie)
+  if (issueChanged) Object.defineProperty(prototype, 'issueCookie', issueDescriptor)
+  const issueDeleted = Reflect.deleteProperty(prototype, 'issueCookie')
+  t.is(issueDeleted, false)
+  t.is(typeof second.issueCookie, 'function')
+  if (issueDeleted) Object.defineProperty(prototype, 'issueCookie', issueDescriptor)
+
+  const respondDescriptor = Object.getOwnPropertyDescriptor(prototype, 'respond')
+  const respondDeleted = Reflect.deleteProperty(prototype, 'respond')
+  t.is(respondDeleted, false)
+  t.is(typeof second.respond, 'function')
+  if (respondDeleted) Object.defineProperty(prototype, 'respond', respondDescriptor)
+  const destroyDescriptor = Object.getOwnPropertyDescriptor(prototype, 'destroy')
+  const destroyDeleted = Reflect.deleteProperty(prototype, 'destroy')
+  t.is(destroyDeleted, false)
+  t.is(typeof second.destroy, 'function')
+  if (destroyDeleted) Object.defineProperty(prototype, 'destroy', destroyDescriptor)
+
+  const fixture = signedAdvertisement()
+  const binding = second.admitCapsRetry({
+    ...query,
+    ...baseline,
+    advertisement: fixture.encoded
+  })
+  const ephemeral = routeKey(68)
+  const body = b4a.alloc(176)
+  body.set(digestRelayCapabilityAdvertisement(fixture.encoded, { now: NOW }), 0)
+  body.set(seed(69), 32)
+  body.set(ephemeral.publicKey, 64)
+  body.writeBigUInt64BE(NOW + ACTIVE_CHALLENGE_TIMEOUT, 96)
+  body.set(query.queryNonce, 104)
+  body.writeBigUInt64BE(baseline.cookieExpiresAtMs, 136)
+  body.set(baseline.returnRoutabilityCookie, 144)
+  const response = second.respond(
+    binding,
+    encodeM3Object({ messageId: M3_MESSAGE_ID.ACTIVE_CHALLENGE_V1, body }),
+    {
+      sourceEndpoint: query.sourceEndpoint,
+      advertisement: fixture.encoded,
+      identitySecretKey: fixture.signer.secretKey,
+      routeEncryptionSecretKey: fixture.route.secretKey
+    }
+  )
+  t.is(response.readUInt16BE(4), M3_MESSAGE_ID.ACTIVE_CHALLENGE_RESPONSE_V1)
+  second.destroy()
+  expectCode(t, () => second.issueCookie(query), 'ERR_DESTROYED')
+  first.destroy()
+})
+
+test('CAPS observer mutation cannot interrupt responder cleanup', (t) => {
+  const fake = clock()
+  const responder = createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x77) }
+  })
+  observeActiveChallengeResponderForTests(responder)
+  fake.advance(300_000)
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 1_000_000n })
+  const query = {
+    sourceEndpoint: endpoint(246),
+    requestedCapabilityMask: 1,
+    randomTarget: seed(224),
+    queryNonce: seed(225),
+    maximumResults: 1
+  }
+  const cookie = responder.issueCookie(query)
+  responder.admitCapsRetry({ ...query, ...cookie, advertisement: fixture.encoded })
+
+  const originalFilter = Array.prototype.filter
+  let destroyError = null
+  Array.prototype.filter = () => {
+    throw new Error('poisoned Array.prototype.filter')
+  }
+  try {
+    responder.destroy()
+  } catch (err) {
+    destroyError = err
+  } finally {
+    Array.prototype.filter = originalFilter
+  }
+  t.is(destroyError, null)
+  responder.destroy()
+  const observed = observeActiveChallengeResponderForTests(responder)
+  t.is(observed.destroyed, true)
+  t.is(
+    observed.events.filter((event) => event.type === 'secret-cleared').length,
+    2,
+    'current and prior secrets are both detached and cleared'
+  )
+  t.is(
+    observed.events.filter((event) => event.type === 'binding-cleared').length,
+    1,
+    'binding ownership is detached and cleared'
+  )
+  for (const event of observed.events) {
+    for (const bytes of event.buffers) t.alike(bytes, b4a.alloc(bytes.byteLength))
+  }
+})
+
+test('CAPS observer bounds retained cleanup events and reports drops', (t) => {
+  const fake = clock()
+  const responder = createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    maxBindings: 80,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x78) }
+  })
+  const fixture = signedAdvertisement()
+  observeActiveChallengeResponderForTests(responder)
+  for (let index = 0; index < 70; index++) {
+    const query = {
+      sourceEndpoint: endpoint(247),
+      requestedCapabilityMask: 1,
+      randomTarget: seed(100 + index),
+      queryNonce: seed(150 + index),
+      maximumResults: 1
+    }
+    const cookie = responder.issueCookie(query)
+    responder.admitCapsRetry({ ...query, ...cookie, advertisement: fixture.encoded })
+  }
+  responder.destroy()
+
+  const observed = observeActiveChallengeResponderForTests(responder)
+  t.ok(Object.isFrozen(observed))
+  t.ok(observed.events.length <= 64)
+  t.ok(observed.droppedEvents > 0)
+  for (const event of observed.events) {
+    for (const bytes of event.buffers) t.alike(bytes, b4a.alloc(bytes.byteLength))
+  }
+  const drained = observeActiveChallengeResponderForTests(responder)
+  t.alike(drained.events, [])
+  t.is(drained.droppedEvents, 0)
+})
+
 test('CAPS cookie survives only the live prior-secret overlap at exact rotation', (t) => {
   const fake = clock(0n)
   let generated = 0
@@ -2194,6 +2527,7 @@ test('CAPS cookie survives only the live prior-secret overlap at exact rotation'
       }
     }
   })
+  observeActiveChallengeResponderForTests(responder)
   const fixture = signedAdvertisement({ issuedAtMs: 0n, expiresAtMs: 1_000_000n })
   const query = {
     sourceEndpoint: endpoint(241),
@@ -2205,10 +2539,11 @@ test('CAPS cookie survives only the live prior-secret overlap at exact rotation'
 
   fake.advance(299_999)
   const cookie = responder.issueCookie(query)
-  const originalSecret = responder._currentSecret.secret
   fake.advance(1)
   t.is(generated, 2, 'idle timer rotates exactly at five minutes')
-  t.unlike(originalSecret, b4a.alloc(32), 'the immediately prior secret remains live')
+  let observed = observeActiveChallengeResponderForTests(responder)
+  t.is(observed.priorEraseScheduled, true)
+  t.alike(observed.events, [], 'the immediately prior secret remains live')
   const binding = responder.admitCapsRetry({
     ...query,
     ...cookie,
@@ -2227,10 +2562,19 @@ test('CAPS cookie survives only the live prior-secret overlap at exact rotation'
   t.is(fake.pending(), 2)
   fake.advance(1)
   t.is(fake.pending(), 1, 'prior-secret erasure does not extend past its original deadline')
-  t.alike(originalSecret, b4a.alloc(32), 'expired prior secret is cleared')
-  const currentSecret = responder._currentSecret.secret
+  observed = observeActiveChallengeResponderForTests(responder)
+  const priorClear = observed.events.find(
+    (event) => event.type === 'secret-cleared' && event.reason === 'prior-expired'
+  )
+  t.ok(priorClear)
+  t.alike(priorClear.buffers[0], b4a.alloc(32), 'expired prior secret is cleared')
   responder.destroy()
-  t.alike(currentSecret, b4a.alloc(32), 'destroy clears the current secret')
+  observed = observeActiveChallengeResponderForTests(responder)
+  const currentClear = observed.events.find(
+    (event) => event.type === 'secret-cleared' && event.reason === 'destroy-current'
+  )
+  t.ok(currentClear)
+  t.alike(currentClear.buffers[0], b4a.alloc(32), 'destroy clears the current secret')
 })
 
 test('CAPS responder catches up delayed rotations without reviving stale overlap', (t) => {
@@ -2249,6 +2593,7 @@ test('CAPS responder catches up delayed rotations without reviving stale overlap
         }
       }
     })
+    observeActiveChallengeResponderForTests(responder)
     const fixture = signedAdvertisement({ issuedAtMs: 0n, expiresAtMs: 1_000_000n })
     const query = {
       sourceEndpoint: endpoint(242),
@@ -2259,7 +2604,6 @@ test('CAPS responder catches up delayed rotations without reviving stale overlap
     }
     fake.advance(299_999)
     const cookie = responder.issueCookie(query)
-    const staleSecret = responder._currentSecret.secret
     fake.jumpWall(10_001)
     if (resume === 'api') {
       expectCode(
@@ -2272,9 +2616,223 @@ test('CAPS responder catches up delayed rotations without reviving stale overlap
     }
     t.is(generated, 2)
     t.is(fake.pending(), 1, 'late catch-up retains only the next rotation timer')
-    t.alike(staleSecret, b4a.alloc(32), 'late catch-up synchronously clears stale secrets')
+    const observed = observeActiveChallengeResponderForTests(responder)
+    const staleClear = observed.events.find(
+      (event) => event.type === 'secret-cleared' && event.reason === 'rotation-stale-current'
+    )
+    t.ok(staleClear)
+    t.alike(
+      staleClear.buffers[0],
+      b4a.alloc(32),
+      'late catch-up synchronously clears stale secrets'
+    )
     responder.destroy()
   }
+})
+
+test('CAPS responder rejects throwing and synchronous initial timer installation', (t) => {
+  for (const mode of ['throw', 'sync']) {
+    const tracked = trackedRelayCapability()
+    const fake = hostileTimerClock()
+    const raw = []
+    fake.failSet(1, mode)
+    tracked.start()
+    let constructionError = null
+    try {
+      tracked.fresh.createActiveChallengeResponderAuthority({
+        now: fake.wallNow,
+        setTimeout: fake.setTimer,
+        clearTimeout: fake.clearTimer,
+        crypto: {
+          ...cryptoSuite,
+          randomBytes(size) {
+            const output = b4a.alloc(size, 0x71)
+            raw.push(output)
+            return output
+          }
+        }
+      })
+    } catch (err) {
+      constructionError = err
+    }
+    t.ok(constructionError instanceof Error, mode)
+    const owned = tracked.take()
+    for (const bytes of raw) t.alike(bytes, b4a.alloc(bytes.byteLength), mode)
+    for (const bytes of owned) t.alike(bytes, b4a.alloc(bytes.byteLength), mode)
+    t.is(
+      fake.pending(),
+      mode === 'throw' ? 1 : 0,
+      `${mode} installation retains no logically live timer`
+    )
+    fake.fireAll()
+    t.is(fake.pending(), 0, `${mode} stale callback is inert`)
+    tracked.restore()
+  }
+})
+
+test('CAPS rotation fails closed at each timer staging point', (t) => {
+  for (const [call, stage] of [
+    [2, 'prior-erasure'],
+    [3, 'next-rotation']
+  ]) {
+    for (const mode of ['throw', 'sync']) {
+      const fake = hostileTimerClock()
+      const raw = []
+      const responder = createActiveChallengeResponderAuthority({
+        now: fake.wallNow,
+        setTimeout: fake.setTimer,
+        clearTimeout: fake.clearTimer,
+        crypto: {
+          ...cryptoSuite,
+          randomBytes(size) {
+            const output = b4a.alloc(size, raw.length + 1)
+            raw.push(output)
+            return output
+          }
+        }
+      })
+      observeActiveChallengeResponderForTests(responder)
+      fake.failSet(call, mode)
+      fake.advance(300_000)
+
+      const observed = observeActiveChallengeResponderForTests(responder)
+      t.is(observed.destroyed, true, `${stage} ${mode}`)
+      t.is(observed.rotationScheduled, false, `${stage} ${mode}`)
+      t.is(observed.priorEraseScheduled, false, `${stage} ${mode}`)
+      t.is(observed.staging, false, `${stage} ${mode}`)
+      t.is(fake.pending(), mode === 'throw' ? 1 : 0, `${stage} ${mode}`)
+      for (const bytes of raw) t.alike(bytes, b4a.alloc(bytes.byteLength), `${stage} ${mode}`)
+      for (const event of observed.events) {
+        for (const bytes of event.buffers) t.alike(bytes, b4a.alloc(bytes.byteLength))
+      }
+      expectCode(t, () => responder.issueCookie({}), 'ERR_DESTROYED')
+      fake.fireAll()
+      const afterLateCallback = observeActiveChallengeResponderForTests(responder)
+      t.is(afterLateCallback.destroyed, true, `${stage} ${mode} stale callback`)
+      t.is(afterLateCallback.rotationScheduled, false, `${stage} ${mode} stale callback`)
+      t.alike(afterLateCallback.events, [], `${stage} ${mode} stale callback`)
+    }
+  }
+})
+
+test('CAPS rotation rejects a prior timer consumed while staging the next timer', (t) => {
+  const fake = hostileTimerClock()
+  const responder = createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x75) }
+  })
+  observeActiveChallengeResponderForTests(responder)
+  fake.failSet(3, 'fire-existing')
+  fake.advance(300_000)
+
+  const afterStaging = observeActiveChallengeResponderForTests(responder)
+  t.is(afterStaging.destroyed, true)
+  t.is(afterStaging.rotationScheduled, false)
+  t.is(afterStaging.priorEraseScheduled, false)
+  t.is(afterStaging.staging, false)
+  t.is(fake.pending(), 0)
+  fake.advance(5_000)
+  const afterDeadline = observeActiveChallengeResponderForTests(responder)
+  t.is(afterDeadline.destroyed, true)
+  t.ok(
+    [...afterStaging.events, ...afterDeadline.events].some(
+      (event) => event.type === 'secret-cleared'
+    ),
+    'consumed staged timer cannot strand uncleared secret material'
+  )
+})
+
+test('CAPS rotation fails closed on scheduler reentry during staging', (t) => {
+  for (const [call, reentry] of [
+    [2, 'destroy'],
+    [3, 'api']
+  ]) {
+    const fake = hostileTimerClock()
+    let responder = null
+    let reentryError = null
+    const query = {
+      sourceEndpoint: endpoint(244),
+      requestedCapabilityMask: 1,
+      randomTarget: seed(220),
+      queryNonce: seed(221),
+      maximumResults: 1
+    }
+    responder = createActiveChallengeResponderAuthority({
+      now: fake.wallNow,
+      setTimeout: fake.setTimer,
+      clearTimeout: fake.clearTimer,
+      crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x72) }
+    })
+    observeActiveChallengeResponderForTests(responder)
+    fake.failSet(call, 'reenter', () => {
+      if (reentry === 'destroy') return responder.destroy()
+      try {
+        responder.issueCookie(query)
+      } catch (err) {
+        reentryError = err
+      }
+    })
+    fake.advance(300_000)
+
+    const observed = observeActiveChallengeResponderForTests(responder)
+    t.is(observed.destroyed, true, reentry)
+    t.is(observed.rotationScheduled, false, reentry)
+    t.is(observed.priorEraseScheduled, false, reentry)
+    t.is(observed.staging, false, reentry)
+    t.is(fake.pending(), 0, reentry)
+    if (reentry === 'api') {
+      t.ok(reentryError instanceof PrivateRouteError)
+      t.is(reentryError && reentryError.code, 'ERR_DESTROYED')
+    }
+  }
+})
+
+test('CAPS responder leaves throwing clearTimeout callbacks inert', (t) => {
+  const rollbackClock = hostileTimerClock()
+  const rollback = createActiveChallengeResponderAuthority({
+    now: rollbackClock.wallNow,
+    setTimeout: rollbackClock.setTimer,
+    clearTimeout: rollbackClock.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x73) }
+  })
+  observeActiveChallengeResponderForTests(rollback)
+  rollbackClock.throwOnClear()
+  rollbackClock.failSet(3, 'throw')
+  rollbackClock.advance(300_000)
+  let observed = observeActiveChallengeResponderForTests(rollback)
+  t.is(observed.destroyed, true)
+  t.is(observed.rotationScheduled, false)
+  t.is(observed.priorEraseScheduled, false)
+  t.ok(rollbackClock.pending() > 0, 'hostile clear retains physical stale callbacks')
+  rollbackClock.fireAll()
+  observed = observeActiveChallengeResponderForTests(rollback)
+  t.is(observed.destroyed, true)
+  t.is(observed.rotationScheduled, false)
+  t.is(observed.priorEraseScheduled, false)
+  t.alike(observed.events, [], 'late rollback callbacks are inert')
+
+  const destroyClock = hostileTimerClock()
+  const authority = createActiveChallengeResponderAuthority({
+    now: destroyClock.wallNow,
+    setTimeout: destroyClock.setTimer,
+    clearTimeout: destroyClock.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x74) }
+  })
+  observeActiveChallengeResponderForTests(authority)
+  destroyClock.throwOnClear()
+  authority.destroy()
+  authority.destroy()
+  observed = observeActiveChallengeResponderForTests(authority)
+  t.is(observed.destroyed, true)
+  t.is(observed.rotationScheduled, false)
+  t.is(observed.priorEraseScheduled, false)
+  t.is(destroyClock.pending(), 1, 'hostile clear retains the physical rotation callback')
+  destroyClock.fireAll()
+  observed = observeActiveChallengeResponderForTests(authority)
+  t.is(observed.destroyed, true)
+  t.alike(observed.events, [], 'late destroy callback is inert')
 })
 
 test('verifier clears raw RNG outputs before challenge publication on every path', async (t) => {
