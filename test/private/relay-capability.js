@@ -217,6 +217,15 @@ function exactRoleIdentity(role) {
   throw new Error('missing deterministic role fixture')
 }
 
+function differentRoleIdentity(role, excluded) {
+  for (let value = 1; value < 255; value++) {
+    const pair = identity(value)
+    if (roleForIdentity(pair.publicKey) !== role) continue
+    if (!b4a.equals(pair.publicKey, excluded)) return pair
+  }
+  throw new Error('missing alternate deterministic role fixture')
+}
+
 function advertisement(signer, route, overrides = {}) {
   const reachableEndpoint = endpoint()
   const capabilityMask = RELAY_CAPABILITY.CIRCUIT_RELAY_V1
@@ -706,6 +715,204 @@ test('verifier owns epochs, idempotence, equivocation quarantine, and projection
   expectCode(t, () => acceptSafety(owner, conflicting), 'ERR_AUTHENTICATION')
   const original = signedAdvertisement()
   expectCode(t, () => acceptSafety(owner, original), 'ERR_AUTHENTICATION')
+  owner.destroy()
+})
+
+test('verifier bounds same-record projection leases without disturbing independent records', async (t) => {
+  const fake = clock()
+  const owner = verifier(fake)
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
+  const otherSigner = differentRoleIdentity(ROLE.SAFETY, fixture.signer.publicKey)
+  const otherRoute = routeKey(117)
+  const otherEndpoint = endpoint(117)
+  const otherValue = advertisement(otherSigner, otherRoute, {
+    reachableEndpoint: otherEndpoint,
+    currentDhtNodeId: deriveM3DhtNodeId(otherEndpoint),
+    expiresAtMs: NOW + 60_000n
+  })
+  const otherSigned = signRelayCapabilityAdvertisement(otherValue, otherSigner.secretKey)
+  const other = {
+    encoded: encodeRelayCapabilityAdvertisement(otherSigned),
+    route: otherRoute,
+    signer: otherSigner,
+    signed: otherSigned,
+    value: otherValue
+  }
+  const projections = [acceptSafety(owner, fixture)]
+  const oldestBuffers = [
+    projections[0].canonicalBytes,
+    projections[0].digest,
+    projections[0].identity,
+    projections[0].canonicalEndpointBytes,
+    projections[0].routePublicKey
+  ]
+  let oldestSends = 0
+  const oldestAuthority = challengeAuthority(projections[0], (message) => {
+    oldestSends++
+    return activeChallengeResponse(fixture, message, seed(118))
+  })
+  const otherProjection = acceptSafety(owner, other)
+  const otherBuffers = [
+    otherProjection.canonicalBytes,
+    otherProjection.digest,
+    otherProjection.identity,
+    otherProjection.canonicalEndpointBytes,
+    otherProjection.routePublicKey
+  ]
+  const otherSnapshots = otherBuffers.map((buffer) => b4a.from(buffer))
+  let otherSends = 0
+  const otherAuthority = challengeAuthority(otherProjection, (message) => {
+    otherSends++
+    return activeChallengeResponse(other, message, seed(119))
+  })
+
+  while (projections.length < 8) projections.push(acceptSafety(owner, fixture))
+  let survivingSends = 0
+  const survivingAuthority = challengeAuthority(projections[7], (message) => {
+    survivingSends++
+    return activeChallengeResponse(fixture, message, seed(120))
+  })
+  projections.push(acceptSafety(owner, fixture))
+
+  for (const buffer of oldestBuffers) {
+    t.alike(buffer, b4a.alloc(buffer.byteLength), 'FIFO eviction zeroizes each owned buffer')
+  }
+  for (let index = 1; index < projections.length; index++) {
+    const projection = projections[index]
+    t.absent(
+      b4a.equals(projection.canonicalBytes, b4a.alloc(projection.canonicalBytes.byteLength)),
+      `projection ${index + 1} remains live within the newest-eight window`
+    )
+    const probe = challengeAuthority(projection, () => {
+      throw new Error('lease liveness probe must not send')
+    })
+    t.ok(Object.isFrozen(probe), `projection ${index + 1} can still mint an authority`)
+  }
+  for (let index = 0; index < otherBuffers.length; index++) {
+    t.alike(otherBuffers[index], otherSnapshots[index], 'other record remains independently live')
+  }
+
+  expectCode(
+    t,
+    () =>
+      challengeAuthority(projections[0], () => {
+        throw new Error('evicted projection must fail before IO')
+      }),
+    'ERR_AUTHENTICATION'
+  )
+  await expectCodeAsync(
+    t,
+    () => owner.beginChallenge(projections[0], oldestAuthority),
+    'ERR_AUTHENTICATION'
+  )
+  await expectCodeAsync(
+    t,
+    () => owner.beginChallenge(projections[8], oldestAuthority),
+    'ERR_AUTHENTICATION'
+  )
+  t.is(oldestSends, 0, 'eviction revokes only the authority bound to the evicted projection')
+
+  const survivingResult = await owner.beginChallenge(projections[7], survivingAuthority)
+  t.alike(survivingResult.digest, projections[7].digest)
+  t.is(survivingSends, 1, 'newer same-record authority survives oldest projection eviction')
+
+  const otherResult = await owner.beginChallenge(otherProjection, otherAuthority)
+  t.alike(otherResult.digest, otherProjection.digest)
+  t.is(otherSends, 1, 'another record authority remains usable after first-record eviction')
+
+  let newestSends = 0
+  const newestAuthority = challengeAuthority(projections[8], (message) => {
+    newestSends++
+    return activeChallengeResponse(fixture, message, seed(121))
+  })
+  const newestResult = await owner.beginChallenge(projections[8], newestAuthority)
+  t.alike(newestResult.digest, projections[8].digest)
+  t.is(newestSends, 1, 'newest projection completes an active challenge after eviction')
+  owner.destroy()
+})
+
+test('active challenge send authority is bound to one exact live projection', async (t) => {
+  const fake = clock()
+  const owner = verifier(fake)
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
+  const first = acceptSafety(owner, fixture)
+  const second = acceptSafety(owner, fixture)
+  let sends = 0
+  const authority = challengeAuthority(first, (message) => {
+    sends++
+    return activeChallengeResponse(fixture, message, seed(122))
+  })
+
+  await expectCodeAsync(t, () => owner.beginChallenge(second, authority), 'ERR_AUTHENTICATION')
+  t.is(sends, 0, 'same-record projection substitution fails before IO')
+  owner.destroy()
+})
+
+test('projection eviction immediately clears every bound send authority while iterating', async (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fake = clock()
+  const owner = new tracked.fresh.RelayCapabilityVerifier({
+    wallNow: fake.wallNow,
+    monotonicNow: fake.monotonicNow,
+    setTimer: fake.setTimer,
+    clearTimer: fake.clearTimer,
+    onInvalidated() {}
+  })
+  const fixture = signedAdvertisement({ expiresAtMs: NOW + 60_000n })
+  const oldest = acceptSafety(owner, fixture)
+  let sends = 0
+  const createTrackedAuthority = (value) => {
+    const capsBinding = {
+      advertisement: oldest,
+      sourceEndpoint: endpoint(value),
+      queryNonce: seed(value + 1),
+      cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+      returnRoutabilityCookie: seed(value + 2),
+      advertisementDigest: oldest.digest,
+      relayIdentity: oldest.identity
+    }
+    tracked.start()
+    const authority = tracked.fresh.createActiveChallengeSendAuthority({
+      capsBinding,
+      send() {
+        sends++
+        throw new Error('evicted authority must fail before IO')
+      }
+    })
+    const owned = tracked.take()
+    t.alike(
+      owned.map((buffer) => buffer.byteLength),
+      [19, 32, 32, 32, 32],
+      'tracking isolates the five authority-owned binding copies'
+    )
+    return { authority, owned }
+  }
+  const first = createTrackedAuthority(123)
+  const second = createTrackedAuthority(126)
+
+  for (let count = 1; count < 9; count++) acceptSafety(owner, fixture)
+
+  for (const entry of [first, second]) {
+    for (const buffer of entry.owned) {
+      t.alike(
+        buffer,
+        b4a.alloc(buffer.byteLength),
+        'eviction immediately clears authority ownership before invocation'
+      )
+    }
+  }
+  await expectCodeAsync(
+    t,
+    () => owner.beginChallenge(oldest, first.authority),
+    'ERR_AUTHENTICATION'
+  )
+  await expectCodeAsync(
+    t,
+    () => owner.beginChallenge(oldest, second.authority),
+    'ERR_AUTHENTICATION'
+  )
+  t.is(sends, 0, 'both authorities fail before IO after deletion-while-iterating cleanup')
   owner.destroy()
 })
 
