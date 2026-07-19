@@ -65,17 +65,28 @@ async function expectCodeAsync(t, fn, code) {
   t.is(error && error.code, code)
 }
 
-function trackedRelayCapability() {
+function trackedRelayCapability(cryptoOverrides = null) {
   const modulePath = require.resolve('../../lib/private/relay-capability')
-  const cached = require.cache[modulePath]
+  const cryptoSuitePath = require.resolve('../../lib/private/crypto-suite')
+  const cacheKey = (path) =>
+    require.cache[path] === undefined
+      ? Object.keys(require.cache).find((key) => key.endsWith(path))
+      : path
+  const moduleCacheKey = cacheKey(modulePath)
+  const cryptoSuiteCacheKey = cacheKey(cryptoSuitePath)
+  const cached = require.cache[moduleCacheKey]
+  const cachedCryptoSuite = require.cache[cryptoSuiteCacheKey]
+  const originalCryptoSuiteExports = cachedCryptoSuite.exports
   const BufferConstructor = b4a.alloc(0).constructor
   const originalB4a = b4a.allocUnsafeSlow
   const originalBuffer = BufferConstructor.allocUnsafeSlow
+  const originalConcat = b4a.concat
   const allocations = []
   let tracking = false
   let failingSize = null
   let failingAllocation = null
   let allocationCount = 0
+  let failAfterConcat = false
   const allocate = (size) => {
     if (tracking) allocationCount++
     if (tracking && allocationCount === failingAllocation) {
@@ -90,19 +101,40 @@ function trackedRelayCapability() {
     if (tracking) allocations.push(value)
     return value
   }
+  const concatenate = (parts) => {
+    const value = Reflect.apply(originalConcat, b4a, [parts])
+    if (tracking) allocations.push(value)
+    if (tracking && failAfterConcat) {
+      failAfterConcat = false
+      failingAllocation = allocationCount + 1
+    }
+    return value
+  }
   b4a.allocUnsafeSlow = allocate
   BufferConstructor.allocUnsafeSlow = allocate
+  b4a.concat = concatenate
+  if (cryptoOverrides !== null) {
+    cachedCryptoSuite.exports = {
+      ...originalCryptoSuiteExports,
+      cryptoSuite: Object.freeze({
+        ...originalCryptoSuiteExports.cryptoSuite,
+        ...cryptoOverrides
+      })
+    }
+  }
   let fresh
   try {
-    delete require.cache[modulePath]
+    delete require.cache[moduleCacheKey]
     fresh = require(modulePath)
   } catch (err) {
     b4a.allocUnsafeSlow = originalB4a
     BufferConstructor.allocUnsafeSlow = originalBuffer
     throw err
   } finally {
-    delete require.cache[modulePath]
-    if (cached) require.cache[modulePath] = cached
+    b4a.concat = originalConcat
+    cachedCryptoSuite.exports = originalCryptoSuiteExports
+    delete require.cache[moduleCacheKey]
+    if (cached) require.cache[moduleCacheKey] = cached
   }
   let restored = false
   return {
@@ -112,19 +144,27 @@ function trackedRelayCapability() {
       failingSize = null
       failingAllocation = null
       allocationCount = 0
+      failAfterConcat = false
       tracking = true
     },
     failAllocationAt(position) {
       failingAllocation = position
     },
+    failNextAllocation() {
+      failingAllocation = allocationCount + 1
+    },
     failAllocationOfSize(size) {
       failingSize = size
+    },
+    failOutputAllocationAfterConcat() {
+      failAfterConcat = true
     },
     take() {
       tracking = false
       failingSize = null
       failingAllocation = null
       allocationCount = 0
+      failAfterConcat = false
       return allocations.splice(0)
     },
     restore() {
@@ -134,6 +174,7 @@ function trackedRelayCapability() {
       failingSize = null
       failingAllocation = null
       allocationCount = 0
+      failAfterConcat = false
       b4a.allocUnsafeSlow = originalB4a
       BufferConstructor.allocUnsafeSlow = originalBuffer
     }
@@ -510,6 +551,94 @@ test('advertisement signing clears normalized ownership on late setup failures',
   }
 })
 
+test('advertisement hash and signature adapters clear raw crypto temporaries', (t) => {
+  const hashOutputs = []
+  const signatureOutputs = []
+  let failHashCopy = false
+  let failSignatureCopy = false
+  let tracked = null
+  tracked = trackedRelayCapability({
+    hash(parts) {
+      const output = cryptoSuite.hash(parts)
+      hashOutputs.push(output)
+      if (failHashCopy) tracked.failNextAllocation()
+      return output
+    },
+    sign(message, secretKey) {
+      const output = cryptoSuite.sign(message, secretKey)
+      signatureOutputs.push(output)
+      if (failSignatureCopy) tracked.failNextAllocation()
+      return output
+    }
+  })
+  t.teardown(tracked.restore)
+  const fixture = signedAdvertisement({ routeSeed: 97 })
+  const callerBuffers = [
+    fixture.encoded,
+    fixture.value.relayIdentity,
+    fixture.value.currentDhtNodeId,
+    fixture.value.reachableEndpoint,
+    fixture.value.routeEncryptionPublicKey,
+    fixture.signer.secretKey
+  ]
+  const snapshots = callerBuffers.map((buffer) => b4a.from(buffer))
+
+  const signed = tracked.fresh.signRelayCapabilityAdvertisement(
+    fixture.value,
+    fixture.signer.secretKey
+  )
+  t.is(signatureOutputs.length, 1)
+  t.alike(signatureOutputs.shift(), b4a.alloc(64), 'successful signing clears raw signature')
+  t.unlike(signed.signature, b4a.alloc(64), 'returned signature retains transferred ownership')
+
+  const advertisementDigest = tracked.fresh.digestRelayCapabilityAdvertisement(fixture.encoded, {
+    now: NOW
+  })
+  t.is(hashOutputs.length, 1)
+  t.alike(hashOutputs.shift(), b4a.alloc(32), 'successful digest clears raw hash output')
+  t.unlike(advertisementDigest, b4a.alloc(32), 'returned digest retains copied ownership')
+
+  tracked.start()
+  failHashCopy = true
+  let hashError = null
+  try {
+    tracked.fresh.digestRelayCapabilityAdvertisement(fixture.encoded, { now: NOW })
+  } catch (err) {
+    hashError = err
+  }
+  failHashCopy = false
+  const failedHashOwnership = tracked.take()
+  t.ok(hashError instanceof Error)
+  t.is(hashOutputs.length, 1)
+  t.alike(hashOutputs.shift(), b4a.alloc(32), 'digest copy failure clears raw hash output')
+  for (const output of failedHashOwnership) {
+    t.alike(output, b4a.alloc(output.byteLength), 'digest copy failure clears owned buffers')
+  }
+
+  tracked.start()
+  failSignatureCopy = true
+  expectCode(
+    t,
+    () => tracked.fresh.signRelayCapabilityAdvertisement(fixture.value, fixture.signer.secretKey),
+    'ERR_AUTHENTICATION'
+  )
+  failSignatureCopy = false
+  const failedSignatureOwnership = tracked.take()
+  t.is(signatureOutputs.length, 1)
+  t.alike(
+    signatureOutputs.shift(),
+    b4a.alloc(64),
+    'signature copy failure clears raw signature output'
+  )
+  for (const output of failedSignatureOwnership) {
+    t.alike(output, b4a.alloc(output.byteLength), 'signature copy failure clears owned buffers')
+  }
+
+  for (let index = 0; index < callerBuffers.length; index++) {
+    t.alike(callerBuffers[index], snapshots[index], 'crypto adapter leaves caller bytes untouched')
+  }
+})
+
 test('verifier owns epochs, idempotence, equivocation quarantine, and projections', (t) => {
   const fake = clock()
   const owner = verifier(fake)
@@ -672,6 +801,161 @@ test('verifier accept publishes nothing when expiry timer setup reenters and thr
   t.is(projection.epoch, fixture.signed.epoch)
   t.is(timers.size, 1, 'retry installs the first live advertisement expiry timer')
   t.is(invalidations, 0)
+  owner.destroy()
+  t.is(timers.size, 0)
+})
+
+test('same-epoch equivocation stays revoked and quarantined when timer cleanup reenters and throws', (t) => {
+  const fixture = signedAdvertisement({ routeSeed: 98, expiresAtMs: NOW + 60_000n })
+  const conflict = signedAdvertisement({
+    routeSeed: 99,
+    maxQueuedBytes: 262_145,
+    expiresAtMs: NOW + 60_000n
+  })
+  const fixtureSnapshot = b4a.from(fixture.encoded)
+  const conflictSnapshot = b4a.from(conflict.encoded)
+  const timers = new Map()
+  let nextTimer = 0
+  let clearCalls = 0
+  let invalidations = 0
+  let owner = null
+  let reentrantProjection = null
+  let reentrantError = null
+  owner = new RelayCapabilityVerifier({
+    wallNow: () => NOW,
+    monotonicNow: () => 0n,
+    setTimer(callback, delay) {
+      const timer = ++nextTimer
+      timers.set(timer, { callback, delay })
+      return timer
+    },
+    clearTimer(timer) {
+      clearCalls++
+      if (clearCalls === 1) {
+        try {
+          reentrantProjection = acceptSafety(owner, fixture)
+        } catch (err) {
+          reentrantError = err
+        }
+        timers.delete(timer)
+        throw new Error('injected clearTimer failure')
+      }
+      timers.delete(timer)
+    },
+    onInvalidated() {
+      invalidations++
+    }
+  })
+  const projection = acceptSafety(owner, fixture)
+  const sensitive = [
+    projection.canonicalBytes,
+    projection.digest,
+    projection.identity,
+    projection.canonicalEndpointBytes,
+    projection.routePublicKey
+  ]
+
+  expectCode(t, () => acceptSafety(owner, conflict), 'ERR_AUTHENTICATION')
+  t.is(reentrantProjection, null, 'timer cleanup reentry observes no selectable record')
+  t.ok(reentrantError instanceof PrivateRouteError)
+  t.is(reentrantError && reentrantError.code, 'ERR_AUTHENTICATION')
+  for (const buffer of sensitive) t.alike(buffer, b4a.alloc(buffer.byteLength))
+  t.is(timers.size, 0, 'throwing cleanup leaves no live timer in the injected scheduler')
+  t.is(invalidations, 0, 'equivocation quarantine does not invalidate the verifier')
+  expectCode(t, () => acceptSafety(owner, fixture), 'ERR_AUTHENTICATION')
+  expectCode(
+    t,
+    () =>
+      createActiveChallengeSendAuthority({
+        capsBinding: {
+          advertisement: projection,
+          sourceEndpoint: endpoint(225),
+          queryNonce: seed(146),
+          cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+          returnRoutabilityCookie: seed(147),
+          advertisementDigest: projection.digest,
+          relayIdentity: projection.identity
+        },
+        send() {
+          throw new Error('revoked projection must not send')
+        }
+      }),
+    'ERR_AUTHENTICATION'
+  )
+  t.alike(fixture.encoded, fixtureSnapshot)
+  t.alike(conflict.encoded, conflictSnapshot)
+  owner.destroy()
+})
+
+test('newer relay epochs replace prior state when timer cleanup reenters and throws', (t) => {
+  const fixture = signedAdvertisement({ routeSeed: 100, expiresAtMs: NOW + 60_000n })
+  const newer = signedAdvertisement({
+    epoch: fixture.signed.epoch + 1n,
+    routeSeed: 101,
+    expiresAtMs: NOW + 60_000n
+  })
+  const timers = new Map()
+  let nextTimer = 0
+  let clearCalls = 0
+  let owner = null
+  let reentrantProjection = null
+  let reentrantError = null
+  owner = new RelayCapabilityVerifier({
+    wallNow: () => NOW,
+    monotonicNow: () => 0n,
+    setTimer(callback, delay) {
+      const timer = ++nextTimer
+      timers.set(timer, { callback, delay })
+      return timer
+    },
+    clearTimer(timer) {
+      clearCalls++
+      timers.delete(timer)
+      if (clearCalls !== 1) return
+      try {
+        reentrantProjection = acceptSafety(owner, fixture)
+      } catch (err) {
+        reentrantError = err
+      }
+      throw new Error('injected prior timer cleanup failure')
+    },
+    onInvalidated() {}
+  })
+  const prior = acceptSafety(owner, fixture)
+  const sensitive = [
+    prior.canonicalBytes,
+    prior.digest,
+    prior.identity,
+    prior.canonicalEndpointBytes,
+    prior.routePublicKey
+  ]
+
+  const replacement = acceptSafety(owner, newer)
+  t.is(replacement.epoch, newer.signed.epoch)
+  t.is(reentrantProjection, null, 'timer cleanup reentry cannot select the prior epoch')
+  t.ok(reentrantError instanceof PrivateRouteError)
+  t.is(reentrantError && reentrantError.code, 'ERR_AUTHENTICATION')
+  for (const buffer of sensitive) t.alike(buffer, b4a.alloc(buffer.byteLength))
+  t.is(timers.size, 1, 'only the replacement expiry timer remains live')
+  expectCode(
+    t,
+    () =>
+      createActiveChallengeSendAuthority({
+        capsBinding: {
+          advertisement: prior,
+          sourceEndpoint: endpoint(226),
+          queryNonce: seed(148),
+          cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+          returnRoutabilityCookie: seed(149),
+          advertisementDigest: prior.digest,
+          relayIdentity: prior.identity
+        },
+        send() {
+          throw new Error('replaced projection must not send')
+        }
+      }),
+    'ERR_AUTHENTICATION'
+  )
   owner.destroy()
   t.is(timers.size, 0)
 })
@@ -865,6 +1149,59 @@ test('verifier invalidates atomically on clock rollback and forward expiry', asy
   t.is(nextClock.pending(), 0)
 })
 
+test('expiry and rollback revoke relay state before timer cleanup can reenter', (t) => {
+  for (const mode of ['expiry', 'rollback']) {
+    const fake = clock()
+    const fixture = signedAdvertisement({
+      routeSeed: mode === 'expiry' ? 102 : 103,
+      expiresAtMs: NOW + 60_000n
+    })
+    let clearCalls = 0
+    let invalidations = 0
+    let owner = null
+    let reentrantProjection = null
+    let reentrantError = null
+    owner = new RelayCapabilityVerifier({
+      wallNow: fake.wallNow,
+      monotonicNow: fake.monotonicNow,
+      setTimer: fake.setTimer,
+      clearTimer(timer) {
+        clearCalls++
+        if (clearCalls === 1) {
+          try {
+            reentrantProjection = acceptSafety(owner, fixture)
+          } catch (err) {
+            reentrantError = err
+          }
+        }
+        fake.clearTimer(timer)
+      },
+      onInvalidated() {
+        invalidations++
+      }
+    })
+    const projection = acceptSafety(owner, fixture)
+    const sensitive = [
+      projection.canonicalBytes,
+      projection.digest,
+      projection.identity,
+      projection.canonicalEndpointBytes,
+      projection.routePublicKey
+    ]
+
+    fake.jumpWall(mode === 'expiry' ? 60_000 : -30_001)
+    expectCode(t, () => acceptSafety(owner, fixture), 'ERR_INCOMPATIBLE_RELAY')
+    t.is(reentrantProjection, null, `${mode} cleanup reentry observes no projection`)
+    t.ok(reentrantError instanceof PrivateRouteError)
+    t.is(reentrantError && reentrantError.code, 'ERR_INCOMPATIBLE_RELAY')
+    t.is(clearCalls, 1, `${mode} cleanup does not recursively invalidate live state`)
+    t.is(invalidations, mode === 'rollback' ? 1 : 0)
+    for (const buffer of sensitive) t.alike(buffer, b4a.alloc(buffer.byteLength))
+    owner.destroy()
+    t.is(fake.pending(), 0)
+  }
+})
+
 test('relay verification exposes no public discovery or dialing API', async (t) => {
   t.is(publicApi.RelayCapabilityVerifier, undefined)
   t.is(publicApi.createActiveChallengeResponderAuthority, undefined)
@@ -1042,6 +1379,73 @@ test('CAPS query late failures clear every earlier owned field copy', (t) => {
   t.alike(query.sourceEndpoint, snapshots.sourceEndpoint)
   t.alike(query.randomTarget, snapshots.randomTarget)
   t.alike(query.queryNonce, snapshots.queryNonce)
+  responder.destroy()
+})
+
+test('keyed hash clears concatenated input and output on setup and hashing failures', (t) => {
+  const tracked = trackedRelayCapability()
+  t.teardown(tracked.restore)
+  const fake = clock()
+  const responder = tracked.fresh.createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+  })
+  const query = {
+    sourceEndpoint: endpoint(224),
+    requestedCapabilityMask: 1,
+    randomTarget: seed(144),
+    queryNonce: seed(145),
+    maximumResults: 1
+  }
+  const callerBuffers = [query.sourceEndpoint, query.randomTarget, query.queryNonce]
+  const snapshots = callerBuffers.map((buffer) => b4a.from(buffer))
+
+  tracked.start()
+  tracked.failOutputAllocationAfterConcat()
+  let allocationError = null
+  try {
+    responder.issueCookie(query)
+  } catch (err) {
+    allocationError = err
+  }
+  const allocationFailureOwned = tracked.take()
+  t.ok(allocationError instanceof Error)
+  for (const output of allocationFailureOwned) {
+    t.alike(output, b4a.alloc(output.byteLength), 'output allocation failure clears hash input')
+  }
+
+  const originalHash = sodium.crypto_generichash
+  let capturedOutput = null
+  let capturedInput = null
+  sodium.crypto_generichash = (output, input) => {
+    capturedOutput = output
+    capturedInput = input
+    throw new Error('injected keyed hash failure')
+  }
+  try {
+    tracked.start()
+    let hashingError = null
+    try {
+      responder.issueCookie(query)
+    } catch (err) {
+      hashingError = err
+    }
+    const hashingFailureOwned = tracked.take()
+    t.ok(hashingError instanceof Error)
+    t.ok(capturedOutput)
+    t.ok(capturedInput)
+    for (const output of hashingFailureOwned) {
+      t.alike(output, b4a.alloc(output.byteLength), 'hashing failure clears input and output')
+    }
+  } finally {
+    sodium.crypto_generichash = originalHash
+  }
+
+  for (let index = 0; index < callerBuffers.length; index++) {
+    t.alike(callerBuffers[index], snapshots[index], 'keyed hash leaves caller bytes untouched')
+  }
   responder.destroy()
 })
 
@@ -1505,6 +1909,167 @@ test('CAPS responder catches up delayed rotations without reviving stale overlap
     t.alike(staleSecret, b4a.alloc(32), 'late catch-up synchronously clears stale secrets')
     responder.destroy()
   }
+})
+
+test('verifier clears raw RNG outputs before challenge publication on every path', async (t) => {
+  const rawOutputs = []
+  let mode = 'ordinary'
+  let reentryOwner = null
+  let reentryProjection = null
+  let reentryAuthority = null
+  let reentryResult = null
+  const tracked = trackedRelayCapability({
+    randomBytes(size) {
+      const output = b4a.alloc(size, rawOutputs.length + 0x71)
+      rawOutputs.push(output)
+      return output
+    },
+    encryptionKeyPair(seedValue) {
+      if (mode === 'reenter') {
+        reentryResult = reentryOwner.beginChallenge(reentryProjection, reentryAuthority).then(
+          () => null,
+          (err) => err
+        )
+        throw new Error('injected key generation failure')
+      }
+      return cryptoSuite.encryptionKeyPair(seedValue)
+    }
+  })
+  t.teardown(tracked.restore)
+  const fixture = signedAdvertisement({ routeSeed: 96, expiresAtMs: NOW + 60_000n })
+  const encodedSnapshot = b4a.from(fixture.encoded)
+  const createOwner = (fake) =>
+    new tracked.fresh.RelayCapabilityVerifier({
+      wallNow: fake.wallNow,
+      monotonicNow: fake.monotonicNow,
+      setTimer: fake.setTimer,
+      clearTimer: fake.clearTimer,
+      onInvalidated() {}
+    })
+  const createAuthority = (projection, send, offset) =>
+    tracked.fresh.createActiveChallengeSendAuthority({
+      capsBinding: {
+        advertisement: projection,
+        sourceEndpoint: endpoint(220 + offset),
+        queryNonce: seed(120 + offset),
+        cookieExpiresAtMs: NOW + ACTIVE_CHALLENGE_TIMEOUT,
+        returnRoutabilityCookie: seed(130 + offset),
+        advertisementDigest: projection.digest,
+        relayIdentity: projection.identity
+      },
+      send
+    })
+
+  const allocationClock = clock()
+  const allocationOwner = createOwner(allocationClock)
+  const allocationProjection = acceptSafety(allocationOwner, fixture)
+  let allocationSends = 0
+  const allocationAuthority = createAuthority(
+    allocationProjection,
+    () => {
+      allocationSends++
+      return b4a.alloc(0)
+    },
+    1
+  )
+  rawOutputs.length = 0
+  tracked.start()
+  tracked.failAllocationAt(2)
+  await expectCodeAsync(
+    t,
+    () => allocationOwner.beginChallenge(allocationProjection, allocationAuthority),
+    'ERR_AUTHENTICATION'
+  )
+  const allocationFailureOwned = tracked.take()
+  t.is(rawOutputs.length, 2)
+  for (const output of rawOutputs)
+    t.alike(output, b4a.alloc(32), 'allocation failure clears raw RNG')
+  for (const output of allocationFailureOwned) {
+    t.alike(output, b4a.alloc(output.byteLength), 'allocation failure clears copied ownership')
+  }
+  t.is(allocationSends, 0, 'allocation failure publishes no challenge')
+  t.is(allocationClock.pending(), 1, 'allocation failure adds no pending timer')
+  allocationOwner.destroy()
+
+  const reentryClock = clock()
+  reentryOwner = createOwner(reentryClock)
+  reentryProjection = acceptSafety(reentryOwner, fixture)
+  let reentrySends = 0
+  reentryAuthority = createAuthority(
+    reentryProjection,
+    () => {
+      reentrySends++
+      return b4a.alloc(0)
+    },
+    2
+  )
+  rawOutputs.length = 0
+  mode = 'reenter'
+  await expectCodeAsync(
+    t,
+    () => reentryOwner.beginChallenge(reentryProjection, reentryAuthority),
+    'ERR_AUTHENTICATION'
+  )
+  const reentryError = await reentryResult
+  t.ok(reentryError instanceof PrivateRouteError)
+  t.is(reentryError && reentryError.code, 'ERR_REPLAY')
+  t.is(rawOutputs.length, 2)
+  for (const output of rawOutputs) t.alike(output, b4a.alloc(32), 'reentry failure clears raw RNG')
+  t.is(reentrySends, 0, 'reentry failure publishes no challenge')
+  t.is(reentryClock.pending(), 1, 'reentry failure adds no pending timer')
+  reentryOwner.destroy()
+
+  const successClock = clock()
+  const successOwner = createOwner(successClock)
+  const successProjection = acceptSafety(successOwner, fixture)
+  const responderClock = clock()
+  const responder = createActiveChallengeResponderAuthority({
+    now: responderClock.wallNow,
+    setTimeout: responderClock.setTimer,
+    clearTimeout: responderClock.clearTimer,
+    crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+  })
+  const query = {
+    sourceEndpoint: endpoint(223),
+    requestedCapabilityMask: 1,
+    randomTarget: seed(142),
+    queryNonce: seed(143),
+    maximumResults: 1
+  }
+  const cookie = responder.issueCookie(query)
+  const binding = responder.admitCapsRetry({
+    ...query,
+    ...cookie,
+    advertisement: fixture.encoded
+  })
+  const successAuthority = tracked.fresh.createActiveChallengeSendAuthority({
+    capsBinding: {
+      advertisement: successProjection,
+      sourceEndpoint: query.sourceEndpoint,
+      queryNonce: query.queryNonce,
+      cookieExpiresAtMs: cookie.cookieExpiresAtMs,
+      returnRoutabilityCookie: cookie.returnRoutabilityCookie,
+      advertisementDigest: successProjection.digest,
+      relayIdentity: successProjection.identity
+    },
+    send(challenge) {
+      return responder.respond(binding, challenge, {
+        sourceEndpoint: query.sourceEndpoint,
+        advertisement: fixture.encoded,
+        identitySecretKey: fixture.signer.secretKey,
+        routeEncryptionSecretKey: fixture.route.secretKey
+      })
+    }
+  })
+  rawOutputs.length = 0
+  mode = 'ordinary'
+  const validated = await successOwner.beginChallenge(successProjection, successAuthority)
+  t.alike(validated.digest, successProjection.digest)
+  t.is(rawOutputs.length, 2)
+  for (const output of rawOutputs) t.alike(output, b4a.alloc(32), 'success clears raw RNG')
+  t.alike(fixture.encoded, encodedSnapshot, 'all paths leave caller advertisement unchanged')
+  responder.destroy()
+  successOwner.destroy()
 })
 
 test('active challenge uses exact vectors, monotonic deadline, possession proof, and single completion', async (t) => {
