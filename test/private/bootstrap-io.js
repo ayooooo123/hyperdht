@@ -16,6 +16,7 @@ const {
   roleForIdentity
 } = require('../../lib/private/protocol')
 const {
+  createActiveChallengeResponderAuthority,
   deriveM3DhtNodeId,
   digestRelayCapabilityAdvertisement,
   encodeCanonicalEndpoint,
@@ -125,12 +126,27 @@ function advertisement(role, index, host, port) {
 function fakeClock() {
   let wall = NOW
   let monotonic = 0n
+  let nextTimer = 0
+  const timers = new Map()
   return {
     wallNow: () => wall,
     monotonicNow: () => monotonic,
+    setTimer(callback, delay) {
+      const id = ++nextTimer
+      timers.set(id, { at: monotonic + BigInt(delay), callback })
+      return id
+    },
+    clearTimer(id) {
+      timers.delete(id)
+    },
     advance(value) {
       wall += BigInt(value)
       monotonic += BigInt(value)
+      for (const [id, timer] of timers) {
+        if (timer.at > monotonic) continue
+        timers.delete(id)
+        timer.callback()
+      }
     }
   }
 }
@@ -138,14 +154,24 @@ function fakeClock() {
 function fixture(options = {}) {
   const clock = fakeClock()
   const local = identityFor(ROLE.SAFETY, 2)
-  const configured = [endpoint('192.0.2.41', 49737), endpoint('198.51.100.42', 49738)]
-  const guard = advertisement(ROLE.SAFETY, 1, configured[0].host, configured[0].port)
-  guard.digest = digestRelayCapabilityAdvertisement(guard.bytes, { now: NOW })
-  const middleA = advertisement(ROLE.SAFETY, 2, '203.0.113.43', 49739)
-  const middleB = advertisement(ROLE.SAFETY, 3, '198.18.4.44', 49740)
+  const configured = [
+    endpoint('192.0.2.41', 49737),
+    endpoint('198.51.100.42', 49738),
+    endpoint('203.0.113.43', 49739)
+  ].slice(0, options.configuredCount || 2)
+  const guards = configured.map((value, index) =>
+    advertisement(ROLE.SAFETY, index + 1, value.host, value.port)
+  )
+  for (const guard of guards) {
+    guard.digest = digestRelayCapabilityAdvertisement(guard.bytes, { now: NOW })
+  }
+  const guard = guards[0]
+  const middleB = advertisement(ROLE.SAFETY, 6, '198.18.4.44', 49740)
   const exitA = advertisement(ROLE.PRIVATE, 4, '198.19.5.45', 49741)
   const exitB = advertisement(ROLE.PRIVATE, 5, '203.0.120.46', 49742)
-  const advertisements = [guard, middleA, middleB, exitA, exitB]
+  const advertisements = options.onlyGuardAdvertisement
+    ? [...guards]
+    : [...guards, middleB, exitA, exitB]
   for (let index = 0; index < (options.extraAdvertisements || 0); index++) {
     advertisements.push(
       advertisement(
@@ -160,6 +186,9 @@ function fixture(options = {}) {
   let destroyed = false
   let responder = null
   let responderEstablished = null
+  let replayedChallengeResponse = null
+  const capsResponders = new Map()
+  const capsBindings = new Map()
   let physicalDestroys = 0
   let inFlight = 0
   let maximumInFlight = 0
@@ -171,6 +200,99 @@ function fixture(options = {}) {
       calls.push([host, port, request.kind])
       try {
         if (options.onSend) await options.onSend({ host, port, request, clock })
+        if (
+          (options.failFirstAt === request.kind && host === configured[0].host) ||
+          options.failAllAt === request.kind
+        ) {
+          throw new Error(`injected ${request.kind} failure`)
+        }
+        if (options.strictTask2Caps !== false) {
+          const endpointKey = `${host}:${port}`
+          let capsResponder = capsResponders.get(endpointKey)
+          if (!capsResponder) {
+            capsResponder = createActiveChallengeResponderAuthority({
+              now: clock.wallNow,
+              setTimeout: clock.setTimer,
+              clearTimeout: clock.clearTimer,
+              crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
+            })
+            capsResponders.set(endpointKey, capsResponder)
+          }
+          if (request.kind === 'caps-query') {
+            const query = {
+              sourceEndpoint: endpointBytes('10.0.0.2', 44000),
+              requestedCapabilityMask: request.requestedCapabilityMask,
+              randomTarget: request.randomTarget,
+              queryNonce: request.queryNonce,
+              maximumResults: request.maximumResults
+            }
+            const cookie = capsResponder.issueCookie(query)
+            if (options.onCapsQueryResponse) options.onCapsQueryResponse()
+            let response = Object.freeze({
+              sourceEndpoint: query.sourceEndpoint,
+              cookieExpiresAtMs: cookie.cookieExpiresAtMs,
+              returnRoutabilityCookie: cookie.returnRoutabilityCookie,
+              advertisements: advertisements.map((entry) => entry.bytes)
+            })
+            if (options.forgeCapsSource) {
+              response = Object.freeze({
+                ...response,
+                sourceEndpoint: endpointBytes('10.0.0.9', 44009)
+              })
+            }
+            if (options.wrongRoleAdvertisement) {
+              response = Object.freeze({ ...response, advertisements: [exitA.bytes] })
+            }
+            return response
+          }
+          if (request.kind === 'caps-retry') {
+            const binding = capsResponder.admitCapsRetry({
+              sourceEndpoint: request.sourceEndpoint,
+              requestedCapabilityMask: request.requestedCapabilityMask,
+              randomTarget: request.randomTarget,
+              queryNonce: request.queryNonce,
+              maximumResults: request.maximumResults,
+              cookieExpiresAtMs: request.cookieExpiresAtMs,
+              returnRoutabilityCookie: request.returnRoutabilityCookie,
+              advertisement: request.advertisement
+            })
+            capsBindings.set(endpointKey, {
+              advertisement: request.advertisement,
+              binding,
+              responder: capsResponder,
+              sourceEndpoint: request.sourceEndpoint
+            })
+            return Object.freeze({})
+          }
+          if (request.kind === 'active-challenge') {
+            if (options.rejectChallenges) throw new Error('challenge rejected')
+            const stored = capsBindings.get(endpointKey)
+            if (!stored) throw new Error('missing CAPS retry binding')
+            const selected = advertisements.find((entry) =>
+              b4a.equals(entry.bytes, stored.advertisement)
+            )
+            if (!selected) throw new Error('unknown challenged advertisement')
+            capsBindings.delete(endpointKey)
+            let bytes = stored.responder.respond(stored.binding, request.bytes, {
+              sourceEndpoint: stored.sourceEndpoint,
+              advertisement: selected.bytes,
+              identitySecretKey: selected.signer.secretKey,
+              routeEncryptionSecretKey: selected.route.secretKey
+            })
+            if (options.replayActiveChallenge) {
+              if (replayedChallengeResponse) bytes = b4a.from(replayedChallengeResponse)
+              else replayedChallengeResponse = b4a.from(bytes)
+            }
+            if (options.forgeActiveChallenge) {
+              bytes = b4a.from(bytes)
+              bytes[bytes.byteLength - 1] ^= 1
+            }
+            if (options.expireActiveChallenge) clock.advance(5_001)
+            if (options.cancelAt === 'active-challenge') io.cancel()
+            return Object.freeze({ bytes })
+          }
+          if (request.kind !== 'link') throw new Error('legacy CAPS transport shape')
+        }
         if (request.kind === 'cookie') return { cookie: b4a.alloc(32, 0x77) }
         if (request.kind === 'caps') {
           return { advertisements: advertisements.map((entry) => entry.bytes) }
@@ -180,11 +302,17 @@ function fixture(options = {}) {
           return { advertisementDigest: b4a.from(guard.digest) }
         }
         if (request.kind === 'link') {
+          const selectedGuard = guards.find(
+            (entry) =>
+              b4a.equals(entry.endpoint, endpointBytes(host, port)) &&
+              roleForIdentity(entry.signer.publicKey) === ROLE.SAFETY
+          )
+          if (!selectedGuard) throw new Error('link attempted for non-guard')
           const responderPhysical = Object.freeze({ destroy() {} })
           responder = createIndexZeroGuardLinkResponder({
-            advertisement: guard.bytes,
-            responderIdentitySecretKey: guard.signer.secretKey,
-            responderRouteEncryptionSecretKey: guard.route.secretKey,
+            advertisement: selectedGuard.bytes,
+            responderIdentitySecretKey: selectedGuard.signer.secretKey,
+            responderRouteEncryptionSecretKey: selectedGuard.route.secretKey,
             now: () => NOW,
             receiveOffer: () => ({
               offer: request.bytes,
@@ -216,7 +344,10 @@ function fixture(options = {}) {
   }
   let io = null
   const sink = createRelayCandidateDirectorySink({
-    wallNow: clock.wallNow,
+    wallNow() {
+      if (options.onSinkWall) options.onSinkWall({ io, clock })
+      return clock.wallNow()
+    },
     monotonicNow() {
       if (options.onSinkMonotonic) options.onSinkMonotonic({ io, clock })
       return clock.monotonicNow()
@@ -249,6 +380,7 @@ function fixture(options = {}) {
     },
     io,
     cleanup() {
+      for (const capsResponder of capsResponders.values()) capsResponder.destroy()
       if (responderEstablished) destroyM3EstablishedLink(responderEstablished)
       if (responder) responder.destroy()
     }
@@ -323,7 +455,7 @@ test('cold start contacts sequentially, pins one guard, revokes generic send bef
   t.is(f.maximumInFlight, 1)
   t.alike(
     f.calls.map((call) => call[2] || call[0]),
-    ['cookie', 'caps', 'cookie', 'caps', 'challenge', 'link', 'destroy']
+    ['caps-query', 'caps-query', 'caps-retry', 'active-challenge', 'link', 'destroy']
   )
   const moved = consumeBootstrapGuardPin(transfer)
   t.alike(Object.keys(moved.guardLeaseMaterial), [])
@@ -349,10 +481,97 @@ test('cold start contacts sequentially, pins one guard, revokes generic send bef
   f.cleanup()
 })
 
+test('cold start authenticates CAPS through the Task2 cookie binding and encoded active challenge', async (t) => {
+  const f = fixture({ strictTask2Caps: true })
+  let transfer = null
+  try {
+    transfer = await f.io.start()
+    const activeChallenge = f.calls.find((call) => call[2] === 'active-challenge')
+    t.ok(activeChallenge, 'Task2 active challenge is emitted')
+    t.is(
+      f.calls.some((call) => call[2] === 'challenge'),
+      false,
+      'legacy digest-shaped challenge is never emitted'
+    )
+    const moved = consumeBootstrapGuardPin(transfer)
+    transfer = null
+    moved.candidateDirectory.destroy()
+  } finally {
+    if (transfer) revokeBootstrapGuardPin(transfer)
+    f.cleanup()
+  }
+})
+
+test('Task2 CAPS integration rejects forged source cookies and wrong-role advertisements', async (t) => {
+  for (const options of [{ forgeCapsSource: true }, { wrongRoleAdvertisement: true }]) {
+    const f = fixture({ configuredCount: 1, ...options })
+    await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+    t.is(
+      f.calls.some((call) => call[2] === 'link'),
+      false
+    )
+    t.ok(f.destroyed)
+    f.cleanup()
+  }
+})
+
+test('Task2 active challenge rejects forgery, replay, expiry, and cancellation reentry', async (t) => {
+  for (const options of [
+    { configuredCount: 1, forgeActiveChallenge: true },
+    { configuredCount: 2, replayActiveChallenge: true, failFirstAt: 'link' },
+    { configuredCount: 1, expireActiveChallenge: true },
+    { configuredCount: 1, cancelAt: 'active-challenge' }
+  ]) {
+    const f = fixture(options)
+    await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+    t.ok(f.destroyed)
+    t.is(f.calls.filter((call) => call[2] === 'link').length, options.replayActiveChallenge ? 1 : 0)
+    f.cleanup()
+  }
+})
+
+test('each failed configured endpoint boundary is cleared before the next endpoint succeeds', async (t) => {
+  for (const failedKind of ['caps-query', 'caps-retry', 'active-challenge', 'link']) {
+    const f = fixture({ failFirstAt: failedKind })
+    let transfer = null
+    try {
+      transfer = await f.io.start()
+      t.is(f.maximumInFlight, 1, `${failedKind} never overlaps endpoint attempts`)
+      t.ok(
+        f.calls.some((call) => call[0] === f.configured[1].host && call[2] === 'caps-query'),
+        `${failedKind} advances to the second configured endpoint`
+      )
+      const moved = consumeBootstrapGuardPin(transfer)
+      transfer = null
+      moved.candidateDirectory.destroy()
+    } finally {
+      if (transfer) revokeBootstrapGuardPin(transfer)
+      f.cleanup()
+    }
+  }
+})
+
+test('all configured endpoint failures exhaust without parallel, fallback, or DNS traffic', async (t) => {
+  for (const failedKind of ['caps-query', 'caps-retry', 'active-challenge', 'link']) {
+    const f = fixture({ failAllAt: failedKind })
+    try {
+      await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+      t.is(f.maximumInFlight, 1, `${failedKind} remains sequential`)
+      t.is(
+        f.calls.some((call) => call[2] === 'fallback' || call[2] === 'dns'),
+        false,
+        `${failedKind} cannot create fallback traffic`
+      )
+    } finally {
+      f.cleanup()
+    }
+  }
+})
+
 test('challenge exhaustion fails closed without link, fallback, DNS, or more than three prospective guards', async (t) => {
-  const f = fixture({ rejectChallenges: true })
+  const f = fixture({ configuredCount: 3, rejectChallenges: true })
   await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
-  t.is(f.calls.filter((call) => call[2] === 'challenge').length, 3)
+  t.is(f.calls.filter((call) => call[2] === 'active-challenge').length, 3)
   t.is(
     f.calls.some((call) => call[2] === 'link'),
     false
@@ -374,7 +593,8 @@ test('one monotonic ten-second budget covers cookie, CAPS, challenge, and first 
   await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
   t.is(
     f.calls.some((call) => call[2] === 'link'),
-    false
+    true,
+    'the first-link request is covered and its over-budget response is rejected'
   )
   t.ok(f.destroyed)
   f.cleanup()
@@ -429,112 +649,154 @@ test('cancel during a pending datagram emits no later packet', async (t) => {
   t.is(f.calls.filter((call) => call[2]).length, 1)
   t.alike(
     f.calls.map((call) => call[2] || call[0]),
-    ['cookie', 'destroy']
+    ['caps-query', 'destroy']
   )
   f.cleanup()
 })
 
 test('three prospective configured guards are challenged sequentially and never as middle or exit contacts', async (t) => {
-  const clock = fakeClock()
-  const local = identityFor(ROLE.SAFETY, 2)
-  const configured = [
-    endpoint('192.0.2.41', 49737),
-    endpoint('198.51.100.42', 49738),
-    endpoint('203.0.113.43', 49739)
-  ]
-  const guards = configured.map((value, index) =>
-    advertisement(ROLE.SAFETY, index + 1, value.host, value.port)
-  )
-  const contacts = []
-  let active = 0
-  let maximum = 0
-  const datagrams = {
-    async send(host, port, request) {
-      active++
-      maximum = Math.max(maximum, active)
-      contacts.push([host, port, request.kind])
-      try {
-        if (request.kind === 'cookie') return { cookie: b4a.alloc(32, 1) }
-        if (request.kind === 'caps') return { advertisements: guards.map((value) => value.bytes) }
-        if (request.kind === 'challenge') throw new Error('no proof')
-        throw new Error('unexpected contact')
-      } finally {
-        active--
-      }
-    },
-    destroy() {}
-  }
-  const io = new BootstrapIO({
-    endpoints: configured,
-    localIdentity: local.publicKey,
-    localSecretKey: local.secretKey,
-    datagrams,
-    wallNow: clock.wallNow,
-    monotonicNow: clock.monotonicNow,
-    randomBytes: (size) => b4a.alloc(size, 9),
-    candidateDirectorySink: createRelayCandidateDirectorySink({
-      wallNow: clock.wallNow,
-      monotonicNow: clock.monotonicNow
-    })
-  })
-  await expectCodeAsync(t, () => io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
-  t.is(contacts.filter((entry) => entry[2] === 'challenge').length, 3)
-  t.is(maximum, 1)
+  const f = fixture({ configuredCount: 3, rejectChallenges: true })
+  await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+  t.is(f.calls.filter((entry) => entry[2] === 'active-challenge').length, 3)
+  t.is(f.maximumInFlight, 1)
   t.is(
-    contacts.some((entry) => entry[2] === 'middle' || entry[2] === 'exit'),
+    f.calls.some((entry) => entry[2] === 'middle' || entry[2] === 'exit'),
     false
   )
+  f.cleanup()
 })
 
-test('candidate projection allocation failure zeroizes every earlier owned copy', async (t) => {
-  const original = b4a.allocUnsafeSlow
-  const allocations = []
-  let armed = false
-  let count = 0
-  b4a.allocUnsafeSlow = (size) => {
-    if (armed && ++count === 4) throw new Error('injected candidate allocation failure')
-    const value = original(size)
-    if (armed) allocations.push(value)
-    return value
-  }
-  let f = null
-  try {
-    f = fixture({
-      onSend({ request }) {
-        if (request.kind === 'caps') armed = true
+test('candidate projection clears every earlier owned copy at all five allocation positions', async (t) => {
+  for (let failurePosition = 1; failurePosition <= 5; failurePosition++) {
+    const original = b4a.allocUnsafeSlow
+    const owned = []
+    let armed = false
+    let sequence = 0
+    let position = 0
+    let f = null
+    try {
+      f = fixture({
+        configuredCount: 1,
+        onCapsQueryResponse() {
+          armed = true
+        }
+      })
+      const encodedSize = f.advertisements[0].bytes.byteLength
+      const expectedSizes = [encodedSize, 32, 32, 19, 32]
+      const snapshots = f.advertisements.map((entry) => b4a.from(entry.bytes))
+      b4a.allocUnsafeSlow = (size) => {
+        if (armed && position === 0 && size === expectedSizes[0]) {
+          sequence++
+          position = 1
+        } else if (armed && position > 0 && size === expectedSizes[position]) {
+          position++
+        } else if (armed) {
+          position = size === expectedSizes[0] ? 1 : 0
+        }
+        const target = sequence === 2 && position === failurePosition
+        if (target) throw new Error(`candidate copy ${failurePosition}`)
+        const value = original(size)
+        if (sequence === 2 && position > 0 && position < failurePosition) owned.push(value)
+        if (position === expectedSizes.length) position = 0
+        return value
       }
-    })
-    await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
-  } finally {
-    b4a.allocUnsafeSlow = original
-    if (f) f.cleanup()
+      await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+      t.is(owned.length, failurePosition - 1, `copy ${failurePosition} owns no partial suffix`)
+      for (const value of owned) t.alike(value, b4a.alloc(value.byteLength))
+      for (let index = 0; index < snapshots.length; index++) {
+        t.alike(
+          f.advertisements[index].bytes,
+          snapshots[index],
+          'caller advertisement is untouched'
+        )
+      }
+    } finally {
+      b4a.allocUnsafeSlow = original
+      if (f) f.cleanup()
+    }
   }
-  t.ok(allocations.length >= 3)
-  for (const value of allocations) t.alike(value, b4a.alloc(value.byteLength))
 })
 
-test('guard-pin consume allocation failure clears earlier pinned projection copies and returns no partial resource', async (t) => {
-  const f = fixture()
-  const transfer = await f.io.start()
-  const original = b4a.allocUnsafeSlow
-  const allocations = []
-  let count = 0
-  b4a.allocUnsafeSlow = (size) => {
-    if (++count === 3) throw new Error('injected pinned projection allocation failure')
-    const value = original(size)
-    allocations.push(value)
-    return value
+test('guard-pin publication clears every earlier owned copy at all three allocation positions', async (t) => {
+  for (let failurePosition = 1; failurePosition <= 3; failurePosition++) {
+    const original = b4a.allocUnsafeSlow
+    const allocations = []
+    let armed = false
+    let position = 0
+    let f = null
+    try {
+      f = fixture({
+        configuredCount: 1,
+        onlyGuardAdvertisement: true,
+        onSinkMonotonic() {
+          armed = true
+        }
+      })
+      const sizes = [32, 19, 32]
+      b4a.allocUnsafeSlow = (size) => {
+        if (armed && size === sizes[position]) position++
+        else if (armed) position = size === sizes[0] ? 1 : 0
+        if (position === failurePosition) throw new Error(`published pin ${failurePosition}`)
+        const value = original(size)
+        if (armed && position > 0 && position < failurePosition) allocations.push(value)
+        if (position === sizes.length) position = 0
+        return value
+      }
+      await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+      t.is(f.physicalDestroys, 1, `copy ${failurePosition} destroys the established link`)
+      t.is(allocations.length, failurePosition - 1)
+      for (const value of allocations) t.alike(value, b4a.alloc(value.byteLength))
+    } finally {
+      b4a.allocUnsafeSlow = original
+      if (f) f.cleanup()
+    }
   }
-  try {
-    t.exception(() => consumeBootstrapGuardPin(transfer))
-  } finally {
-    b4a.allocUnsafeSlow = original
-    f.cleanup()
+})
+
+test('guard-pin consume clears sibling resources at all three pinned copy positions', async (t) => {
+  for (let failurePosition = 1; failurePosition <= 3; failurePosition++) {
+    const f = fixture({ configuredCount: 1, onlyGuardAdvertisement: true })
+    const transfer = await f.io.start()
+    const original = b4a.allocUnsafeSlow
+    const allocations = []
+    let count = 0
+    b4a.allocUnsafeSlow = (size) => {
+      if (++count === failurePosition) throw new Error(`pinned copy ${failurePosition}`)
+      const value = original(size)
+      allocations.push(value)
+      return value
+    }
+    try {
+      t.exception(() => consumeBootstrapGuardPin(transfer))
+    } finally {
+      b4a.allocUnsafeSlow = original
+      f.cleanup()
+    }
+    t.is(f.physicalDestroys, 1, `copy ${failurePosition} destroys the sibling lease`)
+    t.is(allocations.length, failurePosition - 1)
+    for (const value of allocations) t.alike(value, b4a.alloc(value.byteLength))
+    expectCode(t, () => consumeBootstrapGuardPin(transfer), 'ERR_REPLAY')
   }
-  t.is(f.physicalDestroys, 1, 'lease is destroyed when the sibling projection fails')
-  t.is(allocations.length, 2)
-  for (const value of allocations) t.alike(value, b4a.alloc(value.byteLength))
+})
+
+test('reentrant guard-pin revocation poisons an in-progress consume and publishes nothing', async (t) => {
+  let transfer = null
+  let reenter = false
+  let revokeResult = null
+  const f = fixture({
+    onSinkWall() {
+      if (!reenter) return
+      reenter = false
+      revokeResult = revokeBootstrapGuardPin(transfer)
+    }
+  })
+  transfer = await f.io.start()
+  reenter = true
   expectCode(t, () => consumeBootstrapGuardPin(transfer), 'ERR_REPLAY')
+  t.is(revokeResult, true, 'reentrant revoke terminally poisons the transfer')
+  t.is(f.physicalDestroys, 1, 'poison destroys the unpublished lease')
+  expectCode(t, () => consumeBootstrapGuardPin(transfer), 'ERR_REPLAY')
+  f.cleanup()
 })
 
 test('constructor partial allocation failure zeroizes the owned identity and performs no IO', (t) => {

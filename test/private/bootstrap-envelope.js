@@ -561,6 +561,45 @@ test('codec copies hostile and aliased inputs and sanitizes adapter/getter failu
   t.alike(f.rightCodec.decode(encoded, f.leftSource).body, aliasSnapshot)
 })
 
+test('decoded envelope provenance clears all earlier copies at every allocation position', (t) => {
+  for (let failurePosition = 1; failurePosition <= 12; failurePosition++) {
+    const f = fixture()
+    const packet = encodeCreate(f)
+    const original = b4a.allocUnsafeSlow
+    const allocations = []
+    let armed = false
+    let count = 0
+    const crypto = {
+      ...cryptoSuite,
+      hash(...args) {
+        const digest = cryptoSuite.hash(...args)
+        if (b4a.isBuffer(args[0]) && args[0].byteLength === BOOTSTRAP_SIZE) armed = true
+        return digest
+      }
+    }
+    const codec = new BootstrapEnvelopeCodec({
+      crypto,
+      linkHandle: f.right.handle,
+      localIdentitySecretKey: f.responder.secretKey,
+      padding: (size) => b4a.alloc(size)
+    })
+    b4a.allocUnsafeSlow = (size) => {
+      if (armed && ++count === failurePosition) throw new Error(`envelope copy ${failurePosition}`)
+      const value = original(size)
+      if (armed) allocations.push(value)
+      return value
+    }
+    try {
+      expectCode(t, () => codec.decode(packet, f.leftSource), 'INVALID_ROUTE')
+    } finally {
+      b4a.allocUnsafeSlow = original
+      codec.destroy()
+    }
+    t.is(allocations.length, failurePosition - 1)
+    for (const value of allocations) t.alike(value, b4a.alloc(value.byteLength))
+  }
+})
+
 function tableFixture(overrides = {}) {
   const clock = fakeClock()
   const observations = []
@@ -583,6 +622,51 @@ function tableFixture(overrides = {}) {
   })
   return { clock, table, observations }
 }
+
+test('request begin clears record and return copies at every allocation position', (t) => {
+  for (let failurePosition = 1; failurePosition <= 11; failurePosition++) {
+    const f = fixture()
+    const original = b4a.allocUnsafeSlow
+    const allocations = []
+    let armed = false
+    let count = 0
+    const crypto = {
+      ...cryptoSuite,
+      hash(...args) {
+        const digest = cryptoSuite.hash(...args)
+        armed = true
+        return digest
+      }
+    }
+    const { table, clock, observations } = tableFixture({ crypto })
+    b4a.allocUnsafeSlow = (size) => {
+      if (armed && ++count === failurePosition) throw new Error(`request copy ${failurePosition}`)
+      const value = original(size)
+      if (armed) allocations.push(value)
+      return value
+    }
+    try {
+      expectCode(
+        t,
+        () =>
+          table.begin({
+            peerIdentity32: f.responder.publicKey,
+            epoch: 7n,
+            encode: (requestId) => encodeCreate(f, { requestId }),
+            onResponse() {}
+          }),
+        'ROUTE_UNAVAILABLE'
+      )
+    } finally {
+      b4a.allocUnsafeSlow = original
+    }
+    t.is(clock.pending(), 0)
+    t.is(observations.at(-1)?.pending || 0, 0)
+    t.is(allocations.length, failurePosition - 1)
+    for (const value of allocations) t.alike(value, b4a.alloc(value.byteLength))
+    table.destroy()
+  }
+})
 
 test('request table owns nonzero per-peer IDs, exact response correlation, and deadlines', (t) => {
   const f = fixture()
