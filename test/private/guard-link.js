@@ -4,6 +4,11 @@ const test = require('brittle')
 const b4a = require('b4a')
 
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
+const {
+  DatagramReplayWindow,
+  OrderedReceiver,
+  SenderCounter
+} = require('../../lib/private/counters')
 const { digestPayloadParameters } = require('../../lib/private/link-parameters')
 const {
   decodeRelayCapabilityAdvertisement,
@@ -17,6 +22,7 @@ const {
 const {
   BRANCH_CLASS,
   CAPACITY_CLASS,
+  DOMAIN,
   M3_MESSAGE_ID,
   RELAY_CAPABILITY,
   decodeM3Object,
@@ -31,9 +37,55 @@ const {
   readM3EstablishedLink
 } = require('../../lib/private/guard-link')
 
+const TEST_ONLY_COUNTER_FACTORY = Symbol.for('hyperdht-private-routes/test-only-counter-factory')
+
 const LINK_OFFER_SIZE = 374
 const LINK_ACCEPT_SIZE = 285
 const seed = (value) => b4a.alloc(32, value)
+
+function withSlowAllocationProbe(operation, armAtSize, failAt = Infinity) {
+  const originalAlloc = b4a.allocUnsafeSlow
+  const allocations = []
+  let armed = armAtSize === null
+  let position = 0
+  b4a.allocUnsafeSlow = (size) => {
+    if (size === armAtSize) armed = true
+    if (armed && (size === 16 || size === 32)) {
+      if (++position === failAt) throw new Error('injected allocation failure')
+      const output = originalAlloc(size)
+      allocations.push(output)
+      return output
+    }
+    return originalAlloc(size)
+  }
+  try {
+    return { result: operation(), allocations, positions: position }
+  } catch (err) {
+    err.allocations = allocations
+    err.positions = position
+    throw err
+  } finally {
+    b4a.allocUnsafeSlow = originalAlloc
+  }
+}
+
+function allZero(values) {
+  return values.every((value) => value.every((byte) => byte === 0))
+}
+
+function testCounterFactory(failAt, counters) {
+  let position = 0
+  return (cellClass, sender, now) => {
+    if (++position === failAt) throw new Error('injected counter construction failure')
+    const counter = sender
+      ? new SenderCounter()
+      : cellClass === 2
+        ? new DatagramReplayWindow({ window: 256 })
+        : new OrderedReceiver({ window: 256, gapTimeout: 5000, now })
+    counters.push(counter)
+    return counter
+  }
+}
 
 test('Chunk 1 guard-link exports only index-zero ownership operations', (t) => {
   t.alike(Object.keys(require('../../lib/private/guard-link')).sort(), [
@@ -623,4 +675,272 @@ test('destroy erases M3 link contexts and tail secret and closes physical owners
   t.absent(destroyM3EstablishedLink(established))
   destroyM3EstablishedLink(x.accepted.established)
   x.responder.destroy()
+})
+
+test('offer pending construction is atomic at every owned key copy', (t) => {
+  const countFixture = fixture()
+  const countSetup = setup()
+  const counted = withSlowAllocationProbe(
+    () =>
+      createIndexZeroGuardLinkOffer({
+        advertisement: countFixture.advertisement,
+        now: NOW,
+        randomBytes: (size) => b4a.alloc(size, 0x44),
+        ...countSetup
+      }),
+    302
+  )
+  abortIndexZeroGuardLink(counted.result.pending)
+
+  for (let failure = 1; failure <= counted.positions; failure++) {
+    const f = fixture()
+    const value = setup()
+    const callerSecret = b4a.from(value.clientTailEphemeral.secretKey)
+    let error = null
+    let allocations = []
+    try {
+      withSlowAllocationProbe(
+        () =>
+          createIndexZeroGuardLinkOffer({
+            advertisement: f.advertisement,
+            now: NOW,
+            randomBytes: (size) => b4a.alloc(size, 0x44),
+            ...value
+          }),
+        302,
+        failure
+      )
+    } catch (err) {
+      error = err
+      allocations = err.allocations
+    }
+    t.ok(error, `copy ${failure} fails`)
+    t.ok(allZero(allocations), `copy ${failure} clears prior owned buffers`)
+    t.alike(value.clientTailEphemeral.secretKey, callerSecret, `copy ${failure} preserves caller`)
+  }
+})
+
+test('responder and completion counter failures erase prior TX/RX contexts before publication', (t) => {
+  t.is(typeof TEST_ONLY_COUNTER_FACTORY, 'symbol')
+
+  for (const side of ['responder', 'completion']) {
+    for (let failure = 1; failure <= 6; failure++) {
+      const f = fixture()
+      const value = setup()
+      const initiated = createIndexZeroGuardLinkOffer({
+        advertisement: f.advertisement,
+        now: NOW,
+        randomBytes: (size) => b4a.alloc(size, 0x44),
+        ...value
+      })
+      const offerSnapshot = b4a.from(initiated.offer)
+      const endpoint = encodeCanonicalEndpoint({
+        addressFamily: 4,
+        addressBytes: b4a.from([198, 51, 100, 9]),
+        port: 44000
+      })
+      let responderCloses = 0
+      const counters = []
+      const responder = createIndexZeroGuardLinkResponder({
+        advertisement: f.advertisement,
+        responderIdentitySecretKey: f.guard.secretKey,
+        responderRouteEncryptionSecretKey: f.route.secretKey,
+        now: () => NOW,
+        receiveOffer: () => ({
+          offer: initiated.offer,
+          observedPredecessorEndpoint: endpoint,
+          physicalChannel: Object.freeze({
+            destroy() {
+              responderCloses++
+            }
+          })
+        }),
+        randomBytes: (size) => b4a.alloc(size, 0x55),
+        ...(side === 'responder'
+          ? { [TEST_ONLY_COUNTER_FACTORY]: testCounterFactory(failure, counters) }
+          : {})
+      })
+
+      if (side === 'responder') {
+        t.exception(() => responder.accept(), `${side} counter ${failure} fails`)
+        t.is(responderCloses, 1, `${side} counter ${failure} does not publish a link`)
+        abortIndexZeroGuardLink(initiated.pending)
+      } else {
+        const accepted = responder.accept()
+        let initiatorCloses = 0
+        t.exception(
+          () =>
+            completeIndexZeroGuardLink(initiated.pending, accepted.accept, {
+              advertisement: f.advertisement,
+              physicalChannel: Object.freeze({
+                destroy() {
+                  initiatorCloses++
+                }
+              }),
+              now: NOW,
+              [TEST_ONLY_COUNTER_FACTORY]: testCounterFactory(failure, counters)
+            }),
+          `${side} counter ${failure} fails`
+        )
+        t.is(initiatorCloses, 1, `${side} counter ${failure} does not publish a link`)
+        destroyM3EstablishedLink(accepted.established)
+      }
+
+      t.ok(
+        counters.every((counter) => counter.closed),
+        `${side} counter ${failure} destroys prior counters`
+      )
+      t.alike(initiated.offer, offerSnapshot, `${side} counter ${failure} preserves caller offer`)
+      responder.destroy()
+    }
+  }
+})
+
+test('responder and completion secret copies are atomic at every allocation', (t) => {
+  function responderAttempt(failure = Infinity) {
+    const f = fixture()
+    const value = setup()
+    const initiated = createIndexZeroGuardLinkOffer({
+      advertisement: f.advertisement,
+      now: NOW,
+      randomBytes: (size) => b4a.alloc(size, 0x44),
+      ...value
+    })
+    const offer = b4a.from(initiated.offer)
+    let closes = 0
+    const responder = createIndexZeroGuardLinkResponder({
+      advertisement: f.advertisement,
+      responderIdentitySecretKey: f.guard.secretKey,
+      responderRouteEncryptionSecretKey: f.route.secretKey,
+      now: () => NOW,
+      receiveOffer: () => ({
+        offer: initiated.offer,
+        observedPredecessorEndpoint: encodeCanonicalEndpoint({
+          addressFamily: 4,
+          addressBytes: b4a.from([198, 51, 100, 9]),
+          port: 44000
+        }),
+        physicalChannel: Object.freeze({
+          destroy() {
+            closes++
+          }
+        })
+      }),
+      randomBytes: (size) => b4a.alloc(size, 0x55)
+    })
+    let attempt = null
+    let error = null
+    try {
+      attempt = withSlowAllocationProbe(() => responder.accept(), 213, failure)
+    } catch (err) {
+      error = err
+      attempt = { allocations: err.allocations, positions: err.positions, result: null }
+    }
+    if (attempt.result) destroyM3EstablishedLink(attempt.result.established)
+    abortIndexZeroGuardLink(initiated.pending)
+    responder.destroy()
+    return { ...attempt, closes, error, caller: initiated.offer, offer }
+  }
+
+  const responderCount = responderAttempt().positions
+  for (let failure = 1; failure <= responderCount; failure++) {
+    const attempt = responderAttempt(failure)
+    t.ok(attempt.error, `responder allocation ${failure} fails`)
+    t.ok(allZero(attempt.allocations), `responder allocation ${failure} clears prior secrets`)
+    t.is(attempt.closes, 1, `responder allocation ${failure} publishes no link`)
+    t.alike(attempt.caller, attempt.offer, `responder allocation ${failure} preserves caller`)
+  }
+
+  function completionAttempt(failure = Infinity) {
+    const x = exchange()
+    const accept = b4a.from(x.accepted.accept)
+    let closes = 0
+    let attempt = null
+    let error = null
+    try {
+      attempt = withSlowAllocationProbe(
+        () =>
+          completeIndexZeroGuardLink(x.initiated.pending, x.accepted.accept, {
+            advertisement: x.f.advertisement,
+            physicalChannel: Object.freeze({
+              destroy() {
+                closes++
+              }
+            }),
+            now: NOW
+          }),
+        null,
+        failure
+      )
+    } catch (err) {
+      error = err
+      attempt = { allocations: err.allocations, positions: err.positions, result: null }
+    }
+    if (attempt.result) destroyM3EstablishedLink(attempt.result)
+    destroyM3EstablishedLink(x.accepted.established)
+    x.responder.destroy()
+    return { ...attempt, closes, error, caller: x.accepted.accept, accept }
+  }
+
+  const completionCount = completionAttempt().positions
+  for (let failure = 1; failure <= completionCount; failure++) {
+    const attempt = completionAttempt(failure)
+    t.ok(attempt.error, `completion allocation ${failure} fails`)
+    t.ok(allZero(attempt.allocations), `completion allocation ${failure} clears prior secrets`)
+    t.is(attempt.closes, 1, `completion allocation ${failure} publishes no link`)
+    t.alike(attempt.caller, attempt.accept, `completion allocation ${failure} preserves caller`)
+  }
+})
+
+test('derived transcript is erased when key derivation allocation fails', (t) => {
+  const f = fixture()
+  const initiated = createIndexZeroGuardLinkOffer({
+    advertisement: f.advertisement,
+    now: NOW,
+    randomBytes: (size) => b4a.alloc(size, 0x44),
+    ...setup()
+  })
+  const originalConcat = b4a.concat
+  const originalAlloc = b4a.allocUnsafeSlow
+  let transcript = null
+  let failNext = false
+  b4a.concat = (parts, totalLength) => {
+    const output = originalConcat(parts, totalLength)
+    if (parts.length === 4 && b4a.equals(parts[0], DOMAIN.LINK_CREATED)) {
+      transcript = output
+      failNext = true
+    }
+    return output
+  }
+  b4a.allocUnsafeSlow = (size) => {
+    if (failNext) {
+      failNext = false
+      throw new Error('injected derivation allocation failure')
+    }
+    return originalAlloc(size)
+  }
+  const responder = responderFor(f, () => ({
+    offer: initiated.offer,
+    observedPredecessorEndpoint: encodeCanonicalEndpoint({
+      addressFamily: 4,
+      addressBytes: b4a.from([198, 51, 100, 9]),
+      port: 44000
+    }),
+    physicalChannel: Object.freeze({ destroy() {} })
+  }))
+  try {
+    t.exception(() => responder.accept())
+  } finally {
+    b4a.concat = originalConcat
+    b4a.allocUnsafeSlow = originalAlloc
+    responder.destroy()
+    abortIndexZeroGuardLink(initiated.pending)
+  }
+  t.ok(transcript)
+  if (transcript) {
+    t.ok(
+      transcript.every((byte) => byte === 0),
+      'failed derived transcript is zeroized'
+    )
+  }
 })

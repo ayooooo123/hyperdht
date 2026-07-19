@@ -4,6 +4,11 @@ const test = require('brittle')
 const b4a = require('b4a')
 
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
+const {
+  DatagramReplayWindow,
+  OrderedReceiver,
+  SenderCounter
+} = require('../../lib/private/counters')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const { CELL_CLASS, DOMAIN } = require('../../lib/private/protocol')
 const {
@@ -17,7 +22,83 @@ const {
   linkPossessionTag
 } = require('../../lib/private/link-setup')
 
+const TEST_ONLY_COUNTER_FACTORY = Symbol.for('hyperdht-private-routes/test-only-counter-factory')
+
 const seed = (value) => b4a.alloc(32, value)
+
+function injectedCounterFactory(failAt, counters) {
+  let position = 0
+  return (cellClass, sender, now) => {
+    if (++position === failAt) throw new Error('injected counter construction failure')
+    const counter = sender
+      ? new SenderCounter()
+      : cellClass === CELL_CLASS.DATAGRAM
+        ? new DatagramReplayWindow({ window: 256 })
+        : new OrderedReceiver({ window: 256, gapTimeout: 5000, now })
+    counters.push(counter)
+    return counter
+  }
+}
+
+function captureOwnedAllocations(operation) {
+  const originalAlloc = b4a.allocUnsafeSlow
+  const allocations = []
+  b4a.allocUnsafeSlow = (size) => {
+    const output = originalAlloc(size)
+    if (size === 16 || size === 32) allocations.push(output)
+    return output
+  }
+  let error = null
+  try {
+    operation()
+  } catch (err) {
+    error = err
+  } finally {
+    b4a.allocUnsafeSlow = originalAlloc
+  }
+  return { allocations, error }
+}
+
+function probeAllocationFailure(arm, operation, failAt = Infinity) {
+  const originalAlloc = b4a.allocUnsafeSlow
+  const allocations = []
+  let position = 0
+  b4a.allocUnsafeSlow = (size) => {
+    if (arm.value && (size === 16 || size === 32)) {
+      if (++position === failAt) throw new Error('injected allocation failure')
+      const output = originalAlloc(size)
+      allocations.push(output)
+      return output
+    }
+    return originalAlloc(size)
+  }
+  let error = null
+  let result = null
+  try {
+    result = operation()
+  } catch (err) {
+    error = err
+  } finally {
+    b4a.allocUnsafeSlow = originalAlloc
+  }
+  return { allocations, error, positions: position, result }
+}
+
+function derivedStateCrypto(arm) {
+  return {
+    ...cryptoSuite,
+    deriveKeys(shared, transcript) {
+      const keys = cryptoSuite.deriveKeys(shared, transcript)
+      if (
+        transcript.byteLength >= DOMAIN.LINK_CREATED.byteLength &&
+        b4a.equals(transcript.subarray(0, DOMAIN.LINK_CREATED.byteLength), DOMAIN.LINK_CREATED)
+      ) {
+        arm.value = true
+      }
+      return keys
+    }
+  }
+}
 
 function expectCode(t, fn, code) {
   let error = null
@@ -689,4 +770,337 @@ test('hash rejects a shadowed alias before deriving from its input', (t) => {
     'INVALID_ROUTE'
   )
   t.is(derives, 0)
+})
+
+test('responder and completion construction failures clear every prior TX/RX secret', (t) => {
+  t.is(typeof TEST_ONLY_COUNTER_FACTORY, 'symbol')
+
+  for (let failure = 1; failure <= 6; failure++) {
+    const f = fixture(false)
+    const started = f.start()
+    const counters = []
+    const observed = new Map()
+    const responderSecret = b4a.from(f.responderStatic.secretKey)
+    const authority = createLinkSetupAuthority({
+      crypto: cryptoSuite,
+      now: () => 1_000,
+      randomBytes: randomSequence([40 + failure]),
+      [TEST_ONLY_COUNTER_FACTORY]: injectedCounterFactory(failure, counters),
+      [TEST_ONLY_TICKET_OBSERVER](ticket, state) {
+        observed.set(ticket, state)
+      }
+    })
+    const attempt = captureOwnedAllocations(() =>
+      authority.respond(started.message, {
+        ...f.common,
+        responderStaticSecretKey: f.responderStatic.secretKey,
+        responderIdentitySecretKey: f.responderIdentity.secretKey
+      })
+    )
+    t.ok(attempt.error, `responder counter ${failure} fails`)
+    t.is(observed.size, 0, `responder counter ${failure} publishes no ticket`)
+    t.ok(
+      attempt.allocations.every((value) => value.every((byte) => byte === 0)),
+      `responder counter ${failure} clears prior context bytes`
+    )
+    t.ok(
+      counters.every((counter) => counter.closed),
+      `responder counter ${failure} closes prior counters`
+    )
+    t.alike(
+      f.responderStatic.secretKey,
+      responderSecret,
+      `responder counter ${failure} preserves caller secret`
+    )
+    f.authority.abort(started.pending)
+  }
+
+  for (let failure = 1; failure <= 6; failure++) {
+    const initiatorIdentity = cryptoSuite.keyPair(seed(51))
+    const responderIdentity = cryptoSuite.keyPair(seed(52))
+    const responderStatic = cryptoSuite.encryptionKeyPair(seed(53))
+    const observed = new Map()
+    const counters = []
+    const common = {
+      circuitId: b4a.alloc(16, 0x51),
+      epoch: 9n,
+      initiatorIdentity: initiatorIdentity.publicKey,
+      responderIdentity: responderIdentity.publicKey,
+      initiatorLocalId: b4a.alloc(16, 0x52),
+      responderLocalId: b4a.alloc(16, 0x53),
+      expiresAt: 2_000n
+    }
+    const authority = createLinkSetupAuthority({
+      crypto: cryptoSuite,
+      now: () => 1_000,
+      randomBytes: randomSequence([54, 55]),
+      [TEST_ONLY_COUNTER_FACTORY]: injectedCounterFactory(6 + failure, counters),
+      [TEST_ONLY_TICKET_OBSERVER](ticket, state) {
+        observed.set(ticket, state)
+      }
+    })
+    const started = authority.initiate({
+      ...common,
+      responderStaticKey: responderStatic.publicKey,
+      initiatorIdentitySecretKey: initiatorIdentity.secretKey
+    })
+    const accepted = authority.respond(started.message, {
+      ...common,
+      responderStaticSecretKey: responderStatic.secretKey,
+      responderIdentitySecretKey: responderIdentity.secretKey
+    })
+    const acceptedSnapshot = b4a.from(accepted.message)
+    const attempt = captureOwnedAllocations(() =>
+      authority.complete(started.pending, accepted.message)
+    )
+    t.ok(attempt.error, `completion counter ${failure} fails`)
+    t.is(observed.size, 1, `completion counter ${failure} publishes no initiator ticket`)
+    t.ok(
+      attempt.allocations.every((value) => value.every((byte) => byte === 0)),
+      `completion counter ${failure} clears prior context bytes`
+    )
+    t.ok(
+      counters.slice(6).every((counter) => counter.closed),
+      `completion counter ${failure} closes prior counters`
+    )
+    t.alike(
+      accepted.message,
+      acceptedSnapshot,
+      `completion counter ${failure} preserves caller message`
+    )
+    authority.revoke(accepted.ticket)
+  }
+})
+
+test('initiate, responder, and completion copies are atomic at every allocation', (t) => {
+  function initiateAttempt(failure = Infinity) {
+    const f = fixture(false)
+    const arm = { value: false }
+    const crypto = {
+      ...cryptoSuite,
+      sign(...args) {
+        const signature = cryptoSuite.sign(...args)
+        arm.value = true
+        return signature
+      }
+    }
+    const authority = createLinkSetupAuthority({
+      crypto,
+      now: () => 1_000,
+      randomBytes: randomSequence([61])
+    })
+    const secret = b4a.from(f.initiatorIdentity.secretKey)
+    const attempt = probeAllocationFailure(
+      arm,
+      () =>
+        authority.initiate({
+          ...f.common,
+          responderStaticKey: f.responderStatic.publicKey,
+          initiatorIdentitySecretKey: f.initiatorIdentity.secretKey
+        }),
+      failure
+    )
+    if (attempt.result) authority.abort(attempt.result.pending)
+    return { ...attempt, caller: f.initiatorIdentity.secretKey, secret }
+  }
+
+  const initiateCount = initiateAttempt().positions
+  for (let failure = 1; failure <= initiateCount; failure++) {
+    const attempt = initiateAttempt(failure)
+    t.ok(attempt.error, `initiate allocation ${failure} fails`)
+    t.ok(
+      attempt.allocations.every((value) => value.every((byte) => byte === 0)),
+      `initiate allocation ${failure} clears prior secrets`
+    )
+    t.alike(attempt.caller, attempt.secret, `initiate allocation ${failure} preserves caller`)
+  }
+
+  function responderAttempt(failure = Infinity) {
+    const f = fixture(false)
+    const started = f.start()
+    const arm = { value: false }
+    const authority = createLinkSetupAuthority({
+      crypto: derivedStateCrypto(arm),
+      now: () => 1_000,
+      randomBytes: randomSequence([62])
+    })
+    const secret = b4a.from(f.responderStatic.secretKey)
+    const attempt = probeAllocationFailure(
+      arm,
+      () =>
+        authority.respond(started.message, {
+          ...f.common,
+          responderStaticSecretKey: f.responderStatic.secretKey,
+          responderIdentitySecretKey: f.responderIdentity.secretKey
+        }),
+      failure
+    )
+    if (attempt.result) authority.revoke(attempt.result.ticket)
+    f.authority.abort(started.pending)
+    return { ...attempt, caller: f.responderStatic.secretKey, secret }
+  }
+
+  const responderCount = responderAttempt().positions
+  for (let failure = 1; failure <= responderCount; failure++) {
+    const attempt = responderAttempt(failure)
+    t.ok(attempt.error, `responder allocation ${failure} fails`)
+    t.ok(
+      attempt.allocations.every((value) => value.every((byte) => byte === 0)),
+      `responder allocation ${failure} clears prior secrets`
+    )
+    t.alike(attempt.caller, attempt.secret, `responder allocation ${failure} preserves caller`)
+  }
+
+  function completionAttempt(failure = Infinity) {
+    const f = fixture(false)
+    const arm = { value: false }
+    const authority = createLinkSetupAuthority({
+      crypto: derivedStateCrypto(arm),
+      now: () => 1_000,
+      randomBytes: randomSequence([63, 64])
+    })
+    const started = authority.initiate({
+      ...f.common,
+      responderStaticKey: f.responderStatic.publicKey,
+      initiatorIdentitySecretKey: f.initiatorIdentity.secretKey
+    })
+    const accepted = authority.respond(started.message, {
+      ...f.common,
+      responderStaticSecretKey: f.responderStatic.secretKey,
+      responderIdentitySecretKey: f.responderIdentity.secretKey
+    })
+    arm.value = false
+    const message = b4a.from(accepted.message)
+    const attempt = probeAllocationFailure(
+      arm,
+      () => authority.complete(started.pending, accepted.message),
+      failure
+    )
+    if (attempt.result) authority.revoke(attempt.result)
+    authority.revoke(accepted.ticket)
+    return { ...attempt, caller: accepted.message, message }
+  }
+
+  const completionCount = completionAttempt().positions
+  for (let failure = 1; failure <= completionCount; failure++) {
+    const attempt = completionAttempt(failure)
+    t.ok(attempt.error, `completion allocation ${failure} fails`)
+    t.ok(
+      attempt.allocations.every((value) => value.every((byte) => byte === 0)),
+      `completion allocation ${failure} clears prior secrets`
+    )
+    t.alike(attempt.caller, attempt.message, `completion allocation ${failure} preserves caller`)
+  }
+})
+
+test('responder signature and completion possession failures clear adjacent secret artifacts', (t) => {
+  {
+    const f = fixture(false)
+    const started = f.start()
+    const authority = createLinkSetupAuthority({
+      crypto: {
+        ...cryptoSuite,
+        sign() {
+          throw new Error('injected responder signature failure')
+        }
+      },
+      now: () => 1_000,
+      randomBytes: randomSequence([71])
+    })
+    const attempt = captureOwnedAllocations(() =>
+      authority.respond(started.message, {
+        ...f.common,
+        responderStaticSecretKey: f.responderStatic.secretKey,
+        responderIdentitySecretKey: f.responderIdentity.secretKey
+      })
+    )
+    t.ok(attempt.error)
+    t.ok(
+      attempt.allocations.every((value) => value.every((byte) => byte === 0)),
+      'responder clears challenge hash, possession tag, and derived material'
+    )
+    f.authority.abort(started.pending)
+  }
+
+  {
+    const f = fixture(false)
+    const crypto = {
+      ...cryptoSuite,
+      seal(options) {
+        if (options.counter === 1n) throw new Error('injected possession failure')
+        return cryptoSuite.seal(options)
+      }
+    }
+    const authority = createLinkSetupAuthority({
+      crypto,
+      now: () => 1_000,
+      randomBytes: randomSequence([72])
+    })
+    const localStart = authority.initiate({
+      ...f.common,
+      responderStaticKey: f.responderStatic.publicKey,
+      initiatorIdentitySecretKey: f.initiatorIdentity.secretKey
+    })
+    const responderAuthority = createLinkSetupAuthority({
+      crypto: cryptoSuite,
+      now: () => 1_000,
+      randomBytes: randomSequence([73])
+    })
+    const accepted = responderAuthority.respond(localStart.message, {
+      ...f.common,
+      responderStaticSecretKey: f.responderStatic.secretKey,
+      responderIdentitySecretKey: f.responderIdentity.secretKey
+    })
+    const message = b4a.from(accepted.message)
+    const attempt = captureOwnedAllocations(() =>
+      authority.complete(localStart.pending, accepted.message)
+    )
+    t.ok(attempt.error)
+    t.ok(
+      attempt.allocations.every((value) => value.every((byte) => byte === 0)),
+      'completion clears base hash and prior derived material'
+    )
+    t.alike(accepted.message, message)
+    responderAuthority.revoke(accepted.ticket)
+  }
+})
+
+test('failed ticket derivation erases the untransferred transcript', (t) => {
+  const f = fixture(false)
+  const started = f.start()
+  let transcript = null
+  const crypto = {
+    ...cryptoSuite,
+    deriveKeys(shared, value) {
+      if (
+        value.byteLength >= DOMAIN.LINK_CREATED.byteLength &&
+        b4a.equals(value.subarray(0, DOMAIN.LINK_CREATED.byteLength), DOMAIN.LINK_CREATED)
+      ) {
+        transcript = value
+        throw new Error('injected ticket derivation failure')
+      }
+      return cryptoSuite.deriveKeys(shared, value)
+    }
+  }
+  const authority = createLinkSetupAuthority({
+    crypto,
+    now: () => 1_000,
+    randomBytes: randomSequence([81])
+  })
+  expectCode(
+    t,
+    () =>
+      authority.respond(started.message, {
+        ...f.common,
+        responderStaticSecretKey: f.responderStatic.secretKey,
+        responderIdentitySecretKey: f.responderIdentity.secretKey
+      }),
+    'INVALID_ROUTE'
+  )
+  t.ok(transcript)
+  t.ok(
+    transcript.every((byte) => byte === 0),
+    'failed derived transcript is zeroized'
+  )
+  f.authority.abort(started.pending)
 })
