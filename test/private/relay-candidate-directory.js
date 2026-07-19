@@ -208,6 +208,30 @@ function fixture(extraSafety = 1, extraExits = 1, clock = fakeClock()) {
   return { clock, guard, records, scope }
 }
 
+function longFixture(expiresAt, extraSafety = 2, extraExits = 1, clock = fakeClock()) {
+  const advertisementTime = { expiresAtMs: expiresAt }
+  const guard = candidate(ROLE.SAFETY, 0, 1, advertisementTime)
+  const records = []
+  for (let i = 0; i < 2 + extraSafety; i++) {
+    records.push(candidate(ROLE.SAFETY, i + 1, i + 2, advertisementTime))
+  }
+  for (let i = 0; i < 2 + extraExits; i++) {
+    records.push(candidate(ROLE.PRIVATE, i, i + 40, advertisementTime))
+  }
+  return {
+    clock,
+    guard,
+    records,
+    scope: {
+      guardIdentity: guard.identity,
+      guardEndpoint: guard.canonicalEndpointBytes,
+      guardAdvertisementDigest: guard.digest,
+      guardEpoch: guard.epoch,
+      guardExpiresAt: guard.expiresAt
+    }
+  }
+}
+
 function install(input) {
   const sink = createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
@@ -244,6 +268,18 @@ function consumeInitial(transaction, split, generations = [1n, 1n]) {
       generation: generations[1]
     })
   ]
+}
+
+function installInitial(directory, generations = [1n, 1n]) {
+  const transaction = takeRelayPathReservation(
+    directory.reserveInitialPair({
+      lookupGeneration: generations[0],
+      announceGeneration: generations[1]
+    })
+  )
+  const evidence = consumeInitial(transaction, splitRelayPathReservation(transaction), generations)
+  commitRelayPathReservation(transaction)
+  return evidence
 }
 
 test('candidate transfer owns bytes and never reads dialing authority getters', (t) => {
@@ -531,6 +567,7 @@ test('wall rollback clears directory ownership and no generation or callback sur
     timerCount: 0,
     callbackCount: 0,
     generationRecordCount: 0,
+    quarantineCount: 0,
     pendingCount: 0
   })
 
@@ -684,4 +721,269 @@ test('partial allocation and reentrant or throwing clocks clear without publicat
   expectCode(t, () => throwingDirectory.resume(), 'ERR_INCOMPATIBLE_RELAY')
   t.is(throwingDirectory[kInspectRelayCandidateDirectory]().identityCount, 0)
   throwingDirectory.destroy()
+})
+
+test('concurrent opposite replacements revalidate diversity at commit', (t) => {
+  const directory = install(fixture())
+  installInitial(directory)
+
+  const lookup = takeRelayPathReservation(
+    directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n })
+  )
+  const announce = takeRelayPathReservation(
+    directory.reserveReplacement({ branchClass: BRANCH_CLASS.ANNOUNCE, generation: 2n })
+  )
+  const lookupSelections = splitRelayPathReservation(lookup)
+  const announceSelections = splitRelayPathReservation(announce)
+  const lookupEvidence = [
+    consumeSelectedRelayEvidence(lookupSelections.middle, {
+      transaction: lookup,
+      branchClass: BRANCH_CLASS.LOOKUP,
+      position: 'middle',
+      generation: 2n
+    }),
+    consumeSelectedRelayEvidence(lookupSelections.exit, {
+      transaction: lookup,
+      branchClass: BRANCH_CLASS.LOOKUP,
+      position: 'exit',
+      generation: 2n
+    })
+  ]
+  const announceEvidence = [
+    consumeSelectedRelayEvidence(announceSelections.middle, {
+      transaction: announce,
+      branchClass: BRANCH_CLASS.ANNOUNCE,
+      position: 'middle',
+      generation: 2n
+    }),
+    consumeSelectedRelayEvidence(announceSelections.exit, {
+      transaction: announce,
+      branchClass: BRANCH_CLASS.ANNOUNCE,
+      position: 'exit',
+      generation: 2n
+    })
+  ]
+  t.alike(
+    lookupEvidence.map((entry) => entry.advertisementDigest),
+    announceEvidence.map((entry) => entry.advertisementDigest)
+  )
+  commitRelayPathReservation(lookup)
+  expectCode(t, () => commitRelayPathReservation(announce), 'ERR_INCOMPATIBLE_RELAY')
+  t.ok(announceEvidence.every((entry) => entry.canonicalAdvertisement.every((byte) => byte === 0)))
+
+  let retry = null
+  let retryError = null
+  try {
+    retry = takeRelayPathReservation(
+      directory.reserveReplacement({ branchClass: BRANCH_CLASS.ANNOUNCE, generation: 2n })
+    )
+  } catch (err) {
+    retryError = err
+  }
+  t.absent(retryError)
+  if (retry !== null) abortRelayPathReservation(retry)
+  directory.destroy()
+})
+
+test('sealed transfer revalidates expiry, rollback, and hostile clocks before publication', (t) => {
+  const expired = fixture()
+  const tracked = trackedDirectoryModule()
+  const expiredSink = tracked.fresh.createRelayCandidateDirectorySink({
+    wallNow: expired.clock.wallNow,
+    monotonicNow: expired.clock.monotonicNow
+  })
+  tracked.start(null)
+  const expiredToken = tracked.fresh.sealRelayCandidateDirectorySink(
+    expiredSink,
+    expired.records,
+    expired.scope
+  )
+  const sealedAllocations = tracked.take()
+  expired.clock.advance(30_000)
+  expectCode(
+    t,
+    () => tracked.fresh.consumeSealedRelayCandidateDirectory(expiredToken),
+    'ERR_REPLAY'
+  )
+  t.ok(sealedAllocations.length > 0)
+  t.ok(sealedAllocations.every((value) => value.every((byte) => byte === 0)))
+  expectCode(
+    t,
+    () => tracked.fresh.consumeSealedRelayCandidateDirectory(expiredToken),
+    'ERR_REPLAY'
+  )
+
+  const rollback = fixture()
+  const rollbackSink = createRelayCandidateDirectorySink({
+    wallNow: rollback.clock.wallNow,
+    monotonicNow: rollback.clock.monotonicNow
+  })
+  const rollbackToken = sealRelayCandidateDirectorySink(
+    rollbackSink,
+    rollback.records,
+    rollback.scope
+  )
+  rollback.clock.jumpWall(-30_001)
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(rollbackToken), 'ERR_REPLAY')
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(rollbackToken), 'ERR_REPLAY')
+
+  const base = fakeClock()
+  let throwClock = false
+  const throwing = fixture(1, 1, {
+    wallNow() {
+      if (throwClock) throw new Error('injected sealed clock failure')
+      return base.wallNow()
+    },
+    monotonicNow: base.monotonicNow
+  })
+  const throwingSink = createRelayCandidateDirectorySink({
+    wallNow: throwing.clock.wallNow,
+    monotonicNow: throwing.clock.monotonicNow
+  })
+  const throwingToken = sealRelayCandidateDirectorySink(
+    throwingSink,
+    throwing.records,
+    throwing.scope
+  )
+  throwClock = true
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(throwingToken), 'ERR_REPLAY')
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(throwingToken), 'ERR_REPLAY')
+
+  let reenter = false
+  let reentrantToken = null
+  const reentrant = fixture(1, 1, {
+    wallNow() {
+      if (reenter) destroySealedRelayCandidateDirectory(reentrantToken)
+      return NOW
+    },
+    monotonicNow: () => 0n
+  })
+  const reentrantSink = createRelayCandidateDirectorySink({
+    wallNow: reentrant.clock.wallNow,
+    monotonicNow: reentrant.clock.monotonicNow
+  })
+  reentrantToken = sealRelayCandidateDirectorySink(
+    reentrantSink,
+    reentrant.records,
+    reentrant.scope
+  )
+  reenter = true
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(reentrantToken), 'ERR_REPLAY')
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(reentrantToken), 'ERR_REPLAY')
+})
+
+test('evidence and commit reject transaction or directory reentry from wall clock', (t) => {
+  let action = null
+  const base = fakeClock()
+  const input = fixture(1, 1, {
+    wallNow() {
+      const current = action
+      action = null
+      if (current !== null) current()
+      return base.wallNow()
+    },
+    monotonicNow: base.monotonicNow
+  })
+  const directory = install(input)
+  const reservation = directory.reserveInitialPair({
+    lookupGeneration: 1n,
+    announceGeneration: 1n
+  })
+  const transaction = takeRelayPathReservation(reservation)
+  const selections = splitRelayPathReservation(transaction)
+  action = () => abortRelayPathReservation(transaction)
+  expectCode(
+    t,
+    () =>
+      consumeSelectedRelayEvidence(selections.lookup.middle, {
+        transaction,
+        branchClass: BRANCH_CLASS.LOOKUP,
+        position: 'middle',
+        generation: 1n
+      }),
+    'ERR_REPLAY'
+  )
+  const retry = takeRelayPathReservation(
+    directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  abortRelayPathReservation(retry)
+
+  const commitReservation = directory.reserveInitialPair({
+    lookupGeneration: 1n,
+    announceGeneration: 1n
+  })
+  const commitTransaction = takeRelayPathReservation(commitReservation)
+  const evidence = consumeInitial(commitTransaction, splitRelayPathReservation(commitTransaction))
+  action = () => directory.destroy()
+  expectCode(t, () => commitRelayPathReservation(commitTransaction), 'ERR_REPLAY')
+  t.ok(evidence.every((entry) => entry.advertisementDigest.every((byte) => byte === 0)))
+  t.alike(directory[kInspectRelayCandidateDirectory](), {
+    destroyed: true,
+    identityCount: 0,
+    byteBufferCount: 0,
+    digestCount: 0,
+    timerCount: 0,
+    callbackCount: 0,
+    generationRecordCount: 0,
+    quarantineCount: 0,
+    pendingCount: 0
+  })
+})
+
+test('same-epoch equivocation quarantine cannot be bypassed by later transfer records', (t) => {
+  const expiresAt = NOW + 180_000n
+  const input = longFixture(expiresAt)
+  const original = candidate(ROLE.SAFETY, 1, 2, { expiresAtMs: NOW + 60_000n })
+  input.records[0] = original
+  const conflicting = candidate(ROLE.SAFETY, 1, 20, {
+    epoch: original.epoch,
+    expiresAtMs: NOW + 120_000n
+  })
+  const higher = candidate(ROLE.SAFETY, 1, 21, {
+    epoch: original.epoch + 1n,
+    expiresAtMs: expiresAt
+  })
+  input.records.push(conflicting, higher)
+  const directory = install(input)
+  t.is(directory[kInspectRelayCandidateDirectory]().quarantineCount, 1)
+  const transaction = takeRelayPathReservation(
+    directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  const evidence = consumeInitial(transaction, splitRelayPathReservation(transaction))
+  for (const rejected of [original, conflicting, higher]) {
+    t.absent(evidence.some((entry) => b4a.equals(entry.advertisementDigest, rejected.digest)))
+  }
+  abortRelayPathReservation(transaction)
+
+  directory.retainForSuspend()
+  input.clock.advance(119_999)
+  directory.resume()
+  t.is(directory[kInspectRelayCandidateDirectory]().quarantineCount, 1)
+  directory.retainForSuspend()
+  input.clock.advance(1)
+  directory.resume()
+  t.is(directory[kInspectRelayCandidateDirectory]().quarantineCount, 0)
+  directory.destroy()
+
+  const bounded = fixture()
+  const conflicts = []
+  for (let i = 0; i < MAX_RELAY_CANDIDATE_IDENTITIES + 1; i++) {
+    const role = i & 1 ? ROLE.PRIVATE : ROLE.SAFETY
+    const ordinal = i >> 1
+    conflicts.push(candidate(role, ordinal, 80 + i * 2))
+    conflicts.push(candidate(role, ordinal, 81 + i * 2))
+  }
+  const sink = createRelayCandidateDirectorySink({
+    wallNow: bounded.clock.wallNow,
+    monotonicNow: bounded.clock.monotonicNow
+  })
+  let token = null
+  let error = null
+  try {
+    token = sealRelayCandidateDirectorySink(sink, conflicts, bounded.scope)
+  } catch (err) {
+    error = err
+  }
+  t.is(error && error.code, 'ERR_REPLAY')
+  if (token !== null) destroySealedRelayCandidateDirectory(token)
 })
