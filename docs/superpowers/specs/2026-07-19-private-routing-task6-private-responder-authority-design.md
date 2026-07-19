@@ -128,25 +128,20 @@ index 2 those extension keys are forbidden and EXTEND admission is invalid.
 ```js
 // Transcript indices 0 and 1
 {
-  adjacencyAdopter,
-  extensionCommitter,
-  adjacentLinkFactory,
-  tailReadySigner,
-  wallNow,
-  monotonicNow,
-  randomBytes,
-  schedule,
-  cancelScheduled
+  ;(adjacencyAdopter,
+    extensionCommitter,
+    adjacentLinkFactory,
+    tailReadySigner,
+    wallNow,
+    monotonicNow,
+    randomBytes,
+    schedule,
+    cancelScheduled)
 }
 
 // Terminal transcript index 2
 {
-  tailReadySigner,
-  wallNow,
-  monotonicNow,
-  randomBytes,
-  schedule,
-  cancelScheduled
+  ;(tailReadySigner, wallNow, monotonicNow, randomBytes, schedule, cancelScheduled)
 }
 ```
 
@@ -184,14 +179,14 @@ The factory options are exact own data with no accessors or extra keys:
 
 ```js
 {
-  dialAuthority,
-  linkOfferSigner,
-  wallNow,
-  monotonicNow,
-  randomBytes,
-  schedule,
-  cancelScheduled,
-  destroy
+  ;(dialAuthority,
+    linkOfferSigner,
+    wallNow,
+    monotonicNow,
+    randomBytes,
+    schedule,
+    cancelScheduled,
+    destroy)
 }
 ```
 
@@ -217,11 +212,7 @@ accessors or extra keys:
 
 ```js
 {
-  advertisement,
-  advertisementDigest,
-  requiredRole,
-  wireExpiresAt,
-  localDeadline
+  ;(advertisement, advertisementDigest, requiredRole, wireExpiresAt, localDeadline)
 }
 ```
 
@@ -262,16 +253,16 @@ identities must match the successor M3 runtime owner.
 
 ```js
 {
-  advertisement,
-  adjacencyAdopter,
-  extensionResponderSigner,
-  responderRouteEncryptionSecretKey,
-  wallNow,
-  monotonicNow,
-  schedule,
-  cancelScheduled,
-  offerReceiver,
-  randomBytes
+  ;(advertisement,
+    adjacencyAdopter,
+    extensionResponderSigner,
+    responderRouteEncryptionSecretKey,
+    wallNow,
+    monotonicNow,
+    schedule,
+    cancelScheduled,
+    offerReceiver,
+    randomBytes)
 }
 ```
 
@@ -451,12 +442,12 @@ It calls `session.sealExtend(options)` with exact own data:
 
 ```js
 {
-  advertisement,
-  advertisementDigest,
-  extensionIndex,
-  requestedLimits,
-  absoluteDeadline,
-  randomBytes
+  ;(advertisement,
+    advertisementDigest,
+    extensionIndex,
+    requestedLimits,
+    absoluteDeadline,
+    randomBytes)
 }
 ```
 
