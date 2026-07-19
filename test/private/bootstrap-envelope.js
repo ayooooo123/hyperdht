@@ -822,6 +822,35 @@ test('responder validates its own encoded reply without remote endpoint authorit
   table.destroy()
 })
 
+test('responder clears the owned request digest when response validation throws', (t) => {
+  const f = fixture()
+  const request = encodeCreate(f, { requestId: 76n })
+  const decodedRequest = f.rightCodec.decode(request, f.leftSource)
+  const { table } = tableFixture()
+  const originalAlloc = b4a.allocUnsafeSlow
+  const ownedDigests = []
+  b4a.allocUnsafeSlow = (size) => {
+    const value = originalAlloc(size)
+    if (size === 32) ownedDigests.push(value)
+    return value
+  }
+  try {
+    expectCode(
+      t,
+      () =>
+        table.respond(f.initiator.publicKey, decodedRequest, request, () => ({
+          packet: b4a.alloc(BOOTSTRAP_SIZE)
+        })),
+      'UNAUTHORIZED'
+    )
+  } finally {
+    b4a.allocUnsafeSlow = originalAlloc
+  }
+  t.is(ownedDigests.length, 1)
+  t.alike(ownedDigests[0], b4a.alloc(32), 'owned request digest is cleared on throw')
+  table.destroy()
+})
+
 test('request table is bounded, exception safe, cancel-safe, and releases all timers', (t) => {
   const f = fixture()
   const otherFixture = fixture({ responderSeed: 240, grantId32: seed(242) })
