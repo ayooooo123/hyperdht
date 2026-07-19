@@ -116,13 +116,15 @@ function linkPair(hostA, portA, hostB, portB) {
 }
 
 class FakeSocket {
-  constructor(network, hold) {
+  constructor(network, hold, observer = null) {
     this.network = network
     this.hold = hold
+    this.observer = observer
     this.listeners = new Map()
     this.host = null
     this.port = null
     this.closed = false
+    this.closeCalls = 0
   }
   on(name, listener) {
     const values = this.listeners.get(name) || new Set()
@@ -137,6 +139,9 @@ class FakeSocket {
     for (const listener of this.listeners.get(name) || []) listener(...args)
   }
   bind(port, host) {
+    if (this.observer && this.observer.failBindAt === this.observer.sockets.length) {
+      throw new Error('injected bind failure')
+    }
     this.port = port
     this.host = host
     this.network.set(`${host}:${port}`, this)
@@ -152,9 +157,16 @@ class FakeSocket {
     return true
   }
   close() {
-    this.closed = true
-    this.network.delete(`${this.host}:${this.port}`)
-    return true
+    this.closeCalls++
+    const finish = () => {
+      this.closed = true
+      this.network.delete(`${this.host}:${this.port}`)
+      if (this.observer) this.observer.events.push(['close', this])
+      return true
+    }
+    return this.observer && this.observer.closeHold
+      ? Promise.resolve(this.observer.closeHold).then(finish)
+      : finish()
   }
 }
 
@@ -163,10 +175,12 @@ function fakeFactory(network, hold = null, observer = {}) {
     create() {
       return {
         createSocket() {
-          const socket = new FakeSocket(network, hold)
+          const socket = new FakeSocket(network, hold, observer)
           observer.socket = socket
           if (!observer.sockets) observer.sockets = []
+          if (!observer.events) observer.events = []
           observer.sockets.push(socket)
+          observer.events.push(['create', socket])
           return socket
         }
       }
@@ -239,6 +253,68 @@ function linkSessionOptions(links, side, deadline = 10_000) {
     randomBytes: sequence(initiate ? 1 : 11),
     absoluteDeadline: deadline,
     signedExpiry: 60_000
+  }
+}
+
+async function pinnedMaterialFixture(leftPort, rightPort, observerOptions = {}) {
+  const network = new Map()
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const links = linkPair('127.0.0.1', leftPort, '127.0.0.2', rightPort)
+  const leftObserver = { ...observerOptions }
+  let leftSession = null
+  let rightSession = null
+  const left = issuer.createUdxCellEndpointForTest(
+    {
+      ...options('127.0.0.1', leftPort, []),
+      onBootstrap(packet) {
+        if (leftSession) void leftSession.receive(packet)
+      }
+    },
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network, null, leftObserver))
+  )
+  const right = issuer.createUdxCellEndpointForTest(
+    {
+      ...options('127.0.0.2', rightPort, []),
+      onBootstrap(packet) {
+        if (rightSession) void rightSession.receive(packet)
+      }
+    },
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
+  )
+  await left.bind()
+  await right.bind()
+  const authority = createBootstrapUdxAuthority({
+    endpoint: left,
+    configuredEndpoints: [{ host: '127.0.0.2', port: rightPort }],
+    localSecretCapability: createLocalIdentitySecretCapability({
+      localIdentity: links.a.publicKey,
+      localSecretKey: links.a.secretKey
+    }),
+    maxProspectiveGuards: 3,
+    monotonicDeadline: 10_000
+  })
+  bindBootstrapUdxOperation(authority, 10_000, Object.freeze({}))
+  const admission = admitBootstrapUdxGuard(authority, {
+    identity: links.b.publicKey,
+    host: '127.0.0.2',
+    port: rightPort
+  })
+  leftSession = openBootstrapUdxGuard(
+    authority,
+    admission,
+    links.left.handle,
+    linkSessionOptions(links, 'left')
+  )
+  rightSession = right.openLink(links.right.handle, linkSessionOptions(links, 'right'))
+  const established = await leftSession.open()
+  return {
+    issuer,
+    left,
+    right,
+    leftObserver,
+    links,
+    rightSession,
+    material: pinBootstrapUdxGuard(authority, admission, established)
   }
 }
 
@@ -379,6 +455,61 @@ test('failed bootstrap authority creation consumes and clears its local-secret c
     'caller secret remains untouched'
   )
   await endpoint.close()
+})
+
+test('destroying an unconsumed production guard lease closes its original owner once', async (t) => {
+  const fixture = await pinnedMaterialFixture(47125, 47126)
+  const socket = fixture.leftObserver.sockets[0]
+  t.is(socket.closed, false)
+  t.is(socket.closeCalls, 0)
+  t.is(destroyGuardLeaseMaterial(fixture.material), true)
+  await settles()
+  t.is(socket.closed, true)
+  t.is(socket.closeCalls, 1)
+  t.is(destroyGuardLeaseMaterial(fixture.material), false)
+  await settles()
+  t.is(socket.closeCalls, 1)
+  await fixture.rightSession.close()
+  await fixture.right.close()
+  fixture.links.left.directory.destroy()
+  fixture.links.right.directory.destroy()
+})
+
+test('reconnect destroy during owner close and bind failure leave no live socket owner', async (t) => {
+  let releaseClose = null
+  const closeHold = new Promise((resolve) => {
+    releaseClose = resolve
+  })
+  const closing = await pinnedMaterialFixture(47127, 47128, { closeHold })
+  const closingLease = closing.issuer.inspectGuardLeaseMaterial(closing.material)
+  const closingTransport = closingLease.reconnectTransportFactory()
+  t.is(closing.leftObserver.sockets.length, 1)
+  t.is(destroyGuardLeaseMaterial(closing.material), true)
+  t.is(closing.leftObserver.sockets.length, 1)
+  releaseClose(true)
+  await t.exception(closingTransport.send('127.0.0.2', 47128, b4a.alloc(BOOTSTRAP_SIZE)))
+  await settles()
+  t.is(closing.leftObserver.sockets.length, 1)
+  t.is(closing.leftObserver.sockets[0].closed, true)
+  t.is(closing.leftObserver.sockets[0].closeCalls, 1)
+  await closing.rightSession.close()
+  await closing.right.close()
+  closing.links.left.directory.destroy()
+  closing.links.right.directory.destroy()
+
+  const failing = await pinnedMaterialFixture(47129, 47130, { failBindAt: 2 })
+  const failingLease = failing.issuer.inspectGuardLeaseMaterial(failing.material)
+  const failingTransport = failingLease.reconnectTransportFactory()
+  await t.exception(failingTransport.send('127.0.0.2', 47130, b4a.alloc(BOOTSTRAP_SIZE)))
+  await settles()
+  t.is(failing.leftObserver.sockets.length, 2)
+  t.is(failing.leftObserver.sockets[0].closed, true)
+  t.is(failing.leftObserver.sockets[1].closed, true)
+  t.is(destroyGuardLeaseMaterial(failing.material), true)
+  await failing.rightSession.close()
+  await failing.right.close()
+  failing.links.left.directory.destroy()
+  failing.links.right.directory.destroy()
 })
 
 test('bootstrap UDX authority consumes identity secret and revokes every direct send before pin', async (t) => {
@@ -536,8 +667,6 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
   t.is(lease.reconnectTransportFactory.length, 0)
   t.exception(() => lease.reconnectTransportFactory('127.0.0.2'))
   const originalSocket = leftObserver.sockets[0]
-  await left.close()
-  t.is(originalSocket.closed, true)
   let reconnectTransport = null
   let reconnectError = null
   try {
@@ -547,10 +676,17 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
   }
   t.is(reconnectError, null)
   if (reconnectTransport) {
+    t.is(leftObserver.sockets.length, 1, 'fresh owner waits for original owner close')
     t.is(await reconnectTransport.send('127.0.0.2', 47132, probe), true)
+    t.is(originalSocket.closed, true)
+    t.is(originalSocket.closeCalls, 1)
     t.is(leftObserver.sockets.length, 2)
     t.is(leftObserver.sockets[1] === originalSocket, false)
     t.is(leftObserver.sockets[1].closed, false)
+    t.alike(
+      leftObserver.events.map(([event]) => event),
+      ['create', 'close', 'create']
+    )
     await t.exception(reconnectTransport.send('127.0.0.2', 47139, probe))
     reconnectTransport.destroy()
     await settles()
