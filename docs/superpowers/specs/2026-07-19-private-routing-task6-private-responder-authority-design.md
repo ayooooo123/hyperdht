@@ -1,6 +1,6 @@
 # Gate 3B1 Task 6: Private Tail Responder Authority
 
-**Status:** Revised design amendment pending independent re-review
+**Status:** Approved after independent review
 
 **Date:** 2026-07-19
 
