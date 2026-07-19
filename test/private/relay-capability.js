@@ -1748,6 +1748,83 @@ test('CAPS cookie binds every query field and responder consumes one active resp
   responder.destroy()
 })
 
+test('CAPS retry requires the signed advertisement mask to exactly match the query', (t) => {
+  let advertisementDigestCalls = 0
+  const tracked = trackedRelayCapability({
+    hash(parts) {
+      advertisementDigestCalls++
+      return cryptoSuite.hash(parts)
+    }
+  })
+  t.teardown(tracked.restore)
+  const fake = clock()
+  const cryptoCalls = { randomBytes: 0, keyAgreement: 0, sign: 0 }
+  const responder = tracked.fresh.createActiveChallengeResponderAuthority({
+    now: fake.wallNow,
+    setTimeout: fake.setTimer,
+    clearTimeout: fake.clearTimer,
+    crypto: {
+      randomBytes(size) {
+        cryptoCalls.randomBytes++
+        return b4a.alloc(size, 0x5d)
+      },
+      keyAgreement(secretKey, publicKey) {
+        cryptoCalls.keyAgreement++
+        return cryptoSuite.keyAgreement(secretKey, publicKey)
+      },
+      sign(message, secretKey) {
+        cryptoCalls.sign++
+        return cryptoSuite.sign(message, secretKey)
+      }
+    }
+  })
+  const fixture = signedAdvertisement()
+  const query = {
+    sourceEndpoint: endpoint(221),
+    requestedCapabilityMask: 3,
+    randomTarget: seed(220),
+    queryNonce: seed(219),
+    maximumResults: 1
+  }
+  const cookie = responder.issueCookie(query)
+  const retry = { ...query, ...cookie, advertisement: fixture.encoded }
+  t.is(query.requestedCapabilityMask, 3)
+  t.is(fixture.signed.capabilityMask, 1)
+  const callerBuffers = [
+    query.sourceEndpoint,
+    query.randomTarget,
+    query.queryNonce,
+    cookie.returnRoutabilityCookie,
+    fixture.encoded
+  ]
+  const snapshots = callerBuffers.map((buffer) => b4a.from(buffer))
+
+  tracked.start()
+  expectCode(t, () => responder.admitCapsRetry(retry), 'ERR_AUTHENTICATION')
+  const owned = tracked.take()
+
+  let observed = tracked.fresh.observeActiveChallengeResponderForTests(responder)
+  t.is(observed.bindingCount, 0, 'mismatch publishes no binding')
+  t.alike(observed.events, [], 'mismatch needs no binding cleanup event')
+  t.is(advertisementDigestCalls, 0, 'mismatch creates no advertisement digest')
+  t.is(cryptoCalls.randomBytes, 1, 'constructor is the only random-bytes call')
+  t.is(cryptoCalls.keyAgreement, 0, 'mismatch runs no response key agreement')
+  t.is(cryptoCalls.sign, 0, 'mismatch runs no response signature')
+  for (const buffer of owned) {
+    t.alike(buffer, b4a.alloc(buffer.byteLength), 'mismatch clears every owned buffer')
+  }
+  for (let index = 0; index < callerBuffers.length; index++) {
+    t.alike(callerBuffers[index], snapshots[index], 'mismatch leaves caller bytes unchanged')
+  }
+
+  responder.destroy()
+  observed = tracked.fresh.observeActiveChallengeResponderForTests(responder)
+  t.absent(
+    observed.events.find((event) => event.type === 'binding-cleared'),
+    'destroy has no rejected binding to clean'
+  )
+})
+
 test('CAPS query late failures clear every earlier owned field copy', (t) => {
   const tracked = trackedRelayCapability()
   t.teardown(tracked.restore)
