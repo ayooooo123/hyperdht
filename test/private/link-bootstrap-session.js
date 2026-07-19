@@ -11,6 +11,10 @@ const {
   readEstablishedLink,
   TEST_ONLY_LINK_BOOTSTRAP_SESSION_OBSERVER
 } = require('../../lib/private/link-bootstrap-session')
+const linkBootstrapModule = require('../../lib/private/link-bootstrap-session')
+const {
+  LINK_BOOTSTRAP_REGISTER_ESTABLISHED
+} = require('../../lib/private/link-bootstrap-ownership')
 const {
   LINK_OPERATION,
   PROTOCOL_VERSION,
@@ -29,6 +33,10 @@ const {
 // 0305df915b6a767093f9e75e6c06bc0a35da6169.
 
 const seed = (value) => b4a.alloc(32, value)
+
+test('established links expose no raw endpoint reservation reader', (t) => {
+  t.is('readEstablishedLinkReservation' in linkBootstrapModule, false)
+})
 
 function roleIdentity(role, start) {
   for (let value = start; value < 256; value++) {
@@ -219,6 +227,7 @@ function fixture({
       return Promise.resolve(true)
     },
     [UDX_LINK_OPEN]() {},
+    [LINK_BOOTSTRAP_REGISTER_ESTABLISHED]() {},
     [UDX_LINK_CLOSE]() {}
   })
   const sessionOptions = {
@@ -342,10 +351,11 @@ test('link CREATED is cached byte-for-byte and recovered by an exact CREATE retr
   f.right.value.destroy()
 })
 
-test('link bootstrap takes the earliest signed expiry and exact ten-second deadline', async (t) => {
+test('link bootstrap takes the earliest signed, inherited, and five-second local deadline', async (t) => {
   for (const [name, options, remaining] of [
     ['signed expiry', { start: 3_500, absoluteDeadline: 20_000, signedExpiry: 4_000 }, 500],
-    ['ten-second cap', { start: 0, absoluteDeadline: 20_000, signedExpiry: 60_000 }, 10_000]
+    ['inherited branch', { start: 3_500, absoluteDeadline: 5_000, signedExpiry: 60_000 }, 1_500],
+    ['five-second cap', { start: 0, absoluteDeadline: 10_000, signedExpiry: 60_000 }, 5_000]
   ]) {
     const f = fixture({ ...options, drop: true })
     const opening = f.leftSession.open()
