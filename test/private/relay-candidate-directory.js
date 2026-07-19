@@ -872,6 +872,123 @@ test('sealed transfer revalidates expiry, rollback, and hostile clocks before pu
   expectCode(t, () => consumeSealedRelayCandidateDirectory(reentrantToken), 'ERR_REPLAY')
 })
 
+test('caught nested replay irreversibly poisons active seal and consume transfers', (t) => {
+  for (const operation of ['seal', 'revoke']) {
+    const input = fixture()
+    let sink = null
+    let active = false
+    let nestedCode = null
+    let clockCalls = 0
+    const wallNow = () => {
+      clockCalls++
+      if (active) {
+        active = false
+        try {
+          if (operation === 'seal') {
+            sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+          } else {
+            revokeRelayCandidateDirectorySink(sink)
+          }
+        } catch (err) {
+          nestedCode = err && err.code
+        }
+      }
+      return NOW
+    }
+    sink = createRelayCandidateDirectorySink({ wallNow, monotonicNow: () => 0n })
+    active = true
+    let token = null
+    let outerCode = null
+    try {
+      token = sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+    } catch (err) {
+      outerCode = err && err.code
+    }
+    t.is(nestedCode, 'ERR_REPLAY', `${operation} nested replay`)
+    t.is(outerCode, 'ERR_REPLAY', `${operation} outer replay`)
+    t.is(token, null, `${operation} publishes no token`)
+    const callsAfterFailure = clockCalls
+    expectCode(
+      t,
+      () => sealRelayCandidateDirectorySink(sink, input.records, input.scope),
+      'ERR_REPLAY'
+    )
+    t.is(clockCalls, callsAfterFailure, `${operation} retains no clock authority`)
+    if (token !== null) destroySealedRelayCandidateDirectory(token)
+  }
+
+  for (const operation of ['consume', 'destroy']) {
+    const tracked = trackedDirectoryModule()
+    const input = fixture()
+    let token = null
+    let active = false
+    let nestedCode = null
+    let clockCalls = 0
+    const wallNow = () => {
+      clockCalls++
+      if (active) {
+        active = false
+        try {
+          if (operation === 'consume') {
+            tracked.fresh.consumeSealedRelayCandidateDirectory(token)
+          } else {
+            tracked.fresh.destroySealedRelayCandidateDirectory(token)
+          }
+        } catch (err) {
+          nestedCode = err && err.code
+        }
+      }
+      return NOW
+    }
+    const sink = tracked.fresh.createRelayCandidateDirectorySink({
+      wallNow,
+      monotonicNow: () => 0n
+    })
+    tracked.start(null)
+    token = tracked.fresh.sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+    const transferAllocations = tracked.take()
+    active = true
+    let directory = null
+    let outerCode = null
+    try {
+      directory = tracked.fresh.consumeSealedRelayCandidateDirectory(token)
+    } catch (err) {
+      outerCode = err && err.code
+    }
+    t.is(nestedCode, 'ERR_REPLAY', `${operation} nested replay`)
+    t.is(outerCode, 'ERR_REPLAY', `${operation} outer replay`)
+    t.is(directory, null, `${operation} publishes no directory`)
+    t.ok(
+      transferAllocations.every((value) => value.every((byte) => byte === 0)),
+      `${operation} clears owned transfer bytes`
+    )
+    const callsAfterFailure = clockCalls
+    expectCode(t, () => tracked.fresh.consumeSealedRelayCandidateDirectory(token), 'ERR_REPLAY')
+    t.is(clockCalls, callsAfterFailure, `${operation} retains no clock authority`)
+    if (directory !== null) directory.destroy()
+  }
+
+  const uncaught = fixture()
+  let uncaughtSink = null
+  let uncaughtActive = false
+  uncaughtSink = createRelayCandidateDirectorySink({
+    wallNow() {
+      if (uncaughtActive) {
+        uncaughtActive = false
+        sealRelayCandidateDirectorySink(uncaughtSink, uncaught.records, uncaught.scope)
+      }
+      return NOW
+    },
+    monotonicNow: () => 0n
+  })
+  uncaughtActive = true
+  expectCode(
+    t,
+    () => sealRelayCandidateDirectorySink(uncaughtSink, uncaught.records, uncaught.scope),
+    'ERR_REPLAY'
+  )
+})
+
 test('evidence and commit reject transaction or directory reentry from wall clock', (t) => {
   let action = null
   const base = fakeClock()
