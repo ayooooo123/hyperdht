@@ -147,12 +147,15 @@ function fakeClock() {
         timers.delete(id)
         timer.callback()
       }
+    },
+    pending() {
+      return timers.size
     }
   }
 }
 
 function fixture(options = {}) {
-  const clock = fakeClock()
+  const clock = options.clock || fakeClock()
   const local = identityFor(ROLE.SAFETY, 2)
   const configured = [
     endpoint('192.0.2.41', 49737),
@@ -386,6 +389,9 @@ function fixture(options = {}) {
     randomBytes: (size) => b4a.alloc(size, 0x44),
     candidateDirectorySink: sink
   })
+  if (options.bootstrapTimers) {
+    io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER](options.bootstrapTimers)
+  }
   return {
     advertisements,
     calls,
@@ -765,6 +771,103 @@ test('cancel during a pending datagram emits no later packet', async (t) => {
     ['caps-query', 'destroy']
   )
   f.cleanup()
+})
+
+test('one absolute ten-second timer settles a permanently pending cold-start datagram', async (t) => {
+  const clock = fakeClock()
+  const f = fixture({
+    clock,
+    bootstrapTimers: {
+      setTimeout: clock.setTimer,
+      clearTimeout: clock.clearTimer
+    },
+    onSend() {
+      return new Promise(() => {})
+    }
+  })
+  let settled = false
+  const started = f.io.start()
+  void started.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    }
+  )
+  while (f.calls.length === 0) await Promise.resolve()
+  t.is(f.clock.pending(), 1, 'cold start owns one operation timer')
+  f.clock.advance(9_999)
+  await Promise.resolve()
+  t.is(settled, false)
+  f.clock.advance(1)
+  await expectCodeAsync(t, () => started, 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+  t.ok(settled)
+  t.ok(f.destroyed)
+  t.is(f.clock.pending(), 0)
+  t.alike(
+    f.calls.map((call) => call[2] || call[0]),
+    ['caps-query', 'destroy']
+  )
+  t.is(f.io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER]().candidateCount, 0)
+  f.cleanup()
+})
+
+test('cancel and destroy settle cold start even when transport destroy cannot reject pending send', async (t) => {
+  for (const method of ['cancel', 'destroy']) {
+    const clock = fakeClock()
+    const f = fixture({
+      clock,
+      bootstrapTimers: {
+        setTimeout: clock.setTimer,
+        clearTimeout: clock.clearTimer
+      },
+      onSend() {
+        return new Promise(() => {})
+      }
+    })
+    const started = f.io.start()
+    while (f.calls.length === 0) await Promise.resolve()
+    t.is(f.io[method](), true)
+    await expectCodeAsync(t, () => started, 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+    t.alike(
+      f.calls.map((call) => call[2] || call[0]),
+      ['caps-query', 'destroy']
+    )
+    t.is(f.clock.pending(), 0)
+    f.cleanup()
+  }
+})
+
+test('cold-start timer arming fails closed under sync, throw, and reentrant schedulers', async (t) => {
+  for (const mode of ['sync', 'throw', 'reenter']) {
+    let f = null
+    let clears = 0
+    let survivingCallback = null
+    f = fixture({
+      bootstrapTimers: {
+        setTimeout(callback) {
+          survivingCallback = callback
+          if (mode === 'sync') callback()
+          if (mode === 'throw') throw new Error('scheduler failure')
+          if (mode === 'reenter') f.io.cancel()
+          return Object.freeze({ mode })
+        },
+        clearTimeout() {
+          clears++
+        }
+      }
+    })
+    await expectCodeAsync(t, () => f.io.start(), 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+    t.ok(f.destroyed)
+    t.is(f.calls.filter((call) => call[2]).length, 0)
+    t.is(clears, mode === 'throw' ? 0 : 1)
+    const before = f.calls.length
+    survivingCallback()
+    await Promise.resolve()
+    t.is(f.calls.length, before, 'surviving physical callback is inert')
+    f.cleanup()
+  }
 })
 
 test('three prospective configured guards are challenged sequentially and never as middle or exit contacts', async (t) => {
