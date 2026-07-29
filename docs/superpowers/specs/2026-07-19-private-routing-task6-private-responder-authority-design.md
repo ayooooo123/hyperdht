@@ -1,8 +1,8 @@
 # Gate 3B1 Task 6: Private Tail Responder Authority
 
-**Status:** Approved after independent review
+**Status:** Owner-approved on 2026-07-29 after independent design review
 
-**Date:** 2026-07-19
+**Date:** 2026-07-29
 
 **Amends:** [Gate 3B1 implementation plan](../../superpowers/plans/2026-07-18-private-routing-gate-3b1.md), Task 6 only
 
@@ -225,20 +225,191 @@ const dialOptions = {
 }
 ```
 
-Before invoking verification, clock, or dial code, the authority moves from
-`UNUSED` to `DIALING` and tombstones its reusable state. It re-verifies the
-canonical advertisement, expected digest, and required role; requires
-`wallNow() < wireExpiresAt <= decodedAdvertisement.expiresAtMs`; and requires
-`localDeadline` to equal the factory operation's already-retained local
-deadline and remain greater than `monotonicNow()`. It decodes the tuple
-internally, permits one live dial, and returns only an opaque extension setup
-transport to the adjacent factory. The
-authority is not bound to a candidate when the factory is created; it becomes
-request-bound at this one invocation and cannot dial an alternate tuple. Before
-returning, the live setup transport is either transferred into the factory's
-operation record or destroyed; throwing/reentrant completion cannot orphan it.
-`dial` and `socketOwner` remain relay-runtime capabilities and are never
-exposed to endpoint code.
+The dial callback contract is exact:
+
+```js
+dial(socketOwner, canonicalEndpoint) // Promise<ExtensionResponseReceiver>
+destroy() // synchronous, no arguments
+```
+
+`dial` must return a genuine Promise. A synchronous throw is a dial failure. A
+synchronous non-Promise return is a contract violation. If that direct return is
+a live capability recognized by `isExtensionResponseReceiver`, it is first
+consumed with `destroyExtensionResponseReceiver`; no property or method is read
+from any other malformed return. Cleanup precedes the `INVALID_ROUTE` result.
+The Promise may fulfill only with the existing opaque
+`ExtensionResponseReceiver`; this design introduces no setup-transport
+interface.
+
+Authority construction creates one internal linear `SocketOwnerLease`
+containing `{ socketOwner, onceDestroy }`. `onceDestroy` is the sole owner of
+the supplied no-argument `destroy` callback, suppresses its exception, and can
+be spent only once. The lease is never exported. Receiver and physical-channel
+cleanup remains separate channel cleanup and neither spends nor replaces this
+lease.
+
+During `DIALING`, the callback receives a temporary non-owning reference to the
+lease's `socketOwner`, retained by the pending attempt only until settlement,
+and may initiate exactly one connection. After valid installation, a non-owning
+operational reference may remain only inside the returned receiver/physical-
+channel graph, and only while that graph is co-owned and atomically
+co-transferred with the same `SocketOwnerLease`. The graph may neither invoke
+nor own `onceDestroy`, nor export, use, or retain the reference after the lease
+is spent. Every failure drops the graph before spending the lease. The separate
+lease remains the sole destruction owner through factory, completion, and
+runtime ownership.
+
+The operation owns one fresh 19-byte canonical-endpoint copy decoded from the
+verified advertisement. `dial` receives a read-only loan of that exact buffer
+until its Promise settles and may contact only that endpoint: no DNS lookup,
+fallback, alternate candidate, discovery request, or retry target. It may not
+retain the loan after settlement. Abort, destroy, or pre-install deadline
+failure while the Promise is unsettled moves buffer-cleanup ownership into the
+attached endpoint settlement capsule; pending callback code never observes the
+buffer cleared or mutated. The fulfillment/rejection handler clears it exactly
+once.
+
+The callback contract requires settlement no later than the retained local
+deadline and requires socket-owner destruction to drive cancellation
+settlement. Correctness does not trust either promise. If the callback remains
+unsettled after abort or destroy, its capsule retains the same globally counted
+pending-offer lease until settlement. A never-settling Promise therefore
+occupies one bounded global slot rather than creating unbounded uncounted
+buffers or handlers; new attempts fail closed at `MAX_PENDING_OFFERS`.
+
+The adjacent factory creates its operation synchronously and privately binds
+the dial authority to that operation's exact wall-clock identity,
+monotonic-clock identity, and retained local deadline. On the first
+`dialRelayAdvertisement` call, the authority changes `UNUSED -> DIALING` and
+permanently tombstones reuse before option inspection, verification, either
+clock, scheduling, or `dial`. That operation acquires one process-global
+pending-offer lease before any external or cryptographic operation. A malformed
+first call, synchronous throw, rejection, invalid fulfillment, expiry, abort,
+or destroy spends the authority.
+
+Before calling `dial`, the authority re-verifies the canonical advertisement,
+digest, required role, wire expiry, exact retained local deadline, and both
+clock identities. It creates the endpoint copy only after those checks. It
+rechecks generation identity, liveness, and both deadlines after every external
+or reentrant operation.
+
+Before a genuine dial Promise exists with settlement handlers attached, a
+dedicated pre-Promise terminal/failure owner detaches and tombstones the
+operation and cancels any armed timer. Once any synchronous endpoint/socket-
+owner loan has ended, that owner destroys any live direct-return receiver,
+spends `SocketOwnerLease`, clears the endpoint copy, and releases any acquired
+pending-offer lease, in that order. It returns the applicable normalized error
+only after that cleanup. It cannot create a quarantine record without a genuine
+Promise and an attached settlement handler. If a reentrant terminal transition
+occurs while `dial` is on the stack and `dial` then returns a genuine Promise,
+its handler is attached and the unsettled-Promise quarantine rule below applies
+before any loan-coupled owner is released.
+
+The pending-offer lease has one ownership path:
+
+1. While dialing, the authority record owns `{ pendingOfferLease,
+   socketOwnerLease, endpointSettlementCapsule }`.
+2. Promise settlement alone is not a commit. Its handler first validates
+   `isExtensionResponseReceiver`, rechecks the still-`DIALING`
+   authority/factory generation and both deadlines, and performs no external
+   callback between the final state check and commit.
+3. Valid fulfillment commits only by atomically moving `{ receiver,
+   pendingOfferLease, socketOwnerLease }` into the still-live bound factory
+   operation and marking the authority `TRANSFERRED`/spent. Only this install
+   commit wins over a later abort.
+4. Abort or destroy that commits first, including after underlying Promise
+   settlement but before the fulfillment handler's install commit, wins. The
+   uninstalled receiver is destroyed and late settlement cannot mutate factory
+   state.
+5. A settled genuine-Promise pre-install failure—rejection, invalid
+   fulfillment, or failed fulfillment-handler validation—first detaches and
+   tombstones, then destroys any live receiver, spends `socketOwnerLease`,
+   clears the endpoint copy, and releases the pending-offer lease, all once and
+   with callback exceptions suppressed. Synchronous throw/non-Promise follows
+   the pre-Promise owner above instead.
+6. Abort, destroy, or pre-install deadline failure while the genuine dial
+   Promise is unsettled detaches and tombstones the factory operation, then
+   atomically moves `{ pendingOfferLease, endpointSettlementCapsule }` into a
+   globally counted late-settlement quarantine record. It immediately spends
+   `socketOwnerLease` and rejects the outer operation, but does not release the
+   pending-offer lease or clear the endpoint while callback code may still run.
+   Eventual fulfillment/rejection destroys any live receiver, clears the
+   endpoint, releases the lease, and deletes the record. A record that never
+   settles permanently occupies one `MAX_PENDING_OFFERS` slot.
+7. During LINK_OFFER/LINK_ACCEPT/proof exchange after a valid install, the
+   factory operation owns `{ receiver, pendingOfferLease, socketOwnerLease }`.
+   Abort, factory destroy, expiry, or exchange failure first detaches and
+   tombstones the operation and releases the pending-offer lease, then destroys
+   the receiver or already-moved physical channel, and finally spends
+   `socketOwnerLease`.
+8. A terminal completion attempt atomically detaches the pending operation,
+   moving `{ receiver, socketOwnerLease }` into the terminal-attempt owner, and
+   releases the pending-offer lease before validating completion options or
+   invoking `takeExtensionResponse`, matching `completeExtensionLink`'s
+   existing boundary.
+9. The terminal attempt uses `finally` on every pre-transfer failure to destroy
+   whichever of the receiver or taken physical channel it then owns and only
+   afterward spends `socketOwnerLease`. Successful `takeExtensionResponse`
+   atomically replaces the terminal owner's receiver with `{ physicalChannel,
+   socketOwnerLease }` in a factory-local post-take owner. Every subsequent
+   validation, proof, derivation, or establishment failure destroys the
+   physical channel or derived/established link and then spends the lease. Only
+   after the established link and every retained proof/binding are valid does
+   `createExtensionLinkCompletion` atomically move `{ establishedLinkMaterial,
+   socketOwnerLease }` into the completion destruction state. Completion
+   destruction destroys the established link and then spends the lease once.
+10. Successful responder completion/adoption moves `socketOwnerLease` with the
+    established adjacency into the M3 runtime registry's existing destroy owner
+    before clearing completion material. Registry removal, link close, or
+    projected expiry destroys physical-channel/runtime state and then spends
+    the lease. No success path drops the lease or invokes its destructor early.
+
+The first committed terminal transition wins, not Promise settlement time.
+Every pre-install terminal transition uses the same settled-versus-unsettled
+ownership rule. Before the valid fulfillment install commit, abort/destroy
+marks `ABORTED`/spent and detaches the operation before callbacks, performs the
+cleanup or quarantine transfer above, destroys any operation-owned channel,
+spends the socket-owner lease once, and rejects `openExtensionAdjacentLink`
+with `ERR_DESTROYED`; pre-install expiry uses the existing normal expiry error.
+Only quarantined settlement handlers remain. A later rejection is consumed; a
+later live receiver is destroyed and never installed. Settlement clears the
+endpoint and releases the quarantined lease once, without mutating factory
+state or reacquiring a released lease. Reentrant abort/destroy observes the
+tombstone and is an idempotent no-op. After install commits, abort follows the
+normal factory-operation cleanup path.
+
+Post-invocation non-destroy dial failures are cleaned up before normalization to
+`ERR_ROUTE_UNAVAILABLE`; caller-shape violations remain `INVALID_ROUTE`. No
+arbitrary callback exception escapes.
+
+Before this factory consumes a receiver, `takeExtensionResponse` must be
+corrected through TDD. Store `takePhysicalChannel()` in a temporary candidate
+and assign it to the owned `physicalChannel` local only after it passes the
+existing nominal channel check. A malformed truthy candidate therefore leaves
+`physicalChannel` null and runs the receiver's registered destructor. A valid
+candidate is destroyed on every later non-transfer path. This changes no wire
+bytes or API.
+
+Only the already-bound adjacent factory may invoke the authority.
+`dialRelayAdvertisement` resolves its opaque result to factory code only after
+the valid fulfillment install commit. Endpoint code receives no tuple,
+endpoint bytes, socket owner, owner lease, dial function, receiver, physical
+channel, DNS/bind/`trySend`/connect capability, or alternate-dial authority.
+The factory resolves only `ExtensionLinkCompletion`.
+
+Task 6 implementation keeps its existing numbering but executes this dependency
+order without a test-only admission issuer: Step 5a corrects
+`takeExtensionResponse` and implements the relay dial authority plus exact
+adjacent-factory construction/lifecycle; Step 8a implements real token-gated
+responder-authority construction and authenticated `admitTailExtend`, publishes
+the ordinary `AdmittedExtendRequest`, and adds its one-shot
+`takeAdmittedExtendRequest` consumer; Step 5b consumes that honest admitted
+capability synchronously before the factory's first await and performs the
+exact link exchange; Step 8b implements `openTailAdjacentLink`, completion,
+abort, TAIL_READY, and remaining responder transitions, including transfer of
+the socket-owner lease into the M3 runtime destroy owner. The deferred initiator
+LINK_OFFER signer migration finishes only after the production admission path
+can exercise it behaviorally.
 
 On the successor side, `takeExtensionResponderAdjacency` is narrowed to return
 an opaque accepted-adjacency transfer. The private transfer/cache-owner surface
@@ -718,8 +889,8 @@ approved Gate 3B1 boundary.
 
 ## Plan effect
 
-Task 6 Step 4 is amended to add the package-private responder authority and to
-replace prototype discovery-cache and `BranchPathAuthority` admission with the
+Task 6 Step 8a adds the package-private responder authority and replaces
+prototype discovery-cache and `BranchPathAuthority` admission with the
 selected-evidence flow above. The Task 6 file list additionally creates
 `lib/private/relay-identity-signer.js` and
 `test/private/relay-identity-signer.js`; responder transitions remain in
@@ -728,5 +899,20 @@ selected-evidence flow above. The Task 6 file list additionally creates
 refactors `guard-link.js` around the exact adjacent-link factory and signing
 capabilities above, and replaces RouteExtension's single `now` dependency with
 separate `wallNow` and `monotonicNow` functions. Task 3 evidence is unchanged,
-and no `selectedEvidenceExpiry` field is added. Steps 1-3 and 5-7 otherwise
-remain in force; no later task is renumbered or broadened.
+and no `selectedEvidenceExpiry` field is added.
+
+Step 5 is split in place: 5a applies the `takeExtensionResponse` ownership
+correction and implements dial/factory construction through counted
+late-settlement quarantine; after Step 8a produces the real authenticated
+admission capability, 5b consumes it and performs the link exchange. Step 8
+then resumes as 8b for completion, abort, TAIL_READY, and transfer of the
+socket-owner lease into the M3 runtime destroy owner. The initiator LINK_OFFER
+signer caller migration is deferred until that honest admission path exists.
+The pending-offer reservation transfers to the live factory operation or
+globally counted quarantine, releases directly through the pre-Promise owner
+when no settlement handler exists, or releases after genuine-Promise
+settlement. It is never unconditionally released while callback code remains
+unsettled. All unchanged
+requirements in Steps 1-7 remain in force. No later task is renumbered or
+broadened. No wire bytes, public or package-private APIs, discovery/direct-
+authority boundaries, or exact clock requirements change.
