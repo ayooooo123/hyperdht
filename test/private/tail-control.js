@@ -39,15 +39,22 @@ const {
   EXTEND_REQUEST_MAX_SIZE,
   borrowTailControlTransport,
   EXTEND_REQUEST_MIN_SIZE,
+  abortTailExtend,
+  admitTailExtend,
+  completeTailExtend,
+  createTailControlResponderAuthority,
   createTailControlSession,
   decodeExtendRequest,
   decodeExtended,
+  destroyTailControlResponderAuthority,
   destroyTailControlSession,
   digestAdmittedLimits,
   encodeExtendRequest,
   encodeExtended,
   encodeTailControlTranscript,
-  readTailControlDeadline
+  openTailAdjacentLink,
+  readTailControlDeadline,
+  sealTailReady
 } = require('../../lib/private/tail-control')
 
 const TEST_ONLY_M3_ESTABLISHED_ISSUER = Symbol.for(
@@ -115,6 +122,22 @@ function tailSessionOptions(clock, extra = {}) {
     schedule: clock.schedule,
     cancelScheduled: clock.cancelScheduled,
     absoluteDeadline: 10_250n
+  }
+  for (const key of Reflect.ownKeys(extra)) options[key] = extra[key]
+  return options
+}
+
+function responderAuthorityOptions(clock, extra = {}) {
+  const options = {
+    adjacencyAdopter: Object.freeze({}),
+    extensionCommitter: Object.freeze({}),
+    adjacentLinkFactory: Object.freeze({}),
+    tailReadySigner: Object.freeze({}),
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow,
+    randomBytes: () => seed(0xf0),
+    schedule: clock.schedule,
+    cancelScheduled: clock.cancelScheduled
   }
   for (const key of Reflect.ownKeys(extra)) options[key] = extra[key]
   return options
@@ -297,6 +320,84 @@ test('TailControlSession consumes one M3 tail into a five-method stable owner', 
   t.is(destroyTailControlSession(session), true)
   t.is(destroyTailControlSession(session), false)
   t.is(clock.pending(), 1, 'destroy cancels only the TailControl lifetime')
+})
+
+test('TailControl exports the package-private responder authority surface', (t) => {
+  t.is(typeof createTailControlResponderAuthority, 'function')
+  t.is(typeof admitTailExtend, 'function')
+  t.is(typeof openTailAdjacentLink, 'function')
+  t.is(typeof completeTailExtend, 'function')
+  t.is(typeof abortTailExtend, 'function')
+  t.is(typeof sealTailReady, 'function')
+  t.is(typeof destroyTailControlResponderAuthority, 'function')
+})
+
+test('TailControl responder authority consumes exact token and arms subordinate lifetime', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const adopted = owner.adopt(syntheticLink({ initiator: false, wireExpiresAt: 20_000n }))
+  const session = createTailControlSession(adopted.tail, tailSessionOptions(clock))
+
+  const responder = createTailControlResponderAuthority(
+    session,
+    adopted.responderToken,
+    responderAuthorityOptions(clock)
+  )
+
+  t.alike(Object.keys(session).sort(), [
+    'abortClientExtension',
+    'completeClientExtension',
+    'openExtended',
+    'sealExtend',
+    'takeFinalExitHandoff'
+  ])
+  t.alike(Reflect.ownKeys(responder), [])
+  t.is(Object.isFrozen(responder), true)
+  t.is(clock.pending(), 3, 'responder authority arms one subordinate logical lifetime')
+  t.exception(() =>
+    createTailControlResponderAuthority(session, adopted.responderToken, responderAuthorityOptions(clock))
+  )
+  t.is(destroyTailControlResponderAuthority(responder), true)
+  t.is(destroyTailControlResponderAuthority(responder), false)
+  t.is(clock.pending(), 2, 'authority destroy cancels only the subordinate lifetime')
+  t.is(destroyTailControlSession(session), true)
+})
+
+test('TailControl responder authority rejects initiators, token substitutes, and alternate clocks', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const initiator = owner.adopt(syntheticLink({ initiator: true, wireExpiresAt: 20_000n }))
+  const initiatorSession = createTailControlSession(initiator.tail, tailSessionOptions(clock, {
+    absoluteDeadline: 16_000n
+  }))
+  t.exception(() =>
+    createTailControlResponderAuthority(initiatorSession, Object.freeze({}), responderAuthorityOptions(clock))
+  )
+  t.is(destroyTailControlSession(initiatorSession), true)
+
+  const substitute = owner.adopt(syntheticLink({
+    initiator: false,
+    completeOfferDigest: seed(0x81),
+    wireExpiresAt: 20_000n
+  }))
+  const substituteSession = createTailControlSession(substitute.tail, tailSessionOptions(clock))
+  t.exception(() =>
+    createTailControlResponderAuthority(substituteSession, Object.freeze({}), responderAuthorityOptions(clock))
+  )
+  t.is(destroyTailControlSession(substituteSession), true)
+
+  const alternate = owner.adopt(syntheticLink({
+    initiator: false,
+    completeOfferDigest: seed(0x82),
+    wireExpiresAt: 20_000n
+  }))
+  const alternateSession = createTailControlSession(alternate.tail, tailSessionOptions(clock))
+  t.exception(() =>
+    createTailControlResponderAuthority(alternateSession, alternate.responderToken, responderAuthorityOptions(clock, {
+      monotonicNow: () => 10_000n
+    }))
+  )
+  t.is(destroyTailControlSession(alternateSession), true)
 })
 
 test('TailControlSession rejects structural transport and alternate clocks', (t) => {
