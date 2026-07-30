@@ -1510,9 +1510,9 @@ transport ownership gaps while preserving the approved Gate 3B1 boundary.
 This repository-spec incorporation intentionally does not edit the
 implementation plan while the written revision awaits owner review. Once that
 review passes, the plan must be reconciled in place without renumbering tasks:
-Task 5 Step 6; Task 6 Steps 2, 7, 8a/8b, 10, 11, and 12; Task 7 Steps 3-5; and
-Task 9 Steps 1 and 3-4. Task 5's UDX-issued transfer and record-bound dispatch
-are prerequisites; Task 6 implementation cannot resume by substituting a
+Task 5 Step 6; Task 6 Steps 2, 7, 8a/8b, 9, 10, 11, and 12; Task 7 Steps
+3-5; and Task 9 Steps 1 and 3-4. Task 5's UDX-issued transfer and record-bound
+dispatch are prerequisites; Task 6 implementation cannot resume by substituting a
 structural or test-only transport.
 
 The earlier responder-authority dependency order remains in force. Task 6 Step
