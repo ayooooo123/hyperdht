@@ -11,6 +11,11 @@ const {
 } = require('../../lib/private/counters')
 const { digestPayloadParameters } = require('../../lib/private/link-parameters')
 const {
+  createExtensionOfferReceiver,
+  destroyExtensionOfferReceiver
+} = require('../../lib/private/extension-setup-channel')
+const { createM3ResponderAdopter } = require('../../lib/private/m3-adjacency-adopter')
+const {
   decodeRelayCapabilityAdvertisement,
   deriveM3DhtNodeId,
   digestRelayCapabilityAdvertisement,
@@ -20,28 +25,87 @@ const {
   signRelayCapabilityAdvertisement
 } = require('../../lib/private/relay-capability')
 const {
+  decodeRedactedResponderProof,
+  signRedactedResponderProof
+} = require('../../lib/private/redacted-responder-proof')
+const {
   BRANCH_CLASS,
   CAPACITY_CLASS,
   DOMAIN,
+  M3_LINK_ROLE,
   M3_MESSAGE_ID,
   RELAY_CAPABILITY,
+  ROLE,
   decodeM3Object,
-  encodeM3Object
+  encodeM3Object,
+  roleForIdentity
 } = require('../../lib/private/protocol')
 const {
+  abortExtensionAdjacentLink,
   abortIndexZeroGuardLink,
+  answerAcceptedExtensionReplay,
   completeIndexZeroGuardLink,
+  createExtensionAdjacentLinkFactory,
   createIndexZeroGuardLinkOffer,
   createIndexZeroGuardLinkResponder,
+  createRelayAdjacentDialAuthority,
+  destroyAcceptedExtensionAdjacencyOwner,
+  destroyExtensionAdjacentLinkFactory,
   destroyM3EstablishedLink,
-  readM3EstablishedLink
+  destroyRelayAdjacentDialAuthority,
+  dialRelayAdvertisement,
+  readM3EstablishedLink,
+  revokeAcceptedExtensionAdjacencyTransfer,
+  takeAcceptedExtensionAdjacencyTransfer,
+  takeExtensionResponderAdjacency
 } = require('../../lib/private/guard-link')
+const extensionGuardLinks = require('../../lib/private/guard-link')
+const {
+  createExtensionResponderSigner,
+  createLinkOfferSigner,
+  createRelayIdentitySigningAuthority,
+  destroyLinkOfferSigner,
+  destroyRelayIdentitySigningAuthority,
+  signLinkAccept
+} = require('../../lib/private/relay-identity-signer')
 
 const TEST_ONLY_COUNTER_FACTORY = Symbol.for('hyperdht-private-routes/test-only-counter-factory')
 
 const LINK_OFFER_SIZE = 374
 const LINK_ACCEPT_SIZE = 285
 const seed = (value) => b4a.alloc(32, value)
+
+function errorCode(operation) {
+  try {
+    operation()
+  } catch (err) {
+    return err && err.code
+  }
+  return null
+}
+
+test('guard link exposes only opaque authenticated extension operations', (t) => {
+  for (const name of [
+    'abortExtensionAdjacentLink',
+    'answerAcceptedExtensionReplay',
+    'abortExtensionLinkCompletion',
+    'abortExtensionLinkOffer',
+    'completeExtensionLink',
+    'createExtensionAdjacentLinkFactory',
+    'createExtensionLinkOffer',
+    'createExtensionLinkResponder',
+    'createRelayAdjacentDialAuthority',
+    'destroyAcceptedExtensionAdjacencyOwner',
+    'destroyExtensionAdjacentLinkFactory',
+    'destroyRelayAdjacentDialAuthority',
+    'dialRelayAdvertisement',
+    'revokeAcceptedExtensionAdjacencyTransfer',
+    'takeAcceptedExtensionAdjacencyTransfer',
+    'takeExtensionResponderAdjacency'
+  ]) {
+    t.is(typeof extensionGuardLinks[name], 'function', name)
+  }
+})
 
 function withSlowAllocationProbe(operation, armAtSize, failAt = Infinity) {
   const originalAlloc = b4a.allocUnsafeSlow
@@ -87,15 +151,33 @@ function testCounterFactory(failAt, counters) {
   }
 }
 
-test('Chunk 1 guard-link exports only index-zero ownership operations', (t) => {
+test('guard-link exposes only index-zero and authenticated extension ownership', (t) => {
   t.alike(Object.keys(require('../../lib/private/guard-link')).sort(), [
+    'LINK_ACCEPT_SIZE',
+    'LINK_OFFER_SIZE',
+    'abortExtensionAdjacentLink',
+    'abortExtensionLinkCompletion',
+    'abortExtensionLinkOffer',
     'abortIndexZeroGuardLink',
+    'answerAcceptedExtensionReplay',
+    'completeExtensionLink',
     'completeIndexZeroGuardLink',
+    'createExtensionAdjacentLinkFactory',
+    'createExtensionLinkOffer',
+    'createExtensionLinkResponder',
     'createIndexZeroGuardLinkOffer',
     'createIndexZeroGuardLinkResponder',
+    'createRelayAdjacentDialAuthority',
+    'destroyAcceptedExtensionAdjacencyOwner',
+    'destroyExtensionAdjacentLinkFactory',
     'destroyM3EstablishedLink',
+    'destroyRelayAdjacentDialAuthority',
     'destroyTakenM3EstablishedLink',
+    'dialRelayAdvertisement',
     'readM3EstablishedLink',
+    'revokeAcceptedExtensionAdjacencyTransfer',
+    'takeAcceptedExtensionAdjacencyTransfer',
+    'takeExtensionResponderAdjacency',
     'takeM3EstablishedLink'
   ])
 })
@@ -135,8 +217,15 @@ function resign(encoded, messageId, domain, secretKey, mutate) {
   })
 }
 
-function fixture() {
-  const guard = cryptoSuite.keyPair(seed(2))
+function identityForRole(role, start) {
+  for (let value = start; value < 256; value++) {
+    const pair = cryptoSuite.keyPair(seed(value))
+    if (roleForIdentity(pair.publicKey) === role) return pair
+  }
+  throw new Error('missing deterministic role identity')
+}
+
+function fixture(guard = cryptoSuite.keyPair(seed(2))) {
   const route = cryptoSuite.encryptionKeyPair(seed(5))
   const endpoint = encodeCanonicalEndpoint({
     addressFamily: 4,
@@ -177,6 +266,614 @@ function fixture() {
   )
   return { advertisement, endpoint, guard, route }
 }
+
+function exactDialOptions(overrides = {}) {
+  return {
+    advertisement: b4a.alloc(1),
+    advertisementDigest: b4a.alloc(32),
+    requiredRole: ROLE.SAFETY,
+    wireExpiresAt: 2_000n,
+    localDeadline: 3_000n,
+    ...overrides
+  }
+}
+
+function exactFactoryOptions(dialAuthority, linkOfferSigner, destroy, callbacks = {}) {
+  return {
+    dialAuthority,
+    linkOfferSigner,
+    wallNow: callbacks.wallNow || (() => NOW),
+    monotonicNow: callbacks.monotonicNow || (() => NOW),
+    randomBytes: callbacks.randomBytes || ((size) => b4a.alloc(size)),
+    schedule: callbacks.schedule || (() => Object.freeze({})),
+    cancelScheduled: callbacks.cancelScheduled || (() => {}),
+    destroy
+  }
+}
+
+test('relay adjacent dial authority constructor is exact, opaque, and linear', (t) => {
+  const socketOwner = Object.freeze({})
+  let destroyed = 0
+  let reentered = null
+  let authority = null
+  authority = createRelayAdjacentDialAuthority({
+    socketOwner,
+    allowedRole: ROLE.SAFETY,
+    dial: () => Promise.resolve(null),
+    destroy(...args) {
+      destroyed++
+      t.is(args.length, 0, 'socket-owner destroy receives no arguments')
+      t.is(this, undefined, 'socket-owner destroy receives no caller receiver')
+      reentered = destroyRelayAdjacentDialAuthority(authority)
+    }
+  })
+
+  t.ok(Object.isFrozen(authority), 'authority is frozen')
+  t.alike(Reflect.ownKeys(authority), [], 'authority exposes no properties')
+  t.is(destroyRelayAdjacentDialAuthority(authority), true, 'first destroy spends authority')
+  t.is(reentered, false, 'destroy tombstones before invoking owner cleanup')
+  t.is(destroyed, 1, 'socket-owner cleanup runs once')
+  t.is(destroyRelayAdjacentDialAuthority(authority), false, 'repeated destroy is a no-op')
+  t.is(
+    errorCode(() => dialRelayAdvertisement(authority, new Proxy({}, { ownKeys: () => t.fail() }))),
+    'ERR_DESTROYED',
+    'destroyed authority rejects before inspecting dial options'
+  )
+
+  let throwingDestroyed = 0
+  const throwing = createRelayAdjacentDialAuthority({
+    socketOwner: Object.freeze({}),
+    allowedRole: ROLE.PRIVATE,
+    dial: () => Promise.resolve(null),
+    destroy() {
+      throwingDestroyed++
+      throw new Error('owner cleanup failure')
+    }
+  })
+  t.is(destroyRelayAdjacentDialAuthority(throwing), true, 'destructor exceptions are suppressed')
+  t.is(throwingDestroyed, 1, 'throwing destructor is still one-shot')
+
+  for (const [name, options, expectedDestroy] of [
+    [
+      'accessor',
+      {
+        socketOwner,
+        allowedRole: ROLE.SAFETY,
+        dial: () => Promise.resolve(null),
+        get destroy() {
+          t.fail('constructor accessor must not run')
+        }
+      },
+      0
+    ],
+    [
+      'extra own key',
+      {
+        socketOwner,
+        allowedRole: ROLE.SAFETY,
+        dial: () => Promise.resolve(null),
+        destroy: () => {},
+        extra: true
+      },
+      0
+    ],
+    [
+      'invalid role',
+      {
+        socketOwner,
+        allowedRole: -1,
+        dial: () => Promise.resolve(null),
+        destroy: () => destroyed++
+      },
+      1
+    ]
+  ]) {
+    const before = destroyed
+    t.is(
+      errorCode(() => createRelayAdjacentDialAuthority(options)),
+      'INVALID_ROUTE',
+      `${name} rejects`
+    )
+    t.is(destroyed - before, expectedDestroy, `${name} cleanup follows ownership transfer`)
+  }
+})
+
+test('relay dial first call tombstones before exact option inspection', (t) => {
+  let destroyed = 0
+  let nestedInspections = 0
+  let nestedCode = null
+  const authority = createRelayAdjacentDialAuthority({
+    socketOwner: Object.freeze({}),
+    allowedRole: ROLE.SAFETY,
+    dial: () => {
+      t.fail('dial is gated on honest admission')
+    },
+    destroy: () => destroyed++
+  })
+  const nestedOptions = new Proxy(
+    {},
+    {
+      ownKeys() {
+        nestedInspections++
+        return []
+      }
+    }
+  )
+  const options = new Proxy(
+    {},
+    {
+      ownKeys() {
+        t.is(destroyed, 0, 'socket-owner lease remains live during option inspection')
+        nestedCode = errorCode(() => dialRelayAdvertisement(authority, nestedOptions))
+        return []
+      }
+    }
+  )
+
+  t.is(
+    errorCode(() => dialRelayAdvertisement(authority, options)),
+    'INVALID_ROUTE',
+    'malformed first call rejects'
+  )
+  t.is(nestedCode, 'ERR_AUTHENTICATION', 'reentrant dial observes the first-call tombstone')
+  t.is(nestedInspections, 0, 'reentrant dial does not inspect attacker options')
+  t.is(destroyed, 1, 'failed first call spends the socket-owner lease')
+  t.is(
+    errorCode(() => dialRelayAdvertisement(authority, nestedOptions)),
+    'ERR_AUTHENTICATION',
+    'spent authority rejects reuse'
+  )
+  t.is(nestedInspections, 0, 'reuse still does not inspect options')
+  t.is(destroyRelayAdjacentDialAuthority(authority), false, 'spent authority cannot be destroyed twice')
+})
+
+test('relay dial options require exact own data without caller property dispatch', (t) => {
+  const cases = [
+    [
+      'accessor',
+      () => {
+        const options = exactDialOptions()
+        Object.defineProperty(options, 'localDeadline', {
+          enumerable: true,
+          get() {
+            t.fail('dial option accessor must not run')
+          }
+        })
+        return options
+      }
+    ],
+    ['extra key', () => exactDialOptions({ extra: true })],
+    [
+      'symbol key',
+      () => {
+        const options = exactDialOptions()
+        options[Symbol('extra')] = true
+        return options
+      }
+    ],
+    [
+      'inherited shape',
+      () => Object.assign(Object.create({ inherited: true }), exactDialOptions())
+    ],
+    [
+      'unstable prototype Proxy',
+      () => {
+        let reads = 0
+        return new Proxy(exactDialOptions(), {
+          getPrototypeOf() {
+            return reads++ === 0 ? Object.freeze({}) : null
+          }
+        })
+      }
+    ],
+    [
+      'throwing Proxy',
+      () =>
+        new Proxy(exactDialOptions(), {
+          ownKeys() {
+            throw new Error('ownKeys trap')
+          }
+        })
+    ]
+  ]
+
+  for (const [name, makeOptions] of cases) {
+    let destroyed = 0
+    let dialed = 0
+    const authority = createRelayAdjacentDialAuthority({
+      socketOwner: Object.freeze({}),
+      allowedRole: ROLE.SAFETY,
+      dial: () => {
+        dialed++
+      },
+      destroy: () => destroyed++
+    })
+    t.is(
+      errorCode(() => dialRelayAdvertisement(authority, makeOptions())),
+      'INVALID_ROUTE',
+      `${name} rejects`
+    )
+    t.is(dialed, 0, `${name} never reaches dial`)
+    t.is(destroyed, 1, `${name} spends owner cleanup once`)
+  }
+
+  let exactDestroyed = 0
+  let exactDialed = 0
+  const unadmitted = createRelayAdjacentDialAuthority({
+    socketOwner: Object.freeze({}),
+    allowedRole: ROLE.SAFETY,
+    dial: () => {
+      exactDialed++
+    },
+    destroy: () => exactDestroyed++
+  })
+  t.is(
+    errorCode(() => dialRelayAdvertisement(unadmitted, exactDialOptions())),
+    'ERR_DESTROYED',
+    'exact options cannot bypass the honest-admission operation gate'
+  )
+  t.is(exactDialed, 0, 'operation gate precedes dial invocation')
+  t.is(exactDestroyed, 1, 'gated attempt spends the request-bound authority')
+})
+
+test('exact option snapshots never dispatch through Object.prototype', (t) => {
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, 'localDeadline')
+  let dispatched = 0
+  Object.defineProperty(Object.prototype, 'localDeadline', {
+    configurable: true,
+    set() {
+      dispatched++
+    }
+  })
+  try {
+    const authority = createRelayAdjacentDialAuthority({
+      socketOwner: Object.freeze({}),
+      allowedRole: ROLE.SAFETY,
+      dial: () => t.fail('admission gate must precede dial'),
+      destroy: () => {}
+    })
+    t.is(
+      errorCode(() => dialRelayAdvertisement(authority, exactDialOptions())),
+      'ERR_DESTROYED',
+      'exact dial reaches only the honest-admission gate'
+    )
+    t.is(dispatched, 0, 'snapshot writes invoke no inherited setter')
+  } finally {
+    if (original) Object.defineProperty(Object.prototype, 'localDeadline', original)
+    else delete Object.prototype.localDeadline
+  }
+})
+
+test('extension adjacent factory binds one authority and destroys transferred owners once', (t) => {
+  const identityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identityForRole(ROLE.SAFETY, 80).secretKey
+  })
+  const signer = createLinkOfferSigner(identityOwner)
+  const order = []
+  let callbacks = 0
+  const authority = createRelayAdjacentDialAuthority({
+    socketOwner: Object.freeze({}),
+    allowedRole: ROLE.SAFETY,
+    dial: () => Promise.resolve(null),
+    destroy: () => order.push('socket')
+  })
+  let factory = null
+  factory = createExtensionAdjacentLinkFactory(
+    exactFactoryOptions(authority, signer, () => {
+      order.push('factory')
+      t.is(
+        destroyExtensionAdjacentLinkFactory(factory),
+        false,
+        'factory tombstones before owner cleanup'
+      )
+    }, {
+      wallNow: () => {
+        callbacks++
+        return NOW
+      },
+      monotonicNow: () => {
+        callbacks++
+        return NOW
+      },
+      randomBytes: () => {
+        callbacks++
+        return b4a.alloc(32)
+      },
+      schedule: () => {
+        callbacks++
+        return Object.freeze({})
+      },
+      cancelScheduled: () => {
+        callbacks++
+      }
+    })
+  )
+
+  t.ok(Object.isFrozen(factory), 'factory is frozen')
+  t.alike(Reflect.ownKeys(factory), [], 'factory exposes no bound capabilities')
+  t.is(callbacks, 0, 'construction captures providers without invoking them')
+  t.is(abortExtensionAdjacentLink(factory), false, 'idle factory has no operation to abort')
+
+  const secondIdentityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identityForRole(ROLE.SAFETY, 100).secretKey
+  })
+  const secondSigner = createLinkOfferSigner(secondIdentityOwner)
+  let secondDestroyed = 0
+  t.is(
+    errorCode(() =>
+      createExtensionAdjacentLinkFactory(
+        exactFactoryOptions(authority, secondSigner, () => secondDestroyed++)
+      )
+    ),
+    'ERR_AUTHENTICATION',
+    'authority binds to exactly one factory'
+  )
+  t.is(destroyLinkOfferSigner(secondSigner), false, 'failed second factory destroys its signer')
+  t.is(secondDestroyed, 1, 'failed second factory destroys its independent owner')
+
+  t.is(destroyExtensionAdjacentLinkFactory(factory), true, 'factory destroy succeeds once')
+  t.alike(order, ['factory', 'socket'], 'factory state is dropped before socket-owner lease')
+  t.is(destroyLinkOfferSigner(signer), false, 'factory destroys its link-offer signer')
+  t.is(destroyRelayAdjacentDialAuthority(authority), false, 'factory spends its dial authority')
+  t.is(destroyExtensionAdjacentLinkFactory(factory), false, 'factory destroy is idempotent')
+  t.is(callbacks, 0, 'idle destruction invokes no clock, randomness, or scheduler provider')
+  destroyRelayIdentitySigningAuthority(identityOwner)
+  destroyRelayIdentitySigningAuthority(secondIdentityOwner)
+})
+
+test('extension adjacent factory exact options clean transferred owners without accessors', (t) => {
+  const cases = [
+    [
+      'accessor',
+      (options) => {
+        Object.defineProperty(options, 'randomBytes', {
+          enumerable: true,
+          get() {
+            t.fail('factory option accessor must not run')
+          }
+        })
+        return options
+      }
+    ],
+    ['extra key', (options) => ({ ...options, extra: true })],
+    [
+      'symbol key',
+      (options) => {
+        options[Symbol('extra')] = true
+        return options
+      }
+    ],
+    [
+      'inherited prototype',
+      (options) => Object.assign(Object.create({ inherited: true }), options)
+    ],
+    [
+      'unstable prototype Proxy',
+      (options) => {
+        let reads = 0
+        return new Proxy(options, {
+          getPrototypeOf() {
+            return reads++ === 0 ? Object.freeze({}) : null
+          }
+        })
+      }
+    ],
+    [
+      'throwing Proxy',
+      (options) =>
+        new Proxy(options, {
+          ownKeys() {
+            throw new Error('ownKeys trap')
+          }
+        })
+    ]
+  ]
+
+  for (const [name, mutate] of cases) {
+    const identityOwner = createRelayIdentitySigningAuthority({
+      identitySecretKey: identityForRole(ROLE.SAFETY, 120).secretKey
+    })
+    const signer = createLinkOfferSigner(identityOwner)
+    let socketDestroyed = 0
+    let factoryDestroyed = 0
+    const authority = createRelayAdjacentDialAuthority({
+      socketOwner: Object.freeze({}),
+      allowedRole: ROLE.SAFETY,
+      dial: () => Promise.resolve(null),
+      destroy: () => socketDestroyed++
+    })
+    const options = exactFactoryOptions(authority, signer, () => factoryDestroyed++)
+    t.is(
+      errorCode(() => createExtensionAdjacentLinkFactory(mutate(options))),
+      'INVALID_ROUTE',
+      `${name} rejects`
+    )
+    t.is(destroyLinkOfferSigner(signer), false, `${name} destroys the transferred signer`)
+    t.is(
+      destroyRelayAdjacentDialAuthority(authority),
+      false,
+      `${name} destroys the transferred dial authority`
+    )
+    t.is(socketDestroyed, 1, `${name} spends socket-owner cleanup`)
+    t.is(factoryDestroyed, 1, `${name} spends factory cleanup`)
+    destroyRelayIdentitySigningAuthority(identityOwner)
+  }
+})
+
+test('factory rollback cleans the captured snapshot without rereading caller options', (t) => {
+  const originalIdentityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identityForRole(ROLE.SAFETY, 140).secretKey
+  })
+  const alternateIdentityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identityForRole(ROLE.SAFETY, 160).secretKey
+  })
+  const originalSigner = createLinkOfferSigner(originalIdentityOwner)
+  const alternateSigner = createLinkOfferSigner(alternateIdentityOwner)
+  let originalSocketDestroyed = 0
+  let alternateSocketDestroyed = 0
+  let originalFactoryDestroyed = 0
+  let alternateFactoryDestroyed = 0
+  const originalAuthority = createRelayAdjacentDialAuthority({
+    socketOwner: Object.freeze({}),
+    allowedRole: ROLE.SAFETY,
+    dial: () => Promise.resolve(null),
+    destroy: () => originalSocketDestroyed++
+  })
+  const alternateAuthority = createRelayAdjacentDialAuthority({
+    socketOwner: Object.freeze({}),
+    allowedRole: ROLE.SAFETY,
+    dial: () => Promise.resolve(null),
+    destroy: () => alternateSocketDestroyed++
+  })
+  const target = exactFactoryOptions(
+    originalAuthority,
+    originalSigner,
+    () => originalFactoryDestroyed++
+  )
+  target.wallNow = null
+  const reads = new Map()
+  const options = new Proxy(target, {
+    getOwnPropertyDescriptor(object, name) {
+      const count = reads.get(name) || 0
+      reads.set(name, count + 1)
+      if (count === 0) return Reflect.getOwnPropertyDescriptor(object, name)
+      if (name === 'dialAuthority') {
+        return { configurable: true, enumerable: true, writable: true, value: alternateAuthority }
+      }
+      if (name === 'linkOfferSigner') {
+        return { configurable: true, enumerable: true, writable: true, value: alternateSigner }
+      }
+      if (name === 'destroy') {
+        return {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value: () => alternateFactoryDestroyed++
+        }
+      }
+      return Reflect.getOwnPropertyDescriptor(object, name)
+    }
+  })
+
+  t.is(
+    errorCode(() => createExtensionAdjacentLinkFactory(options)),
+    'INVALID_ROUTE',
+    'semantic validation rejects after a complete exact snapshot'
+  )
+  t.is(destroyLinkOfferSigner(originalSigner), false, 'rollback destroys captured signer')
+  t.is(
+    destroyRelayAdjacentDialAuthority(originalAuthority),
+    false,
+    'rollback destroys captured dial authority'
+  )
+  t.is(originalSocketDestroyed, 1, 'captured socket owner is spent')
+  t.is(originalFactoryDestroyed, 1, 'captured factory owner is spent')
+  t.is(destroyLinkOfferSigner(alternateSigner), true, 'later signer substitution is untouched')
+  t.is(
+    destroyRelayAdjacentDialAuthority(alternateAuthority),
+    true,
+    'later authority substitution is untouched'
+  )
+  t.is(alternateSocketDestroyed, 1, 'alternate owner is cleaned only by this test')
+  t.is(alternateFactoryDestroyed, 0, 'later destroy substitution is never invoked')
+  destroyRelayIdentitySigningAuthority(originalIdentityOwner)
+  destroyRelayIdentitySigningAuthority(alternateIdentityOwner)
+})
+
+test('failed factory construction pins authority across reentrant owner cleanup', (t) => {
+  const identityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identityForRole(ROLE.SAFETY, 180).secretKey
+  })
+  const nestedIdentityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identityForRole(ROLE.SAFETY, 200).secretKey
+  })
+  const signer = createLinkOfferSigner(identityOwner)
+  const nestedSigner = createLinkOfferSigner(nestedIdentityOwner)
+  let socketDestroyed = 0
+  let outerDestroyed = 0
+  let nestedDestroyed = 0
+  let nestedCode = null
+  let nestedFactory = null
+  const authority = createRelayAdjacentDialAuthority({
+    socketOwner: Object.freeze({}),
+    allowedRole: ROLE.SAFETY,
+    dial: () => Promise.resolve(null),
+    destroy: () => socketDestroyed++
+  })
+  const outerOptions = exactFactoryOptions(
+    authority,
+    signer,
+    () => {
+      outerDestroyed++
+      nestedCode = errorCode(() => {
+        nestedFactory = createExtensionAdjacentLinkFactory(
+          exactFactoryOptions(authority, nestedSigner, () => nestedDestroyed++)
+        )
+      })
+    }
+  )
+  outerOptions.wallNow = null
+
+  t.is(
+    errorCode(() => createExtensionAdjacentLinkFactory(outerOptions)),
+    'INVALID_ROUTE',
+    'outer semantic failure is preserved'
+  )
+  t.is(nestedCode, 'ERR_AUTHENTICATION', 'reentrant construction sees a pinned authority')
+  t.is(nestedFactory, null, 'no nested factory is published')
+  t.is(destroyLinkOfferSigner(signer), false, 'outer signer is consumed')
+  t.is(destroyLinkOfferSigner(nestedSigner), false, 'nested rollback consumes its signer')
+  t.is(nestedDestroyed, 1, 'nested rollback consumes its owner')
+  t.is(outerDestroyed, 1, 'outer owner runs once')
+  t.is(destroyRelayAdjacentDialAuthority(authority), false, 'outer rollback tombstones authority')
+  t.is(socketDestroyed, 1, 'socket owner is spent after factory owners')
+  if (nestedFactory) destroyExtensionAdjacentLinkFactory(nestedFactory)
+  destroyRelayIdentitySigningAuthority(identityOwner)
+  destroyRelayIdentitySigningAuthority(nestedIdentityOwner)
+})
+
+test('factory destruction keeps authority bound across reentrant owner cleanup', (t) => {
+  const identityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identityForRole(ROLE.SAFETY, 220).secretKey
+  })
+  const nestedIdentityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identityForRole(ROLE.SAFETY, 240).secretKey
+  })
+  const signer = createLinkOfferSigner(identityOwner)
+  const nestedSigner = createLinkOfferSigner(nestedIdentityOwner)
+  const order = []
+  let nestedDestroyed = 0
+  let nestedCode = null
+  let nestedFactory = null
+  const authority = createRelayAdjacentDialAuthority({
+    socketOwner: Object.freeze({}),
+    allowedRole: ROLE.SAFETY,
+    dial: () => Promise.resolve(null),
+    destroy: () => order.push('socket')
+  })
+  const factory = createExtensionAdjacentLinkFactory(
+    exactFactoryOptions(authority, signer, () => {
+      order.push('factory')
+      nestedCode = errorCode(() => {
+        nestedFactory = createExtensionAdjacentLinkFactory(
+          exactFactoryOptions(authority, nestedSigner, () => nestedDestroyed++)
+        )
+      })
+      t.alike(order, ['factory'], 'socket owner remains live throughout reentrant cleanup')
+    })
+  )
+
+  t.is(destroyExtensionAdjacentLinkFactory(factory), true, 'outer factory destruction succeeds')
+  t.is(nestedCode, 'ERR_AUTHENTICATION', 'reentrant construction sees terminal binding')
+  t.is(nestedFactory, null, 'destructor reentry publishes no nested factory')
+  t.is(destroyLinkOfferSigner(nestedSigner), false, 'nested rollback consumes its signer')
+  t.is(nestedDestroyed, 1, 'nested rollback consumes its owner')
+  t.alike(order, ['factory', 'socket'], 'authority tombstones only after factory callbacks')
+  t.is(destroyRelayAdjacentDialAuthority(authority), false, 'authority is already terminal')
+  if (nestedFactory) destroyExtensionAdjacentLinkFactory(nestedFactory)
+  destroyRelayIdentitySigningAuthority(identityOwner)
+  destroyRelayIdentitySigningAuthority(nestedIdentityOwner)
+})
 
 function setup(value = {}) {
   return {
@@ -234,6 +931,957 @@ function responderFor(f, receiveOffer, random = 0x55) {
   })
 }
 
+function extensionResponderClock({
+  wall = NOW,
+  monotonic = 10_000n,
+  synchronous = false
+} = {}) {
+  let currentWall = wall
+  let currentMonotonic = monotonic
+  let nextHandle = 0
+  const timers = new Map()
+  const cancelled = []
+  return {
+    wallNow() {
+      return currentWall
+    },
+    monotonicNow() {
+      return currentMonotonic
+    },
+    schedule(callback, delay) {
+      const handle = ++nextHandle
+      timers.set(handle, { callback, delay })
+      if (synchronous) callback()
+      return handle
+    },
+    cancelScheduled(handle) {
+      cancelled.push(handle)
+      timers.delete(handle)
+    },
+    fire(handle) {
+      const timer = timers.get(handle)
+      if (!timer) return false
+      timers.delete(handle)
+      timer.callback()
+      return true
+    },
+    setWall(value) {
+      currentWall = value
+    },
+    setMonotonic(value) {
+      currentMonotonic = value
+    },
+    pending() {
+      return timers.size
+    },
+    handles() {
+      return [...timers.keys()]
+    },
+    cancelled
+  }
+}
+
+function extensionResponderExchange({
+  signerIdentity = null,
+  clock = extensionResponderClock()
+} = {}) {
+  const responderIdentity = identityForRole(ROLE.SAFETY, 20)
+  const initiatorIdentity = identityForRole(ROLE.SAFETY, 40)
+  const f = fixture(responderIdentity)
+  const initiated = createIndexZeroGuardLinkOffer({
+    advertisement: f.advertisement,
+    now: NOW,
+    randomBytes: (size) => b4a.alloc(size, 0x44),
+    ...setup({ clientCircuitIdentity: initiatorIdentity })
+  })
+  const object = decodeM3Object(initiated.offer)
+  object.body[96] = M3_LINK_ROLE.SAFETY_RELAY
+  object.body[139] = 1
+  const offer = encodeM3Object({
+    messageId: M3_MESSAGE_ID.LINK_OFFER_V1,
+    body: object.body,
+    authSuffix: cryptoSuite.sign(
+      signatureInput(OFFER_DOMAIN, M3_MESSAGE_ID.LINK_OFFER_V1, object.body),
+      initiatorIdentity.secretKey
+    )
+  })
+  abortIndexZeroGuardLink(initiated.pending)
+
+  const inbound = [offer, null]
+  const outbound = []
+  let finished = 0
+  let transportDestroyed = 0
+  let destroyedAdjacencies = 0
+  const offerReceiver = createExtensionOfferReceiver({
+    observedPredecessorEndpoint: f.endpoint,
+    receiveObject: () => inbound.shift(),
+    takePhysicalChannel: () =>
+      Object.freeze({
+        destroy() {
+          transportDestroyed++
+        }
+      }),
+    sendObject: (value) => outbound.push(value),
+    finish: () => finished++,
+    destroy: () => transportDestroyed++
+  })
+  const adoptedAdjacencies = []
+  const adjacencyAdopter = createM3ResponderAdopter(
+    (established) => {
+      const adjacency = Object.freeze({ established })
+      adoptedAdjacencies.push(adjacency)
+      return adjacency
+    },
+    (value) => {
+      destroyedAdjacencies++
+      destroyM3EstablishedLink(value.established)
+    }
+  )
+  const identity = signerIdentity || responderIdentity
+  const identityOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: identity.secretKey
+  })
+  const extensionResponderSigner = createExtensionResponderSigner(identityOwner)
+  const options = {
+    advertisement: f.advertisement,
+    adjacencyAdopter,
+    extensionResponderSigner,
+    responderRouteEncryptionSecretKey: f.route.secretKey,
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow,
+    schedule: clock.schedule,
+    cancelScheduled: clock.cancelScheduled,
+    offerReceiver,
+    randomBytes: (size) => b4a.alloc(size, 0x55)
+  }
+  return {
+    adoptedAdjacencies,
+    clock,
+    extensionResponderSigner,
+    f,
+    destroyedAdjacencies: () => destroyedAdjacencies,
+    finished: () => finished,
+    identityOwner,
+    initiatorIdentity,
+    offerReceiver,
+    offer,
+    options,
+    outbound,
+    responderIdentity,
+    transportDestroyed: () => transportDestroyed
+  }
+}
+
+function extensionReplayReceiver(x, { offer = x.offer, sendObject = null } = {}) {
+  const inbound = [offer, null]
+  const outbound = []
+  let finished = 0
+  let destroyed = 0
+  const receiver = createExtensionOfferReceiver({
+    observedPredecessorEndpoint: x.f.endpoint,
+    receiveObject: () => inbound.shift(),
+    takePhysicalChannel: () =>
+      Object.freeze({
+        destroy() {
+          destroyed++
+        }
+      }),
+    sendObject(value) {
+      outbound.push(value)
+      if (sendObject) sendObject(value, outbound.length)
+    },
+    finish: () => finished++,
+    destroy: () => destroyed++
+  })
+  return {
+    receiver,
+    outbound,
+    finished: () => finished,
+    destroyed: () => destroyed
+  }
+}
+
+function takeAcceptedExtensionMaterial(x) {
+  const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+  const { accepted } = responder.accept()
+  const transfer = takeExtensionResponderAdjacency(responder, accepted)
+  const material = takeAcceptedExtensionAdjacencyTransfer(transfer)
+  return { material, responder }
+}
+
+function expectRouteCode(t, operation, code, message) {
+  let error = null
+  try {
+    operation()
+  } catch (err) {
+    error = err
+  }
+  t.is(error && error.code, code, message)
+}
+
+test('extension responder signs exact ACCEPT then proof bytes without reading a raw identity key', (t) => {
+  const x = extensionResponderExchange()
+  const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+  responder.accept()
+
+  t.is(x.outbound.length, 2)
+  t.is(x.finished(), 1)
+  t.is(x.outbound[0].byteLength, LINK_ACCEPT_SIZE)
+  t.is(x.outbound[1].byteLength, 378)
+  const accept = decodeM3Object(x.outbound[0])
+  const proof = decodeM3Object(x.outbound[1])
+  t.is(accept.body.byteLength, 213)
+  t.is(proof.body.byteLength, 306)
+  t.ok(
+    cryptoSuite.verify(
+      signatureInput(ACCEPT_DOMAIN, M3_MESSAGE_ID.LINK_ACCEPT_V1, accept.body),
+      accept.authSuffix,
+      x.responderIdentity.publicKey
+    ),
+    'LINK_ACCEPT is signed by the responder capability identity'
+  )
+  t.alike(
+    accept.authSuffix,
+    cryptoSuite.sign(
+      signatureInput(ACCEPT_DOMAIN, M3_MESSAGE_ID.LINK_ACCEPT_V1, accept.body),
+      x.responderIdentity.secretKey
+    ),
+    'signer-capability LINK_ACCEPT bytes equal the former raw-key signature'
+  )
+  const proofValue = decodeRedactedResponderProof(x.outbound[1])
+  t.alike(
+    x.outbound[1],
+    signRedactedResponderProof(proofValue, x.responderIdentity.secretKey),
+    'proof signer seam preserves every prototype wire byte'
+  )
+
+  t.ok(responder.destroy())
+  t.is(x.transportDestroyed(), 1)
+  expectRouteCode(
+    t,
+    () => signLinkAccept(x.extensionResponderSigner, accept.body, x.responderIdentity.publicKey),
+    'ERR_DESTROYED',
+    'responder destruction destroys the transferred signer'
+  )
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('extension responder has no raw-key fallback and destroys a wrong signer on failure', (t) => {
+  const wrongIdentity = identityForRole(ROLE.SAFETY, 80)
+  const x = extensionResponderExchange({ signerIdentity: wrongIdentity })
+  const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+
+  expectRouteCode(
+    t,
+    () => responder.accept(),
+    'ERR_AUTHENTICATION',
+    'wrong signer identity cannot fall back to a raw identity key'
+  )
+  t.is(x.outbound.length, 0)
+  t.is(x.transportDestroyed(), 1)
+  expectRouteCode(
+    t,
+    () => signLinkAccept(x.extensionResponderSigner, b4a.alloc(213), wrongIdentity.publicKey),
+    'ERR_DESTROYED',
+    'operation failure destroys the transferred signer and its cached bytes'
+  )
+  t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('extension responder constructor failure destroys the transferred signer', (t) => {
+  const x = extensionResponderExchange()
+  x.options.responderRouteEncryptionSecretKey = cryptoSuite.encryptionKeyPair(seed(99)).secretKey
+
+  expectRouteCode(
+    t,
+    () => extensionGuardLinks.createExtensionLinkResponder(x.options),
+    'ERR_AUTHENTICATION',
+    'route-key mismatch fails construction'
+  )
+  t.is(x.transportDestroyed(), 1)
+  expectRouteCode(
+    t,
+    () =>
+      signLinkAccept(
+        x.extensionResponderSigner,
+        b4a.alloc(213),
+        x.responderIdentity.publicKey
+      ),
+    'ERR_DESTROYED',
+    'constructor rollback destroys the transferred signer'
+  )
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('extension responder basic-option failure destroys both transferred capabilities', (t) => {
+  const x = extensionResponderExchange()
+  const advertisement = b4a.from(x.options.advertisement)
+  const routeSecretKey = b4a.from(x.options.responderRouteEncryptionSecretKey)
+  x.options.wallNow = null
+
+  expectRouteCode(
+    t,
+    () => extensionGuardLinks.createExtensionLinkResponder(x.options),
+    'INVALID_ROUTE',
+    'malformed basic options fail construction'
+  )
+  t.is(x.transportDestroyed(), 1, 'offer receiver ownership is destroyed exactly once')
+  t.absent(
+    destroyExtensionOfferReceiver(x.offerReceiver),
+    'offer receiver cannot be destroyed a second time'
+  )
+  expectRouteCode(
+    t,
+    () =>
+      signLinkAccept(
+        x.extensionResponderSigner,
+        b4a.alloc(213),
+        x.responderIdentity.publicKey
+      ),
+    'ERR_DESTROYED',
+    'malformed basic options destroy the transferred signer'
+  )
+  t.alike(x.options.advertisement, advertisement, 'caller advertisement remains unchanged')
+  t.alike(
+    x.options.responderRouteEncryptionSecretKey,
+    routeSecretKey,
+    'caller route secret remains unchanged'
+  )
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('invalid opaque responder signer destroys a valid offer receiver on first use', (t) => {
+  const x = extensionResponderExchange()
+  x.options.extensionResponderSigner = Object.freeze({})
+  const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+
+  expectRouteCode(
+    t,
+    () => responder.accept(),
+    'INVALID_ROUTE',
+    'the opaque signer is validated by its first domain operation'
+  )
+  t.is(x.transportDestroyed(), 1, 'failed first use destroys receiver transport exactly once')
+  t.absent(
+    destroyExtensionOfferReceiver(x.offerReceiver),
+    'consumed offer receiver cannot be destroyed a second time'
+  )
+  t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+function rejectResponderOptions(t, mutate, label) {
+  const x = extensionResponderExchange()
+  const advertisement = b4a.from(x.options.advertisement)
+  const routeSecretKey = b4a.from(x.options.responderRouteEncryptionSecretKey)
+  const options = mutate(x.options) || x.options
+  let responder = null
+  let error = null
+  try {
+    responder = extensionGuardLinks.createExtensionLinkResponder(options)
+  } catch (err) {
+    error = err
+  }
+  if (responder) responder.destroy()
+
+  t.is(error && error.code, 'INVALID_ROUTE', `${label} rejects exact options`)
+  t.is(x.transportDestroyed(), 1, `${label} destroys receiver ownership exactly once`)
+  t.absent(
+    destroyExtensionOfferReceiver(x.offerReceiver),
+    `${label} leaves no live receiver capability`
+  )
+  expectRouteCode(
+    t,
+    () =>
+      signLinkAccept(
+        x.extensionResponderSigner,
+        b4a.alloc(213),
+        x.responderIdentity.publicKey
+      ),
+    'ERR_DESTROYED',
+    `${label} destroys signer ownership`
+  )
+  t.alike(options.advertisement, advertisement, `${label} preserves caller advertisement`)
+  t.alike(
+    options.responderRouteEncryptionSecretKey,
+    routeSecretKey,
+    `${label} preserves caller route secret`
+  )
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner), `${label} owner cleanup`)
+}
+
+test('extension responder exact options reject accessors without invoking them', (t) => {
+  let throwingCalls = 0
+  rejectResponderOptions(
+    t,
+    (options) => {
+      Object.defineProperty(options, 'randomBytes', {
+        enumerable: true,
+        get() {
+          throwingCalls++
+          throw new Error('random getter invoked')
+        }
+      })
+    },
+    'throwing randomBytes accessor'
+  )
+  t.is(throwingCalls, 0, 'throwing randomBytes accessor is never invoked')
+
+  let reentrantCalls = 0
+  rejectResponderOptions(
+    t,
+    (options) => {
+      Object.defineProperty(options, 'randomBytes', {
+        enumerable: true,
+        get() {
+          reentrantCalls++
+          try {
+            extensionGuardLinks.createExtensionLinkResponder({})
+          } catch {}
+          return (size) => b4a.alloc(size, 0x55)
+        }
+      })
+    },
+    'reentrant randomBytes accessor'
+  )
+  t.is(reentrantCalls, 0, 'reentrant randomBytes accessor is never invoked')
+})
+
+test('extension responder requires an exact own randomBytes successor option', (t) => {
+  rejectResponderOptions(
+    t,
+    (options) => {
+      delete options.randomBytes
+    },
+    'missing randomBytes'
+  )
+})
+
+test('extension responder exact options reject extras, inheritance, and Proxy traps', (t) => {
+  let staleRawKeyCalls = 0
+  rejectResponderOptions(
+    t,
+    (options) => {
+      Object.defineProperty(options, 'responderIdentitySecretKey', {
+        enumerable: true,
+        get() {
+          staleRawKeyCalls++
+          throw new Error('stale raw key getter invoked')
+        }
+      })
+    },
+    'stale raw-key option'
+  )
+  t.is(staleRawKeyCalls, 0, 'stale raw-key accessor is never invoked')
+
+  rejectResponderOptions(
+    t,
+    (options) => {
+      options[Symbol('extra')] = true
+    },
+    'symbol extra'
+  )
+
+  rejectResponderOptions(
+    t,
+    (options) => {
+      const inherited = Object.create({ wallNow: options.wallNow })
+      for (const [key, value] of Object.entries(options)) {
+        if (key !== 'wallNow') inherited[key] = value
+      }
+      return inherited
+    },
+    'inherited required option'
+  )
+
+  let ownKeysCalls = 0
+  rejectResponderOptions(
+    t,
+    (options) =>
+      new Proxy(options, {
+        ownKeys() {
+          ownKeysCalls++
+          throw new Error('ownKeys trap invoked')
+        }
+      }),
+    'throwing Proxy ownKeys trap'
+  )
+  t.is(ownKeysCalls, 1, 'Proxy ownKeys trap is contained')
+})
+
+test('extension responder option snapshots never dispatch through Object.prototype', (t) => {
+  const x = extensionResponderExchange()
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, 'wallNow')
+  let dispatched = 0
+  let responder = null
+  let error = null
+  Object.defineProperty(Object.prototype, 'wallNow', {
+    configurable: true,
+    set() {
+      dispatched++
+    }
+  })
+  try {
+    responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+  } catch (err) {
+    error = err
+  } finally {
+    if (original) Object.defineProperty(Object.prototype, 'wallNow', original)
+    else delete Object.prototype.wallNow
+  }
+  t.absent(error, 'captured option snapshots ignore inherited setters')
+  t.is(dispatched, 0, 'snapshot invokes no inherited setter')
+  if (responder) t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('accepted extension adjacency moves only as one opaque atomic transfer', (t) => {
+  const x = extensionResponderExchange()
+  const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+  const { accepted } = responder.accept()
+  expectRouteCode(
+    t,
+    () => takeExtensionResponderAdjacency(Object.freeze({}), accepted),
+    'ERR_AUTHENTICATION',
+    'wrong responder cannot consume accepted ownership'
+  )
+  const transfer = takeExtensionResponderAdjacency(responder, accepted)
+
+  t.ok(Object.isFrozen(transfer), 'transfer is frozen')
+  t.alike(Object.keys(transfer), [], 'transfer exposes neither owner')
+  t.not(transfer, x.adoptedAdjacencies[0], 'adjacency is not returned directly')
+
+  const material = takeAcceptedExtensionAdjacencyTransfer(transfer)
+  t.ok(Object.isFrozen(material), 'taken material is frozen')
+  t.alike(Object.keys(material).sort(), ['adjacency', 'replayOwner'])
+  t.is(material.adjacency, x.adoptedAdjacencies[0])
+  t.ok(Object.isFrozen(material.replayOwner), 'replay owner is opaque and frozen')
+  t.alike(Object.keys(material.replayOwner), [])
+  expectRouteCode(
+    t,
+    () => takeAcceptedExtensionAdjacencyTransfer(transfer),
+    'ERR_REPLAY',
+    'transfer is one-shot'
+  )
+  t.absent(
+    revokeAcceptedExtensionAdjacencyTransfer(transfer),
+    'taken transfer cannot revoke moved ownership'
+  )
+
+  t.ok(destroyM3EstablishedLink(material.adjacency.established), 'registry rollback destroys adjacency')
+  t.ok(
+    destroyAcceptedExtensionAdjacencyOwner(material.replayOwner),
+    'registry rollback destroys replay owner'
+  )
+  t.absent(destroyAcceptedExtensionAdjacencyOwner(material.replayOwner), 'owner destroy is idempotent')
+  t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('accepted extension transfer revoke atomically destroys adjacency and replay ownership', (t) => {
+  const x = extensionResponderExchange()
+  const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+  const { accepted } = responder.accept()
+  const transfer = takeExtensionResponderAdjacency(responder, accepted)
+
+  t.is(x.destroyedAdjacencies(), 0)
+  t.is(x.clock.pending(), 1, 'accepted replay owner arms expiry before transfer publication')
+  t.ok(revokeAcceptedExtensionAdjacencyTransfer(transfer))
+  t.is(x.destroyedAdjacencies(), 1, 'revoke destroys adjacency')
+  t.is(x.clock.pending(), 0, 'revoke cancels replay expiry')
+  t.is(x.clock.cancelled.length, 1, 'one scheduled handle is cancelled')
+  t.absent(revokeAcceptedExtensionAdjacencyTransfer(transfer), 'revoke is idempotent')
+  expectRouteCode(
+    t,
+    () => takeAcceptedExtensionAdjacencyTransfer(transfer),
+    'ERR_REPLAY',
+    'revoked transfer is tombstoned'
+  )
+
+  t.ok(responder.destroy())
+  t.is(x.destroyedAdjacencies(), 1, 'responder no longer owns transferred material')
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('accepted replay answers only the exact duplicate with cached semantic bytes', (t) => {
+  const x = extensionResponderExchange()
+  const originalAccept = b4a.from(x.outbound[0] || b4a.alloc(0))
+  const originalProof = b4a.from(x.outbound[1] || b4a.alloc(0))
+  const { material, responder } = takeAcceptedExtensionMaterial(x)
+  const cachedAccept = b4a.from(x.outbound[0])
+  const cachedProof = b4a.from(x.outbound[1])
+  const replayChannel = extensionReplayReceiver(x)
+
+  expectRouteCode(
+    t,
+    () => answerAcceptedExtensionReplay(Object.freeze({}), replayChannel.receiver),
+    'ERR_AUTHENTICATION',
+    'foreign owner fails before taking caller response ownership'
+  )
+  t.ok(answerAcceptedExtensionReplay(material.replayOwner, replayChannel.receiver))
+  t.alike(replayChannel.outbound, [cachedAccept, cachedProof], 'replay writes cached semantic bytes')
+  t.is(replayChannel.finished(), 1)
+  t.is(replayChannel.destroyed(), 1, 'duplicate channel is closed without becoming adjacency')
+  t.is(x.adoptedAdjacencies.length, 1, 'duplicate allocates no second adjacency')
+  t.alike(originalAccept, b4a.alloc(0), 'cache is created only by the accepted exchange')
+  t.alike(originalProof, b4a.alloc(0), 'proof cache is created only by the accepted exchange')
+
+  expectRouteCode(
+    t,
+    () => answerAcceptedExtensionReplay(material.replayOwner, replayChannel.receiver),
+    'ERR_REPLAY',
+    'one-shot response channel cannot be reused'
+  )
+  const secondChannel = extensionReplayReceiver(x)
+  t.ok(answerAcceptedExtensionReplay(material.replayOwner, secondChannel.receiver))
+  t.alike(secondChannel.outbound, [cachedAccept, cachedProof])
+  t.is(x.adoptedAdjacencies.length, 1, 'a later exact duplicate still allocates no adjacency')
+
+  t.ok(destroyM3EstablishedLink(material.adjacency.established))
+  t.ok(destroyAcceptedExtensionAdjacencyOwner(material.replayOwner))
+  t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('accepted replay rechecks ownership after a reentrant monotonic clock callback', (t) => {
+  const clock = extensionResponderClock()
+  const x = extensionResponderExchange({ clock })
+  const monotonicNow = clock.monotonicNow
+  let calls = 0
+  let material = null
+  x.options.monotonicNow = () => {
+    calls++
+    if (calls === 2) destroyAcceptedExtensionAdjacencyOwner(material.replayOwner)
+    return monotonicNow()
+  }
+  const taken = takeAcceptedExtensionMaterial(x)
+  material = taken.material
+  const replayChannel = extensionReplayReceiver(x)
+
+  expectRouteCode(
+    t,
+    () => answerAcceptedExtensionReplay(material.replayOwner, replayChannel.receiver),
+    'ERR_DESTROYED',
+    'clock reentry tombstones before caller response ownership moves'
+  )
+  t.ok(
+    destroyExtensionOfferReceiver(replayChannel.receiver),
+    'post-clock owner recheck preserves caller response ownership'
+  )
+  t.alike(replayChannel.outbound, [], 'clock reentry publishes no response bytes')
+  t.ok(destroyM3EstablishedLink(material.adjacency.established))
+  t.ok(taken.responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('accepted replay rejects a conflicting authenticated offer without answering', (t) => {
+  const x = extensionResponderExchange()
+  const { material, responder } = takeAcceptedExtensionMaterial(x)
+  const conflicting = resign(
+    x.offer,
+    M3_MESSAGE_ID.LINK_OFFER_V1,
+    OFFER_DOMAIN,
+    x.initiatorIdentity.secretKey,
+    (body) => (body[204] ^= 1)
+  )
+  const conflictChannel = extensionReplayReceiver(x, { offer: conflicting })
+
+  expectRouteCode(
+    t,
+    () => answerAcceptedExtensionReplay(material.replayOwner, conflictChannel.receiver),
+    'ERR_AUTHENTICATION',
+    'different authenticated nonce is not a duplicate'
+  )
+  t.alike(conflictChannel.outbound, [])
+  t.is(conflictChannel.finished(), 0)
+  t.is(conflictChannel.destroyed(), 1, 'conflicting channel ownership is destroyed')
+  t.is(x.adoptedAdjacencies.length, 1)
+
+  t.ok(destroyM3EstablishedLink(material.adjacency.established))
+  t.ok(destroyAcceptedExtensionAdjacencyOwner(material.replayOwner))
+  t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('responder wall high-water rejects post-adoption regression before replay projection', (t) => {
+  const clock = extensionResponderClock()
+  const x = extensionResponderExchange({ clock })
+  let postAdoptionSamples = 0
+  x.options.wallNow = () => {
+    if (x.adoptedAdjacencies.length === 0) return NOW
+    postAdoptionSamples++
+    return postAdoptionSamples === 1 ? NOW + 500n : NOW
+  }
+  const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+
+  expectRouteCode(
+    t,
+    () => responder.accept(),
+    'ERR_AUTHENTICATION',
+    'an earlier post-adoption wall high-water cannot regress before replay projection'
+  )
+  t.is(postAdoptionSamples, 2, 'the first regressing wall sample fails immediately')
+  t.is(clock.pending(), 0, 'wall regression releases replay capacity without scheduling')
+  t.alike(x.outbound, [], 'wall regression publishes no response')
+  t.is(x.destroyedAdjacencies(), 1, 'wall regression destroys unpublished adjacency state')
+  t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('accepted replay projection rejects a backward responder wall sample', (t) => {
+  const clock = extensionResponderClock()
+  const x = extensionResponderExchange({ clock })
+  let randomCalls = 0
+  let proofWallSamples = 0
+  x.options.randomBytes = (size) => {
+    randomCalls++
+    return b4a.alloc(size, 0x55)
+  }
+  x.options.wallNow = () => {
+    if (randomCalls < 3) return NOW
+    proofWallSamples++
+    if (proofWallSamples === 1) return NOW + 500n
+    if (proofWallSamples === 2) return NOW
+    return NOW + 500n
+  }
+  const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+
+  expectRouteCode(
+    t,
+    () => responder.accept(),
+    'ERR_AUTHENTICATION',
+    'wall rollback cannot extend the replay owner beyond wire expiry'
+  )
+  t.is(proofWallSamples, 2, 'projection compares against the retained prior wall sample')
+  t.is(clock.pending(), 0, 'rejected projection arms no extended local deadline')
+  t.alike(x.outbound, [], 'rejected projection publishes no response')
+  t.is(x.destroyedAdjacencies(), 1, 'rejected projection rolls adjacency back')
+  t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+})
+
+test('accepted replay fails closed on monotonic rollback in answer and timer paths', (t) => {
+  const x = extensionResponderExchange()
+  const taken = takeAcceptedExtensionMaterial(x)
+  const replayChannel = extensionReplayReceiver(x)
+  x.clock.setMonotonic(9_999n)
+  expectRouteCode(
+    t,
+    () => answerAcceptedExtensionReplay(taken.material.replayOwner, replayChannel.receiver),
+    'ERR_DESTROYED',
+    'answer-time monotonic rollback destroys replay ownership'
+  )
+  t.ok(
+    destroyExtensionOfferReceiver(replayChannel.receiver),
+    'answer-time rollback preserves caller response ownership'
+  )
+  t.alike(replayChannel.outbound, [], 'answer-time rollback publishes no bytes')
+  t.is(x.clock.pending(), 0, 'answer-time rollback cancels replay expiry')
+  destroyAcceptedExtensionAdjacencyOwner(taken.material.replayOwner)
+  t.ok(destroyM3EstablishedLink(taken.material.adjacency.established))
+  t.ok(taken.responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+
+  const y = extensionResponderExchange()
+  const timerTaken = takeAcceptedExtensionMaterial(y)
+  const [handle] = y.clock.handles()
+  y.clock.setMonotonic(9_999n)
+  t.ok(y.clock.fire(handle), 'rollback reaches the armed timer callback')
+  t.is(y.clock.pending(), 0, 'timer rollback destroys instead of rearming')
+  t.absent(y.clock.fire(handle), 'repeated rollback cannot refire the stale handle')
+  const staleChannel = extensionReplayReceiver(y)
+  expectRouteCode(
+    t,
+    () => answerAcceptedExtensionReplay(timerTaken.material.replayOwner, staleChannel.receiver),
+    'ERR_DESTROYED',
+    'timer rollback tombstones replay ownership'
+  )
+  t.ok(
+    destroyExtensionOfferReceiver(staleChannel.receiver),
+    'timer rollback preserves later caller response ownership'
+  )
+  destroyAcceptedExtensionAdjacencyOwner(timerTaken.material.replayOwner)
+  t.ok(destroyM3EstablishedLink(timerTaken.material.adjacency.established))
+  t.ok(timerTaken.responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(y.identityOwner))
+})
+
+test('accepted replay expiry and scheduler reentry tear down before callbacks continue', (t) => {
+  const x = extensionResponderExchange()
+  const { material, responder } = takeAcceptedExtensionMaterial(x)
+  const [handle] = x.clock.handles()
+  x.clock.setMonotonic(14_000n)
+  t.ok(x.clock.fire(handle))
+  t.is(x.clock.pending(), 0)
+  const expiredChannel = extensionReplayReceiver(x)
+  expectRouteCode(
+    t,
+    () => answerAcceptedExtensionReplay(material.replayOwner, expiredChannel.receiver),
+    'ERR_DESTROYED',
+    'local expiry tombstones replay owner before taking a channel'
+  )
+  t.ok(destroyExtensionOfferReceiver(expiredChannel.receiver), 'pre-take expiry preserves caller owner')
+  t.ok(destroyM3EstablishedLink(material.adjacency.established), 'replay expiry does not destroy runtime')
+  t.ok(responder.destroy())
+  t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+
+  const reentrantClock = extensionResponderClock()
+  const y = extensionResponderExchange({ clock: reentrantClock })
+  const schedule = reentrantClock.schedule
+  let reentrantResponder = null
+  y.options.schedule = (callback, delay) => {
+    const timer = schedule(callback, delay)
+    reentrantResponder.destroy()
+    return timer
+  }
+  reentrantResponder = extensionGuardLinks.createExtensionLinkResponder(y.options)
+  expectRouteCode(
+    t,
+    () => reentrantResponder.accept(),
+    'INVALID_ROUTE',
+    'scheduler reentry destroys before response publication'
+  )
+  t.is(y.outbound.length, 0)
+  t.is(y.destroyedAdjacencies(), 1, 'post-adoption reentry rolls adjacency back')
+  t.is(reentrantClock.pending(), 0)
+  t.is(reentrantClock.cancelled.length, 1, 'reentry cancels the armed handle')
+  t.ok(destroyRelayIdentitySigningAuthority(y.identityOwner))
+})
+
+test('accepted replay cache construction zeroizes every partial semantic owner', (t) => {
+  const attempt = (failure = Infinity) => {
+    const x = extensionResponderExchange()
+    const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+    let result = null
+    let error = null
+    try {
+      result = withSlowAllocationProbe(() => responder.accept(), null, failure)
+    } catch (err) {
+      error = err
+      result = { allocations: err.allocations, positions: err.positions }
+    } finally {
+      responder.destroy()
+      destroyRelayIdentitySigningAuthority(x.identityOwner)
+    }
+    return { ...result, error }
+  }
+
+  const baseline = attempt().positions
+  t.ok(baseline >= 4, 'accepted owner performs four final nonce/digest copies')
+  for (let failure = baseline - 3; failure <= baseline; failure++) {
+    const result = attempt(failure)
+    t.ok(result.error, `cache copy ${failure - baseline + 4} fails`)
+    t.ok(allZero(result.allocations), `cache copy ${failure - baseline + 4} clears every prior buffer`)
+  }
+})
+
+test('responder replay owners reserve the exact process-global 4096 bound before callbacks', (t) => {
+  const maximum = 4096
+  const base = extensionResponderExchange()
+  const clock = base.clock
+  const responders = []
+  let extraResponder = null
+  const candidate = (calls = null) => {
+    const inbound = [base.offer, null]
+    const offerReceiver = createExtensionOfferReceiver({
+      observedPredecessorEndpoint: base.f.endpoint,
+      receiveObject() {
+        if (calls) calls.receive++
+        return inbound.shift()
+      },
+      takePhysicalChannel: () => Object.freeze({ destroy() {} }),
+      sendObject() {
+        if (calls) calls.send++
+      },
+      finish() {
+        if (calls) calls.finish++
+      },
+      destroy() {}
+    })
+    const adjacencyAdopter = createM3ResponderAdopter(
+      (established) => Object.freeze({ established }),
+      (adjacency) => destroyM3EstablishedLink(adjacency.established)
+    )
+    const extensionResponderSigner = createExtensionResponderSigner(base.identityOwner)
+    return extensionGuardLinks.createExtensionLinkResponder({
+      advertisement: base.f.advertisement,
+      adjacencyAdopter,
+      extensionResponderSigner,
+      responderRouteEncryptionSecretKey: base.f.route.secretKey,
+      wallNow() {
+        if (calls) calls.wall++
+        return clock.wallNow()
+      },
+      monotonicNow() {
+        if (calls) calls.monotonic++
+        return clock.monotonicNow()
+      },
+      schedule(callback, delay) {
+        if (calls) calls.schedule++
+        return clock.schedule(callback, delay)
+      },
+      cancelScheduled: clock.cancelScheduled,
+      offerReceiver,
+      randomBytes(size) {
+        if (calls) calls.random++
+        return b4a.alloc(size, 0x55)
+      }
+    })
+  }
+
+  try {
+    const first = extensionGuardLinks.createExtensionLinkResponder(base.options)
+    first.accept()
+    responders.push(first)
+    for (let index = 1; index < maximum; index++) {
+      const responder = candidate()
+      responder.accept()
+      responders.push(responder)
+    }
+    t.is(responders.length, maximum, 'exact threshold is admitted')
+
+    const calls = {
+      wall: 0,
+      monotonic: 0,
+      schedule: 0,
+      receive: 0,
+      send: 0,
+      finish: 0,
+      random: 0
+    }
+    extraResponder = candidate(calls)
+    const constructorCalls = { ...calls }
+    expectRouteCode(
+      t,
+      () => extraResponder.accept(),
+      'ERR_BUSY',
+      'threshold plus one is rejected'
+    )
+    t.alike(calls, constructorCalls, 'capacity reservation precedes every external callback')
+
+    const [rollbackHandle] = clock.handles()
+    clock.setMonotonic(9_999n)
+    t.ok(clock.fire(rollbackHandle), 'rollback reaches one threshold owner timer')
+    t.is(clock.pending(), maximum - 1, 'rollback releases its timer and global reservation')
+    t.absent(clock.fire(rollbackHandle), 'repeated rollback does not rearm the stale handle')
+    let retryError = null
+    try {
+      extraResponder.accept()
+    } catch (err) {
+      retryError = err
+    }
+    t.absent(retryError, 'the same pre-take responder retries after rollback releases capacity')
+    t.ok(calls.receive > 0, 'capacity release permits responder callbacks')
+    t.is(clock.pending(), maximum, 'retry restores exactly the active threshold')
+  } finally {
+    if (extraResponder) extraResponder.destroy()
+    for (const responder of responders) responder.destroy()
+    destroyRelayIdentitySigningAuthority(base.identityOwner)
+  }
+  t.is(clock.pending(), 0, 'global threshold cleanup cancels every timer')
+})
+
 test('index-zero offer and accept are exact fixed signed messages with mutual link keys', (t) => {
   const x = exchange()
   t.is(x.initiated.offer.byteLength, LINK_OFFER_SIZE)
@@ -265,6 +1913,7 @@ test('index-zero offer and accept are exact fixed signed messages with mutual li
   )
   t.alike(left.contexts[0].tx.key, right.contexts[0].rx.key)
   t.alike(left.contexts[0].rx.key, right.contexts[0].tx.key)
+
   t.alike(
     left.contexts[0].tx.key,
     b4a.from('79d446bc8e1dc435118fea8ebb98f51144ed99a98f78019868dfe858536522c9', 'hex'),
