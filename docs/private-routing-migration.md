@@ -8,6 +8,13 @@ Direct mode remains the only public behavior. Gate 3A has no live route authorit
 
 The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
 
+The owner-approved Gate 3B1 Task 5 authenticated-M3 transport and Task 6
+tail-control lifetime/ownership amendment is now incorporated into the
+canonical design documents. This written repository revision awaits owner
+review. It records required migration compatibility only: it does not declare
+provisional implementation complete or accepted, and it does not change the
+implementation plan.
+
 ## Reviewed prototype source
 
 Every migrated module below came from the reviewed private-routes prototype at exact commit `0305df915b6a767093f9e75e6c06bc0a35da6169`. The migration changed ESM imports and exports to HyperDHT's CommonJS module style, changed local import paths, and retained the listed focused/vector coverage. Subsequent fork review added defensive ownership, hostile-shape handling, intrinsic capture, bounded allocation, and clearing checks without intentionally changing the listed normative protocol bytes.
@@ -36,6 +43,78 @@ Every migrated module below came from the reviewed private-routes prototype at e
 | `lib/private/link-control-session.js`      | Adjacent-link portions of `packages/private-routes/lib/link-control-session.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                        | Narrow CommonJS port retaining fixed link-control wire bytes, CONTROL/STREAM ordering, DATAGRAM replay delivery decisions, bounded ACK state, 500 ms ping, 1,500 ms unresponsive close, five-second ACK/circuit teardown, counter exhaustion, opaque direction capabilities, and clearing. Prototype remote-actor and async route-control integrations are deliberately absent from this Task 5 owner.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `lib/private/udx-adapter.js`               | `packages/private-routes/lib/udx-adapter.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                                                           | CommonJS adapter pinned to direct runtime dependency `udx-native@1.20.7`; it owns the reviewed internal symbol registry and platform-specific numeric loopback selection without adding any public dial API.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `lib/private/udx-cell-endpoint.js`         | Adjacent socket-owner portions of `packages/private-routes/lib/udx-cell-endpoint.js` at `0305df915b6a767093f9e75e6c06bc0a35da6169`                                                                                   | Sole native UDX instance/socket owner for one role process, with exact tuple/identity/generation reservations, PENDING/OPEN demultiplexing, 64-packet and 76,800-byte global queue bounds, per-peer inbound bounds, atomic reservation before packet copying, listener/native-send/socket close ordering, opaque local-secret/bootstrap authorities, pin-time direct-send revocation, and shared `GuardLeaseMaterial`. Established ownership binds and consumes an opaque internal token rather than exposing endpoint/session reservations. Lease destruction closes the original established owner exactly once. The zero-argument reconnect factory starts and awaits that same close before creating and binding a fresh socket owner, remains exact-tuple and one-shot, and closes the fresh owner on setup failure or revocation. Fake adapters are reachable only through the symbol-keyed one-shot test issuer; production Node/Bare loopback tests use the default native adapter. Prototype actor-control paths are excluded with the narrowed link-control owner. |
+
+### Gate 3B1 authenticated M3 transport and tail ownership amendment
+
+The exact Task 5 production contract now lives in the Gate 3B1 design's
+[`AdjacentLink`](superpowers/specs/2026-07-18-private-routing-gate-3b1-live-immutable-get-design.md#adjacentlink)
+section. The exact Task 6 stable owner, logical lifetime, authenticated
+transport borrower, responder stages, forwarding, final-exit, and destruction
+contracts live in the
+[Task 6 responder-authority design](superpowers/specs/2026-07-19-private-routing-task6-private-responder-authority-design.md).
+Those sections, not provisional structural objects, are the migration
+boundary.
+
+Migration must preserve these compatibility rules:
+
+1. `udx-cell-endpoint.js` remains the sole UDX socket and established-record
+   owner. An OPEN record first issues a slot-reserving one-shot
+   `M3CellLinkTransferIssuer`; lexical `guard-link.js` authentication
+   separately issues the exact `M3AuthenticatedBranchBinding`.
+   `registerM3CellLinkTransfer(issuer, binding)` consumes and joins both,
+   compares endpoint/link/setup, tuple/peer, link provenance, M3
+   branch/circuit/generation/cell directions, and record-owned physical policy,
+   then issues `M3CellLinkTransfer`. Revoke/failure removes tentative
+   registration/charges and releases the slot exactly once. No production or
+   test migration may replace either proof with a structural channel or fake
+   issuer.
+2. Existing 64-packet/76,800-byte global and 8-packet/9,600-byte per-peer UDX
+   bounds remain exact. Record-bound `{ epoch, circuitId, direction }` M3
+   dispatch uses the M3 branch/runtime generation as offset-4 `epoch`; the
+   established LinkControlSession epoch is separate provenance checked during
+   issuer registration, transfer take, and adoption. The specified
+   four/shared or one/non-shared borrower limits, two initiator or one
+   responder receive reservations, and full 1,200-byte receipt/envelope
+   charges are additive. Logical release returns every charge/registration
+   without closing a shared GuardLease physical link.
+3. Non-shared relay M3 runtime ownership moves only the exact opaque
+   `physicalOwner`; shared pinned-guard runtimes never gain physical close
+   authority. `extension-setup-channel.js`, `guard-link.js`, and
+   `M3AdjacencyAuthority.adopt` move the issuer, authenticated binding, and
+   registered transfer instead of reading `physicalChannel.destroy`.
+4. Task 6 takes the authenticated borrower into one stable `TailControlOwner`
+   and independently timed `M3TailLifetime`. Client completion, both successor
+   sessions, RouteExtension transfer, final-exit handoff, and Task 7/Task 9
+   same-runtime activation move that same state; none creates a replacement
+   deadline, timer, transport, lifetime, or borrower.
+5. Clean cutover removes structural `tailControlTransportFactory` input and a
+   consumer `.destroy()` method. The session remains exactly five methods;
+   destruction and borrowing use package-private `destroyTailControlSession`
+   and `borrowTailControlTransport`.
+6. Responder forwarding carries the stable owner through a one-shot
+   `TailForwardingTransfer`. `completeTailExtend` emits the exact frozen
+   `{ transfer, publicationClaim }` runtime-event payload, and the registry
+   presents that object-identical claim when taking the transfer synchronously.
+   Its exact M3 lease owns lifetime/callback and both borrower identities; the
+   taken value carries opaque owner, lease, claim, and forwarding facade. The
+   registry publishes both runtime records before an exact receipt permits
+   logical lifetime/transport release. Clock/deadline mismatch fails
+   publication; every rollback destroys the pair and releases both slots. No
+   facade-only transfer or hidden-claim lookup is compatible.
+7. `final-exit-activation.js` alone issues
+   `FinalExitActivationClaim`/`FinalExitActivationOwner` and exposes the exact
+   `claimFinalExitActivation` operation. Its fixed prepare/commit/revoke bridge
+   keeps `TAIL_CONTROL_OWNERS` lexical, verifies the live handoff,
+   lifetime/callback/clocks/deadline/generation, and routes cleanup from either
+   module without accepting an arbitrary destructor.
+
+This amendment changes no existing wire byte, message order, public HyperDHT
+API, direct-mode behavior, or address-authority boundary. One 1,101-byte M3
+context envelope still produces one 1,200-byte CONTROL cell. Task 6 remains
+blocked until the Task 5 production issuer, record-bound demultiplexing, and
+reservation accounting can satisfy the exact design; fake issuers, raw
+sockets, arbitrary callbacks, physical destructors, and direct dial authority
+are not compatibility substitutes.
 
 ### Gate 3A resource bounds
 
