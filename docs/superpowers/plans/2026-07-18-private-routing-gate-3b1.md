@@ -87,32 +87,69 @@ New production units have one owner each:
   one-shot topology/link handles required by the bootstrap envelope.
 - `link-parameters.js`: one exact owner for admitted-limit and payload-parameter
   bytes/digests shared by guard, tail, and final-exit handshakes.
-- `guard-link.js`: authenticated index-zero links plus the relay-owned,
-  request-bound extension adjacent-link factory, dial authority, accepted
-  adjacency/replay transfer, and no endpoint-visible tuple or raw identity key.
+- `guard-link.js`: authenticated index-zero links; the relay-owned,
+  request-bound extension adjacent-link factory and dial authority; accepted
+  adjacency/replay transfer; and the lexical issuer for an empty
+  `M3AuthenticatedBranchBinding`. It joins that binding only with the exact
+  `M3CellLinkTransferIssuer` that moved with the authenticated established
+  link; no endpoint-visible tuple, raw identity key, structural channel, or
+  test issuer exists.
 - `relay-identity-signer.js`: empty WeakMap-backed, relay-identity-owned,
-  domain-limited LINK_OFFER, LINK_ACCEPT/redacted-proof, and TAIL_READY signers.
+  domain-limited LINK_OFFER, LINK_ACCEPT/redacted-proof, TAIL_READY, and
+  DHT_EXIT_READY signers.
 - `guard-reconnect-authority.js`: single-use, exact-tuple suspend/resume authority.
 - `m3-context.js`: M3 inner associated-data and fixed envelope codecs.
-- `m3-adjacency-adopter.js`, `m3-adjacency-runtime.js`: one-shot link adoption,
-  paired responder-tail/token ownership, actor-local wire-expiry projection,
-  proactive runtime timers, and installed forwarding ownership.
-- `link-bootstrap-session.js`, `link-control-session.js`, `udx-adapter.js`, `udx-cell-endpoint.js`: live adjacent UDX lifecycle, liveness, queue bounds, direct-authority audit points, and cell delivery.
-- `tail-control.js`: authenticated in-route `EXTEND_REQUEST`/`EXTENDED`/
-  `TAIL_READY`, initiator state, co-located token-gated responder transitions,
-  ordered AEAD counters, and terminal handoff.
+- `m3-adjacency-adopter.js`, `m3-adjacency-runtime.js`: registered
+  `M3CellLinkTransfer` adoption; paired responder-tail/token ownership; separate
+  proactive physical-runtime and logical `M3TailLifetime` timers; the
+  `M3TailControlTransportOwner`; and exact forwarding claim/lease/publication/
+  receipt ownership.
+- `link-bootstrap-session.js`, `link-control-session.js`, `udx-adapter.js`:
+  adjacent bootstrap/control wire state and the native adapter boundary.
+- `udx-cell-endpoint.js`: sole live UDX socket/established-record owner,
+  record-owned `SHARED_GUARD`/`NON_SHARED_RELAY` policy, slot-reserving
+  `M3CellLinkTransferIssuer`, two-capability registration, private
+  `{ M3 generation, circuitId, direction }` dispatch, send/receive reservation
+  and full-cell accounting, and the physical-owner split.
+- `guard-lease.js`: sole holder and closer of already pin-branded
+  `SHARED_GUARD` established ownership, with up to four logical branch/
+  replacement slots; logical M3 release never closes it. Non-shared runtime
+  teardown instead consumes only its exact moved physical owner.
+- `tail-control.js`: exact authenticated `EXTEND_REQUEST`/`EXTENDED`/
+  `TAIL_READY` bytes; one stable `TailControlOwner`; the sole logical transport
+  destructor; send/receive-only borrower; co-located token-gated responder
+  transitions; exact forwarding transfer; ordered AEAD counters; and the
+  prepare/commit/revoke final-exit bridge.
 - `extension-setup-channel.js`, `extension-link-completion.js`: physical
-  LINK_OFFER/LINK_ACCEPT/proof exchange and one-shot completed-link ownership.
+  LINK_OFFER/LINK_ACCEPT/proof exchange and linear movement of authenticated
+  established ownership, the UDX-issued transfer issuer/registered transfer,
+  socket-owner lease, and one-shot completion.
 - `route-extension.js`: endpoint-local selected-evidence initiator orchestration
-  with separate wall/monotonic clocks and no discovery or dialing surface.
-- `tail-extension-committer.js`: staged `EXTENDED` installation and
-  failure-atomic opaque forwarding-facade transfer.
-- `final-exit-handoff.js`: one-shot same-runtime terminal handoff carrying
-  authenticated wire expiry, projected local deadline, and clock identity.
-- `final-exit.js`, `final-exit-activation.js`: terminal ACTIVATE/READY/ACK/OPEN transcript and inner AEAD.
+  that moves the same stable owner, armed lifetime, authenticated borrower,
+  clocks, and deadlines; it has no discovery, dialing, structural transport,
+  or replacement-timer surface.
+- `tail-extension-committer.js`: staged `EXTENDED` installation and movement of
+  the exact M3 forwarding publication claim/facade into tail-control ownership;
+  it does not publish a facade by itself.
+- `final-exit-handoff.js`: one-shot same-runtime terminal handoff carrying the
+  stable owner, armed lifetime, authenticated borrower, wire expiry, projected
+  local deadline, and clock identity.
+- `final-exit.js`: exact terminal ACTIVATE/READY/ACK/OPEN codecs, transcript,
+  derivation, and inner AEAD.
+- `final-exit-activation.js`: sole issuer of
+  `FinalExitActivationClaim`/`FinalExitActivationOwner`, exact claim operation,
+  activation state, responder-only DHT_EXIT_READY signer consumption, the fixed
+  cross-module cleanup bridge, and lexical `OpenRouteHandoff` issuance only
+  after authenticated OPEN.
+- `open-route-handoff.js`: consumer/revoke/destroy boundary for the one-shot
+  terminal OPEN capability already issued by `final-exit-activation.js`; it
+  accepts no arbitrary owner/material issuer and moves the exact activation/
+  stable owner, borrower accounting, and route material into Task 9 without
+  exposing keys, transport, deadline owners, or destructors.
 - `branch-path-authority.js`, `route-manager.js`: later Task 9-only branch
-  publication, global deadline, rotation, and generation ownership; Task 6 has
-  no `BranchPathAuthority` dependency.
+  publication, global deadline, rotation, generation ownership, and movement
+  of the same TailControl owner/lifetime/borrower through extension and
+  final-exit activation; Task 6 has no `BranchPathAuthority` dependency.
 - `relay-service.js`: relay circuit quotas, fairness, expiry, cancellation, and tombstones.
 - `dht-exit-seeds.js`: new `0x0045` DHT-only seed object.
 - `dht-exit-test-topology-grant.js`: test-issuer-only verification of exact, signed, one-shot isolated-address grants; it is not exported by the package.
@@ -900,21 +937,56 @@ teardown, and clearing tests from prototype `test/link-control-session.test.js`.
 Then port `lib/link-control-session.js` with its opaque direction capabilities.
 It receives an already-established reservation from the same socket owner.
 
-- [ ] **Step 6: Add one exact Node/Bare UDX socket owner**
+- [ ] **Step 6: Add the exact Node/Bare UDX owner and authenticated M3 transfer**
 
-Add direct runtime dependency `"udx-native": "1.20.7"`, matching the exact
-reviewed prototype/runtime version. Port prototype `lib/udx-adapter.js` and
-`lib/udx-cell-endpoint.js` to CommonJS. `UdxCellEndpoint` is the sole socket
-owner for one role process: it creates the UDX instance/socket through
-`UdxAdapter`, binds it, attaches one message/error demultiplexer, owns all
-pending and established reservations, and closes both socket and adapter-owned
-UDX references.
+- [ ] **Step 6a: Write the failing OPEN-record transfer, dispatch, and accounting tests**
 
-Run `npm pkg set dependencies.udx-native=1.20.7 && npm install`, verify
+In `test/private/udx-cell-endpoint.js` and `test/private/guard-link.js`, use the
+real loopback owner—not a structural channel or test-issued M3 transport—to
+prove that one OPEN established record can issue an M3 transfer only by joining
+two independent one-shot capabilities:
+
+1. `takeM3CellLinkTransferIssuer(establishedLink)` reserves a logical slot and
+   tentative registration charge from the exact live OPEN UDX record; and
+2. lexical authenticated `guard-link.js` code issues one empty
+   `M3AuthenticatedBranchBinding` only after LINK_OFFER/LINK_ACCEPT,
+   advertisement, proof, transcript, peer, and cell-context authentication.
+
+Add RED cases for swapped, foreign, replayed, or revoked issuer/binding pairs;
+wrong endpoint/send/topology/setup identity, tuple/peer, link-control
+epoch/circuit provenance, authenticated identities/digests, M3
+branch/circuit/generation/extension index/cell IDs/directions, physical policy,
+duplicate dispatch key, and use of the LinkControlSession circuit as an M3 key.
+Also freeze four simultaneous shared-guard logical slots and one non-shared
+slot; issuer-take-through-revoke/release charging; two ordered initiator
+receive reservations and one responder reservation; full 1,200-byte
+receipt/envelope accounting; unknown-key drop before copy; and exact rollback
+without physical close.
+
+Run:
+
+```bash
+npx brittle-node test/private/udx-cell-endpoint.js test/private/guard-link.js
+bare node_modules/brittle/cmd.js test/private/udx-cell-endpoint.js test/private/guard-link.js
+```
+
+Expected RED: missing `takeM3CellLinkTransferIssuer`,
+`registerM3CellLinkTransfer`, record-bound dispatch/reservation operations, or
+the lexical authenticated-binding issuer. A fake issuer, raw socket, arbitrary
+callback, or structural `{ send, receive, destroy }` object is an invalid RED
+fixture.
+
+- [ ] **Step 6b: Port the sole native UDX owner and preserve bootstrap authority**
+
+Add direct runtime dependency `"udx-native": "1.20.7"`, matching the reviewed
+prototype/runtime exactly. Run
+`npm pkg set dependencies.udx-native=1.20.7 && npm install`, verify
 `require('udx-native/package.json').version === '1.20.7'`, and confirm the
-ignored `package-lock.json` is not staged.
+ignored `package-lock.json` is not staged. Port prototype `lib/udx-adapter.js`
+and `lib/udx-cell-endpoint.js` to CommonJS.
 
-Its exact constructor is:
+`UdxCellEndpoint` remains the sole socket owner for one role process. Its
+production constructor still accepts only:
 
 ```js
 new UdxCellEndpoint({
@@ -933,59 +1005,98 @@ new UdxCellEndpoint({
 ```
 
 `openLink(linkHandle, sessionOptions)` consumes a topology-grant link handle,
-binds one peer identity+numeric tuple, installs a PENDING record, and returns a
-`LinkBootstrapSession`. On valid CREATED, that exact record atomically changes
-to OPEN, installs cell codec/control state, and returns role-scoped send/control
-capabilities. Receive demux accepts the reserved bootstrap class only for
-PENDING and established cells only for OPEN; source tuple/identity mismatch is
-dropped before callbacks. `close()` first marks closing, revokes all send
-handles, rejects queues, removes listeners, closes pending/control sessions,
-waits native sends, closes the socket, then clears the adapter-owned UDX
-reference; it does not call an undocumented UDX destroy method. It is
-idempotent and no caller may close the inner socket directly.
+binds one peer identity and numeric tuple, installs a PENDING record, and
+returns a `LinkBootstrapSession`. Valid CREATED atomically changes that record
+to OPEN and installs cell codec/control state. PENDING accepts only bootstrap;
+OPEN accepts only established traffic; tuple/identity mismatch drops before
+callback. `close()` tombstones first, revokes send handles, rejects queues,
+removes listeners, closes pending/control sessions, waits native sends, closes
+the socket, and clears adapter-owned UDX state without an undocumented destroy.
 
-The production constructor never accepts an adapter. Queue/allocation tests use
-only this separate test boundary:
+The production constructor never accepts an adapter. Existing queue/allocation
+tests retain only the frozen, one-shot `TEST_ONLY_UDX_ADAPTER_ISSUER` boundary;
+production loopback tests must observe the default `UdxAdapter`/`udx-native`.
+Keep the exact pre-pin `createLocalIdentitySecretCapability`,
+`createBootstrapUdxAuthority`, `sendConfigured`,
+`sendProspectiveGuard`, and `pinBootstrapUdxGuard` flow. Successful pinning
+consumes the exact hidden GuardLease ownership token, brands that OPEN record
+`SHARED_GUARD` before any M3 issuer can be taken, revokes every generic handle,
+and returns opaque `GuardLeaseMaterial` carrying the already-branded
+established ownership plus exact socket/local-secret/reconnect ownership.
+
+- [ ] **Step 6c: Implement the two-capability registration and private dispatch**
+
+An OPEN record records immutable physical policy only from hidden ownership:
+bootstrap pinning consumes the exact GuardLease ownership token and brands
+`SHARED_GUARD`; the one-shot extension setup owner brands
+`NON_SHARED_RELAY`. No later GuardLease constructor, M3 caller, or policy enum
+can choose, defer, or mutate that value.
+
+Implement this exact package-private UDX surface:
 
 ```js
-const adapterAuthority = createTestUdxAdapterAuthority(fakeFactory)
-const endpoint = createUdxCellEndpointForTest(options, adapterAuthority)
+takeM3CellLinkTransferIssuer(establishedLink)
+registerM3CellLinkTransfer(transferIssuer, authenticatedBinding)
+revokeM3CellLinkTransferIssuer(transferIssuer)
+takeM3CellLinkTransfer(transfer)
+revokeM3CellLinkTransfer(transfer)
+reserveM3CellSend(borrower)
+commitM3CellSend(reservation, cell1200)
+abortM3CellSend(reservation)
+reserveM3CellReceive(borrower)
+takeM3CellReceipt(borrower, receipt)
+releaseM3CellReceipt(borrower, receipt)
+releaseM3CellBorrower(borrower)
+destroyM3PhysicalLinkOwner(owner)
 ```
 
-Both functions are exported only under `TEST_ONLY_UDX_ADAPTER_ISSUER`; the
-authority is frozen, WeakMap-backed, one-shot, and cannot be passed to the
-production constructor. Production tests assert the default constructor reaches
-`UdxAdapter`/`udx-native` by observing real loopback packets.
+The issuer is frozen and empty. Its WeakMap record binds the OPEN endpoint
+record, established send/topology handles, peer identity/canonical tuple,
+current link-control epoch/circuit, hidden physical policy, reserved slot, and
+issuer generation. `guard-link.js` exposes only
+`takeM3AuthenticatedBranchBinding(binding, transferIssuer)` and
+`revokeM3AuthenticatedBranchBinding(binding)` as package-private consumers.
+Registration tombstones both inputs before callbacks, compares every hidden
+record and authenticated M3 field, rejects the link-control circuit and a
+duplicate pending/active M3 dispatch key, then replaces the tentative charge
+with one empty `M3CellLinkTransfer`.
 
-Before guard pinning, create one opaque authority through:
+Each OPEN record owns a dispatch map keyed exactly by
+`{ epoch, circuitId, direction }`, where `epoch` is M3 generation from the u64
+at offset 4 and `circuitId` is the M3 value at offset 12. The established
+LinkControlSession epoch remains separate record provenance and is rechecked at
+registration, transfer take, and M3 adoption. Parse only the fixed 36-byte
+clear header before any decoder/allocation. Link-control circuit traffic stays
+on its existing path; an exact M3 key consumes one queued opaque reservation;
+unknown/malformed/conflicting keys clear and drop without closing the physical
+link.
 
-```js
-const localSecretCapability = createLocalIdentitySecretCapability({
-  localIdentity,
-  localSecretKey
-})
-const bootstrapUdxAuthority = createBootstrapUdxAuthority({
-  endpoint,
-  configuredEndpoints,
-  localSecretCapability,
-  maxProspectiveGuards: 3,
-  monotonicDeadline
-})
+Taking a non-shared transfer moves one opaque `physicalOwner`; taking a shared
+guard transfer returns only the logical borrower because physical ownership
+remains in `GuardLease`. Logical release tombstones reservations/receipts,
+rejects pending work, releases every slot/packet/byte charge once, and never
+emits close or spends shared physical ownership. GuardLease close first
+invalidates every issuer/transfer/borrower and then closes once. Every
+registration/revoke/reentry failure clears copied identities, tentative
+dispatch, slot, and accounting before returning and never permits a callback
+before rollback.
+
+- [ ] **Step 6d: Make the authenticated transport prerequisite GREEN**
+
+Run:
+
+```bash
+npx brittle-node test/private/udx-cell-endpoint.js test/private/guard-link.js test/private/udx-loopback.js
+bare node_modules/brittle/cmd.js test/private/udx-cell-endpoint.js test/private/guard-link.js test/private/udx-loopback.js
 ```
 
-Creation consumes the local-secret capability into authority state; failure
-clears it. BootstrapIO can consume the authority only through module-internal operations
-`sendConfigured(index, packet)` and `sendProspectiveGuard(admission, packet)`;
-neither accepts a tuple. Candidate admission binds one of at most three verified
-guard identities/tuples and returns an opaque token. On successful guard LINK
-ACCEPT, `pinBootstrapUdxGuard(authority, admission, establishedLink)` atomically
-revokes every configured/candidate handle, changes receive demux to the exact
-guard only, and returns one opaque `GuardLeaseMaterial`. That material owns the
-established guard-link capability, socket-owner capability, local identity
-secret capability, and a zero-argument exact-tuple reconnect transport factory;
-none is inspectable or separately consumable. BootstrapIO stores this material
-inside the final guard-pin transfer instead of a raw link. Task 4 fake transports
-must implement this same capability contract.
+Expected GREEN: real Node and Bare UDX loopback issue both capabilities,
+register and take one transfer, send/receive one exact 1,200-byte M3 cell,
+release logical ownership with exact zero accounting, preserve shared guard
+physical ownership, and reject every mismatch/replay before authority moves.
+Only after this step and Task 5 Steps 7-8 are GREEN and committed may Task 6
+resume; Task 6 must not substitute provisional structural or test-only
+transport.
 
 - [ ] **Step 7: Add failing fake and real UDX endpoint tests**
 
@@ -1032,6 +1143,7 @@ wire bytes or the public package API.
 - Create: `lib/private/route-extension.js`
 - Create: `lib/private/tail-extension-committer.js`
 - Create: `lib/private/final-exit-handoff.js`
+- Create: `lib/private/final-exit-activation.js`
 - Create: `lib/private/tail-control.js`
 - Modify: `lib/private/guard-link.js`
 - Create: `test/private/redacted-responder-proof.js`
@@ -1042,6 +1154,7 @@ wire bytes or the public package API.
 - Create: `test/private/route-extension-session.js`
 - Create: `test/private/tail-extension-committer.js`
 - Create: `test/private/final-exit-handoff.js`
+- Create: `test/private/final-exit-activation.js`
 - Create: `test/private/tail-control.js`
 - Create: `test/private/route-extension.js`
 - Modify: `test/private/guard-link.js`
@@ -1097,38 +1210,97 @@ modules/exports or mismatched exact vectors, never a syntax or fixture error.
 Port only the pure codecs/proofs required to make those vectors green. Do not
 invent bytes or change an adopted vector to match provisional code.
 
-- [ ] **Step 2: Add dual-clock M3 adoption and proactive runtime expiry**
+- [ ] **Step 2: Add authenticated-transfer M3 adoption and independent runtime/lifetime clocks**
 
-In `test/private/m3-adjacency-runtime.js`, add one bounded failing test at a
-time for:
+- [ ] **Step 2a: Write the failing registered-transfer and timer tests**
 
-1. projecting `wireExpiresAt` into the adopting actor's monotonic clock exactly
-   once as
-   `monotonicNow() + max(0, wireExpiresAt - wallNow())`;
-2. moving frozen `{ wireExpiresAt, localDeadline, clockIdentity }` through the
-   opaque tail capability without a second projection;
-3. rejecting overflow, non-positive intervals, backward wall time,
-   non-monotonic `monotonicNow`, and alternate clock function identities;
-4. arming one proactive expiry handle before publishing a runtime, tail, or
-   responder token;
-5. destroying unpublished state on synchronous firing, throwing scheduling,
-   failure to record a handle, or reentrant cancellation; and
-6. after `commitM3Install`, letting the first of the two installed handles
-   consume the internal `M3ForwardingOwner`, cancel both handles, and close both
-   contexts exactly once.
+In `test/private/m3-adjacency-runtime.js`, build adoption from Task 5's real
+loopback path: OPEN record issuer + lexical guard-link binding -> registered
+`M3CellLinkTransfer`. Add no structural `physicalChannel`, fake transport
+issuer, or arbitrary destructor. Add one bounded RED case at a time proving:
 
-Expected RED: the provisional authority accepts one `now` function, lacks the
-projected dual-clock record, or publishes runtime state without an owned timer.
-Replace the ambiguous `now` option in `M3AdjacencyAuthority` with exact
-`wallNow`, `monotonicNow`, `schedule`, and `cancelScheduled` capabilities.
-The successor relay projects independently in its own process. Never encode or
-compare a local monotonic value across actors.
+1. `M3AdjacencyAuthority.adopt` consumes the registered transfer and rechecks
+   its exact endpoint/link/setup identities, canonical tuple/peer, separate
+   established-link epoch provenance, M3 branch/circuit/generation/cell
+   IDs/directions, and hidden physical policy;
+2. a shared guard adoption receives only the logical borrower, while a
+   non-shared relay adoption moves exactly one opaque `physicalOwner`;
+3. `wireExpiresAt` projects once into the adopting actor's monotonic clock as
+   `monotonicNow() + max(0, wireExpiresAt - wallNow())`, and the frozen
+   `{ wireExpiresAt, localDeadline, clockIdentity }` moves without reprojection;
+4. overflow, non-positive intervals, backward wall time, non-monotonic
+   `monotonicNow`, alternate clock identities, transfer replay, and any joined
+   record mismatch fail before publishing runtime/tail state;
+5. one physical-runtime expiry handle is armed before runtime, tail, responder
+   token, or pending tail transport can publish; synchronous firing, scheduler
+   throw, invalid handle, reentrant cancellation, or failure to retain the
+   handle destroys unpublished state; and
+6. after exact forwarding installation, the first installed runtime expiry
+   consumes the internal `M3ForwardingOwner`, cancels both runtime handles, and
+   closes both contexts/borrowers/eligible non-shared physical owners once.
 
 Run:
 
 ```bash
-$NODE node_modules/brittle/bin/node.js test/private/m3-adjacency-runtime.js
+$NODE node_modules/brittle/bin/node.js test/private/m3-adjacency-runtime.js test/private/udx-cell-endpoint.js
 ```
+
+Expected RED: adoption still accepts structural channel material or ambiguous
+`now`, cannot consume `M3CellLinkTransfer`, confuses M3 generation with the
+established-link epoch, leaks shared physical close authority, or publishes
+without an owned timer.
+
+- [ ] **Step 2b: Implement the exact adoption and separate lifetime owner**
+
+Replace `M3AdjacencyAuthority`'s ambiguous `now` with exact `wallNow`,
+`monotonicNow`, `schedule`, and `cancelScheduled`. Adoption consumes only the
+registered transfer, rechecks the complete joined record, and creates a frozen
+empty pending `TailControlTransportTransfer` bound to the exact runtime, tail,
+M3 borrower, branch/circuit/generation/extension index, local/peer cell IDs,
+initiator direction, clock identity, and moved deadlines. Store it only inside
+the tail-capability record; never return an unbound transfer.
+
+Implement the M3-owned logical-lifetime surface:
+
+```js
+takeM3TailCapability(capability, { wallNow, monotonicNow }, ownerDestroy)
+shortenM3TailLifetime(lifetime, ownerDestroy, {
+  wireExpiresAt,
+  localDeadline
+})
+releaseM3TailLifetime(lifetime, ownerDestroy)
+```
+
+Capability take validates and spends the exact tail capability and clock
+identities, creates one empty `M3TailLifetime`, records the stable
+`ownerDestroy`, runtime reservation/generation, binding, and moved bounds,
+arms the lifetime's own timer at `localDeadline`, then atomically consumes the
+pending transport transfer into an opaque `M3TailControlTransportOwner`.
+Responder token and tail binding attach to that same lifetime/callback before
+publication. Any failure destroys the unpublished lifetime, borrower,
+transport owner, token/binding, and moved material.
+
+The logical timer is independent of the physical runtime timer. Logical expiry
+invokes stable-owner cleanup and releases only logical M3 ownership; it never
+closes a runtime or physical link. Runtime/context teardown first tombstones
+the lifetime, cancels its timer, clears token/binding, invokes `ownerDestroy`
+once with exceptions suppressed, and only then performs eligible physical
+cleanup. `shortenM3TailLifetime` accepts only non-increasing wire/local bounds
+and the identical callback/clock, arms the replacement before canceling the
+old logical timer, and fail-closes on every synchronous/reentrant scheduling
+boundary. `releaseM3TailLifetime` is terminal-only and never closes physical
+state.
+
+- [ ] **Step 2c: Run the focused GREEN proof**
+
+```bash
+$NODE node_modules/brittle/bin/node.js test/private/m3-adjacency-runtime.js test/private/udx-cell-endpoint.js
+```
+
+Expected GREEN: the real registered transfer is consumed once; runtime and
+logical timers stay independently armed; shared and non-shared physical
+ownership remain distinct; every mismatch/expiry releases exact borrower,
+slot, receipt/envelope, timer, and copied binding state once.
 
 - [ ] **Step 3: Pair each authenticated responder tail with one token**
 
@@ -1172,26 +1344,29 @@ destroyExtensionResponderSigner(signer)
 createTailReadySigner(identityOwner)
 signTailReady(signer, body, expectedIdentity)
 destroyTailReadySigner(signer)
+createFinalExitReadySigner(identityOwner)
+signFinalExitReady(signer, body, expectedIdentity)
+destroyFinalExitReadySigner(signer)
 destroyRelayIdentitySigningAuthority(identityOwner)
 ```
 
 The owner copies and validates the secret once, derives the public identity
 internally, and zeroizes its copy on destroy. Consumers accept only the exact
 registered message ID, signature domain, body length, and expected identity,
-then verify the produced 64-byte signature before returning it. LINK_OFFER and
-TAIL_READY signers are spent after one semantic object. The extension responder
-signer follows exactly LINK_ACCEPT then redacted proof and is spent after the
-second signature. Retries reuse cached semantic bytes and do not spend another
-signer.
+then verify the produced 64-byte signature before returning it. LINK_OFFER,
+TAIL_READY, and DHT_EXIT_READY signers are spent after one semantic object. The
+extension responder signer follows exactly LINK_ACCEPT then redacted proof and
+is spent after the second signature. Retries reuse cached semantic bytes and do
+not spend another signer.
 
 Expected RED: raw secret-key options are still required, the wrong domain/body
 signs, or a signer is reusable. Implement the signer module only after these
 tests fail correctly. Defer the initiator LINK_OFFER caller migration in
 `guard-link.js` until Step 8a supplies an honest production admission; finish
 and exercise that migration in Step 5b. The extension-responder caller migrates
-in Step 8a. At completion, neither `createExtensionLinkOffer` nor the extension
-responder may receive `initiatorIdentitySecretKey` or
-`responderIdentitySecretKey`.
+in Step 8a. The final-exit READY caller migrates in Task 7 Step 3. At
+completion, neither `createExtensionLinkOffer`, the extension responder, nor
+final-exit activation may receive raw identity secret keys.
 
 Run:
 
@@ -1458,15 +1633,18 @@ response channel is reused, destroy leaves a retry armed, runtime/token teardown
 retains cached bytes, threshold-plus-one allocates, a conflicting replay is
 answered, or a duplicate allocates another adjacency.
 
-- [ ] **Step 7: Narrow the initiator `TailControlSession` and dual-clock deadline**
+- [ ] **Step 7: Build the stable TailControl owner, lifetime, and authenticated borrower**
 
-In `test/private/tail-control.js`, first keep the exact pure codec/vector RED
-cases from Step 1. Construct sessions only by consuming an M3 tail capability.
-`createTailControlSession(capability, options)` accepts common `wallNow`,
-`monotonicNow`, and optional deterministic `crypto`; an initiator also requires
-the RouteManager-owned monotonic `absoluteDeadline`.
+- [ ] **Step 7a: Write the failing lifetime/transport/session authority tests**
 
-The session object exposes only:
+In `test/private/tail-control.js` and
+`test/private/m3-adjacency-runtime.js`, retain Step 1's exact codec/vector
+cases, then construct a session only by consuming a Task 5-registered M3 tail
+capability. Add RED cases proving one empty `TailControlOwner` and the
+object-identical `M3TailLifetime`/M3 borrower survive current session ->
+client-waiting-ready -> successor session through both extensions.
+
+The session object exposes exactly five methods:
 
 ```js
 session.sealExtend(options)
@@ -1474,18 +1652,96 @@ session.openExtended(envelope)
 session.completeClientExtension(completion, readyEnvelope)
 session.abortClientExtension(completion)
 session.takeFinalExitHandoff()
+```
+
+The package-private direct consumers are functions, never session methods:
+
+```js
 takeAdmittedExtendRequest(capability)
 completeClientTailExtension(completion, readyEnvelope)
 abortClientTailExtension(completion)
 readTailControlDeadline(session)
+destroyTailControlSession(session)
+borrowTailControlTransport(session)
 ```
 
-It moves `{ wireExpiresAt, localDeadline, clockIdentity }`, verifies exact clock
-function identities, never projects again, and clamps initiator
-`localDeadline` to `absoluteDeadline`. `readTailControlDeadline` returns only
-that process-local monotonic deadline.
+Reject `.destroy()`, responder methods, structural
+`tailControlTransportFactory`, a raw transport, alternate `ownerDestroy`,
+replacement lifetime/borrower, and deadline/timer reset. In Step 7, exercise
+only the stable owner stages reachable before responder installation,
+forwarding, and final-exit activation:
 
-Add one RED case per `sealExtend` requirement using exact own data:
+```text
+UNBOUND
+CONSTRUCTING_SESSION
+ACTIVE_SESSION
+WAITING_READY_SESSION
+CLIENT_WAITING_READY
+DESTROYING
+DESTROYED
+```
+
+Move the stage-specific RED cases for `RESPONDER_INSTALLING` to Step 8b,
+`RESPONDER_FORWARDING_TRANSFER` to Step 9, and `FINAL_EXIT_HANDOFF`/
+`FINAL_EXIT_ACTIVATION` to Step 11.
+
+Run:
+
+```bash
+$NODE node_modules/brittle/bin/node.js test/private/tail-control.js test/private/m3-adjacency-runtime.js
+```
+
+Expected RED: session construction can use structural transport, the spent tail
+capability is the only cleanup path, logical expiry closes the physical link,
+the five-method shape is not exact, or transfer creates a new owner/lifetime/
+borrower/deadline.
+
+- [ ] **Step 7b: Implement stable ownership and authenticated tail transport**
+
+`tail-control.js` creates one lexical stable `ownerDestroy` closing over the
+empty `TailControlOwner`; no caller supplies it. Immediately after
+`takeM3TailCapability`, store every moved field, the `M3TailLifetime`, and the
+opaque `M3TailControlTransportOwner` under `CONSTRUCTING_SESSION` before any
+further clock, crypto, validation, or callback. Publication rechecks lifetime,
+owner generation, and deadline before entering ACTIVE or WAITING_READY.
+
+`createTailControlSession(capability, options)` accepts common `wallNow`,
+`monotonicNow`, and optional deterministic `crypto`; an initiator additionally
+requires RouteManager's `absoluteDeadline`. It verifies the retained clock
+identities, never projects again, and calls `shortenM3TailLifetime` to clamp
+both moved wire/local bounds without replacing the timer owner.
+`readTailControlDeadline` returns only the actor-local monotonic deadline.
+
+Use only the M3-owned transport operations:
+
+```js
+sendM3TailControl(owner, envelope1101)
+receiveM3TailControl(owner)
+takeM3ReceivedEnvelope(owner, envelope)
+releaseM3ReceivedEnvelope(owner, envelope)
+releaseM3TailControlTransport(owner)
+```
+
+`borrowTailControlTransport(session)` returns a frozen send/receive-only facade.
+Every call checks owner/lifetime/runtime generation and deadline before producer
+entry and after settlement. Send reserves one Task 5 cell before advancing the
+semantic counter, seals one exact 1,101-byte envelope, and commits one
+1,200-byte CONTROL cell; seal failure aborts reservation, while post-seal
+commit failure spends the counter and destroys the logical owner. Receive uses
+the exact record dispatch reservation. After M3 open, move the full-cell charge
+into an opaque `M3ReceivedEnvelope`; decoding paths must take that exact object
+and release it in `finally`. A structurally equal buffer is invalid.
+
+Initiators reserve both ordered `EXTENDED_V1` and `TAIL_READY_V1` receives
+before sending `EXTEND_REQUEST_V1`; responders keep exactly one EXTEND receive
+and renew only after settlement. Preserve Task 5's four/shared and
+one/non-shared borrower limits, two/one receive limits, and full-cell receipt/
+envelope accounting. Logical release rejects pending work and returns every
+charge/slot without closing the shared guard physical link.
+
+- [ ] **Step 7c: Implement exact initiator sealing and prove GREEN**
+
+Add one RED-then-GREEN case per exact `sealExtend` own-data field:
 
 ```js
 {
@@ -1498,26 +1754,34 @@ Add one RED case per `sealExtend` requirement using exact own data:
 }
 ```
 
-The session owns branch/circuit/generation/current-tail bindings. Verify the
-next index, required role, canonical advertisement/signature/digest, payload
-parameters, authenticated wire expiry, and local bound before allocation.
-Generate fresh client-tail ephemeral and extension nonces, retain one pending
-extension, and seal prototype-exact `EXTEND_REQUEST_V1`. The effective endpoint
-deadline is the minimum of RouteManager absolute deadline, moved session
-deadline, start plus 5,000 ms, and separately projected signed-manager and
-advertisement wall expiries. Encode only a wall-clock requested expiry no later
-than every authenticated bound or the wall time corresponding to remaining
-local budget. No `selectedEvidenceExpiry` field exists.
+The session owns branch/circuit/generation/current-tail bindings. Verify next
+index/role, canonical advertisement/signature/digest, payload parameters,
+wire expiry, and local bound before allocation. Generate fresh client-tail
+ephemeral and extension nonces, retain one pending extension, and seal the
+prototype-exact request. The endpoint deadline is the minimum of RouteManager
+absolute deadline, moved session deadline, start + 5,000 ms, manager signed
+expiry, and selected-advertisement expiry projected once in this actor.
+Requested wire expiry cannot exceed any authenticated or local-budget bound.
+Task 3 evidence gains no `selectedEvidenceExpiry`.
 
-Expected RED: provisional single-`now` behavior reprojects/resets a deadline,
-accepts alternate clock identity, allows a second pending request, or accepts
-an extension later than either authenticated bound.
+Run:
 
-- [ ] **Step 8: Co-locate token-gated responder transitions with session state**
+```bash
+$NODE node_modules/brittle/bin/node.js test/private/tail-control.js test/private/m3-adjacency-runtime.js test/private/udx-cell-endpoint.js
+```
 
-Keep responder mutation beside `SESSIONS` in `tail-control.js`; do not add
-responder methods to the session object or re-export them from HyperDHT's entry
-point. Add RED tests for the unchanged package-private surface:
+Expected GREEN: exact vectors remain unchanged; the stable owner/lifetime/
+borrower and independent logical timer move without a gap; exact UDX
+reservation and accounting paths are used; destroy/expiry/reentry tombstone
+first, release logical ownership once, and leave no physical-close authority
+on shared guard sessions.
+
+- [ ] **Step 8: Co-locate token-gated responder transitions with stable session ownership**
+
+Keep responder mutation beside `SESSIONS` and `TAIL_CONTROL_OWNERS` in
+`tail-control.js`; add no responder method to the five-method session and
+re-export nothing from HyperDHT's entry point. Preserve this package-private
+surface:
 
 ```js
 createTailControlResponderAuthority(session, responderToken, options)
@@ -1529,152 +1793,258 @@ sealTailReady(authority)
 destroyTailControlResponderAuthority(authority)
 ```
 
-At transcript indices 0 and 1, exact authority options remain:
+At indices 0/1 the exact own-data options are
+`{ adjacencyAdopter, extensionCommitter, adjacentLinkFactory, tailReadySigner,
+wallNow, monotonicNow, randomBytes, schedule, cancelScheduled }`. At terminal
+index 2 the first three extension keys are forbidden; only the signer, clocks,
+randomness, scheduler, and canceller remain.
 
-```js
-{
-  adjacencyAdopter,
-  extensionCommitter,
-  adjacentLinkFactory,
-  tailReadySigner,
-  wallNow,
-  monotonicNow,
-  randomBytes,
-  schedule,
-  cancelScheduled
-}
-```
+Execute Step 8 around Step 5b in this exact order: 8a RED/GREEN -> 5b
+RED/GREEN -> 8b RED/GREEN. Do not renumber and do not create a test admission
+issuer.
 
-At terminal index 2, forbid the first three extension keys and accept only:
+- [ ] **Step 8a: Construct the real authority and publish authenticated admission**
 
-```js
-{
-  tailReadySigner,
-  wallNow,
-  monotonicNow,
-  randomBytes,
-  schedule,
-  cancelScheduled
-}
-```
+First add RED cases in `test/private/tail-control.js` proving authority
+construction atomically consumes the responder token and requires object
+identity for its hidden tail binding, deadline object, `M3TailLifetime`,
+stable `ownerDestroy`, responder session, and local relay. It must validate
+exact options/clock identities and arm one subordinate authority timer at the
+already-projected local deadline before return. Initiator adoption has no
+token. A deep import without the exact token grants nothing.
 
-Execute Step 8 in two in-place substeps around Step 5b; do not renumber later
-steps and do not introduce a test-only admission issuer.
+Mismatch, synchronous timer firing, schedule throw, invalid handle, reentrant
+cancellation, expiry, or failure to retain the handle destroys session,
+lifetime, token/binding, transport owner/borrower, signer/factory/committer
+options, and copied bytes once. `adjacencyAdopter` remains borrowed from its
+`M3AdjacencyAuthority`: abort its live one-shot adoption but never destroy that
+borrowed owner.
 
-**Step 8a — construct real authority and publish authenticated admission**
-
-Authority construction atomically consumes the paired token, requires its
-hidden binding object to equal the responder session binding, validates exact
-own-data options and identical clocks, and arms one authority expiry handle
-before return. Mismatch, synchronous firing, schedule throw, reentrant cancel,
-or failure to retain a handle destroys session, token, and every transferred
-owned option. `adjacencyAdopter` remains borrowed from its
-`M3AdjacencyAuthority`: abort any live one-shot adoption, but never destroy the
-borrowed owner during authority cleanup. Add mismatch, abort, and reentrant RED
-cases proving that distinction.
-
-Implement the production `admitTailExtend` path here. It opens ordered tail
-AEAD and verifies exact current bindings, next index/role, complete canonical
-advertisement/signature/digest/route key/endpoint/expiry, payload parameters,
-requested limits, fresh nonces, and local deadline without a discovery cache.
-The responder independently clamps to its moved session deadline, start plus
-5,000 ms, projected advertisement expiry, and projected requested wall expiry.
-On success it publishes the ordinary opaque `AdmittedExtendRequest`; add the
-one-shot `takeAdmittedExtendRequest` consumer already listed in Step 7. Add RED
-cases for forged/mismatched/replayed/expired envelopes, terminal-session EXTEND,
-admission reuse, accessor/extra-key inputs, and any external callback observing
-reusable pre-transition state.
-
-Create and migrate the extension-responder signer caller in this substep. Keep
-the initiator LINK_OFFER caller migration deferred until this production
-admission can exercise it. After 8a is GREEN, return to Step 5b: consume this
-honest admission synchronously before the factory's first await, finish the
-initiator signer migration, and exercise the exact exchange behaviorally.
-
-**Step 8b — finish responder transitions and transfer runtime ownership**
-
-Resume only after Step 5b is GREEN. `openTailAdjacentLink` verifies object
-identity, clears `liveAdmission`, enters `LINK_OPENING` before external code,
-and hands the capability to its bound factory. It records the exact returned
-completion. `completeTailExtend` clears and spends that exact completion before
-taking it, verifies proof and all retained digests/nonces/limits, adopts only
-through `adoptM3ResponderLink`, seals exact `EXTENDED_V1`, and invokes the
-committer from an irreversible `INSTALLING` generation. Reentry must never
-admit, abort, or publish twice. Implement `abortTailExtend`, TAIL_READY, and all
-remaining responder transitions here.
-
-Successful responder completion/adoption must atomically move the factory's
-`SocketOwnerLease` with the established adjacency into the M3 runtime
-registry's existing destroy owner before clearing completion material. Registry
-removal, link close, or projected expiry destroys the physical channel/runtime
-state and then spends the lease exactly once. Every failure before publication
-destroys the channel/derived or established link first, then spends the lease;
-no success path drops the lease or calls its destructor early.
-
-`destroyTailControlResponderAuthority` cancels the recorded handle before
-destroying protocol state. The old authority retains its handle until both
-installed M3 handles own cleanup; only then may forwarding installation cancel
-it. Successor and terminal-index-2 authorities retain their own handles until
-explicit destroy or expiry. Add RED cases for every normal lifetime boundary,
-for abort after admission/open/completion movement, and for completion/runtime
-transfer rollback—not only construction failure.
-
-Expected RED across 8a/8b: an initiator can obtain authority; a deep import
-works without the paired token; a terminal session admits EXTEND; alternate
-clocks/options are accepted; admission is synthetic or reusable; responder
-state mutates after an external callback without a committed transition; abort
-drops a moved owner; or completion clears material before the runtime registry
-owns the socket-owner lease.
+`admitTailExtend` first consumes the exact registered `M3ReceivedEnvelope`,
+opens ordered tail AEAD, and verifies current branch/circuit/generation/tail,
+next index/role, complete canonical advertisement/signature/digest/route
+key/endpoint/expiry, payload parameters, requested limits, fresh nonces, and
+deadline without discovery. It projects selected/requested wall expiries once
+in this responder and must successfully call `shortenM3TailLifetime` before
+publishing one opaque `AdmittedExtendRequest`. Store that exact object as the
+sole live admission; `takeAdmittedExtendRequest` transfers request bytes,
+current-tail identity/digest, and effective deadline once without separately
+returning a tuple.
 
 Run:
 
 ```bash
-$NODE node_modules/brittle/bin/node.js test/private/tail-control.js
+$NODE node_modules/brittle/bin/node.js test/private/tail-control.js test/private/m3-adjacency-runtime.js
 ```
 
-- [ ] **Step 9: Make forwarding installation a failure-atomic transfer**
+Expected RED: token/session/lifetime mismatch survives, the authority accepts
+alternate clocks, a raw buffer can replace the registered envelope, admission
+uses discovery or is reusable, the lifetime is not shortened first, or cleanup
+reaches shared physical close. Implement only the production token-gated
+authority/admission path until this command is GREEN, then return to Step 5b.
 
-In `test/private/tail-extension-committer.js`, add RED cases for:
+- [ ] **Step 8b: Finish responder transitions and move authenticated runtime ownership**
+
+Resume only after Step 5b consumes the honest admission synchronously before
+its first await and passes. Add RED cases for `RESPONDER_INSTALLING` and each
+remaining responder transition reachable in this step. `openTailAdjacentLink`
+requires object identity with `liveAdmission`, clears it, advances to
+`LINK_OPENING` before external code, and records the exact
+`ExtensionLinkCompletion`. The factory internally consumes the advertisement,
+contacts only its canonical tuple, and linearly moves established ownership
+plus Task 5's `M3CellLinkTransferIssuer`; no downstream module reads
+`.destroy`.
+
+`completeTailExtend` clears/spends the exact completion before take, moves the
+stable owner and rollback fields to `RESPONDER_INSTALLING`, verifies the
+redacted proof and every retained binding, then lets lexical guard-link code
+issue `M3AuthenticatedBranchBinding` and call
+`registerM3CellLinkTransfer`. Any proof/registration failure revokes binding,
+issuer, and unpublished transfer before established-owner destruction. Adopt
+the registered transfer only through `adoptM3ResponderLink`, seal the exact
+prototype `EXTENDED_V1`, and invoke the committer from an irreversible
+installation generation. No callback may re-admit, abort, or publish twice.
+
+Successful non-shared adoption atomically moves the factory's
+`SocketOwnerLease` with the exact opaque M3 `physicalOwner` into runtime
+destruction ownership before clearing completion material. Shared guard
+adoption has no movable physical owner. Registry removal, link close, or
+projected physical-runtime expiry destroys runtime/eligible established state
+and then spends the lease once. Every pre-publication failure revokes logical
+transfer/borrower/slot state, destroys derived/established ownership, and only
+then spends the lease; no success path drops or invokes it early.
+
+Implement `abortTailExtend`, `sealTailReady`, and remaining responder
+transitions. Authority destroy cancels its subordinate timer before protocol
+state. The old authority keeps that timer until the independently armed M3
+runtimes own both contexts; successor and terminal authorities keep theirs
+until destroy/expiry. Lifetime teardown first tombstones the subordinate,
+aborts live admission/open/completion, and then clears token/signer/factory/
+committer state.
+
+Run:
+
+```bash
+$NODE node_modules/brittle/bin/node.js test/private/tail-control.js test/private/guard-link.js test/private/extension-setup-channel.js test/private/extension-link-completion.js test/private/m3-adjacency-runtime.js
+```
+
+Expected GREEN: only the token-bound relay can admit; exact Task 5 issuer +
+lexical binding registration precedes adoption; abort/reentry/expiry releases
+every logical slot/charge and socket-owner lease once; shared physical
+ownership remains in GuardLease; and exact EXTENDED/TAIL_READY vectors and
+ordering are unchanged.
+
+- [ ] **Step 9: Publish forwarding through the exact transfer/claim/lease/receipt chain**
+
+- [ ] **Step 9a: Write the failing paired-capability and rollback tests**
+
+In `test/private/tail-extension-committer.js`,
+`test/private/tail-control.js`, and
+`test/private/m3-adjacency-runtime.js`, first add RED cases for the exact
+tail-control transfer surface:
 
 ```js
-takeTailForwardingTransfer(transfer)
+takeTailForwardingTransfer(transfer, publicationClaim)
 revokeTailForwardingTransfer(transfer)
+commitTailForwardingTransfer(taken, publication)
+destroyTakenTailForwardingTransfer(taken)
 ```
 
-`TailExtensionCommitter.install()` stages `EXTENDED_V1` and the next runtime,
-obtains the existing frozen `{ diagnostics, destroy }` forwarding facade, and
-wraps that facade in one opaque `TailForwardingTransfer`. It never exports the
-separate empty internal `M3ForwardingOwner`. Before take, revocation destroys
-the facade. `m3-adjacency-runtime.js`'s existing authority/runtime records are
-the concrete forwarding registry owner; its package-private forwarding event
-handler takes the facade, calls `commitM3Install`, and publishes both installed
-records atomically. After take and before publication, the handler holds the
-facade in a tracked local and calls `facade.destroy()` in `finally` on every
-failure. Publication is the ownership boundary; registry removal uses the same
-destroy path. Test take-through-publication, throw/reentry rollback, and
-registry removal through the production event path without adding a public
-registry API.
+`completeTailExtend` must emit one exact frozen own-data event payload:
 
-Successful forwarding cancels the old responder-authority handle only after
-the independently armed M3 runtime handles own both installed contexts.
-Context/link close or proactive local expiry consumes the facade and destroys
-both installed sides. Do not claim synchronous cleanup on another machine.
+```js
+{
+  transfer,
+  publicationClaim
+}
+```
 
-Expected RED: install returns the facade directly, abandonment leaks it,
-publication failure skips destroy, or an old timer is cancelled before the new
-runtime timers own cleanup.
+Require the object-identical pair, no extra keys/accessors, and synchronous
+registry take before the event handler returns. Reject missing, swapped,
+foreign, replayed, or retained pair members. Cover handler throw/cancel before
+take; wrong/replayed lease; lifetime/callback/borrower/clock/deadline mismatch;
+failure before and after runtime publication; publication-receipt or commit
+failure; expiry/reentry at each boundary; and exact two-runtime/two-slot
+rollback before a facade is retained.
 
 Run:
 
 ```bash
-$NODE node_modules/brittle/bin/node.js test/private/tail-extension-committer.js test/private/m3-adjacency-runtime.js
+$NODE node_modules/brittle/bin/node.js test/private/tail-extension-committer.js test/private/tail-control.js test/private/m3-adjacency-runtime.js
 ```
 
-- [ ] **Step 10: Reconcile `RouteExtensionSession` with selected evidence only**
+Expected RED: the provisional facade-only transfer has no publication claim,
+lease, pair identity, receipt, moved-borrower ownership, or failure-atomic
+rollback.
 
-In `test/private/route-extension-session.js`, add RED tests around the existing
-Task 3 evidence transaction. Preserve the exact own-data factory surface while
-replacing only `now` with separate clocks:
+- [ ] **Step 9b: Implement exact forwarding ownership and publication**
+
+Add the stage-specific RED case for `RESPONDER_FORWARDING_TRANSFER` here: no
+earlier step may create or test this stage before the committer and forwarding
+lease exist.
+
+`TailExtensionCommitter.install()` stages exact `EXTENDED_V1`, calls
+`beginM3Install`/`validateM3Install`, and receives one empty
+`M3ForwardingPublicationClaim` plus the existing frozen
+`{ diagnostics, destroy }` facade. The claim binds the install plan,
+previous/next runtimes and reservations, both exact borrowers/physical
+policies, clocks/deadlines, pending internal `M3ForwardingOwner`, and facade.
+The committer moves claim/facade into `tail-control.js`; it publishes neither.
+
+While the stable owner is `RESPONDER_INSTALLING`, `tail-control.js` invokes:
+
+```js
+createM3TailForwardingLease(
+  transportOwner,
+  lifetime,
+  ownerDestroy,
+  publicationClaim
+)
+```
+
+This atomically tombstones send/receive borrow facades and moves the predecessor
+borrower out of `M3TailControlTransportOwner` into one empty
+`M3TailForwardingLease` without unregistering it or disarming/releasing the
+logical lifetime. The lease binds lifetime/callback, transport owner, moved
+predecessor borrower, next-runtime borrower, both runtime reservation/
+generation identities, clock/deadline, and claim. Failure restores nothing:
+revoke the unpublished install and destroy the stable owner.
+
+Only `tail-control.js` creates `TailForwardingTransfer`, binding stable owner/
+generation, `RESPONDER_FORWARDING_TRANSFER`, lifetime/callback, lease, exact
+claim, facade, and rollback state. Take tombstones transfer, advances owner
+generation, and returns exactly:
+
+```js
+{
+  tailControlOwner,
+  m3ForwardingLease,
+  publicationClaim,
+  forwarding
+}
+```
+
+The first three values are empty opaque capabilities; `forwarding` is only the
+exact facade and owns neither lifetime nor borrower.
+
+The runtime registry then uses only:
+
+```js
+publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
+takeM3TailForwardingPublication(
+  publication,
+  m3ForwardingLease,
+  publicationClaim
+)
+revokeM3TailForwardingLease(m3ForwardingLease)
+destroyM3TailForwardingPublication(publication)
+```
+
+Publication verifies claim/lease/facade, pending runtime records,
+lifetime/callback, and both borrowers. Require
+`previous.clockIdentity === next.clockIdentity === lifetime.clockIdentity` and
+prove
+`min(previous.localDeadline, next.localDeadline) <= lifetime.localDeadline`;
+clock mismatch or an unprovable bound fails—no optional retention fallback.
+With no allocation, clock, crypto, or callback remaining, atomically point both
+runtimes and borrowers/physical owners at the pending `M3ForwardingOwner`, then
+return one opaque publication receipt.
+
+`commitTailForwardingTransfer(taken, publication)` tombstones the taken record
+and advances owner generation before consuming that receipt with the exact
+lease/claim. Only after the M3 owner holds both borrowers does commit call
+`releaseM3TailLifetime` and clear `M3TailControlTransportOwner` without
+`releaseM3CellBorrower`; the predecessor borrower already moved. The registry
+may retain/publish the facade only after commit returns.
+
+- [ ] **Step 9c: Prove terminal ownership and every rollback GREEN**
+
+Revoke before take destroys claim/lease/facade and stable owner. Any take,
+publish, receipt, or commit failure runs
+`destroyTakenTailForwardingTransfer` in `finally`: tombstone stable owner first,
+destroy unpublished/published runtime pair, release both borrower slots once,
+cancel logical lifetime, clear pair records, and zeroize rollback state.
+Registry removal or either physical-runtime expiry consumes the internal owner,
+cancels both handles, destroys both sides, and releases both borrowers. Never
+export the internal owner or claim synchronous cleanup on another machine.
+
+Run:
+
+```bash
+$NODE node_modules/brittle/bin/node.js test/private/tail-extension-committer.js test/private/tail-control.js test/private/m3-adjacency-runtime.js
+```
+
+Expected GREEN: exact pair is taken synchronously, publication owns both
+registered borrowers before the receipt commits stable-owner release, no moved
+borrower is released early, every failure returns both slots/charges exactly
+once, and facade publication occurs only after commit.
+
+- [ ] **Step 10: Move RouteExtension through selected evidence and the existing borrower**
+
+- [ ] **Step 10a: Write the failing clean-cutover request-shape tests**
+
+In `test/private/route-extension-session.js`, add RED cases around the existing
+Task 3 evidence transaction. The exact own-data request is:
 
 ```js
 const request = createRouteExtensionSessionRequest({
@@ -1693,18 +2063,31 @@ const request = createRouteExtensionSessionRequest({
   schedule,
   cancelScheduled,
   cancel,
-  tailControl,
-  tailControlTransportFactory
+  tailControl
 })
 const session = new RouteExtensionSession(request)
 const transfer = await session.open()
 const next = takeRouteExtensionTransfer(transfer)
 ```
 
-Reject accessors, inherited properties, omitted fields, and extra keys before
-retaining any input.
+Reject accessors, inherited/omitted/extra fields, legacy `now`,
+`tailControlTransportFactory`, raw transport, endpoint/dial callbacks,
+`.destroy()`, a test issuer, discovery service/query state, and
+`selectedEvidenceExpiry` before retaining input.
 
-The constructor consumes exactly:
+Run:
+
+```bash
+$NODE node_modules/brittle/bin/node.js test/private/route-extension-session.js test/private/tail-control.js
+```
+
+Expected RED: the provisional request still requires a transport factory or
+structural transport, can replace the stable borrower/deadline, or publishes a
+successor before authenticated READY.
+
+- [ ] **Step 10b: Implement selected-evidence initiation without new ownership**
+
+Consume only:
 
 ```js
 consumeSelectedRelayEvidence(selection, {
@@ -1715,112 +2098,238 @@ consumeSelectedRelayEvidence(selection, {
 })
 ```
 
-It receives complete owned canonical advertisement bytes/digest and role/index
-metadata, with no independent evidence-expiry field and no dial authority.
-Extension index 1 selects a safety relay; index 2 selects a DHT exit; no third
-extension is valid. `signedExpiry` is manager-owned current-branch wire expiry
-and may only shorten the tail capability's authenticated wire expiry.
+This returns complete owned advertisement bytes/digest and role/index metadata,
+with no independent evidence expiry or dial authority. Index 1 requires a
+safety relay; index 2 requires a DHT exit; no third extension exists.
+`signedExpiry` is manager-owned current-branch wire expiry and may only shorten
+the authenticated tail lifetime.
 
-The endpoint sequence is: seal one `EXTEND_REQUEST_V1` containing the complete
-advertisement; send it only on authenticated current-tail transport; open and
-verify exact `EXTENDED_V1`; retain an opaque client completion without
-publishing the next tail; receive valid `TAIL_READY_V1`; atomically complete
-and publish the next `TailControlSession`. Task 9, not Task 6, commits the
-complete branch-pair directory transaction.
+Obtain the already-bound transport only through
+`borrowTailControlTransport(tailControl)`. Reserve the two ordered reverse
+receives before sending prototype-exact `EXTEND_REQUEST_V1`, then await/open
+`EXTENDED_V1` and retain one opaque client completion without publishing a
+successor. Only exact registered `TAIL_READY_V1` may atomically call lexical
+`createTailControlSessionFromOwnedMaterial`.
 
-Destroy, abort, expiry, authentication failure, or TAIL_READY rejection must:
-tombstone and consume manager cancellation; cancel endpoint-local timers;
-abort completion and destroy uncommitted next-tail state; revoke only the
-failed logical tail transport without closing the shared pinned-guard physical
-link; leave Task 9's transaction owner to abort reservation; then zeroize
-owned nonces, secrets, transcripts, advertisements, proofs, and semantic
-bytes.
+The one-shot RouteExtension transfer moves the ACTIVE successor session and
+its object-identical send/receive borrower. It must also move, not recreate,
+the same stable owner, armed `M3TailLifetime`, clock identity, wire/local
+deadlines, transcript, keys/nonces, and counters. The lifetime timer stays
+armed across `takeRouteExtensionTransfer`; no transfer/publication gap exists.
+Task 9 synchronously takes the transfer into its pre-created draft owner and
+calls `destroyTailControlSession` in `finally` on every pre-publication failure.
 
-Expected RED: provisional code accepts `now`, discovery service/query state,
-`selectedEvidenceExpiry`, endpoint dialing, or publishes a next tail before
-TAIL_READY.
+Destroy, abort, expiry, authentication failure, or READY rejection tombstones
+session/manager cancellation first, aborts client completion, destroys staged
+successor state, releases only the failed logical borrower/slot/charges, leaves
+the shared pinned-guard physical link open, leaves Task 9's transaction owner
+to abort directory reservation, and zeroizes all owned semantic/secret bytes.
+
+- [ ] **Step 10c: Run the focused GREEN proof**
+
+```bash
+$NODE node_modules/brittle/bin/node.js test/private/route-extension-session.js test/private/tail-control.js test/private/udx-cell-endpoint.js
+```
+
+Expected GREEN: selected evidence drives only authenticated current-tail IO,
+both receive reservations precede send, valid READY moves the original owner/
+lifetime/borrower without reset, invalid READY returns exact zero logical
+accounting, and no structural/dial/discovery authority is reachable.
+
+- [ ] **Step 11: Gate TAIL_READY and bridge the same owner into final-exit activation**
+
+- [ ] **Step 11a: Write the failing READY, handoff, claim, and cleanup tests**
+
+In `test/private/tail-control.js`,
+`test/private/final-exit-handoff.js`, and
+`test/private/final-exit-activation.js`, first add RED cases proving
+`sealTailReady(authority)` succeeds only after the successor owns the adopted
+runtime and can process authenticated control. It uses only its bound
+TAIL_READY signer/randomness, returns one owned exact M3 envelope, and moves
+`WAITING_READY -> ACTIVE`. Indices 0/1 may admit one extension; index 2 may
+only create final handoff. Before valid READY, no endpoint successor,
+application-send authority, activation owner, or directory commit exists.
+
+After index-2 readiness, `session.takeFinalExitHandoff()` must tombstone the
+session and move the same stable owner/lifetime to `FINAL_EXIT_HANDOFF`.
+The opaque one-shot handoff owns the exact 290-byte transcript, shared secret,
+finalize keys/nonces, initiator flag, wire expiry, local deadline, and clock
+identity; the M3 borrower/destructor remains inside the stable owner. It cannot
+cross processes or expose raw transport/physical destructor.
+
+Add claim create/revoke/replay, foreign handoff/owner, lifetime/callback/clock/
+deadline/generation mismatch, reentrant prepare, expiry between prepare and
+commit, commit failure, handoff revoke, and destruction initiated from either
+module. Every case must prove the same owner, lifetime, clock, deadline, and
+borrower move—never replacement state.
 
 Run:
 
 ```bash
-$NODE node_modules/brittle/bin/node.js test/private/route-extension-session.js
+$NODE node_modules/brittle/bin/node.js test/private/tail-control.js test/private/final-exit-handoff.js test/private/final-exit-activation.js
 ```
 
-- [ ] **Step 11: Gate TAIL_READY publication and the final-exit handoff**
+Expected RED: handoff consumption bypasses an activation claim, resets the
+lifetime/deadline, exposes transport/destructor, or either module can remain
+live after the other is destroyed.
 
-In `test/private/tail-control.js` and `test/private/final-exit-handoff.js`, add
-RED cases proving the successor calls `sealTailReady(authority)` only after it
-owns the adopted adjacency and can process authenticated control. The authority
-uses only its bound `tailReadySigner` and randomness, returns one owned exact M3
-context envelope, and moves `WAITING_READY -> ACTIVE`. Indices 0/1 may then
-admit one extension; index 2 may only create the terminal handoff.
+- [ ] **Step 11b: Implement the fixed final-activation ownership bridge**
 
-Only valid `TAIL_READY_V1` lets `completeClientExtension` return the next
-initiator `TailControlSession`. Before it, no endpoint application-send
-authority, final-exit activation, or directory commit exists.
+`final-exit-activation.js` alone issues activation capabilities:
 
-After index 2 readiness, `session.takeFinalExitHandoff()` returns one opaque
-same-runtime handoff containing the tail-control owner, exact 290-byte
-transcript, shared secret, finalize keys and nonce prefixes, initiator flag,
-authenticated `wireExpiresAt`, process-local `localDeadline`, and clock
-identity. `consumeFinalExitHandoff` moves it once into Task 7. Task 7 must
-present the same clock identity and reuse the moved deadline without projection
-or reset. Revoke, destroy, or expiry erases every field. The handoff cannot
-cross processes and exposes no destination table, DHT socket, endpoint tuple,
-or payload key bytes to intermediate relays.
+```js
+createFinalExitActivationClaim(handoff)
+claimFinalExitActivation(handoff, claim)
+revokeFinalExitActivationClaim(claim)
+destroyFinalExitActivationOwner(owner)
+reserveFinalExitActivationOwner(owner)
+consumeFinalExitActivationOwnerReservation(reservation, owner)
+revokeFinalExitActivationOwnerReservation(reservation)
+```
 
-Expected RED: provisional handoff carries only one ambiguous expiry, crosses a
-clock identity, activates before ready, or is reusable.
+Creation accepts only the opaque handoff identity, permits one live claim, and
+creates paired empty `FinalExitActivationClaim`/
+`FinalExitActivationOwner` WeakMap records. The claim starts UNBOUND and is
+one-shot. Neither capability contains a destructor, callback, handoff field,
+clock, key, or transport; neither is a package-entry export.
+
+Because `TAIL_CONTROL_OWNERS` remains lexical, claiming coordinates only
+through this fixed tail-control bridge:
+
+```js
+prepareTailControlFinalExitActivation(handoff, activationOwner)
+commitTailControlFinalExitActivation(transfer, activationOwner)
+revokeTailControlFinalExitActivation(transfer)
+destroyTailControlFinalExitActivation(tailControlOwner, activationOwner)
+```
+
+`claimFinalExitActivation` validates exact handoff/claim identity, spends the
+claim, detaches its paired owner, and calls prepare. Prepare requires the live
+handoff, `FINAL_EXIT_HANDOFF`, owner generation, object-identical lifetime and
+`ownerDestroy`, wire/local bounds, clock identity, and
+`monotonicNow() < localDeadline`. Before cross-module calls it removes the
+handoff slot, advances owner generation, sets a non-reentrant claiming flag,
+tombstones old consumers, and reserves the exact module-issued activation
+owner.
+
+Prepare consumes the one-shot handoff and returns only frozen
+`{ transfer, material }`. The empty transfer binds stable owner/generation,
+lifetime/callback, activation owner/reservation, claimed handoff, and rollback;
+material is the already-owned final-exit material, with no new timer,
+deadline, transport, key, or destructor.
+
+Claim installs material into its still-live paired owner, then commit rechecks
+all identities/deadline, consumes the reservation, removes claiming state, and
+moves the stable stage to `FINAL_EXIT_ACTIVATION` with that exact owner as sole
+consumer. Claim returns only the activation owner. Keep the existing lifetime
+timer armed; Task 7 reuses `localDeadline` and uses `wireExpiresAt` only for
+authenticated transcript comparison.
+
+- [ ] **Step 11c: Prove bidirectional destruction and READY vectors GREEN**
+
+Claim revoke destroys the unbound paired owner. Any post-take failure revokes
+the tail transfer/reservation and destroys the activation owner in `finally`.
+Both modules tombstone before cross-module cleanup. Lifetime/runtime teardown
+resolves only the current claim transfer or exact activation owner; activation
+destroy calls the fixed tail-control destructor with paired identities. Every
+path releases logical borrower/slot/charges once without shared physical close
+and zeroizes handoff/material.
 
 Run:
 
 ```bash
-$NODE node_modules/brittle/bin/node.js test/private/tail-control.js test/private/final-exit-handoff.js
+$NODE node_modules/brittle/bin/node.js test/private/tail-control.js test/private/final-exit-handoff.js test/private/final-exit-activation.js test/private/m3-adjacency-runtime.js
 ```
 
-- [ ] **Step 12: Prove guard → middle → DHT-exit routing and actor-local cleanup**
+Expected GREEN: exact TAIL_READY bytes/order remain frozen; only READY creates
+handoff; prepare/claim/commit move the original stable state with no timer gap;
+expiry/revoke/failure/reentry from either module leaves zero claim, transfer,
+owner, borrower charge, timer, or secret state.
 
-Create the real in-memory integration in `test/private/route-extension.js`.
-Feed Task 3 selected advertisement evidence into the endpoint's current tail.
-Assert the only post-pin semantic stages are:
+- [ ] **Step 12: Prove the full guard -> middle -> DHT-exit authority chain and cleanup**
+
+- [ ] **Step 12a: Write the failing real-transport integration**
+
+Create `test/private/route-extension.js` from the production owners. Feed Task
+3 selected evidence into the endpoint's authenticated current tail, and create
+every adjacency through real Task 5 OPEN-record issuer + lexical guard-link
+binding + registration + M3 adoption. No fake issuer, structural channel,
+transport factory, raw socket, or arbitrary destructor is allowed.
+
+Build guard -> middle, then middle -> DHT exit under independent actor clocks
+and fresh nonces. Assert the only post-pin semantic stages remain:
 
 ```text
 EXTEND_REQUEST_V1 -> LINK_OFFER/LINK_ACCEPT -> EXTENDED_V1 -> TAIL_READY_V1
 ```
 
-The current tail contacts exactly the tuple inside the authenticated
-advertisement. Keep an endpoint direct-send trap untouched. Add a semantic scan
-and runtime traps rejecting `RELAY_DISCOVER_V1`,
-`RELAY_DISCOVER_RESPONSE_V1`, random discovery targets, DNS, arbitrary
+The current tail contacts exactly the tuple in the authenticated advertisement;
+the endpoint direct-send trap remains untouched. Scan and trap
+`RELAY_DISCOVER_V1`, `RELAY_DISCOVER_RESPONSE_V1`, random targets, DNS,
 enumeration, and any Task 9 `BranchPathAuthority` dependency in
 `route-extension.js`, `tail-control.js`, or `guard-link.js`.
 
-Build guard→middle and then middle→DHT-exit with independent actor clocks and
-fresh one-shot nonces. Before valid TAIL_READY, relay contexts may carry only
-authenticated control; assert no endpoint next-tail/application-send
-authority, final-exit activation, or directory commit. Exercise same-counter
-tail replay, semantic EXTEND replay, exact lower-link cached duplicate,
-conflicting duplicate, wrong bindings/roles, malicious proof, expired
-advertisement, deadline races, dropped setup packet, cancellation, quota
-rejection, throwing/reentrant clocks and schedulers, observed transport close,
-and half-built second extension.
-
-Every pre-install failure leaves zero locally owned uncommitted timer, callback,
-capability, transport, replay cache, or secret immediately. Already-installed
-remote forwarding/adjacency state closes on observed transport/context close
-and in all cases by that actor's authenticated projected expiry. The endpoint
-retains only its pinned guard physical link where the Gate 3B1 design requires
-it; no failure bootstraps, discovers, dials, or races a fallback peer.
-
-Expected RED: any forbidden semantic trap fires, publication occurs before
-TAIL_READY, replay allocates a second adjacency, or a manual-clock advance past
-expiry leaves installed actor-local state.
+Before valid READY, staged relay contexts may carry only tail-control cells:
+assert no endpoint successor/application authority, activation owner, or
+directory commit. Then prove the same stable owner/lifetime/authenticated
+borrower survives both client extensions and the final-exit claim bridge, while
+relay forwarding publishes only through exact
+`{ transfer, publicationClaim }` -> lease -> publication receipt -> commit.
 
 Run:
 
 ```bash
-$NODE node_modules/brittle/bin/node.js test/private/route-extension.js test/private/guard-link.js test/private/tail-control.js
+$NODE node_modules/brittle/bin/node.js test/private/route-extension.js test/private/guard-link.js test/private/udx-cell-endpoint.js test/private/m3-adjacency-runtime.js test/private/tail-control.js test/private/final-exit-activation.js
 ```
+
+Expected RED: any production edge still accepts a structural/test transport,
+the two capability proofs are not joined, a deadline/timer/borrower is replaced,
+publication precedes READY/forwarding receipt/final claim commit, or a
+forbidden semantic trap fires.
+
+- [ ] **Step 12b: Add adversarial lifetime, accounting, and rollback coverage**
+
+Exercise wrong issuer/binding/record/tuple/peer/link epoch/M3 generation/
+circuit/direction/physical policy; same-counter tail replay; semantic EXTEND
+replay; exact lower-link cached duplicate and conflict; wrong roles/proofs;
+expired advertisement; dropped setup; cancellation; quota exhaustion;
+throwing/reentrant clocks, schedulers, cancellers, destructors, and runtime
+registry callbacks; never-settling dial quarantine; observed transport close;
+forwarding pair/lease/receipt failure; final-activation prepare/commit races;
+and a half-built second extension.
+
+At every boundary assert the universal local destruction order: tombstone live
+WeakMaps/owner generation first; tombstone transport/forwarding/final-activation
+records; capture and clear timers/borrower/secrets; cancel logical and
+subordinate timers; abort admission/completion; call only the package-private
+logical release or exact forwarding rollback; clear token/signer/factory/
+committer/claim state; then zeroize cells/envelopes/nonces/proofs/transcripts/
+keys/counters before `DESTROYED`.
+
+Assert Task 5's 64-packet/76,800-byte global and 8-packet/9,600-byte per-peer
+bounds, four/shared and one/non-shared borrower limits, two/one receive
+reservations, and every 1,200-byte receipt/envelope charge at every failure.
+Logical release preserves the shared pinned-guard physical link; GuardLease
+physical close invalidates every attached issuer/transfer/borrower before one
+close; non-shared teardown consumes only its moved physical owner.
+
+Installed remote forwarding/adjacency state closes on observed authenticated
+transport/context close and in all cases by that actor's projected expiry; do
+not claim impossible synchronous remote erasure. Endpoint failure retains only
+the pinned guard where specified and never bootstraps/discovers/dials/races a
+fallback.
+
+- [ ] **Step 12c: Run the focused integration GREEN**
+
+```bash
+$NODE node_modules/brittle/bin/node.js test/private/route-extension.js test/private/guard-link.js test/private/udx-cell-endpoint.js test/private/m3-adjacency-runtime.js test/private/tail-control.js test/private/tail-extension-committer.js test/private/final-exit-handoff.js test/private/final-exit-activation.js
+```
+
+Expected GREEN: the real registered UDX/M3 path carries the unchanged four
+semantic stages, record dispatch/accounting is exact, stable owner/lifetime/
+borrower transfer has no gap, forwarding and final activation commit through
+their paired capabilities, and every local failure leaves zero uncommitted
+timer/callback/capability/transport/cache/charge/secret immediately.
 
 - [ ] **Step 13: Audit registration and generate the final aggregate runner**
 
@@ -1887,9 +2396,13 @@ authorization gate.
 **Files:**
 
 - Create: `lib/private/final-exit.js`
-- Create: `lib/private/final-exit-activation.js`
+- Modify: `lib/private/final-exit-activation.js`
+- Create: `lib/private/open-route-handoff.js`
+- Modify: `lib/private/relay-identity-signer.js`
 - Create: `test/private/final-exit.js`
-- Create: `test/private/final-exit-activation.js`
+- Modify: `test/private/final-exit-activation.js`
+- Create: `test/private/open-route-handoff.js`
+- Modify: `test/private/relay-identity-signer.js`
 - Modify: `test/private-routing.js`
 - Regenerate: `test/all.js`
 - Modify: `docs/private-routing-migration.md`
@@ -1920,72 +2433,200 @@ admitted/payload parameter helpers with imports from `link-parameters.js` while
 proving the bytes remain identical. Keep all codecs strict, owned, bounded, and
 cleared. No seed or routed-DHT logic belongs in this file.
 
-- [ ] **Step 3: Add failing ACTIVATE/READY transition tests**
+- [ ] **Step 3: Add failing claim-owned ACTIVATE/READY transition tests**
 
-Construct `FinalExitActivationSession` only from
-`consumeFinalExitHandoff(handoff)` plus exact own options:
+Task 6 Step 11 must already have created the reviewed
+final-activation claim/owner bridge and its tests; if
+`lib/private/final-exit-activation.js` or
+`test/private/final-exit-activation.js` is absent, resume Task 6 at the stable
+TailControl owner/session prerequisite instead of starting Task 7. In
+`test/private/final-exit-activation.js`, obtain each actor's session only from
+its own claimed activation owner. Freeze two distinct exact own-data shapes.
+The endpoint initiator forbids a READY signer:
 
 ```js
-new FinalExitActivationSession(handoff, {
+const initiatorClaim = createFinalExitActivationClaim(initiatorHandoff)
+const initiatorOwner = claimFinalExitActivation(
+  initiatorHandoff,
+  initiatorClaim
+)
+const initiatorSession = new FinalExitActivationSession(initiatorOwner, {
   branchId,
   circuitId,
   generation,
   selectedExitAdvertisement,
-  absoluteDeadline,
-  signedExpiry,
-  now,
+  wallNow,
+  monotonicNow,
   randomBytes,
   schedule,
   cancelScheduled
 })
 ```
 
-`schedule(delay, callback)` returns one opaque timer handle and
-`cancelScheduled(handle)` consumes it once while guaranteeing the callback
-cannot run afterward. The session records every handle before leaving its
-scheduling mutation and cancels all handles before clearing protocol state.
+The responder DHT exit requires its relay-identity-owned, domain-limited
+READY signer:
 
-Test ACTIVATE→READY first with the endpoint's fresh X25519 ephemeral secret and
-the selected exit advertisement's route public key. Assert READY signature
-verification and every transcript equality check precedes availability of ACK.
-Substitute every identity/key/digest/nonce/branch/circuit/generation field and
-assert `ERR_AUTHENTICATION` with handoff material erased.
+```js
+const responderClaim = createFinalExitActivationClaim(responderHandoff)
+const responderOwner = claimFinalExitActivation(responderHandoff, responderClaim)
+const responderSession = new FinalExitActivationSession(responderOwner, {
+  branchId,
+  circuitId,
+  generation,
+  selectedExitAdvertisement,
+  readySigner,
+  wallNow,
+  monotonicNow,
+  randomBytes,
+  schedule,
+  cancelScheduled
+})
+```
 
-- [ ] **Step 4: Add failing ACK/OPEN publication and retry tests**
+Each activation owner already owns that actor's same TailControl owner,
+`M3TailLifetime`, authenticated borrower, `wireExpiresAt`, `localDeadline`, and
+clock identity. The responder-only `readySigner` is one-shot and bound by the
+relay identity owner to the exact exit identity, DHT_EXIT_READY message/domain,
+and 233-byte READY body. The responder activation owner owns signer cleanup on
+success, failure, expiry, and destroy. Neither actor receives a raw identity
+secret or arbitrary signing callback.
 
-Continue READY→ACK→OPEN. The exit enters OPEN only after ACK, and the endpoint
-publishes no terminal binding before valid OPEN. Local finalization expiry is
-`min(initialActivate + 5_000, absoluteDeadline, signedExpiry, handoffExpiry)`.
-Exact semantic send offsets from initial ACTIVATE are 0, 250, 750, 1,750, and
-3,750 ms, but sends after the effective inherited deadline are forbidden. Add
-the critical late-start case: ACTIVATE begins 3,500 ms after `GUARD_PINNED`, so
-the session gets only the remaining 1,500 ms rather than a fresh five seconds.
-Retries reuse semantic bytes under fresh datagram counters; duplicates receive
-only cached next responses; conflicts or expiry destroy. After OPEN, cached OPEN
-and receive-only tombstones live exactly 5,000 ms, capped by branch/session
-expiry, then retired contexts, keys, and semantic caches are erased.
+Reject `readySigner` as an extra key for the initiator; reject an omitted,
+foreign, replayed, spent, wrong-identity/domain/body signer for the responder.
+For both shapes reject direct `consumeFinalExitHandoff`, `absoluteDeadline`,
+`signedExpiry`, ambiguous `now`, alternate clocks, replacement timers/
+borrowers, raw handoff material, arbitrary destructors, and raw identity keys.
 
-Add revoke-during-retry, destroy-before-next-offset, suspend at 749 ms, and
-deadline-races-scheduled-callback tests. Each must show zero later send,
-callback, timer handle, or retained semantic bytes.
+`schedule(callback, delay)` returns one opaque handle and
+`cancelScheduled(handle)` consumes it once while preventing later callback.
+Protocol retry handles are subordinate to the activation owner; the existing
+M3 logical-lifetime timer remains armed and is never replaced or released.
 
-- [ ] **Step 5: Port `FinalExitActivationSession` and prove inner AEAD**
+Test ACTIVATE -> READY between the two actor-specific sessions using the
+endpoint's fresh X25519 secret, selected exit advertisement route key, and only
+the responder's domain-limited READY signer. READY signing/verification and
+every transcript equality must precede ACK availability; signer cleanup must
+follow the responder activation owner's tombstone-first path. Substitute each
+identity/key/digest/nonce/branch/circuit/generation/owner/lifetime/deadline
+binding and assert `ERR_AUTHENTICATION` after both actor-local activation/
+stable-owner cleanups and zeroization.
 
-Port prototype `lib/final-exit-activation.js`. Add a test that seals one routed
-payload with the derived terminal payload key, forwards it unchanged through
-guard/middle fixtures, and opens it only at the selected exit. Adjacent relays
-must fail to decrypt or substitute it. Session success returns one opaque
-terminal binding containing branch/circuit/generation/exit identity/expiry and
-role-scoped inner payload/control capabilities; it returns no key bytes.
+Run:
+
+```bash
+npx brittle-node test/private/final-exit.js test/private/final-exit-activation.js test/private/final-exit-handoff.js
+```
+
+Expected RED: the provisional constructor has one shared option shape, accepts
+`readySigner` on the initiator, accepts a responder without the exact signer,
+accepts handoff material directly, reprojects expiry, resets the monotonic
+budget, or is not bound to the exact actor-local activation/stable owner pair.
+
+- [ ] **Step 4: Add failing ACK/OPEN, retry, expiry, and owner-race tests**
+
+Continue READY -> ACK -> OPEN. The exit enters OPEN only after ACK; the endpoint
+publishes no terminal binding before valid OPEN. The finalization operation may
+use only `min(initialActivate + 5_000, moved localDeadline)` in this actor;
+`wireExpiresAt` is authenticated transcript comparison, not permission to
+project/reset the lifetime. Exact semantic offsets remain 0, 250, 750, 1,750,
+and 3,750 ms, but no send may cross the moved deadline.
+
+Add the late-start case: ACTIVATE at 3,500 ms after `GUARD_PINNED` retains only
+the 1,500 ms remaining in the already-armed branch lifetime. Retries reuse
+semantic bytes under fresh datagram counters; duplicates get only cached next
+responses; conflicts/expiry destroy. Cached OPEN and receive-only tombstones
+survive at most 5,000 ms after OPEN, capped by moved lifetime/wire bounds, then
+retired contexts, keys, and semantic caches erase.
+
+Add expiry before/after claim, between Task 6 prepare/commit, during each
+ACTIVATE/READY/ACK/OPEN stage, owner destroy from either module,
+revoke-during-retry, destroy-before-offset, suspend at 749 ms, synchronous
+timer firing, scheduling throw, cancel reentry, and deadline callback races.
+Each must leave zero later send, callback, activation claim/transfer/owner,
+borrower charge, timer handle, or secret; shared physical guard ownership stays
+outside this cleanup.
+
+Run:
+
+```bash
+npx brittle-node test/private/final-exit-activation.js test/private/tail-control.js test/private/m3-adjacency-runtime.js
+```
+
+Expected RED: any race publishes terminal state, disarms/replaces the stable
+lifetime timer, leaves either module live alone, or releases/closes the moved
+borrower/physical link incorrectly.
+
+- [ ] **Step 5: Implement activation on the moved owner and prove inner AEAD GREEN**
+
+Complete the prototype `FinalExitActivationSession` state machine in the Task
+6-owned `lib/private/final-exit-activation.js`; do not recreate its claim/
+owner bridge. Consume only the exact module-issued activation owner and
+revalidate its stable owner generation, lifetime/callback, clock identity, and
+deadline before/after each crypto, clock, scheduler, or send operation.
+
+Add `lib/private/open-route-handoff.js` as the package-private consumer,
+revocation, and destruction boundary for one terminal OPEN capability. Its
+Task 9-facing surface is exactly:
+
+```js
+consumeOpenRouteHandoff(handoff)
+revokeOpenRouteHandoff(handoff)
+destroyOpenRouteMaterial(material)
+```
+
+It exports no create/issue operation and accepts no activation owner plus
+arbitrary material. `final-exit-activation.js` lexically owns handoff issuance:
+only its authenticated OPEN transition may create/register one frozen empty
+`OpenRouteHandoff`, after all OPEN authentication, transcript equality,
+actor-role, activation/stable-owner, lifetime, borrower, clock, and deadline
+checks succeed. `FinalExitActivationSession.takeOpenHandoff()` may consume that
+already-proven OPEN state once and return the issued capability; no caller
+supplies material, owner, claim, callback, or destructor, and repeated take is
+tombstoned.
+
+The hidden handoff record binds the object-identical activation/stable owner,
+lifetime/callback, authenticated borrower, clocks/deadlines, branch/circuit/
+generation, exit identity, role-scoped inner payload/control material, the
+one-shot endpoint OPEN authority transfer slot, and rollback/expiry cleanup.
+`consumeOpenRouteHandoff` spends it once and returns only the exact terminal
+material, still-charged borrower/slot accounting, endpoint OPEN authority
+transfer, and an empty activation-owner transfer for Task 9's pre-created
+draft. Revoke takes the exact handoff—not an owner—and Task 9 may only consume,
+revoke, or destroy. Revoke, destroy, and failed consume tombstone before
+callbacks and release logical borrower/slot/charges once without shared
+physical close; successful consume transfers the live charge into the draft.
+
+Add RED cases proving no handoff exists before authenticated OPEN; invalid,
+substituted, expired, or wrong-role OPEN cannot issue; deep-imported
+`open-route-handoff.js` has no issuer; caller-provided owner/material is
+rejected; replayed take/consume/revoke is inert; and activation destruction
+reaches any issued-but-unconsumed handoff exactly once.
+
+Add a test that seals one routed payload with the derived terminal payload key,
+forwards it unchanged through guard/middle fixtures, and opens it only at the
+selected exit. Adjacent relays cannot decrypt/substitute it. Success publishes
+only the opaque terminal OPEN handoff; no key bytes, transport borrower,
+deadline owner, or destructor is returned to endpoint code.
+
+Run:
+
+```bash
+npx brittle-node test/private/final-exit.js test/private/final-exit-activation.js test/private/final-exit-handoff.js test/private/open-route-handoff.js test/private/relay-identity-signer.js test/private/tail-control.js
+```
+
+Expected GREEN: exact Task 7 vectors/KDFs/message order remain unchanged;
+claim-owned activation reuses the armed lifetime and borrower; valid OPEN alone
+creates the one-shot terminal OPEN handoff; every substitution/race cleans both
+modules and leaves zero logical accounting.
 
 - [ ] **Step 6: Run both runtimes and commit**
 
 ```bash
-npx brittle-node test/private/final-exit.js test/private/final-exit-activation.js
-bare node_modules/brittle/cmd.js test/private/final-exit.js test/private/final-exit-activation.js
+npx brittle-node test/private/final-exit.js test/private/final-exit-activation.js test/private/final-exit-handoff.js test/private/open-route-handoff.js test/private/relay-identity-signer.js
+bare node_modules/brittle/cmd.js test/private/final-exit.js test/private/final-exit-activation.js test/private/final-exit-handoff.js test/private/open-route-handoff.js test/private/relay-identity-signer.js
 npm run test:generate
 git diff --check
-git add lib/private/final-exit.js lib/private/final-exit-activation.js test/private/final-exit.js test/private/final-exit-activation.js test/private-routing.js test/all.js docs/private-routing-migration.md
+git add lib/private/final-exit.js lib/private/final-exit-activation.js lib/private/open-route-handoff.js lib/private/relay-identity-signer.js test/private/final-exit.js test/private/final-exit-activation.js test/private/open-route-handoff.js test/private/relay-identity-signer.js test/private-routing.js test/all.js docs/private-routing-migration.md
 git commit -m "feat: authenticate private DHT exits end to end"
 ```
 
@@ -2051,7 +2692,9 @@ git commit -m "feat: bound private relay forwarding"
 - Regenerate: `test/all.js`
 - Modify: `docs/private-routing-migration.md`
 
-- [ ] **Step 1: Add failing guard-lease ownership tests**
+- [ ] **Step 1: Prove GuardLease is the sole shared physical owner**
+
+- [ ] **Step 1a: Write the failing shared-link ownership and borrower-limit tests**
 
 Construct a lease only through:
 
@@ -2067,34 +2710,76 @@ const lease = createGuardLease({
 })
 ```
 
-`guardLossSink` is a frozen empty capability created by the future controller;
-an imported internal publisher records one sanitized event after lease state is
-already tombstoned and never invokes caller code synchronously.
+Use Task 5's real loopback-established `guardLeaseMaterial`. Add RED cases
+proving bootstrap pinning already consumed the hidden ownership token and
+branded the OPEN record `SHARED_GUARD` before returning that material.
+`createGuardLease` consumes and retains the already-branded established
+ownership but never brands, chooses, or mutates its policy; it becomes the only
+physical close owner.
+Each active lookup/announce build, and at most
+one unpublished replacement for each, obtains a distinct slot-reserving
+`M3CellLinkTransferIssuer` from that same OPEN record. A fifth issuer fails
+before allocation/callback.
 
-`guardLeaseMaterial` is the one-shot Task 5 object returned by
-`consumeBootstrapGuardPin`; `createGuardLease` atomically consumes it and binds
-its exact guard identity/tuple, advertisement digest/epoch/expiry, established
-adjacent link, socket owner, local-secret capability, and exact-tuple reconnect
-factory to the separately returned `pinnedGuard`. Any mismatch destroys both
-inputs. When `RouteManager` later receives the lease and candidate directory,
-it uses an imported internal equality check to require the directory's sealed
-guard scope to equal the lease; the lease does not own or enumerate directory
-records. The lease exposes only opaque manager
-capabilities consumed through module-internal `sendToGuard`,
-`suspendGuardLease`, and `destroyGuardLease`; it has no property methods
-returning material.
+Take each issuer through the lexical authenticated binding and registered
+transfer path. Shared M3 adoption must receive a logical borrower but no
+`physicalOwner`. Releasing one/all logical borrowers returns dispatch, receipt/
+envelope, packet/byte, and slot charges without emitting link close. Lease
+destroy/link loss first invalidates every issuer, unpublished transfer,
+reservation, receipt, and active branch borrower, then closes the physical
+record/socket exactly once.
+
+Run:
+
+```bash
+npx brittle-node test/private/guard-lease.js test/private/udx-cell-endpoint.js test/private/guard-link.js
+```
+
+Expected RED: GuardLeaseMaterial has no hidden shared brand, M3 receives shared
+physical close authority, more than four slots issue, logical release closes
+the guard, or physical close leaves a usable issuer/borrower.
+
+- [ ] **Step 1b: Implement exact pin, scope, suspend, and reconnect ownership**
+
+`guardLossSink` remains an empty controller-issued capability; its internal
+publisher records one sanitized event only after lease tombstone and never
+invokes caller code synchronously.
+
+Atomically consume `guardLeaseMaterial` and bind exact guard identity/tuple,
+advertisement digest/epoch/expiry, SHARED_GUARD established ownership, socket
+owner, local-secret capability, reconnect factory, and the separately returned
+`pinnedGuard`; mismatch destroys both. RouteManager later uses the imported
+internal equality check to match sealed directory scope. The lease neither owns
+nor enumerates directory records and exposes only opaque manager capabilities
+consumed through package-private `sendToGuard`, `suspendGuardLease`, and
+`destroyGuardLease`; no property returns material.
+
+The existing branch-build path asks the live lease to obtain the Task 5 issuer
+from its retained OPEN record for each exact active/replacement slot. Slot
+identity is tied to branch class/generation inside the issuer/authenticated
+binding join; callers never receive established ownership, tuple, policy, or
+physical close authority.
 
 `suspendGuardLease` first creates one `GuardReconnectAuthority` by moving the
-local-secret capability and zero-argument reconnect factory into it, then
-revokes the live guard send capability, closes the established link and socket
-owner, and returns the reconnect capability only after zero live socket/send
-state is confirmed. The candidate directory remains controller-owned and is
-sealed separately; it never enters the reconnect object. Reconnect success
-creates a fresh socket owner/link and resolves one fresh `GuardLeaseMaterial`
-for the exact same identity/tuple/digest/epoch/expiry. Failure destroys the
-fresh socket and returns no material. Test expiry, link loss, replacement
-attempt, network change, duplicate destroy, and zero state; guard substitution
-always returns `ERR_PRIVATE_GUARD_UNAVAILABLE` and never bootstraps another guard.
+local-secret capability and zero-argument reconnect factory, then revokes every
+issuer/borrower/send capability, closes the shared established link/socket, and
+returns reconnect only after zero live UDX/M3 registration or charge remains.
+The sealed directory stays controller-owned. Reconnect success creates a fresh
+socket/OPEN shared record and one fresh `GuardLeaseMaterial` for the exact same
+identity/tuple/digest/epoch/expiry; failure destroys it. Expiry, link loss,
+replacement attempt, network change, duplicate destroy, and guard substitution
+fail closed without bootstrapping another guard.
+
+- [ ] **Step 1c: Run the focused GREEN proof**
+
+```bash
+npx brittle-node test/private/guard-lease.js test/private/udx-cell-endpoint.js test/private/guard-link.js test/private/m3-adjacency-runtime.js
+```
+
+Expected GREEN: GuardLease alone retains shared physical ownership; exactly four
+logical slots cover active/replacement branches; logical cleanup is accounting-
+exact and non-closing; suspend/destroy invalidates every registration before one
+physical close and leaves zero socket/send/borrower/timer/secret state.
 
 - [ ] **Step 2: Add failing initial-pair construction tests**
 
@@ -2114,19 +2799,23 @@ validation receive that same deadline and may not reset it. Readiness is false
 until both branches reach terminal OPEN. Half-success destroys both branches
 and commits no directory reservation.
 
-- [ ] **Step 3: Freeze RouteManager's dependency capabilities**
+- [ ] **Step 3: Freeze dual-clock factories that move existing tail ownership**
 
-Create module-private factories before constructing the manager:
+- [ ] **Step 3a: Write the failing dependency-shape and ownership tests**
+
+In `test/private/route-manager.js`, freeze these module-private factories:
 
 ```js
 const extensionFactory = createRouteExtensionFactory({
-  now,
+  wallNow,
+  monotonicNow,
   randomBytes,
   schedule,
   cancelScheduled
 })
 const terminalFactory = createFinalExitActivationFactory({
-  now,
+  wallNow,
+  monotonicNow,
   randomBytes,
   schedule,
   cancelScheduled
@@ -2141,19 +2830,66 @@ const manager = createRouteManager({
 })
 ```
 
-Both factories are frozen empty WeakMap capabilities. `route-manager.js` calls
-only imported internal `openRouteExtension(factory, exactOptions)` and
-`openFinalExit(factory, exactOptions)`; callers cannot inject callbacks or
-replace protocol steps. The extension factory may create only exact selected
-in-route requests through the manager-owned current tail transport; the remote
-relay's own role socket owner creates the next adjacency. The terminal factory consumes only
-the second-tail `FinalExitHandoff` and inherited deadline.
+Both factories are empty frozen WeakMap capabilities and retain the exact same
+clock, callback-first scheduler, and canceller identities used by the
+GuardLease/current tail. Reject legacy `now`, alternate clocks, alternate
+scheduler/canceller pairs, structural transport/factory objects, caller
+callbacks, physical destructors, direct dial authority, and replacement owner/
+lifetime/borrower/deadline state.
 
-- [ ] **Step 4: Port path authority and implement transactional pair publication**
+`route-manager.js` may call only imported package-private
+`openRouteExtension(factory, exactOptions)` and
+`openFinalExit(factory, exactOptions)`. Extension opens an already-selected
+in-route request through the manager's current authenticated tail; remote relay
+ownership creates the next adjacency. Terminal open consumes the exact opaque
+index-2 `FinalExitHandoff`, internally creates and claims Task 6's
+final-activation owner, and drives Task 7 ACTIVATE/READY/ACK/OPEN under the
+same deadline/scheduler graph. Only `final-exit-activation.js` may lexically
+issue `OpenRouteHandoff` after authenticated OPEN; the manager receives that
+capability and may only synchronously consume it into the pre-created draft or
+revoke/destroy it. It never issues a handoff, supplies owner/material to an
+issuer, consumes raw handoff material/keys, or projects a fresh deadline.
 
-Port the narrowed selection/reservation pieces of prototype
-`lib/branch-path-authority.js` and `lib/route-manager.js`; do not port the
-compiled simulator or discovery path. Implement exact internal methods:
+Run:
+
+```bash
+npx brittle-node test/private/route-manager.js test/private/route-extension-session.js test/private/final-exit-activation.js
+```
+
+Expected RED: factories still accept ambiguous `now`, alternate schedulers, a
+structural transport/factory object, raw handoff material, or create a new
+timer/lifetime/borrower instead of moving Task 6 state.
+
+- [ ] **Step 3b: Implement the exact private factories and prove GREEN**
+
+Bind factory operations to the manager-owned branch draft, selected evidence,
+GuardLease branch slot, absolute construction deadline, exact stable
+TailControl owner/lifetime/borrower/clock identities, and object-identical
+callback-first scheduler/canceller pair. RouteExtension transfer is taken
+synchronously into the draft. Final activation consumes the exact index-2
+`FinalExitHandoff`; after authenticated OPEN,
+`final-exit-activation.js` lexically issues the terminal handoff and the manager
+synchronously consumes it into the draft. Factory cleanup is limited to
+`destroyTailControlSession`, `revokeOpenRouteHandoff`,
+`destroyOpenRouteMaterial`, or the exact final-activation owner destructor; it
+cannot create an OPEN handoff or close shared physical ownership.
+
+Run:
+
+```bash
+npx brittle-node test/private/route-manager.js test/private/route-extension-session.js test/private/final-exit-activation.js
+```
+
+Expected GREEN: both empty factories accept only the exact dual-clock graph,
+perform no discovery/dialing, and carry one stable owner/lifetime/borrower from
+the shared guard current tail through extension and terminal activation.
+
+- [ ] **Step 4: Port path selection and publish both complete ownership graphs transactionally**
+
+- [ ] **Step 4a: Write the failing pair-publication and rollback tests**
+
+Before implementation, add RED cases in `test/private/route-manager.js` and
+`test/private/guard-lease.js` around the exact internal methods:
 
 ```js
 manager.buildInitialPair()
@@ -2162,23 +2898,63 @@ manager.branchCapability(branchClass)
 manager.destroy()
 ```
 
-The manager reads the guard lease's owned guard-pinned monotonic timestamp;
-callers cannot supply or choose a later start. Initial publication is one
-synchronous mutation: reserve the directory's atomic pair; consume its selected
-evidence into two unobservable draft branches; build both extensions and
-terminal sessions concurrently under the same deadline; verify both OPEN;
-commit the directory reservation; install both branch slots; mark the pair
-ready; only then permit branch-capability issuance. Before commit, any failure
-aborts the directory reservation and destroys both drafts. After directory
-commit, any impossible publication failure destroys both committed generations
-and enters unavailable; it never retries that generation.
+For each lookup/announce draft, prove the manager synchronously takes every
+RouteExtension transfer and consumes the terminal `OpenRouteHandoff` that
+`final-exit-activation.js` issued only after authenticated OPEN. The
+object-identical stable owner, armed lifetime, authenticated borrower, clock
+identity, and non-increasing deadlines survive both extensions and OPEN.
+No draft may issue/synthesize an OPEN handoff, transport, timer, lifetime,
+borrower, final claim, arbitrary owner/material pair, or physical owner. Before
+consume it may only revoke the exact handoff; after consume it may only destroy
+the returned material. Assert shared GuardLease slots remain charged from Task
+5 issuer through draft rollback or final branch destruction.
 
-Capabilities are frozen empty objects backed by WeakMaps and expose no path
-array or address. `branchCapability` becomes issuable only after adjacent links
-and terminal OPEN are complete. Module-internal consumers return only route
-payload/control send authority and owned branch/circuit/generation/expiry/exit
-identity metadata. Revocation removes the capability from its WeakMap before
-closing transport so reentrant sends fail.
+Run:
+
+```bash
+npx brittle-node test/private/route-manager.js test/private/guard-lease.js test/private/route-extension-session.js test/private/final-exit-activation.js
+```
+
+Expected RED: a draft publishes after structural readiness, resets state between
+extension/final activation, commits one branch alone, releases the shared slot
+early, or leaks one owner on pair failure.
+
+- [ ] **Step 4b: Implement one synchronous pair publication boundary**
+
+Port only narrowed selection/reservation from prototype
+`branch-path-authority.js`/`route-manager.js`; exclude simulator/discovery.
+Read the guard-pinned timestamp from GuardLease—callers cannot choose a later
+start. Reserve the atomic directory pair; consume selected evidence into two
+unobservable drafts; obtain exact shared-guard issuers/registered borrowers;
+build both extensions and final activations concurrently under the same
+deadline; verify both terminal OPEN; then in one synchronous mutation commit
+directory reservation, install both fully owned branch slots, and mark ready.
+Only afterward may `branchCapability` issue.
+
+Before commit, any failure aborts the directory transaction and destroys both
+draft activation/session owners in `finally`, causing each stable owner to
+release its logical borrower/dispatch/slot/charges once without closing the
+shared guard. After directory commit, impossible publication failure destroys
+both committed generations and enters unavailable; never retry that generation
+or leave one branch published.
+
+Branch capabilities are empty WeakMap objects exposing no path, address,
+borrower, lifetime, timer, or physical close authority. Internal consumers get
+only route payload/control authority and owned branch/circuit/generation/
+expiry/exit metadata. Revocation tombstones capability and stable branch owner
+before transport callbacks, then releases logical borrower accounting.
+
+- [ ] **Step 4c: Run the focused transactional GREEN proof**
+
+```bash
+npx brittle-node test/private/route-manager.js test/private/guard-lease.js test/private/branch-path-authority.js test/private/route-extension-session.js test/private/final-exit-activation.js test/private/udx-cell-endpoint.js
+```
+
+Expected GREEN: pair publication occurs only after both exact ownership graphs
+reach OPEN; no owner/lifetime/borrower/clock/deadline is recreated; half-success
+returns both branch-build logical slots/charges while preserving the guard
+physical link; committed revocation tombstones before callback and leaves no
+usable branch authority.
 
 - [ ] **Step 5: Add failing make-before-break rotation tests**
 
@@ -2314,9 +3090,11 @@ git commit -m "feat: freeze private DHT exit seeds"
 - Create: `lib/private/dht-exit-io.js`
 - Modify: `lib/private/final-exit.js`
 - Modify: `lib/private/final-exit-activation.js`
+- Modify: `lib/private/open-route-handoff.js`
 - Create: `test/private/dht-exit-wire.js`
 - Create: `test/private/dht-exit-reservation.js`
 - Create: `test/private/dht-exit-io.js`
+- Modify: `test/private/open-route-handoff.js`
 - Modify: `test/private-routing.js`
 - Regenerate: `test/all.js`
 - Modify: `docs/private-routing-migration.md`
@@ -2363,6 +3141,12 @@ removed finalization send authority, and installed the 5,000 ms retired-context
 tombstone. Cross-side, duplicate, pre-ACK, conflicting-transcript, and expired
 takes fail and destroy the narrow session. Tests derive both from one live
 transcript and prove every field substitution prevents later seed acceptance.
+Production never exposes the endpoint session or a direct take path: Task 9's
+terminal factory receives the endpoint-side capability only as the opaque
+endpoint OPEN authority transfer moved through `OpenRouteHandoff` into the
+branch draft. This step updates `open-route-handoff.js` and its tests so
+successful handoff consume preserves that one-shot authority while revoke,
+destroy, failed consume, or draft rollback spends it before callbacks.
 
 Create a reservation channel only by consuming the exit-side authority:
 
@@ -2420,11 +3204,11 @@ waits native sends, closes the socket, and clears codec state.
 - [ ] **Step 3: Run fake/native packet tests and commit**
 
 ```bash
-npx brittle-node test/private/dht-exit-wire.js test/private/dht-exit-reservation.js test/private/dht-exit-io.js
-bare node_modules/brittle/cmd.js test/private/dht-exit-wire.js test/private/dht-exit-reservation.js test/private/dht-exit-io.js
+npx brittle-node test/private/dht-exit-wire.js test/private/dht-exit-reservation.js test/private/dht-exit-io.js test/private/open-route-handoff.js
+bare node_modules/brittle/cmd.js test/private/dht-exit-wire.js test/private/dht-exit-reservation.js test/private/dht-exit-io.js test/private/open-route-handoff.js
 npm run test:generate
 git diff --check
-git add lib/private/dht-exit-wire.js lib/private/dht-exit-reservation.js lib/private/dht-exit-io.js lib/private/final-exit.js lib/private/final-exit-activation.js test/private/dht-exit-wire.js test/private/dht-exit-reservation.js test/private/dht-exit-io.js test/private-routing.js test/all.js docs/private-routing-migration.md
+git add lib/private/dht-exit-wire.js lib/private/dht-exit-reservation.js lib/private/dht-exit-io.js lib/private/final-exit.js lib/private/final-exit-activation.js lib/private/open-route-handoff.js test/private/dht-exit-wire.js test/private/dht-exit-reservation.js test/private/dht-exit-io.js test/private/open-route-handoff.js test/private-routing.js test/all.js docs/private-routing-migration.md
 git commit -m "feat: own private DHT exit packet IO"
 ```
 
