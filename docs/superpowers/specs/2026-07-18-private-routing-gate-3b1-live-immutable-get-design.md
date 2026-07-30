@@ -1,6 +1,6 @@
 # HyperDHT Private Routing Gate 3B1: Live Routed Immutable Get
 
-**Status:** Approved design draft
+**Status:** Approved design draft. The owner-approved Task 5 authenticated-M3 transport amendment incorporated on 2026-07-29 awaits owner review of this written repository revision.
 
 **Date:** 2026-07-18
 
@@ -403,6 +403,163 @@ replay, wrong direction, wrong branch, wrong generation, counter exhaustion,
 expiry, or liveness failure closes the link and notifies dependent circuits.
 No caller can use the link to send to an arbitrary tuple.
 
+Task 5 additionally owns the authenticated production bridge from an OPEN UDX
+established-link reservation into M3. It is a two-capability join; neither the
+UDX record nor authenticated guard-link transcript can authorize a transfer
+alone.
+
+When `udx-cell-endpoint.js` marks an established record OPEN, it also records
+whether physical ownership is `SHARED_GUARD` or `NON_SHARED_RELAY`. That value
+comes only from the hidden established-ownership brand: bootstrap pinning
+consumes the exact GuardLease ownership token and brands the record
+`SHARED_GUARD`; the one-shot extension setup owner brands its record
+`NON_SHARED_RELAY`. No caller supplies or changes an enum/policy value.
+`takeM3CellLinkTransferIssuer(establishedLink)`
+checks the exact live OPEN ownership material and policy, reserves one logical
+borrower slot and tentative registration charge before allocation or callbacks,
+and returns one frozen empty `M3CellLinkTransferIssuer`. Its WeakMap record
+binds the endpoint record, established send handle, topology link handle, peer
+identity and canonical tuple, current link-control wire epoch and circuit ID,
+physical policy, slot identity, and issuer generation. The issuer contains no
+tuple, socket, endpoint, method, handle, branch field, or policy field.
+
+`extension-setup-channel.js` linearly moves that issuer with the established
+link ownership; it never exposes it to endpoint code. For a shared guard,
+`GuardLease` retains the established ownership and obtains one issuer for each
+active or unpublished replacement branch. For a non-shared extension,
+the setup channel moves the sole issuer to `guard-link.js`.
+
+Only after LINK_OFFER/LINK_ACCEPT, advertisement, proof, transcript, peer, and
+cell-context authentication succeeds does a lexical, non-exported guard-link
+issuer create one frozen empty `M3AuthenticatedBranchBinding`. Its WeakMap
+record binds the exact transfer issuer identity, authenticated setup-channel
+and topology-link identities, branch/circuit/generation/extension index,
+local/peer M3 cell IDs and complementary directions, initiator role,
+local/peer identities and advertisement digests, admitted deadline, and
+required physical policy. The guard-link package-private consumer surface is:
+
+```js
+takeM3AuthenticatedBranchBinding(binding, transferIssuer)
+revokeM3AuthenticatedBranchBinding(binding)
+```
+
+`registerM3CellLinkTransfer(transferIssuer, authenticatedBinding)` first
+tombstones both one-shot capabilities and then consumes the binding through
+`takeM3AuthenticatedBranchBinding` using the exact issuer identity. It compares
+the returned hidden values with the issuer's still-OPEN endpoint record:
+endpoint/send/topology/setup identities, canonical tuple and peer identity,
+link-control wire epoch/circuit provenance, authenticated local/peer
+identities, branch/circuit/generation/extension index, M3 cell IDs/directions,
+and the record-owned physical policy must all match. It also proves the M3
+dispatch key is not the LinkControlSession circuit and is unique across active
+and pending registrations. Only then does it replace the tentative charge with
+one frozen empty `M3CellLinkTransfer` bound to the complete joined record.
+
+One shared pinned-guard established record permits at most four simultaneous
+logical slots: lookup and announce plus at most one unpublished replacement
+for each branch. A non-shared relay adjacency permits exactly one. A slot is
+charged from issuer take through transfer revoke or borrower release; failed
+registration never permits another callback before rollback.
+
+The exact package-private UDX surface is:
+
+```js
+takeM3CellLinkTransferIssuer(establishedLink)
+registerM3CellLinkTransfer(transferIssuer, authenticatedBinding)
+revokeM3CellLinkTransferIssuer(transferIssuer)
+takeM3CellLinkTransfer(transfer)
+revokeM3CellLinkTransfer(transfer)
+reserveM3CellSend(borrower)
+commitM3CellSend(reservation, cell1200)
+abortM3CellSend(reservation)
+reserveM3CellReceive(borrower)
+takeM3CellReceipt(borrower, receipt)
+releaseM3CellReceipt(borrower, receipt)
+releaseM3CellBorrower(borrower)
+destroyM3PhysicalLinkOwner(owner)
+```
+
+`revokeM3CellLinkTransferIssuer` tombstones an unregistered issuer, removes its
+tentative key/charge, and releases its slot. Registration failure or reentry
+revokes/tombstones the binding, issuer, and any unpublished transfer; removes
+the tentative dispatch entry; releases the slot and every packet/byte charge;
+and clears copied identities before returning an error. `revokeM3CellLinkTransfer`
+does the same after successful registration but before take. These rollback
+paths never close the physical link. Repeated revoke/take is replay or an
+idempotent cleanup no-op as appropriate; no slot can be released twice.
+
+Taking the transfer returns an opaque logical `borrower`. For a non-shared
+relay adjacency it also moves one opaque `physicalOwner` into the M3 runtime.
+For either shared pinned-guard branch, physical ownership remains solely in
+`GuardLease`; its M3 runtimes receive no close authority. A borrower can
+send/receive only exact 1,200-byte M3 cells on its hidden joined registration.
+`releaseM3CellBorrower` unregisters that logical consumer, rejects pending
+work, clears accounted cells, and releases its slot. It never emits
+`UDX_LINK_CLOSE`, closes a socket, destroys the endpoint, or spends a physical
+owner. GuardLease physical close first invalidates every issuer, transfer, and
+branch borrower on its established record, then closes once. Non-shared
+runtime teardown can consume only its exact moved `physicalOwner`.
+
+`M3AdjacencyAuthority.adopt` consumes the registered transfer and rechecks its
+joined endpoint/link/setup and branch identities against the exact adopted
+runtime, including circuit, generation, cell IDs/directions, peers, link epoch
+provenance, and physical policy. Demultiplex registration keys remain unique
+across both active shared-guard branches and every pending replacement.
+
+Every OPEN established UDX record owns one private dispatch map keyed by the
+exact M3 clear-header `{ epoch, circuitId, direction }`. For this map, `epoch`
+is exactly the authenticated M3 branch/runtime `generation` encoded as the
+wire u64 at offset 4; it is not the established LinkControlSession wire epoch.
+`circuitId` is the 16-byte M3 value at offset 12. The established-link epoch
+remains separate endpoint-record provenance and must still equal the current
+OPEN record during issuer registration, transfer take, and M3 adoption. Thus
+both epochs are checked in their own domains and are never substituted.
+
+One dispatch entry belongs to one hidden borrower/runtime binding and holds its
+bounded FIFO of opaque one-shot receive reservations.
+`reserveM3CellReceive(borrower)` synchronously appends to that existing entry;
+callers cannot supply a key, binding, handler, or callback. Entry creation
+derives the key from the joined hidden binding, permanently excludes the
+established record's LinkControlSession circuit ID from M3 registration, and
+rejects a second borrower or conflicting binding for the same key.
+An initiator borrower can hold two ordered reservations under its
+single key; a responder can hold one. Each reservation returns a Promise for
+one opaque receipt. There is no free-running packet queue and a packet without
+an exact reservation is dropped before copy.
+
+At the existing UDX `receive` entry, before `receiveEstablished` or any codec
+`open`, the endpoint parses only the fixed 36-byte clear header without
+allocation. A packet whose circuit ID equals the record's link-control circuit
+ID follows the existing LinkControlSession path. An exact registered M3 key
+atomically consumes and resolves exactly one reservation with an opaque
+`M3CellReceipt` retaining the still-accounted 1,200-byte packet. Unknown,
+conflicting, malformed, wrong-class, and unregistered keys are dropped and
+cleared without entering either decoder or closing the physical link.
+`takeM3CellReceipt` verifies exact borrower/receipt identity and moves the
+packet to M3 `openTail` exactly once. Tag, class, circuit, epoch, or counter
+failure destroys only that logical owner. `releaseM3CellReceipt` returns UDX
+accounting in `finally`. Borrower release tombstones every reservation before
+settlement, rejects pending Promises, clears receipts and packets, releases
+every charge, and cannot affect another branch.
+
+The endpoint initiator reserves at most two receives per extension; the
+responder holds one EXTEND receive reservation and renews it only after the
+prior request settles. Every asynchronous settlement rechecks reservation,
+receipt, borrower/runtime generation, and deadline. Existing UDX limits remain
+64 packets/76,800 bytes globally and 8 packets/9,600 bytes per peer. The M3
+layer additionally enforces the four-borrower shared-guard limit, one-borrower
+non-shared limit, two initiator reservations, one responder reservation, and
+full 1,200-byte receipt/envelope charges, leaving no unaccounted bytes or
+registrations.
+
+This Task 5 amendment changes no wire bytes and exposes no public API. One exact
+1,101-byte M3 context envelope still fits the existing 1,146-byte cell payload
+and produces one 1,200-byte CONTROL cell. If this UDX-issued,
+record-authenticated transfer and dispatch contract cannot be implemented
+exactly, Task 6 remains blocked; a structural object, arbitrary callback, raw
+socket, physical destructor, direct dial, or test-only issuer is not a
+substitute.
+
 ### `RelayService`
 
 Owns opaque adjacent forwarding state. A relay installs only previous-hop and
@@ -774,6 +931,23 @@ Node and Bare run identical focused suites for:
 - branch diversity, independent generations, the global construction deadline,
   rotation, and teardown;
 - adjacent authentication, tuple binding, replay, liveness, and counters;
+- real Node and Bare UDX loopback exercises OPEN-record issuer take, lexical
+  guard-link authenticated-binding issue, two-capability registration,
+  transfer take, exact 1,200-byte send/receive, and logical release with no test
+  issuer; wrong issuer/binding identity, endpoint/link/setup/tuple/peer,
+  physical policy, M3 generation/circuit/cell direction, and replay fail;
+- revoke and every registration failure release the pre-reserved slot,
+  tentative dispatch key, packet/byte charges, and copied binding exactly once
+  without physical close;
+- exact `{ epoch, circuitId, direction }` demultiplexing uses M3 generation at
+  offset 4 while separately checking established-link epoch provenance,
+  permanently excludes the LinkControlSession circuit, keeps
+  active/replacement registrations unique, enforces ordered two-receive
+  initiator and one-receive responder limits, drops unknown keys before copy,
+  retains full-cell receipt/envelope charges, and releases exact accounting;
+- four-borrower shared-guard and one-borrower non-shared limits, slot accounting
+  from issue through release, physical-link preservation after logical release,
+  GuardLease close invalidation, and non-shared physical-owner destruction;
 - terminal exit identity/key/transcript substitution, finalization retries,
   OPEN gating, inner AEAD, and retired-context erasure;
 - relay quotas, fair queueing, expiry, cancellation, and tombstones;
