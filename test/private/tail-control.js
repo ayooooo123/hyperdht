@@ -36,6 +36,7 @@ const {
   decodeRelayCapabilityAdvertisement
 } = require('../../lib/private/relay-capability')
 const { encodeM3ContextEnvelope } = require('../../lib/private/m3-context')
+const { createExtensionLinkCompletion } = require('../../lib/private/extension-link-completion')
 const {
   EXTENDED_SIZE,
   EXTEND_REQUEST_MAX_SIZE,
@@ -48,9 +49,11 @@ const {
   createTailControlSession,
   decodeExtendRequest,
   decodeExtended,
+  decodeTailReady,
   destroyTailControlResponderAuthority,
   destroyTailControlSession,
   digestAdmittedLimits,
+  deriveTailControlTestVector,
   encodeExtendRequest,
   encodeExtended,
   encodeTailControlTranscript,
@@ -59,6 +62,13 @@ const {
   sealTailReady,
   takeAdmittedExtendRequest
 } = require('../../lib/private/tail-control')
+const { signRedactedResponderProof } = require('../../lib/private/redacted-responder-proof')
+const { consumeFinalExitHandoff } = require('../../lib/private/final-exit-handoff')
+const {
+  claimFinalExitActivation,
+  createFinalExitActivationClaim,
+  destroyFinalExitActivationOwner
+} = require('../../lib/private/final-exit-activation')
 
 const TEST_ONLY_M3_ESTABLISHED_ISSUER = Symbol.for(
   'hyperdht-private-routes/test-only-m3-established-issuer'
@@ -66,6 +76,75 @@ const TEST_ONLY_M3_ESTABLISHED_ISSUER = Symbol.for(
 const OFFER_DIGEST = b4a.from(Array.from({ length: 32 }, (_, index) => index))
 function seed(byte, size = 32) {
   return b4a.alloc(size, byte)
+}
+
+function errorCode(operation) {
+  try {
+    operation()
+  } catch (err) {
+    return err && err.code
+  }
+  return null
+}
+
+function writeUint16(target, value, offset) {
+  target[offset] = value >>> 8
+  target[offset + 1] = value
+}
+
+function writeUint32(target, value, offset) {
+  target[offset] = value >>> 24
+  target[offset + 1] = value >>> 16
+  target[offset + 2] = value >>> 8
+  target[offset + 3] = value
+}
+
+function writeUint64(target, value, offset) {
+  for (let index = 7; index >= 0; index--) {
+    target[offset + index] = Number(value & 0xffn)
+    value >>= 8n
+  }
+}
+
+const TAIL_READY_DOMAIN = b4a.from('hyperdht-private-routes/m3/tail-ready/v1')
+const TAIL_READY_TRANSCRIPT_DOMAIN = b4a.from(
+  'hyperdht-private-routes/m3/tail-control/transcript-digest/v1'
+)
+
+function signatureInput(domain, messageId, body) {
+  const input = b4a.alloc(10 + domain.byteLength + body.byteLength)
+  writeUint16(input, domain.byteLength, 0)
+  input.set(domain, 2)
+  writeUint32(input, 1, 2 + domain.byteLength)
+  writeUint16(input, messageId, 6 + domain.byteLength)
+  writeUint16(input, body.byteLength, 8 + domain.byteLength)
+  input.set(body, 10 + domain.byteLength)
+  return input
+}
+
+function tailReadyTranscriptDigest(transcript) {
+  return cryptoSuite.hash([TAIL_READY_TRANSCRIPT_DOMAIN, transcript])
+}
+
+function encodeTailReadyFor(extended, request, signer, overrides = {}) {
+  const body = b4a.alloc(210)
+  body[0] = extended.branchClass
+  body.set(extended.branchId, 1)
+  body.set(extended.circuitId, 17)
+  writeUint64(body, extended.generation, 33)
+  body[41] = extended.extensionIndex
+  body.set(overrides.transcriptDigest, 42)
+  body.set(signer.publicKey, 74)
+  body.set(extended.responderAdvertisementDigest, 106)
+  body.set(overrides.clientNonce || request.clientNonce, 138)
+  body.set(overrides.readyNonce || seed(0xa3), 170)
+  writeUint64(body, overrides.expiresAtMs, 202)
+  const input = signatureInput(TAIL_READY_DOMAIN, M3_MESSAGE_ID.TAIL_READY_V1, body)
+  return encodeM3Object({
+    messageId: M3_MESSAGE_ID.TAIL_READY_V1,
+    body,
+    authSuffix: overrides.signature || cryptoSuite.sign(input, signer.secretKey)
+  })
 }
 
 function fakeClock({ wall = 1_000n, monotonic = 10_000n } = {}) {
@@ -79,6 +158,9 @@ function fakeClock({ wall = 1_000n, monotonic = 10_000n } = {}) {
     },
     monotonicNow() {
       return currentMonotonic
+    },
+    advanceWall(wall) {
+      currentWall = wall
     },
     schedule(callback, delay) {
       const handle = ++nextHandle
@@ -153,17 +235,18 @@ function channel() {
 function channelPair() {
   const left = []
   const right = []
-  const make = (inbox, outbox) => Object.freeze({
-    send(packet) {
-      outbox.push(b4a.from(packet))
-      return true
-    },
-    receive() {
-      if (inbox.length === 0) throw new Error('empty inbox')
-      return inbox.shift()
-    },
-    destroy() {}
-  })
+  const make = (inbox, outbox) =>
+    Object.freeze({
+      send(packet) {
+        outbox.push(b4a.from(packet))
+        return true
+      },
+      receive() {
+        if (inbox.length === 0) throw new Error('empty inbox')
+        return inbox.shift()
+      },
+      destroy() {}
+    })
   return [make(left, right), make(right, left)]
 }
 
@@ -206,43 +289,42 @@ function syntheticLink(overrides = {}) {
     branchId: seed(0x41, 16),
     circuitId: seed(0x42, 16),
     generation: 7n,
-    extensionIndex: overrides.extensionIndex === undefined ? (initiator ? 2 : 1) : overrides.extensionIndex,
+    extensionIndex:
+      overrides.extensionIndex === undefined ? (initiator ? 2 : 1) : overrides.extensionIndex,
     localIdentity: seed(0x51),
     peerIdentity: seed(0x52),
     expiresAt: overrides.wireExpiresAt === undefined ? 10_000n : overrides.wireExpiresAt,
     contexts: contexts(initiator),
     physicalChannel: overrides.physicalChannel || channel(),
-    clientTailEphemeralSecretKey: initiator ? (overrides.clientTailEphemeralSecretKey || seed(0x63)) : null,
+    clientTailEphemeralSecretKey: initiator
+      ? overrides.clientTailEphemeralSecretKey || seed(0x63)
+      : null,
     tailControlTranscript: overrides.tailControlTranscript || seed(0x64, 290)
   }
   return guardLinks[TEST_ONLY_M3_ESTABLISHED_ISSUER].issue(state)
 }
 
-function initiatorSealLink(signedAdvertisement, requestedLimits, overrides = {}) {
-  const currentAdvertisement = overrides.currentAdvertisement || signedAdvertisement
+function initiatorTailControlTranscript(
+  currentAdvertisement,
+  requestedLimits,
+  currentTailPair = cryptoSuite.encryptionKeyPair(seed(0x61))
+) {
   const decoded = decodeRelayCapabilityAdvertisement(currentAdvertisement)
   const advertisementDigest = digestRelayCapabilityAdvertisement(currentAdvertisement)
   const admittedLimitsDigest = digestAdmittedLimits(requestedLimits)
-  const currentTailPair = cryptoSuite.encryptionKeyPair(seed(0x61))
   try {
-    return syntheticLink({
-      ...overrides,
-      initiator: true,
+    return encodeTailControlTranscript({
+      branchClass: BRANCH_CLASS.LOOKUP,
+      branchId: seed(0x41, 16),
+      circuitId: seed(0x42, 16),
+      generation: 7n,
       extensionIndex: 1,
-      clientTailEphemeralSecretKey: currentTailPair.secretKey,
-      tailControlTranscript: encodeTailControlTranscript({
-        branchClass: BRANCH_CLASS.LOOKUP,
-        branchId: seed(0x41, 16),
-        circuitId: seed(0x42, 16),
-        generation: 7n,
-        extensionIndex: 1,
-        clientTailEphemeralPublicKey: currentTailPair.publicKey,
-        advertisedTailRouteEncryptionPublicKey: decoded.routeEncryptionPublicKey,
-        candidateAdvertisementDigest: advertisementDigest,
-        clientNonce: seed(0x62),
-        tailIdentity: decoded.relayIdentity,
-        admittedLimitsDigest
-      })
+      clientTailEphemeralPublicKey: currentTailPair.publicKey,
+      advertisedTailRouteEncryptionPublicKey: decoded.routeEncryptionPublicKey,
+      candidateAdvertisementDigest: advertisementDigest,
+      clientNonce: seed(0x62),
+      tailIdentity: decoded.relayIdentity,
+      admittedLimitsDigest
     })
   } finally {
     b4a.fill(advertisementDigest, 0)
@@ -250,6 +332,22 @@ function initiatorSealLink(signedAdvertisement, requestedLimits, overrides = {})
     b4a.fill(decoded.relayIdentity, 0)
     b4a.fill(decoded.routeEncryptionPublicKey, 0)
   }
+}
+
+function initiatorSealLink(signedAdvertisement, requestedLimits, overrides = {}) {
+  const currentAdvertisement = overrides.currentAdvertisement || signedAdvertisement
+  const currentTailPair = cryptoSuite.encryptionKeyPair(seed(0x61))
+  return syntheticLink({
+    ...overrides,
+    initiator: true,
+    extensionIndex: 1,
+    clientTailEphemeralSecretKey: currentTailPair.secretKey,
+    tailControlTranscript: initiatorTailControlTranscript(
+      currentAdvertisement,
+      requestedLimits,
+      currentTailPair
+    )
+  })
 }
 
 function responderSealLink(signedAdvertisement, requestedLimits, overrides = {}) {
@@ -373,15 +471,114 @@ test('TailControlSession consumes one M3 tail into a five-method stable owner', 
   t.alike(Object.keys(transport).sort(), ['receive', 'send'])
   t.is(Object.isFrozen(transport), true)
   t.is(borrowTailControlTransport(session), transport)
-  t.exception(() =>
-    createTailControlSession(adopted.tail, tailSessionOptions(clock))
-  )
+  t.exception(() => createTailControlSession(adopted.tail, tailSessionOptions(clock)))
   t.is(revokeM3TailCapability(adopted.tail), false)
   t.exception(() => borrowTailControlTransport(Object.freeze({})))
   t.is(clock.pending(), 2, 'TailControl arms one independent logical lifetime')
   t.is(destroyTailControlSession(session), true)
   t.is(destroyTailControlSession(session), false)
   t.is(clock.pending(), 1, 'destroy cancels only the TailControl lifetime')
+})
+
+test('TailControl transport destroy rejects a pending registered M3 receive', async (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const physicalChannel = Object.freeze({
+    send() {
+      return true
+    },
+    receive() {
+      return new Promise(() => {})
+    },
+    destroy() {}
+  })
+  const adopted = owner.adopt(syntheticLink({ physicalChannel, wireExpiresAt: 1_250n }))
+  const session = createTailControlSession(adopted.tail, tailSessionOptions(clock))
+  const pending = borrowTailControlTransport(session).receive()
+  await Promise.resolve()
+  t.is(destroyTailControlSession(session), true)
+  let code = null
+  try {
+    await pending
+  } catch (err) {
+    code = err && err.code
+  } finally {
+    adopted.runtime.destroy()
+  }
+  t.is(code, 'ERR_DESTROYED', 'logical release rejects the pending receive waiter')
+  t.is(clock.pending(), 0, 'runtime and TailControl timers are cleared')
+})
+
+test('TailControl receive resolves buffered ordered envelopes to existing waiters', async (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const outbound = []
+  const inbound = []
+  const initiatorChannel = Object.freeze({
+    send(packet) {
+      outbound.push(b4a.from(packet))
+      return true
+    },
+    receive() {
+      return new Promise(() => {})
+    },
+    destroy() {}
+  })
+  const responderChannel = Object.freeze({
+    send() {
+      return true
+    },
+    receive() {
+      const next = inbound.shift()
+      if (!next) throw new Error('missing physical receive slot')
+      return next.promise
+    },
+    destroy() {}
+  })
+  const initiator = owner.adopt(
+    syntheticLink({ initiator: true, physicalChannel: initiatorChannel, wireExpiresAt: 1_250n })
+  )
+  const responder = owner.adopt(
+    syntheticLink({ initiator: false, physicalChannel: responderChannel, wireExpiresAt: 1_250n })
+  )
+  const initiatorSession = createTailControlSession(initiator.tail, tailSessionOptions(clock))
+  const responderSession = createTailControlSession(responder.tail, tailSessionOptions(clock))
+  try {
+    await borrowTailControlTransport(initiatorSession).send(seed(0xa1, 1101))
+    await borrowTailControlTransport(initiatorSession).send(seed(0xa2, 1101))
+    t.is(outbound.length, 2, 'two physical packets are available for reordering')
+    let firstPhysicalResolve = null
+    let secondPhysicalResolve = null
+    inbound.push({
+      promise: new Promise((resolve) => {
+        firstPhysicalResolve = resolve
+      })
+    })
+    inbound.push({
+      promise: new Promise((resolve) => {
+        secondPhysicalResolve = resolve
+      })
+    })
+    const first = borrowTailControlTransport(responderSession).receive()
+    const second = borrowTailControlTransport(responderSession).receive()
+    let firstValue = null
+    let secondValue = null
+    first.catch(() => {})
+    second.catch(() => {})
+    await Promise.resolve()
+    firstPhysicalResolve(outbound[1])
+    await Promise.resolve()
+    secondPhysicalResolve(outbound[0])
+    firstValue = await first
+    secondValue = await second
+    t.alike(firstValue, seed(0xa1, 1101), 'oldest waiter receives the first logical envelope')
+    t.alike(secondValue, seed(0xa2, 1101), 'second waiter receives the buffered logical envelope')
+  } finally {
+    destroyTailControlSession(initiatorSession)
+    destroyTailControlSession(responderSession)
+    initiator.runtime.destroy()
+    responder.runtime.destroy()
+  }
 })
 
 test('TailControl exports the package-private responder authority surface', (t) => {
@@ -417,7 +614,11 @@ test('TailControl responder authority consumes exact token and arms subordinate 
   t.is(Object.isFrozen(responder), true)
   t.is(clock.pending(), 3, 'responder authority arms one subordinate logical lifetime')
   t.exception(() =>
-    createTailControlResponderAuthority(session, adopted.responderToken, responderAuthorityOptions(clock))
+    createTailControlResponderAuthority(
+      session,
+      adopted.responderToken,
+      responderAuthorityOptions(clock)
+    )
   )
   t.is(destroyTailControlResponderAuthority(responder), true)
   t.is(destroyTailControlResponderAuthority(responder), false)
@@ -425,39 +626,86 @@ test('TailControl responder authority consumes exact token and arms subordinate 
   t.is(destroyTailControlSession(session), true)
 })
 
+test('TailControl terminal responder authority requires only readiness capabilities', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const adopted = owner.adopt(
+    syntheticLink({ initiator: false, extensionIndex: 2, wireExpiresAt: 20_000n })
+  )
+  const session = createTailControlSession(adopted.tail, tailSessionOptions(clock))
+  const options = responderAuthorityOptions(clock)
+  delete options.adjacencyAdopter
+  delete options.extensionCommitter
+  delete options.adjacentLinkFactory
+
+  const responder = createTailControlResponderAuthority(session, adopted.responderToken, options)
+
+  t.alike(Reflect.ownKeys(responder), [])
+  t.is(Object.isFrozen(responder), true)
+  t.is(clock.pending(), 3, 'terminal responder authority arms readiness lifetime')
+  t.exception(() =>
+    createTailControlResponderAuthority(
+      session,
+      adopted.responderToken,
+      responderAuthorityOptions(clock)
+    )
+  )
+  t.is(destroyTailControlResponderAuthority(responder), true)
+  t.is(destroyTailControlSession(session), true)
+})
+
 test('TailControl responder authority rejects initiators, token substitutes, and alternate clocks', (t) => {
   const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const owner = authority(clock)
   const initiator = owner.adopt(syntheticLink({ initiator: true, wireExpiresAt: 20_000n }))
-  const initiatorSession = createTailControlSession(initiator.tail, tailSessionOptions(clock, {
-    absoluteDeadline: 16_000n
-  }))
+  const initiatorSession = createTailControlSession(
+    initiator.tail,
+    tailSessionOptions(clock, {
+      absoluteDeadline: 16_000n
+    })
+  )
   t.exception(() =>
-    createTailControlResponderAuthority(initiatorSession, Object.freeze({}), responderAuthorityOptions(clock))
+    createTailControlResponderAuthority(
+      initiatorSession,
+      Object.freeze({}),
+      responderAuthorityOptions(clock)
+    )
   )
   t.is(destroyTailControlSession(initiatorSession), true)
 
-  const substitute = owner.adopt(syntheticLink({
-    initiator: false,
-    completeOfferDigest: seed(0x81),
-    wireExpiresAt: 20_000n
-  }))
+  const substitute = owner.adopt(
+    syntheticLink({
+      initiator: false,
+      completeOfferDigest: seed(0x81),
+      wireExpiresAt: 20_000n
+    })
+  )
   const substituteSession = createTailControlSession(substitute.tail, tailSessionOptions(clock))
   t.exception(() =>
-    createTailControlResponderAuthority(substituteSession, Object.freeze({}), responderAuthorityOptions(clock))
+    createTailControlResponderAuthority(
+      substituteSession,
+      Object.freeze({}),
+      responderAuthorityOptions(clock)
+    )
   )
   t.is(destroyTailControlSession(substituteSession), true)
 
-  const alternate = owner.adopt(syntheticLink({
-    initiator: false,
-    completeOfferDigest: seed(0x82),
-    wireExpiresAt: 20_000n
-  }))
+  const alternate = owner.adopt(
+    syntheticLink({
+      initiator: false,
+      completeOfferDigest: seed(0x82),
+      wireExpiresAt: 20_000n
+    })
+  )
   const alternateSession = createTailControlSession(alternate.tail, tailSessionOptions(clock))
   t.exception(() =>
-    createTailControlResponderAuthority(alternateSession, alternate.responderToken, responderAuthorityOptions(clock, {
-      monotonicNow: () => 10_000n
-    }))
+    createTailControlResponderAuthority(
+      alternateSession,
+      alternate.responderToken,
+      responderAuthorityOptions(clock, {
+        monotonicNow: () => 10_000n
+      })
+    )
   )
   t.is(destroyTailControlSession(alternateSession), true)
 })
@@ -478,21 +726,31 @@ test('TailControl responder admission consumes one registered control envelope',
     idleTimeoutMs: 5_000,
     expiresAtMs: 5_000n
   })
-  const initiator = initiatorOwner.adopt(initiatorSealLink(signedAdvertisement, requestedLimits, {
-    currentAdvertisement,
-    physicalChannel: initiatorChannel,
-    wireExpiresAt: 20_000n
-  }))
-  const responder = responderOwner.adopt(responderSealLink(signedAdvertisement, requestedLimits, {
-    currentAdvertisement,
-    physicalChannel: responderChannel,
-    wireExpiresAt: 20_000n
-  }))
-  const initiatorSession = createTailControlSession(initiator.tail, tailSessionOptions(initiatorClock, {
-    absoluteDeadline: 16_000n,
-    crypto: cryptoSuite
-  }))
-  const responderSession = createTailControlSession(responder.tail, tailSessionOptions(responderClock))
+  const initiator = initiatorOwner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      physicalChannel: initiatorChannel,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const responder = responderOwner.adopt(
+    responderSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      physicalChannel: responderChannel,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const initiatorSession = createTailControlSession(
+    initiator.tail,
+    tailSessionOptions(initiatorClock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
+  const responderSession = createTailControlSession(
+    responder.tail,
+    tailSessionOptions(responderClock)
+  )
   const responderAuthority = createTailControlResponderAuthority(
     responderSession,
     responder.responderToken,
@@ -515,7 +773,10 @@ test('TailControl responder admission consumes one registered control envelope',
   await borrowTailControlTransport(initiatorSession).send(tailControlEnvelope(encoded))
   const received = await borrowTailControlTransport(responderSession).receive()
 
-  t.exception(() => admitTailExtend(responderAuthority, b4a.from(received)), 'a structural envelope copy is not registered')
+  t.exception(
+    () => admitTailExtend(responderAuthority, b4a.from(received)),
+    'a structural envelope copy is not registered'
+  )
   const admitted = admitTailExtend(responderAuthority, received)
   t.alike(Reflect.ownKeys(admitted), [])
   t.ok(Object.isFrozen(admitted))
@@ -524,17 +785,21 @@ test('TailControl responder admission consumes one registered control envelope',
   t.alike(Object.keys(taken).sort(), [
     'currentTailAdvertisementDigest',
     'currentTailIdentity',
-    'deadline',
-    'request'
+    'localDeadline',
+    'request',
+    'wireExpiresAt'
   ])
-  t.is(taken.deadline, 5_000n)
+  t.is(taken.wireExpiresAt, 5_000n)
+  t.is(taken.localDeadline, readTailControlDeadline(responderSession))
   t.alike(taken.request, decodeExtendRequest(encoded))
   const decodedNextAdvertisement = decodeRelayCapabilityAdvertisement(taken.request.advertisement)
   t.ok(!b4a.equals(taken.currentTailIdentity, decodedNextAdvertisement.relayIdentity))
-  t.ok(!b4a.equals(
-    taken.currentTailAdvertisementDigest,
-    digestRelayCapabilityAdvertisement(taken.request.advertisement)
-  ))
+  t.ok(
+    !b4a.equals(
+      taken.currentTailAdvertisementDigest,
+      digestRelayCapabilityAdvertisement(taken.request.advertisement)
+    )
+  )
   t.exception(() => admitTailExtend(responderAuthority, received), 'registered envelope is one-use')
   t.exception(() => takeAdmittedExtendRequest(admitted), 'admission is one-use')
   await borrowTailControlTransport(initiatorSession).send(tailControlEnvelope(encoded))
@@ -553,6 +818,354 @@ test('TailControl responder admission consumes one registered control envelope',
   t.alike(retransmitted, b4a.alloc(1101), 'destroy clears rejected retransmission envelope')
 })
 
+test('TailControl responder opens, completes, and seals tail readiness from admitted ownership', async (t) => {
+  const { createM3ResponderAdopter } = require('../../lib/private/m3-adjacency-adopter')
+  const { createTailExtensionCommitter } = require('../../lib/private/tail-extension-committer')
+  const relayIdentitySigner = require('../../lib/private/relay-identity-signer')
+  const originalOpenExtensionAdjacentLink = guardLinks.openExtensionAdjacentLink
+  const originalSignTailReady = relayIdentitySigner.signTailReady
+  const initiatorClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const responderClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const initiatorOwner = authority(initiatorClock)
+  const responderOwner = authority(responderClock)
+  const [initiatorChannel, responderChannel] = channelPair()
+  const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
+  const signedAdvertisement = advertisementForRole(ROLE.PRIVATE)
+  const decodedAdvertisement = decodeRelayCapabilityAdvertisement(signedAdvertisement)
+  const currentDecodedAdvertisement = decodeRelayCapabilityAdvertisement(currentAdvertisement)
+  const requestedLimits = Object.freeze({
+    cellSize: 1200,
+    maxCells: 64,
+    maxBytes: 65_536,
+    maxCommands: 10,
+    idleTimeoutMs: 5_000,
+    expiresAtMs: 5_000n
+  })
+  const redactedProof = encodeM3Object({
+    messageId: M3_MESSAGE_ID.REDACTED_RESPONDER_PROOF_V1,
+    body: seed(0x91, 306),
+    authSuffix: seed(0x92, 64)
+  })
+  let adopterEstablished = null
+  let installedRuntime = null
+  let enqueuedEnvelope = null
+  let forwardingDestroyed = 0
+  let completionDestroyed = 0
+  let replayDuringOpen = null
+  try {
+    const initiator = initiatorOwner.adopt(
+      initiatorSealLink(signedAdvertisement, requestedLimits, {
+        currentAdvertisement,
+        physicalChannel: initiatorChannel,
+        wireExpiresAt: 20_000n
+      })
+    )
+    const responder = responderOwner.adopt(
+      responderSealLink(signedAdvertisement, requestedLimits, {
+        currentAdvertisement,
+        physicalChannel: responderChannel,
+        wireExpiresAt: 20_000n
+      })
+    )
+    const initiatorSession = createTailControlSession(
+      initiator.tail,
+      tailSessionOptions(initiatorClock, {
+        absoluteDeadline: 16_000n,
+        crypto: cryptoSuite
+      })
+    )
+    const responderSession = createTailControlSession(
+      responder.tail,
+      tailSessionOptions(responderClock)
+    )
+    const adjacencyAdopter = createM3ResponderAdopter(
+      (established) => {
+        adopterEstablished = established
+        return Object.freeze({ tag: 'next-runtime' })
+      },
+      () => {}
+    )
+    const extensionCommitter = createTailExtensionCommitter({
+      enqueue(envelope) {
+        enqueuedEnvelope = b4a.from(envelope)
+      },
+      install(runtime) {
+        installedRuntime = runtime
+        return Object.freeze({
+          diagnostics() {
+            return Object.freeze({})
+          },
+          destroy() {
+            forwardingDestroyed++
+          }
+        })
+      },
+      destroy() {}
+    })
+    const adjacentLinkFactory = Object.freeze({})
+    const tailReadySigner = Object.freeze({})
+    const responderAuthority = createTailControlResponderAuthority(
+      responderSession,
+      responder.responderToken,
+      responderAuthorityOptions(responderClock, {
+        adjacencyAdopter,
+        extensionCommitter,
+        adjacentLinkFactory,
+        tailReadySigner,
+        randomBytes: (size) => {
+          t.is(size, 32)
+          return seed(0xf5)
+        }
+      })
+    )
+    const encoded = initiatorSession.sealExtend({
+      advertisement: signedAdvertisement,
+      advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+      extensionIndex: 2,
+      requestedLimits,
+      absoluteDeadline: 16_000n,
+      randomBytes: (() => {
+        const randomSeeds = [seed(0x70), seed(0x71), seed(0x72)]
+        return (size) => {
+          t.is(size, 32)
+          return randomSeeds.shift()
+        }
+      })()
+    })
+    const request = decodeExtendRequest(encoded)
+    const expectedProof = {
+      responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+      initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
+      responderIdentity: decodedAdvertisement.relayIdentity,
+      branchClass: request.branchClass,
+      branchId: request.branchId,
+      circuitId: request.circuitId,
+      generation: request.generation,
+      extensionIndex: request.extensionIndex,
+      clientTailEphemeralPublicKey: request.clientTailEphemeralPublicKey,
+      clientNonce: request.clientNonce,
+      advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
+      admittedLimitsDigest: digestAdmittedLimits(requestedLimits),
+      expiresAtMs: requestedLimits.expiresAtMs,
+      responderProofNonce: seed(0x93)
+    }
+    const established = Object.freeze({ tag: 'established-link' })
+    const completion = createExtensionLinkCompletion(
+      {
+        established,
+        verifiedProof: Object.freeze({ tag: 'proof' }),
+        proofConsumer: Object.freeze({ tag: 'consumer' }),
+        expectedProof,
+        redactedProof,
+        extensionNonce: request.extensionNonce
+      },
+      () => {
+        completionDestroyed++
+      }
+    )
+    guardLinks.openExtensionAdjacentLink = (factory, admittedRequest) => {
+      t.is(factory, adjacentLinkFactory)
+      const taken = takeAdmittedExtendRequest(admittedRequest)
+      t.alike(taken.request, request)
+      replayDuringOpen = errorCode(() => takeAdmittedExtendRequest(admittedRequest))
+      return Promise.resolve(completion)
+    }
+    relayIdentitySigner.signTailReady = (signer, body, expectedIdentity) => {
+      t.is(signer, tailReadySigner)
+      t.is(body.byteLength, 210)
+      t.alike(expectedIdentity, decodedAdvertisement.relayIdentity)
+      return seed(0xb7, 64)
+    }
+    await borrowTailControlTransport(initiatorSession).send(tailControlEnvelope(encoded))
+    const received = await borrowTailControlTransport(responderSession).receive()
+    const admitted = admitTailExtend(responderAuthority, received)
+    const openedCompletion = await openTailAdjacentLink(responderAuthority, admitted)
+    t.is(openedCompletion, completion)
+    t.is(replayDuringOpen, 'INVALID_ROUTE')
+    const extendedEnvelope = completeTailExtend(responderAuthority, openedCompletion)
+    t.alike(enqueuedEnvelope, extendedEnvelope)
+    t.is(adopterEstablished, established)
+    t.alike(installedRuntime, Object.freeze({ tag: 'next-runtime' }))
+    const extended = decodeExtended(extendedEnvelope.subarray(1, 1 + EXTENDED_SIZE))
+    t.alike(extended.redactedProof, redactedProof)
+    t.alike(extended.extensionNonce, request.extensionNonce)
+    t.is(completionDestroyed, 1)
+    const ready = decodeTailReady(sealTailReady(responderAuthority))
+    t.alike(ready.tailIdentity, decodedAdvertisement.relayIdentity)
+    t.alike(ready.tailAdvertisementDigest, expectedProof.responderAdvertisementDigest)
+    t.alike(ready.clientNonce, request.clientNonce)
+    t.alike(ready.signature, seed(0xb7, 64))
+    t.is(destroyTailControlResponderAuthority(responderAuthority), true)
+    t.is(forwardingDestroyed, 1)
+    t.is(destroyTailControlSession(initiatorSession), true)
+    t.is(destroyTailControlSession(responderSession), true)
+  } finally {
+    guardLinks.openExtensionAdjacentLink = originalOpenExtensionAdjacentLink
+    relayIdentitySigner.signTailReady = originalSignTailReady
+    b4a.fill(decodedAdvertisement.relayIdentity, 0)
+    b4a.fill(decodedAdvertisement.routeEncryptionPublicKey, 0)
+    b4a.fill(currentDecodedAdvertisement.relayIdentity, 0)
+    b4a.fill(redactedProof, 0)
+  }
+})
+
+test('TailControl complete rejects responder authority destroyed during install', async (t) => {
+  const { createM3ResponderAdopter } = require('../../lib/private/m3-adjacency-adopter')
+  const { createTailExtensionCommitter } = require('../../lib/private/tail-extension-committer')
+  const originalOpenExtensionAdjacentLink = guardLinks.openExtensionAdjacentLink
+  const initiatorClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const responderClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const initiatorOwner = authority(initiatorClock)
+  const responderOwner = authority(responderClock)
+  const [initiatorChannel, responderChannel] = channelPair()
+  const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
+  const signedAdvertisement = advertisementForRole(ROLE.PRIVATE)
+  const decodedAdvertisement = decodeRelayCapabilityAdvertisement(signedAdvertisement)
+  const currentDecodedAdvertisement = decodeRelayCapabilityAdvertisement(currentAdvertisement)
+  const requestedLimits = Object.freeze({
+    cellSize: 1200,
+    maxCells: 64,
+    maxBytes: 65_536,
+    maxCommands: 10,
+    idleTimeoutMs: 5_000,
+    expiresAtMs: 5_000n
+  })
+  const redactedProof = encodeM3Object({
+    messageId: M3_MESSAGE_ID.REDACTED_RESPONDER_PROOF_V1,
+    body: seed(0x91, 306),
+    authSuffix: seed(0x92, 64)
+  })
+  let responderAuthority = null
+  let forwardingDestroyed = 0
+  let adoptedRuntimeDestroyed = 0
+  let completionDestroyed = 0
+  try {
+    const initiator = initiatorOwner.adopt(
+      initiatorSealLink(signedAdvertisement, requestedLimits, {
+        currentAdvertisement,
+        physicalChannel: initiatorChannel,
+        wireExpiresAt: 20_000n
+      })
+    )
+    const responder = responderOwner.adopt(
+      responderSealLink(signedAdvertisement, requestedLimits, {
+        currentAdvertisement,
+        physicalChannel: responderChannel,
+        wireExpiresAt: 20_000n
+      })
+    )
+    const initiatorSession = createTailControlSession(
+      initiator.tail,
+      tailSessionOptions(initiatorClock, {
+        absoluteDeadline: 16_000n,
+        crypto: cryptoSuite
+      })
+    )
+    const responderSession = createTailControlSession(
+      responder.tail,
+      tailSessionOptions(responderClock)
+    )
+    const adjacencyAdopter = createM3ResponderAdopter(
+      () => Object.freeze({ tag: 'next-runtime' }),
+      () => {
+        adoptedRuntimeDestroyed++
+      }
+    )
+    const extensionCommitter = createTailExtensionCommitter({
+      enqueue() {},
+      install() {
+        destroyTailControlResponderAuthority(responderAuthority)
+        return Object.freeze({
+          diagnostics() {
+            return Object.freeze({})
+          },
+          destroy() {
+            forwardingDestroyed++
+            adoptedRuntimeDestroyed++
+          }
+        })
+      },
+      destroy() {}
+    })
+    responderAuthority = createTailControlResponderAuthority(
+      responderSession,
+      responder.responderToken,
+      responderAuthorityOptions(responderClock, {
+        adjacencyAdopter,
+        extensionCommitter,
+        adjacentLinkFactory: Object.freeze({}),
+        tailReadySigner: Object.freeze({})
+      })
+    )
+    const encoded = initiatorSession.sealExtend({
+      advertisement: signedAdvertisement,
+      advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+      extensionIndex: 2,
+      requestedLimits,
+      absoluteDeadline: 16_000n,
+      randomBytes: (() => {
+        const randomSeeds = [seed(0x70), seed(0x71), seed(0x72)]
+        return () => randomSeeds.shift()
+      })()
+    })
+    const request = decodeExtendRequest(encoded)
+    const expectedProof = {
+      responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+      initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
+      responderIdentity: decodedAdvertisement.relayIdentity,
+      branchClass: request.branchClass,
+      branchId: request.branchId,
+      circuitId: request.circuitId,
+      generation: request.generation,
+      extensionIndex: request.extensionIndex,
+      clientTailEphemeralPublicKey: request.clientTailEphemeralPublicKey,
+      clientNonce: request.clientNonce,
+      advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
+      admittedLimitsDigest: digestAdmittedLimits(requestedLimits),
+      expiresAtMs: requestedLimits.expiresAtMs,
+      responderProofNonce: seed(0x93)
+    }
+    const completion = createExtensionLinkCompletion(
+      {
+        established: Object.freeze({ tag: 'established-link' }),
+        verifiedProof: Object.freeze({ tag: 'proof' }),
+        proofConsumer: Object.freeze({ tag: 'consumer' }),
+        expectedProof,
+        redactedProof,
+        extensionNonce: request.extensionNonce
+      },
+      () => {
+        completionDestroyed++
+      }
+    )
+    guardLinks.openExtensionAdjacentLink = () => Promise.resolve(completion)
+    await borrowTailControlTransport(initiatorSession).send(tailControlEnvelope(encoded))
+    const received = await borrowTailControlTransport(responderSession).receive()
+    const admitted = admitTailExtend(responderAuthority, received)
+    const openedCompletion = await openTailAdjacentLink(responderAuthority, admitted)
+    t.is(openedCompletion, completion)
+    let code = null
+    try {
+      completeTailExtend(responderAuthority, openedCompletion)
+    } catch (err) {
+      code = err && err.code
+    }
+    t.is(code, 'ERR_DESTROYED', 'destroyed authority cannot publish EXTENDED')
+    t.is(forwardingDestroyed, 1, 'forwarding returned by reentrant install is destroyed')
+    t.is(adoptedRuntimeDestroyed, 1, 'adopted M3 responder runtime is destroyed')
+    t.is(completionDestroyed, 1, 'completion ownership is consumed exactly once')
+    t.is(destroyTailControlResponderAuthority(responderAuthority), false)
+    t.is(destroyTailControlSession(initiatorSession), true)
+    t.is(destroyTailControlSession(responderSession), true)
+  } finally {
+    guardLinks.openExtensionAdjacentLink = originalOpenExtensionAdjacentLink
+    b4a.fill(decodedAdvertisement.relayIdentity, 0)
+    b4a.fill(decodedAdvertisement.routeEncryptionPublicKey, 0)
+    b4a.fill(currentDecodedAdvertisement.relayIdentity, 0)
+    b4a.fill(redactedProof, 0)
+  }
+})
+
 test('TailControl responder admission rejects unbound and out-of-policy limits', async (t) => {
   const initiatorClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const responderClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
@@ -568,19 +1181,22 @@ test('TailControl responder admission rejects unbound and out-of-policy limits',
   })
   const withinAdvertisement = Object.freeze({ ...transcriptLimits, maxCells: 65 })
   const beyondAdvertisement = Object.freeze({ ...transcriptLimits, maxCells: 101 })
-  const makeEncoded = (limits, nonce) => encodeExtendRequest({
-    branchClass: BRANCH_CLASS.LOOKUP,
-    branchId: seed(0x41, 16),
-    circuitId: seed(0x42, 16),
-    generation: 7n,
-    extensionIndex: 2,
-    advertisement: signedAdvertisement,
-    clientTailEphemeralPublicKey: cryptoSuite.encryptionKeyPair(seed(0x70 + nonce)).publicKey,
-    clientNonce: seed(0x80 + nonce),
-    payloadParametersDigest: digestPayloadParameters(decodeRelayCapabilityAdvertisement(signedAdvertisement)),
-    requestedLimits: limits,
-    extensionNonce: seed(0x90 + nonce)
-  })
+  const makeEncoded = (limits, nonce) =>
+    encodeExtendRequest({
+      branchClass: BRANCH_CLASS.LOOKUP,
+      branchId: seed(0x41, 16),
+      circuitId: seed(0x42, 16),
+      generation: 7n,
+      extensionIndex: 2,
+      advertisement: signedAdvertisement,
+      clientTailEphemeralPublicKey: cryptoSuite.encryptionKeyPair(seed(0x70 + nonce)).publicKey,
+      clientNonce: seed(0x80 + nonce),
+      payloadParametersDigest: digestPayloadParameters(
+        decodeRelayCapabilityAdvertisement(signedAdvertisement)
+      ),
+      requestedLimits: limits,
+      extensionNonce: seed(0x90 + nonce)
+    })
   for (const [limits, transcriptAdmittedLimits, expectedCode] of [
     [withinAdvertisement, transcriptLimits, 'ERR_AUTHENTICATION'],
     [beyondAdvertisement, beyondAdvertisement, 'ERR_PRIVACY_UNAVAILABLE']
@@ -588,27 +1204,39 @@ test('TailControl responder admission rejects unbound and out-of-policy limits',
     const initiatorOwner = authority(initiatorClock)
     const responderOwner = authority(responderClock)
     const [initiatorChannel, responderChannel] = channelPair()
-    const initiator = initiatorOwner.adopt(initiatorSealLink(signedAdvertisement, transcriptAdmittedLimits, {
-      currentAdvertisement,
-      physicalChannel: initiatorChannel,
-      wireExpiresAt: 20_000n
-    }))
-    const responder = responderOwner.adopt(responderSealLink(signedAdvertisement, transcriptAdmittedLimits, {
-      currentAdvertisement,
-      physicalChannel: responderChannel,
-      wireExpiresAt: 20_000n
-    }))
-    const initiatorSession = createTailControlSession(initiator.tail, tailSessionOptions(initiatorClock, {
-      absoluteDeadline: 16_000n,
-      crypto: cryptoSuite
-    }))
-    const responderSession = createTailControlSession(responder.tail, tailSessionOptions(responderClock))
+    const initiator = initiatorOwner.adopt(
+      initiatorSealLink(signedAdvertisement, transcriptAdmittedLimits, {
+        currentAdvertisement,
+        physicalChannel: initiatorChannel,
+        wireExpiresAt: 20_000n
+      })
+    )
+    const responder = responderOwner.adopt(
+      responderSealLink(signedAdvertisement, transcriptAdmittedLimits, {
+        currentAdvertisement,
+        physicalChannel: responderChannel,
+        wireExpiresAt: 20_000n
+      })
+    )
+    const initiatorSession = createTailControlSession(
+      initiator.tail,
+      tailSessionOptions(initiatorClock, {
+        absoluteDeadline: 16_000n,
+        crypto: cryptoSuite
+      })
+    )
+    const responderSession = createTailControlSession(
+      responder.tail,
+      tailSessionOptions(responderClock)
+    )
     const responderAuthority = createTailControlResponderAuthority(
       responderSession,
       responder.responderToken,
       responderAuthorityOptions(responderClock)
     )
-    await borrowTailControlTransport(initiatorSession).send(tailControlEnvelope(makeEncoded(limits, expectedCode.length)))
+    await borrowTailControlTransport(initiatorSession).send(
+      tailControlEnvelope(makeEncoded(limits, expectedCode.length))
+    )
     const received = await borrowTailControlTransport(responderSession).receive()
     let code = null
     try {
@@ -660,21 +1288,31 @@ test('TailControl responder admission reserves before reentrant clocks', async (
   })
   const responderOwner = authority(responderClockWithReentry)
   const [initiatorChannel, responderChannel] = channelPair()
-  const initiator = initiatorOwner.adopt(initiatorSealLink(signedAdvertisement, requestedLimits, {
-    currentAdvertisement,
-    physicalChannel: initiatorChannel,
-    wireExpiresAt: 20_000n
-  }))
-  const responder = responderOwner.adopt(responderSealLink(signedAdvertisement, requestedLimits, {
-    currentAdvertisement,
-    physicalChannel: responderChannel,
-    wireExpiresAt: 20_000n
-  }))
-  const initiatorSession = createTailControlSession(initiator.tail, tailSessionOptions(initiatorClock, {
-    absoluteDeadline: 16_000n,
-    crypto: cryptoSuite
-  }))
-  const responderSession = createTailControlSession(responder.tail, tailSessionOptions(responderClockWithReentry))
+  const initiator = initiatorOwner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      physicalChannel: initiatorChannel,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const responder = responderOwner.adopt(
+    responderSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      physicalChannel: responderChannel,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const initiatorSession = createTailControlSession(
+    initiator.tail,
+    tailSessionOptions(initiatorClock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
+  const responderSession = createTailControlSession(
+    responder.tail,
+    tailSessionOptions(responderClockWithReentry)
+  )
   responderAuthority = createTailControlResponderAuthority(
     responderSession,
     responder.responderToken,
@@ -720,21 +1358,31 @@ test('TailControl responder admission clamps local projection to inherited deadl
   const initiatorOwner = authority(initiatorClock)
   const responderOwner = authority(responderClock)
   const [initiatorChannel, responderChannel] = channelPair()
-  const initiator = initiatorOwner.adopt(initiatorSealLink(signedAdvertisement, requestedLimits, {
-    currentAdvertisement,
-    physicalChannel: initiatorChannel,
-    wireExpiresAt: 20_000n
-  }))
-  const responder = responderOwner.adopt(responderSealLink(signedAdvertisement, requestedLimits, {
-    currentAdvertisement,
-    physicalChannel: responderChannel,
-    wireExpiresAt: 20_000n
-  }))
-  const initiatorSession = createTailControlSession(initiator.tail, tailSessionOptions(initiatorClock, {
-    absoluteDeadline: 29_000n,
-    crypto: cryptoSuite
-  }))
-  const responderSession = createTailControlSession(responder.tail, tailSessionOptions(responderClock))
+  const initiator = initiatorOwner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      physicalChannel: initiatorChannel,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const responder = responderOwner.adopt(
+    responderSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      physicalChannel: responderChannel,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const initiatorSession = createTailControlSession(
+    initiator.tail,
+    tailSessionOptions(initiatorClock, {
+      absoluteDeadline: 29_000n,
+      crypto: cryptoSuite
+    })
+  )
+  const responderSession = createTailControlSession(
+    responder.tail,
+    tailSessionOptions(responderClock)
+  )
   const responderAuthority = createTailControlResponderAuthority(
     responderSession,
     responder.responderToken,
@@ -756,7 +1404,8 @@ test('TailControl responder admission clamps local projection to inherited deadl
   const received = await borrowTailControlTransport(responderSession).receive()
   const admitted = admitTailExtend(responderAuthority, received)
   const taken = takeAdmittedExtendRequest(admitted)
-  t.is(taken.deadline, 20_000n)
+  t.is(taken.wireExpiresAt, 20_000n)
+  t.is(taken.localDeadline, 29_000n)
   t.is(readTailControlDeadline(responderSession), 29_000n)
   t.is(destroyTailControlResponderAuthority(responderAuthority), true)
   t.is(destroyTailControlSession(initiatorSession), true)
@@ -769,15 +1418,20 @@ test('TailControlSession rejects structural transport and alternate clocks', (t)
   const adopted = owner.adopt(syntheticLink({ wireExpiresAt: 1_250n }))
 
   t.exception(() =>
-    createTailControlSession(adopted.tail, tailSessionOptions(clock, {
-      wallNow: () => 1_000n
-    }))
+    createTailControlSession(
+      adopted.tail,
+      tailSessionOptions(clock, {
+        wallNow: () => 1_000n
+      })
+    )
   )
 
-  const missingDeadline = owner.adopt(syntheticLink({
-    completeOfferDigest: seed(0x72),
-    wireExpiresAt: 1_250n
-  }))
+  const missingDeadline = owner.adopt(
+    syntheticLink({
+      completeOfferDigest: seed(0x72),
+      wireExpiresAt: 1_250n
+    })
+  )
   const noDeadline = {
     wallNow: clock.wallNow,
     monotonicNow: clock.monotonicNow,
@@ -786,11 +1440,16 @@ test('TailControlSession rejects structural transport and alternate clocks', (t)
   }
   t.exception(() => createTailControlSession(missingDeadline.tail, noDeadline))
 
-  const second = owner.adopt(syntheticLink({ completeOfferDigest: seed(0x71), wireExpiresAt: 1_250n }))
+  const second = owner.adopt(
+    syntheticLink({ completeOfferDigest: seed(0x71), wireExpiresAt: 1_250n })
+  )
   t.exception(() =>
-    createTailControlSession(second.tail, tailSessionOptions(clock, {
-      destroy() {}
-    }))
+    createTailControlSession(
+      second.tail,
+      tailSessionOptions(clock, {
+        destroy() {}
+      })
+    )
   )
 })
 
@@ -800,15 +1459,19 @@ test('TailControl transport sends and receives only through M3-owned control cel
   const initiatorOwner = authority(initiatorClock)
   const responderOwner = authority(responderClock)
   const [initiatorChannel, responderChannel] = channelPair()
-  const initiator = initiatorOwner.adopt(syntheticLink({
-    physicalChannel: initiatorChannel,
-    wireExpiresAt: 1_250n
-  }))
-  const responder = responderOwner.adopt(syntheticLink({
-    initiator: false,
-    physicalChannel: responderChannel,
-    wireExpiresAt: 1_250n
-  }))
+  const initiator = initiatorOwner.adopt(
+    syntheticLink({
+      physicalChannel: initiatorChannel,
+      wireExpiresAt: 1_250n
+    })
+  )
+  const responder = responderOwner.adopt(
+    syntheticLink({
+      initiator: false,
+      physicalChannel: responderChannel,
+      wireExpiresAt: 1_250n
+    })
+  )
   const initiatorSession = createTailControlSession(
     initiator.tail,
     tailSessionOptions(initiatorClock)
@@ -839,13 +1502,18 @@ test('TailControl logical expiry releases session without closing physical link'
       destroys++
     }
   })
-  const adopted = owner.adopt(syntheticLink({
-    physicalChannel,
-    wireExpiresAt: 1_250n
-  }))
-  const session = createTailControlSession(adopted.tail, tailSessionOptions(clock, {
-    absoluteDeadline: 10_100n
-  }))
+  const adopted = owner.adopt(
+    syntheticLink({
+      physicalChannel,
+      wireExpiresAt: 1_250n
+    })
+  )
+  const session = createTailControlSession(
+    adopted.tail,
+    tailSessionOptions(clock, {
+      absoluteDeadline: 10_100n
+    })
+  )
 
   t.alike(clock.delays(), [250, 100])
   clock.advance(10_100n)
@@ -869,10 +1537,13 @@ test('TailControlSession rejects synchronous scheduler reentry before publicatio
   }
 
   t.exception(() =>
-    createTailControlSession(adopted.tail, tailSessionOptions(clock, {
-      schedule: reentrantSchedule,
-      cancelScheduled
-    }))
+    createTailControlSession(
+      adopted.tail,
+      tailSessionOptions(clock, {
+        schedule: reentrantSchedule,
+        cancelScheduled
+      })
+    )
   )
   t.alike(cancelled, [99])
   t.is(revokeM3TailCapability(adopted.tail), false)
@@ -882,12 +1553,17 @@ test('TailControlSession arms far deadlines with platform-safe chunks', (t) => {
   const maxTimerDelay = 0x7fff_ffff
   const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const owner = authority(clock)
-  const adopted = owner.adopt(syntheticLink({
-    wireExpiresAt: 1_000n + BigInt(maxTimerDelay) + 5n
-  }))
-  const session = createTailControlSession(adopted.tail, tailSessionOptions(clock, {
-    absoluteDeadline: 10_000n + BigInt(maxTimerDelay) + 5n
-  }))
+  const adopted = owner.adopt(
+    syntheticLink({
+      wireExpiresAt: 1_000n + BigInt(maxTimerDelay) + 5n
+    })
+  )
+  const session = createTailControlSession(
+    adopted.tail,
+    tailSessionOptions(clock, {
+      absoluteDeadline: 10_000n + BigInt(maxTimerDelay) + 5n
+    })
+  )
 
   t.alike(clock.delays(), [maxTimerDelay, maxTimerDelay])
   t.is(readTailControlDeadline(session), 10_000n + BigInt(maxTimerDelay) + 5n)
@@ -902,9 +1578,11 @@ test('TailControl far-deadline rearm releases transport after synchronous destru
   const maxTimerDelay = 0x7fff_ffff
   const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const owner = authority(clock)
-  const adopted = owner.adopt(syntheticLink({
-    wireExpiresAt: 1_000n + BigInt(maxTimerDelay) + 5n
-  }))
+  const adopted = owner.adopt(
+    syntheticLink({
+      wireExpiresAt: 1_000n + BigInt(maxTimerDelay) + 5n
+    })
+  )
   const cancelled = []
   let releases = 0
   let session = null
@@ -925,11 +1603,14 @@ test('TailControl far-deadline rearm releases transport after synchronous destru
     return releaseTransport(transportOwner)
   }
   try {
-    session = createTailControlSession(adopted.tail, tailSessionOptions(clock, {
-      absoluteDeadline: 10_000n + BigInt(maxTimerDelay) + 5n,
-      schedule,
-      cancelScheduled
-    }))
+    session = createTailControlSession(
+      adopted.tail,
+      tailSessionOptions(clock, {
+        absoluteDeadline: 10_000n + BigInt(maxTimerDelay) + 5n,
+        schedule,
+        cancelScheduled
+      })
+    )
 
     clock.advance(10_000n + BigInt(maxTimerDelay))
     t.is(clock.fireDelay(maxTimerDelay), true, 'runtime chunk fires first')
@@ -951,9 +1632,11 @@ test('TailControl far-deadline rearm releases transport when scheduler destroys 
   const maxTimerDelay = 0x7fff_ffff
   const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const owner = authority(clock)
-  const adopted = owner.adopt(syntheticLink({
-    wireExpiresAt: 1_000n + BigInt(maxTimerDelay) + 5n
-  }))
+  const adopted = owner.adopt(
+    syntheticLink({
+      wireExpiresAt: 1_000n + BigInt(maxTimerDelay) + 5n
+    })
+  )
   let releases = 0
   let session = null
   let tailSchedules = 0
@@ -968,10 +1651,13 @@ test('TailControl far-deadline rearm releases transport when scheduler destroys 
     return releaseTransport(transportOwner)
   }
   try {
-    session = createTailControlSession(adopted.tail, tailSessionOptions(clock, {
-      absoluteDeadline: 10_000n + BigInt(maxTimerDelay) + 5n,
-      schedule
-    }))
+    session = createTailControlSession(
+      adopted.tail,
+      tailSessionOptions(clock, {
+        absoluteDeadline: 10_000n + BigInt(maxTimerDelay) + 5n,
+        schedule
+      })
+    )
 
     clock.advance(10_000n + BigInt(maxTimerDelay))
     t.is(clock.fireDelay(maxTimerDelay), true, 'runtime chunk fires first')
@@ -997,19 +1683,24 @@ test('TailControl initiator sealExtend owns exact request fields', (t) => {
     expiresAtMs: 5_000n
   })
   const owner = authority(clock)
-  const adopted = owner.adopt(initiatorSealLink(signedAdvertisement, requestedLimits, {
-    currentAdvertisement,
-    wireExpiresAt: 20_000n
-  }))
+  const adopted = owner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      wireExpiresAt: 20_000n
+    })
+  )
   const randomSeeds = [seed(0x70), seed(0x71), seed(0x72)]
   const randomBytes = (size) => {
     t.is(size, 32)
     return randomSeeds.shift()
   }
-  const session = createTailControlSession(adopted.tail, tailSessionOptions(clock, {
-    absoluteDeadline: 16_000n,
-    crypto: cryptoSuite
-  }))
+  const session = createTailControlSession(
+    adopted.tail,
+    tailSessionOptions(clock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
   const encoded = session.sealExtend({
     advertisement: signedAdvertisement,
     advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
@@ -1053,6 +1744,624 @@ test('TailControl initiator sealExtend owns exact request fields', (t) => {
   t.is(destroyTailControlSession(session), true)
 })
 
+test('TailControl initiator keeps completion reusable after rejected ready', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
+  let responderSeed = null
+  for (let byte = 0x50; byte <= 0xff; byte++) {
+    const pair = cryptoSuite.keyPair(seed(byte))
+    if (roleForIdentity(pair.publicKey) === ROLE.PRIVATE) {
+      responderSeed = byte
+      break
+    }
+  }
+  const responder = cryptoSuite.keyPair(seed(responderSeed))
+  const signedAdvertisement = advertisement(responderSeed)
+  const decodedAdvertisement = decodeRelayCapabilityAdvertisement(signedAdvertisement)
+  const currentDecodedAdvertisement = decodeRelayCapabilityAdvertisement(currentAdvertisement)
+  const requestedLimits = Object.freeze({
+    cellSize: 1200,
+    maxCells: 64,
+    maxBytes: 65_536,
+    maxCommands: 10,
+    idleTimeoutMs: 5_000,
+    expiresAtMs: 5_000n
+  })
+  const admittedLimitsDigest = digestAdmittedLimits(requestedLimits)
+  const transcriptDigest = tailReadyTranscriptDigest(
+    initiatorTailControlTranscript(currentAdvertisement, requestedLimits)
+  )
+  const owner = authority(clock)
+  const adopted = owner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const session = createTailControlSession(
+    adopted.tail,
+    tailSessionOptions(clock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
+  const randomSeeds = [seed(0x90), seed(0x91), seed(0x92)]
+  const encoded = session.sealExtend({
+    advertisement: signedAdvertisement,
+    advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    extensionIndex: 2,
+    requestedLimits,
+    absoluteDeadline: 16_000n,
+    randomBytes: (size) => {
+      t.is(size, 32)
+      return randomSeeds.shift()
+    }
+  })
+  const request = decodeExtendRequest(encoded)
+  const proofValue = {
+    responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
+    responderIdentity: decodedAdvertisement.relayIdentity,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: request.branchId,
+    circuitId: request.circuitId,
+    generation: request.generation,
+    extensionIndex: request.extensionIndex,
+    clientTailEphemeralPublicKey: request.clientTailEphemeralPublicKey,
+    clientNonce: request.clientNonce,
+    advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
+    admittedLimitsDigest,
+    expiresAtMs: 4_500n,
+    responderProofNonce: seed(0x93)
+  }
+  const redactedProof = signRedactedResponderProof(proofValue, responder.secretKey)
+  const proofObject = decodeM3Object(redactedProof)
+  const extended = {
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: request.branchId,
+    circuitId: request.circuitId,
+    generation: request.generation,
+    extensionIndex: request.extensionIndex,
+    responderAdvertisementDigest: proofValue.responderAdvertisementDigest,
+    redactedProof,
+    extensionNonce: request.extensionNonce
+  }
+  t.exception(
+    () =>
+      session.openExtended(
+        encodeExtended({
+          ...extended,
+          redactedProof: encodeM3Object({
+            messageId: M3_MESSAGE_ID.REDACTED_RESPONDER_PROOF_V1,
+            body: proofObject.body,
+            authSuffix: seed(0x94, 64)
+          })
+        })
+      ),
+    'a forged redacted responder proof is rejected'
+  )
+  const completion = session.openExtended(encodeExtended(extended))
+  t.exception(
+    () =>
+      session.completeClientExtension(
+        completion,
+        encodeTailReadyFor(extended, request, responder, {
+          transcriptDigest,
+          expiresAtMs: proofValue.expiresAtMs,
+          signature: seed(0xa4, 64)
+        })
+      ),
+    'a forged TAIL_READY signature is rejected'
+  )
+  t.exception(
+    () =>
+      session.completeClientExtension(
+        completion,
+        encodeTailReadyFor(extended, request, responder, {
+          transcriptDigest: seed(0xa5),
+          expiresAtMs: proofValue.expiresAtMs
+        })
+      ),
+    'a wrong TAIL_READY transcript digest is rejected'
+  )
+  t.exception(
+    () =>
+      session.completeClientExtension(
+        completion,
+        encodeTailReadyFor(extended, request, responder, {
+          transcriptDigest,
+          clientNonce: seed(0xff),
+          expiresAtMs: proofValue.expiresAtMs
+        })
+      ),
+    'a mismatched TAIL_READY client nonce is rejected'
+  )
+  const preFinalTransport = borrowTailControlTransport(session)
+  t.is(
+    session.completeClientExtension(
+      completion,
+      encodeTailReadyFor(extended, request, responder, {
+        transcriptDigest,
+        expiresAtMs: proofValue.expiresAtMs
+      })
+    ),
+    session
+  )
+  t.exception(
+    () => borrowTailControlTransport(session),
+    'final-exit readiness closes tail transport'
+  )
+  t.exception(
+    () => preFinalTransport.send(seed(0x74, 1101)),
+    'final-exit readiness closes borrowed transport sends'
+  )
+  t.exception(
+    () => preFinalTransport.receive(),
+    'final-exit readiness closes borrowed transport receives'
+  )
+  t.exception(
+    () =>
+      session.sealExtend({
+        advertisement: signedAdvertisement,
+        advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+        extensionIndex: 2,
+        requestedLimits,
+        absoluteDeadline: 16_000n,
+        randomBytes: () => seed(0x73)
+      }),
+    'final-exit readiness closes further extension'
+  )
+  const expiryClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const expiryOwner = authority(expiryClock)
+  const expiryAdopted = expiryOwner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const expirySession = createTailControlSession(
+    expiryAdopted.tail,
+    tailSessionOptions(expiryClock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
+  const expiryRandomSeeds = [seed(0x90), seed(0x91), seed(0x92)]
+  const expiryEncoded = expirySession.sealExtend({
+    advertisement: signedAdvertisement,
+    advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    extensionIndex: 2,
+    requestedLimits,
+    absoluteDeadline: 16_000n,
+    randomBytes: (size) => {
+      t.is(size, 32)
+      return expiryRandomSeeds.shift()
+    }
+  })
+  const expiryRequest = decodeExtendRequest(expiryEncoded)
+  const expiryProofValue = {
+    responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
+    responderIdentity: decodedAdvertisement.relayIdentity,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: expiryRequest.branchId,
+    circuitId: expiryRequest.circuitId,
+    generation: expiryRequest.generation,
+    extensionIndex: expiryRequest.extensionIndex,
+    clientTailEphemeralPublicKey: expiryRequest.clientTailEphemeralPublicKey,
+    clientNonce: expiryRequest.clientNonce,
+    advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
+    admittedLimitsDigest,
+    expiresAtMs: 4_500n,
+    responderProofNonce: seed(0x93)
+  }
+  const expiryExtended = {
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: expiryRequest.branchId,
+    circuitId: expiryRequest.circuitId,
+    generation: expiryRequest.generation,
+    extensionIndex: expiryRequest.extensionIndex,
+    responderAdvertisementDigest: expiryProofValue.responderAdvertisementDigest,
+    redactedProof: signRedactedResponderProof(expiryProofValue, responder.secretKey),
+    extensionNonce: expiryRequest.extensionNonce
+  }
+  const expiryCompletion = expirySession.openExtended(encodeExtended(expiryExtended))
+  t.is(
+    expirySession.completeClientExtension(
+      expiryCompletion,
+      encodeTailReadyFor(expiryExtended, expiryRequest, responder, {
+        transcriptDigest,
+        expiresAtMs: expiryProofValue.expiresAtMs
+      })
+    ),
+    expirySession
+  )
+  const expiringHandoff = expirySession.takeFinalExitHandoff()
+  expiryClock.advance(16_000n)
+  t.is(expiryClock.fireDelay(3_500), true)
+  t.exception(() => consumeFinalExitHandoff(expiringHandoff), 'expired handoff is revoked')
+  const directClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const directOwner = authority(directClock)
+  const directAdopted = directOwner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const directSession = createTailControlSession(
+    directAdopted.tail,
+    tailSessionOptions(directClock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
+  const directRandomSeeds = [seed(0x90), seed(0x91), seed(0x92)]
+  const directEncoded = directSession.sealExtend({
+    advertisement: signedAdvertisement,
+    advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    extensionIndex: 2,
+    requestedLimits,
+    absoluteDeadline: 16_000n,
+    randomBytes: (size) => {
+      t.is(size, 32)
+      return directRandomSeeds.shift()
+    }
+  })
+  const directRequest = decodeExtendRequest(directEncoded)
+  const directProofValue = {
+    responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
+    responderIdentity: decodedAdvertisement.relayIdentity,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: directRequest.branchId,
+    circuitId: directRequest.circuitId,
+    generation: directRequest.generation,
+    extensionIndex: directRequest.extensionIndex,
+    clientTailEphemeralPublicKey: directRequest.clientTailEphemeralPublicKey,
+    clientNonce: directRequest.clientNonce,
+    advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
+    admittedLimitsDigest,
+    expiresAtMs: 4_500n,
+    responderProofNonce: seed(0x93)
+  }
+  const directExtended = {
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: directRequest.branchId,
+    circuitId: directRequest.circuitId,
+    generation: directRequest.generation,
+    extensionIndex: directRequest.extensionIndex,
+    responderAdvertisementDigest: directProofValue.responderAdvertisementDigest,
+    redactedProof: signRedactedResponderProof(directProofValue, responder.secretKey),
+    extensionNonce: directRequest.extensionNonce
+  }
+  const directCompletion = directSession.openExtended(encodeExtended(directExtended))
+  t.is(
+    directSession.completeClientExtension(
+      directCompletion,
+      encodeTailReadyFor(directExtended, directRequest, responder, {
+        transcriptDigest,
+        expiresAtMs: directProofValue.expiresAtMs
+      })
+    ),
+    directSession
+  )
+  const directHandoff = directSession.takeFinalExitHandoff()
+  t.exception(
+    () => consumeFinalExitHandoff(directHandoff),
+    'bridge handoff requires activation claim'
+  )
+
+  const handoff = session.takeFinalExitHandoff()
+  const claim = createFinalExitActivationClaim(handoff)
+  const activationOwner = claimFinalExitActivation(handoff, claim)
+  t.alike(Reflect.ownKeys(activationOwner), [])
+  t.exception(
+    () =>
+      session.completeClientExtension(
+        completion,
+        encodeTailReadyFor(extended, request, responder, {
+          transcriptDigest,
+          expiresAtMs: proofValue.expiresAtMs
+        })
+      ),
+    'accepted completion becomes spent'
+  )
+  t.exception(() => session.takeFinalExitHandoff(), 'handoff is one-shot')
+  t.exception(() => consumeFinalExitHandoff(handoff), 'claimed handoff is spent')
+  t.is(destroyFinalExitActivationOwner(activationOwner), true)
+  t.is(destroyFinalExitActivationOwner(activationOwner), false)
+  t.is(destroyTailControlSession(session), false)
+})
+
+test('TailControl initiator rejects ready at authenticated proof expiry', (t) => {
+  const proofExpiresAt = 4_500n
+  const clock = fakeClock({ wall: proofExpiresAt - 1n, monotonic: 10_000n })
+  const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
+  let responderSeed = null
+  for (let byte = 0x50; byte <= 0xff; byte++) {
+    const pair = cryptoSuite.keyPair(seed(byte))
+    if (roleForIdentity(pair.publicKey) === ROLE.PRIVATE) {
+      responderSeed = byte
+      break
+    }
+  }
+  const responder = cryptoSuite.keyPair(seed(responderSeed))
+  const signedAdvertisement = advertisement(responderSeed)
+  const decodedAdvertisement = decodeRelayCapabilityAdvertisement(signedAdvertisement)
+  const currentDecodedAdvertisement = decodeRelayCapabilityAdvertisement(currentAdvertisement)
+  const requestedLimits = Object.freeze({
+    cellSize: 1200,
+    maxCells: 64,
+    maxBytes: 65_536,
+    maxCommands: 10,
+    idleTimeoutMs: 5_000,
+    expiresAtMs: 5_000n
+  })
+  const admittedLimitsDigest = digestAdmittedLimits(requestedLimits)
+  const owner = authority(clock)
+  const adopted = owner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const session = createTailControlSession(
+    adopted.tail,
+    tailSessionOptions(clock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
+  const randomSeeds = [seed(0x90), seed(0x91), seed(0x92)]
+  const encoded = session.sealExtend({
+    advertisement: signedAdvertisement,
+    advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    extensionIndex: 2,
+    requestedLimits,
+    absoluteDeadline: 16_000n,
+    randomBytes: () => randomSeeds.shift()
+  })
+  const request = decodeExtendRequest(encoded)
+  const transcriptDigest = tailReadyTranscriptDigest(
+    initiatorTailControlTranscript(currentAdvertisement, requestedLimits)
+  )
+  const proofValue = {
+    responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
+    responderIdentity: decodedAdvertisement.relayIdentity,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: request.branchId,
+    circuitId: request.circuitId,
+    generation: request.generation,
+    extensionIndex: request.extensionIndex,
+    clientTailEphemeralPublicKey: request.clientTailEphemeralPublicKey,
+    clientNonce: request.clientNonce,
+    advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
+    admittedLimitsDigest,
+    expiresAtMs: proofExpiresAt,
+    responderProofNonce: seed(0x93)
+  }
+  const extended = {
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: request.branchId,
+    circuitId: request.circuitId,
+    generation: request.generation,
+    extensionIndex: request.extensionIndex,
+    responderAdvertisementDigest: proofValue.responderAdvertisementDigest,
+    redactedProof: signRedactedResponderProof(proofValue, responder.secretKey),
+    extensionNonce: request.extensionNonce
+  }
+  const completion = session.openExtended(encodeExtended(extended))
+  clock.advance(15_500n)
+  let code = null
+  try {
+    session.completeClientExtension(
+      completion,
+      encodeTailReadyFor(extended, request, responder, {
+        transcriptDigest,
+        expiresAtMs: proofExpiresAt
+      })
+    )
+  } catch (err) {
+    code = err && err.code
+  }
+  t.is(code, 'ERR_PRIVACY_UNAVAILABLE', 'elapsed projected proof deadline is expiry')
+  t.exception(() => readTailControlDeadline(session), 'elapsed proof projection releases tail')
+  t.is(destroyTailControlSession(session), false)
+
+  const underflowLimits = Object.freeze({
+    ...requestedLimits,
+    expiresAtMs: 16_000n
+  })
+  const underflowAdmittedLimitsDigest = digestAdmittedLimits(underflowLimits)
+  const underflowTranscriptDigest = tailReadyTranscriptDigest(
+    initiatorTailControlTranscript(currentAdvertisement, underflowLimits)
+  )
+  const underflowClock = fakeClock({ wall: 10_000n, monotonic: 1n })
+  const underflowOwner = authority(underflowClock)
+  const underflowAdopted = underflowOwner.adopt(
+    initiatorSealLink(signedAdvertisement, underflowLimits, {
+      currentAdvertisement,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const underflowSession = createTailControlSession(
+    underflowAdopted.tail,
+    tailSessionOptions(underflowClock, {
+      absoluteDeadline: 10_001n,
+      crypto: cryptoSuite
+    })
+  )
+  const underflowRandomSeeds = [seed(0x90), seed(0x91), seed(0x92)]
+  const underflowEncoded = underflowSession.sealExtend({
+    advertisement: signedAdvertisement,
+    advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    extensionIndex: 2,
+    requestedLimits: underflowLimits,
+    absoluteDeadline: 10_001n,
+    randomBytes: () => underflowRandomSeeds.shift()
+  })
+  const underflowRequest = decodeExtendRequest(underflowEncoded)
+  const underflowProofExpiresAt = 500n
+  const underflowProofValue = {
+    responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
+    responderIdentity: decodedAdvertisement.relayIdentity,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: underflowRequest.branchId,
+    circuitId: underflowRequest.circuitId,
+    generation: underflowRequest.generation,
+    extensionIndex: underflowRequest.extensionIndex,
+    clientTailEphemeralPublicKey: underflowRequest.clientTailEphemeralPublicKey,
+    clientNonce: underflowRequest.clientNonce,
+    advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
+    admittedLimitsDigest: underflowAdmittedLimitsDigest,
+    expiresAtMs: underflowProofExpiresAt,
+    responderProofNonce: seed(0x93)
+  }
+  const underflowExtended = {
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: underflowRequest.branchId,
+    circuitId: underflowRequest.circuitId,
+    generation: underflowRequest.generation,
+    extensionIndex: underflowRequest.extensionIndex,
+    responderAdvertisementDigest: underflowProofValue.responderAdvertisementDigest,
+    redactedProof: signRedactedResponderProof(underflowProofValue, responder.secretKey),
+    extensionNonce: underflowRequest.extensionNonce
+  }
+  underflowClock.advanceWall(1n)
+  const underflowCompletion = underflowSession.openExtended(encodeExtended(underflowExtended))
+  code = null
+  try {
+    underflowSession.completeClientExtension(
+      underflowCompletion,
+      encodeTailReadyFor(underflowExtended, underflowRequest, responder, {
+        transcriptDigest: underflowTranscriptDigest,
+        expiresAtMs: underflowProofExpiresAt
+      })
+    )
+  } catch (err) {
+    code = err && err.code
+  }
+  t.is(code, 'ERR_PRIVACY_UNAVAILABLE', 'underflowed projected proof deadline is expiry')
+  t.exception(
+    () => readTailControlDeadline(underflowSession),
+    'underflowed proof projection releases tail'
+  )
+  t.is(destroyTailControlSession(underflowSession), false)
+})
+
+test('TailControl completion destroys session when deadline rearm throws', (t) => {
+  const baseClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  let failTailRearm = false
+  const clock = {
+    wallNow: baseClock.wallNow,
+    monotonicNow: baseClock.monotonicNow,
+    schedule(callback, delay) {
+      if (failTailRearm) {
+        failTailRearm = false
+        throw new Error('injected rearm failure')
+      }
+      return baseClock.schedule(callback, delay)
+    },
+    cancelScheduled: baseClock.cancelScheduled,
+    pending: baseClock.pending
+  }
+  const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
+  let responderSeed = null
+  for (let byte = 0x50; byte <= 0xff; byte++) {
+    const pair = cryptoSuite.keyPair(seed(byte))
+    if (roleForIdentity(pair.publicKey) === ROLE.PRIVATE) {
+      responderSeed = byte
+      break
+    }
+  }
+  const responder = cryptoSuite.keyPair(seed(responderSeed))
+  const signedAdvertisement = advertisement(responderSeed)
+  const decodedAdvertisement = decodeRelayCapabilityAdvertisement(signedAdvertisement)
+  const currentDecodedAdvertisement = decodeRelayCapabilityAdvertisement(currentAdvertisement)
+  const requestedLimits = Object.freeze({
+    cellSize: 1200,
+    maxCells: 64,
+    maxBytes: 65_536,
+    maxCommands: 10,
+    idleTimeoutMs: 5_000,
+    expiresAtMs: 7_000n
+  })
+  const admittedLimitsDigest = digestAdmittedLimits(requestedLimits)
+  const transcriptDigest = tailReadyTranscriptDigest(
+    initiatorTailControlTranscript(currentAdvertisement, requestedLimits)
+  )
+  const owner = authority(clock)
+  const adopted = owner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const session = createTailControlSession(
+    adopted.tail,
+    tailSessionOptions(clock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
+  const randomSeeds = [seed(0x90), seed(0x91), seed(0x92)]
+  const encoded = session.sealExtend({
+    advertisement: signedAdvertisement,
+    advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    extensionIndex: 2,
+    requestedLimits,
+    absoluteDeadline: 16_000n,
+    randomBytes: () => randomSeeds.shift()
+  })
+  const request = decodeExtendRequest(encoded)
+  const proofValue = {
+    responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
+    responderIdentity: decodedAdvertisement.relayIdentity,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: request.branchId,
+    circuitId: request.circuitId,
+    generation: request.generation,
+    extensionIndex: request.extensionIndex,
+    clientTailEphemeralPublicKey: request.clientTailEphemeralPublicKey,
+    clientNonce: request.clientNonce,
+    advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
+    admittedLimitsDigest,
+    expiresAtMs: 6_500n,
+    responderProofNonce: seed(0x93)
+  }
+  const extended = {
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: request.branchId,
+    circuitId: request.circuitId,
+    generation: request.generation,
+    extensionIndex: request.extensionIndex,
+    responderAdvertisementDigest: proofValue.responderAdvertisementDigest,
+    redactedProof: signRedactedResponderProof(proofValue, responder.secretKey),
+    extensionNonce: request.extensionNonce
+  }
+  const completion = session.openExtended(encodeExtended(extended))
+  failTailRearm = true
+  let message = null
+  try {
+    session.completeClientExtension(
+      completion,
+      encodeTailReadyFor(extended, request, responder, {
+        transcriptDigest,
+        expiresAtMs: proofValue.expiresAtMs
+      })
+    )
+  } catch (err) {
+    message = err && err.message
+  }
+  t.is(message, 'injected rearm failure')
+  t.is(failTailRearm, false, 'completion attempts the shortened deadline rearm')
+  t.exception(() => readTailControlDeadline(session), 'rearm failure destroys the client tail')
+  t.is(destroyTailControlSession(session), false)
+})
+
 test('TailControl initiator sealExtend rejects requested wire expiry beyond local budget', (t) => {
   const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
@@ -1066,14 +2375,19 @@ test('TailControl initiator sealExtend rejects requested wire expiry beyond loca
     expiresAtMs: 7_001n
   })
   const owner = authority(clock)
-  const adopted = owner.adopt(initiatorSealLink(signedAdvertisement, requestedLimits, {
-    currentAdvertisement,
-    wireExpiresAt: 20_000n
-  }))
-  const session = createTailControlSession(adopted.tail, tailSessionOptions(clock, {
-    absoluteDeadline: 16_000n,
-    crypto: cryptoSuite
-  }))
+  const adopted = owner.adopt(
+    initiatorSealLink(signedAdvertisement, requestedLimits, {
+      currentAdvertisement,
+      wireExpiresAt: 20_000n
+    })
+  )
+  const session = createTailControlSession(
+    adopted.tail,
+    tailSessionOptions(clock, {
+      absoluteDeadline: 16_000n,
+      crypto: cryptoSuite
+    })
+  )
   let code = null
   try {
     session.sealExtend({

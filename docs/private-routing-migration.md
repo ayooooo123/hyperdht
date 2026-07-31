@@ -9,11 +9,10 @@ Direct mode remains the only public behavior. Gate 3A has no live route authorit
 The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
 
 The owner-approved Gate 3B1 Task 5 authenticated-M3 transport and Task 6
-tail-control lifetime/ownership amendment is now incorporated into the
-canonical design documents. This written repository revision awaits owner
-review. It records required migration compatibility only: it does not declare
-provisional implementation complete or accepted, and it does not change the
-implementation plan.
+tail-control lifetime/ownership amendment is incorporated into the canonical
+design documents and implemented internally in this fork. This remains a
+package-private compatibility slice: it does not add a public constructor,
+export, required-mode controller, production route, or anonymity claim.
 
 ## Reviewed prototype source
 
@@ -108,13 +107,37 @@ Migration must preserve these compatibility rules:
    lifetime/callback/clocks/deadline/generation, and routes cleanup from either
    module without accepting an arbitrary destructor.
 
-This amendment changes no existing wire byte, message order, public HyperDHT
-API, direct-mode behavior, or address-authority boundary. One 1,101-byte M3
-context envelope still produces one 1,200-byte CONTROL cell. Task 6 remains
-blocked until the Task 5 production issuer, record-bound demultiplexing, and
-reservation accounting can satisfy the exact design; fake issuers, raw
-sockets, arbitrary callbacks, physical destructors, and direct dial authority
-are not compatibility substitutes.
+Task 6 changes no existing wire byte, message order, public HyperDHT API,
+direct-mode behavior, or address-authority boundary. One 1,101-byte M3 context
+envelope still produces one 1,200-byte CONTROL cell. The implementation depends
+on Task 5 production OPEN-record issuers, record-bound demultiplexing, and
+reservation accounting; fake issuers, raw sockets, arbitrary callbacks,
+physical destructors, and direct dial authority remain incompatible
+substitutes.
+
+Local Task 6 verification used Node v22.19.0, npm 11.10.0, and the exact Bare
+v1.30.3 runtime restored into `/tmp/hyperdht-bare-v1.30.3` outside the
+repository:
+
+- Focused Task 6 suite
+  (`test/private/route-extension.js`, `test/private/guard-link.js`,
+  `test/private/udx-cell-endpoint.js`, `test/private/m3-adjacency-runtime.js`,
+  `test/private/tail-control.js`, `test/private/tail-extension-committer.js`,
+  `test/private/final-exit-handoff.js`, and
+  `test/private/final-exit-activation.js`) passed independently in Node and
+  Bare with 135/135 tests and 1,660/1,660 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 662/662 tests and 14,937/14,937 assertions.
+- `npm test` passed its repository-wide Prettier check, then reproduced the
+  documented local host-topology exception in direct-mode
+  `createServer + connect - same-LAN explicit keypair opens server`: Node
+  observed `HOLEPUNCH_ABORTED` in top-level test 18 and timed out without a
+  final TAP summary. This local full-suite run is not reported as green.
+- Exact Bare v1.30.3 direct full-suite verification reached 749 top-level
+  tests and 15,264 assertions, failing only the same direct-mode same-LAN
+  explicit-keypair case with `ETIMEDOUT`; final TAP was 748/749 tests and
+  15,263/15,264 assertions. This local full-suite run is not reported as
+  green.
 
 ### Gate 3A resource bounds
 

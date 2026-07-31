@@ -18,14 +18,20 @@ const {
   abortM3Install,
   beginM3Install,
   commitM3Install,
+  createM3ForwardingPublicationClaim,
+  createM3TailForwardingLease,
+  destroyM3TailForwardingPublication,
+  publishM3TailForwarding,
   consumeTailResponderToken,
   deriveM3CellIds,
   revokeM3TailCapability,
+  revokeM3TailForwardingLease,
   revokeTailResponderToken,
+  shortenM3TailLifetime,
   takeM3TailCapability,
+  takeM3TailForwardingPublication,
   validateM3Install
 } = require('../../lib/private/m3-adjacency-runtime')
-
 function fakeClock({ wall = 1_000n, monotonic = 10_000n } = {}) {
   let currentWall = wall
   let currentMonotonic = monotonic
@@ -339,6 +345,596 @@ test('installed pair expiry consumes forwarding owner once and cancels both hand
   t.is(nextLink.channel.destroys, 1)
   t.is(clock.fireNext(), false, 'the cancelled sibling callback cannot fire')
   t.is(destroys, 1, 'a cancelled sibling cannot consume the owner again')
+})
+
+test('forwarding publication claim and lease require object-identical synchronous take', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x7b),
+    peerIdentity: b4a.alloc(32, 0x7c),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const previousTail = takeM3TailCapability(previous.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  let forwardingDestroys = 0
+  let lifetimeDestroys = 0
+  const forwarding = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const publicationClaim = createM3ForwardingPublicationClaim(plan, forwarding)
+  t.ok(Object.isFrozen(publicationClaim), 'publication claim is opaque and frozen')
+  t.alike(Object.keys(publicationClaim), [], 'publication claim exposes no state')
+  t.exception(
+    () =>
+      createM3TailForwardingLease(
+        previousTail.transportOwner,
+        Object.freeze({}),
+        () => {},
+        publicationClaim
+      ),
+    'foreign lifetime cannot lease the forwarding claim'
+  )
+  const shortenedDeadline = shortenM3TailLifetime(
+    previousTail,
+    previousTail.deadline.localDeadline - 1n
+  )
+  t.is(shortenedDeadline, previousTail.deadline, 'shortening refreshes the exact leased lifetime')
+  const m3ForwardingLease = createM3TailForwardingLease(
+    previousTail.transportOwner,
+    previousTail.deadline,
+    () => {
+      lifetimeDestroys++
+    },
+    publicationClaim
+  )
+  t.ok(Object.isFrozen(m3ForwardingLease), 'forwarding lease is opaque and frozen')
+  t.alike(Object.keys(m3ForwardingLease), [], 'forwarding lease exposes no state')
+  const publication = publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
+  t.alike(
+    clock.delays,
+    [1_000, 1_000, 999, 999],
+    'publication is capped by the leased tail deadline'
+  )
+  const taken = takeM3TailForwardingPublication(publication, m3ForwardingLease, publicationClaim)
+  t.alike(Object.keys(taken), [
+    'm3ForwardingOwner',
+    'm3ForwardingLease',
+    'publicationClaim',
+    'forwarding'
+  ])
+  t.ok(
+    Object.isFrozen(taken.m3ForwardingOwner),
+    'taken publication carries an opaque forwarding owner'
+  )
+  t.is(taken.m3ForwardingLease, m3ForwardingLease)
+  t.is(taken.publicationClaim, publicationClaim)
+  t.is(typeof taken.forwarding.destroy, 'function')
+  t.is(
+    destroyM3TailForwardingPublication(publication),
+    false,
+    'publication handle is consumed by take'
+  )
+  t.is(
+    destroyM3TailForwardingPublication(taken),
+    true,
+    'taken publication destroys forwarding owner'
+  )
+  t.is(lifetimeDestroys, 1, 'publication destroy spends forwarding lease lifetime once')
+  t.is(forwardingDestroys, 1, 'publication destroy spends forwarding facade once')
+  t.is(previousLink.channel.destroys, 1)
+  t.is(nextLink.channel.destroys, 1)
+})
+
+test('aborting a leased forwarding claim spends the lease owner once', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x8f),
+    peerIdentity: b4a.alloc(32, 0x90),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const previousTail = takeM3TailCapability(previous.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  let forwardingDestroys = 0
+  let lifetimeDestroys = 0
+  const forwarding = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const publicationClaim = createM3ForwardingPublicationClaim(plan, forwarding)
+  const m3ForwardingLease = createM3TailForwardingLease(
+    previousTail.transportOwner,
+    previousTail.deadline,
+    () => {
+      lifetimeDestroys++
+    },
+    publicationClaim
+  )
+
+  t.is(abortM3Install(plan), true)
+  t.is(revokeM3TailForwardingLease(m3ForwardingLease), false)
+  t.is(lifetimeDestroys, 1, 'abort spends the forwarding lease owner')
+  t.is(forwardingDestroys, 1, 'abort destroys the staged forwarding facade')
+  previous.runtime.destroy()
+  next.runtime.destroy()
+})
+
+test('staged forwarding destroy uses the validated descriptor value', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x91),
+    peerIdentity: b4a.alloc(32, 0x92),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  let destroys = 0
+  const target = forwardingFacade(() => {
+    destroys++
+  })
+  const forwarding = new Proxy(target, {
+    get(value, property, receiver) {
+      if (property === 'destroy') throw new Error('destroy getter trap')
+      return Reflect.get(value, property, receiver)
+    }
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  createM3ForwardingPublicationClaim(plan, forwarding)
+
+  t.is(abortM3Install(plan), true)
+  t.is(destroys, 1, 'abort invokes the accepted data descriptor destroy')
+  previous.runtime.destroy()
+  next.runtime.destroy()
+})
+
+test('publishing forwarding uses the staged descriptor without re-reflection', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x95),
+    peerIdentity: b4a.alloc(32, 0x96),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const previousTail = takeM3TailCapability(previous.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  let publishing = false
+  let forwardingDestroys = 0
+  const target = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const forwarding = new Proxy(target, {
+    getOwnPropertyDescriptor(value, property) {
+      if (publishing && (property === 'diagnostics' || property === 'destroy')) {
+        throw new Error('descriptor reflection repeated during publish')
+      }
+      return Reflect.getOwnPropertyDescriptor(value, property)
+    }
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const publicationClaim = createM3ForwardingPublicationClaim(plan, forwarding)
+  const m3ForwardingLease = createM3TailForwardingLease(
+    previousTail.transportOwner,
+    previousTail.deadline,
+    () => {},
+    publicationClaim
+  )
+
+  publishing = true
+  const publication = publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
+  const taken = takeM3TailForwardingPublication(publication, m3ForwardingLease, publicationClaim)
+  t.is(destroyM3TailForwardingPublication(taken), true)
+  t.is(forwardingDestroys, 1)
+})
+
+test('taken forwarding publication tombstones before lease reentry', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x93),
+    peerIdentity: b4a.alloc(32, 0x94),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const previousTail = takeM3TailCapability(previous.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  let taken = null
+  let nestedDestroy = null
+  let lifetimeDestroys = 0
+  let forwardingDestroys = 0
+  const forwarding = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const publicationClaim = createM3ForwardingPublicationClaim(plan, forwarding)
+  const m3ForwardingLease = createM3TailForwardingLease(
+    previousTail.transportOwner,
+    previousTail.deadline,
+    () => {
+      lifetimeDestroys++
+      nestedDestroy = destroyM3TailForwardingPublication(taken)
+    },
+    publicationClaim
+  )
+  const publication = publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
+  taken = takeM3TailForwardingPublication(publication, m3ForwardingLease, publicationClaim)
+
+  t.is(destroyM3TailForwardingPublication(taken), true)
+  t.is(nestedDestroy, false, 'lease cleanup reentry observes a tombstoned receipt')
+  t.is(lifetimeDestroys, 1)
+  t.is(forwardingDestroys, 1)
+})
+
+test('taken forwarding publication retires owner before lease callback reentry', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x97),
+    peerIdentity: b4a.alloc(32, 0x98),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const previousTail = takeM3TailCapability(previous.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  let taken = null
+  let nestedForwardingDestroy = null
+  let lifetimeDestroys = 0
+  let forwardingDestroys = 0
+  const forwarding = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const publicationClaim = createM3ForwardingPublicationClaim(plan, forwarding)
+  const m3ForwardingLease = createM3TailForwardingLease(
+    previousTail.transportOwner,
+    previousTail.deadline,
+    () => {
+      lifetimeDestroys++
+      nestedForwardingDestroy = taken.forwarding.destroy()
+    },
+    publicationClaim
+  )
+  const publication = publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
+  taken = takeM3TailForwardingPublication(publication, m3ForwardingLease, publicationClaim)
+
+  t.is(destroyM3TailForwardingPublication(taken), true)
+  t.is(nestedForwardingDestroy, false, 'lease callback sees a retired forwarding owner')
+  t.is(lifetimeDestroys, 1)
+  t.is(forwardingDestroys, 1)
+})
+
+test('forwarding publication expires with its installed owner before receipt take', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x81),
+    peerIdentity: b4a.alloc(32, 0x82),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const previousTail = takeM3TailCapability(previous.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  let forwardingDestroys = 0
+  let lifetimeDestroys = 0
+  const forwarding = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const publicationClaim = createM3ForwardingPublicationClaim(plan, forwarding)
+  const m3ForwardingLease = createM3TailForwardingLease(
+    previousTail.transportOwner,
+    previousTail.deadline,
+    () => {
+      lifetimeDestroys++
+    },
+    publicationClaim
+  )
+  const publication = publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
+
+  t.is(clock.fireNext(), true, 'runtime expiry reaches the forwarding owner')
+  t.is(lifetimeDestroys, 1, 'owner expiry spends the forwarding lease owner')
+  t.is(forwardingDestroys, 1, 'owner expiry destroys the forwarding facade')
+  t.exception(
+    () => takeM3TailForwardingPublication(publication, m3ForwardingLease, publicationClaim),
+    'expired publication cannot be consumed'
+  )
+  t.is(destroyM3TailForwardingPublication(publication), false)
+})
+
+test('publish closes claim and lease before clock reentry can revoke them', (t) => {
+  const baseClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  let onWall = null
+  const runtimeClock = {
+    wallNow() {
+      if (onWall) onWall()
+      return baseClock.wallNow()
+    },
+    monotonicNow: baseClock.monotonicNow,
+    schedule: baseClock.schedule,
+    cancelScheduled: baseClock.cancelScheduled
+  }
+  const owner = authority(runtimeClock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x86),
+    peerIdentity: b4a.alloc(32, 0x87),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const previousTail = takeM3TailCapability(previous.tail, {
+    wallNow: runtimeClock.wallNow,
+    monotonicNow: runtimeClock.monotonicNow
+  })
+  let forwardingDestroys = 0
+  let lifetimeDestroys = 0
+  let revoked = null
+  const forwarding = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const publicationClaim = createM3ForwardingPublicationClaim(plan, forwarding)
+  const m3ForwardingLease = createM3TailForwardingLease(
+    previousTail.transportOwner,
+    previousTail.deadline,
+    () => {
+      lifetimeDestroys++
+    },
+    publicationClaim
+  )
+  onWall = () => {
+    onWall = null
+    revoked = revokeM3TailForwardingLease(m3ForwardingLease)
+  }
+  const publication = publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
+
+  t.is(revoked, false, 'publish phase makes the forwarding lease non-revocable before callbacks')
+  t.is(forwardingDestroys, 0)
+  t.is(lifetimeDestroys, 0)
+  t.is(destroyM3TailForwardingPublication(publication), true)
+  t.is(forwardingDestroys, 1)
+  t.is(lifetimeDestroys, 1)
+})
+
+test('forwarding claim creation rejects facade reflection reentry', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x8b),
+    peerIdentity: b4a.alloc(32, 0x8c),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+
+  let reentered = false
+  let reentryClaim = null
+  let reentryError = null
+  const target = forwardingFacade()
+  const reflected = new Proxy(target, {
+    ownKeys(value) {
+      if (!reentered) {
+        reentered = true
+        try {
+          reentryClaim = createM3ForwardingPublicationClaim(plan, forwardingFacade())
+        } catch (err) {
+          reentryError = err
+        }
+      }
+      return Reflect.ownKeys(value)
+    }
+  })
+
+  t.exception(
+    () => createM3ForwardingPublicationClaim(plan, reflected),
+    'facade reflection cannot reenter claim creation'
+  )
+  t.is(reentryClaim, null, 'reentrant claim is never published')
+  t.ok(reentryError, 'reentrant creation attempt is rejected')
+  t.is(abortM3Install(plan), true)
+  previous.runtime.destroy()
+  next.runtime.destroy()
+})
+
+test('aborting a claimed forwarding install rejects destroy reentry claims', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x8d),
+    peerIdentity: b4a.alloc(32, 0x8e),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+
+  let reentryClaim = null
+  let reentryError = null
+  let destroys = 0
+  const forwarding = forwardingFacade(() => {
+    destroys++
+    try {
+      reentryClaim = createM3ForwardingPublicationClaim(plan, forwardingFacade())
+    } catch (err) {
+      reentryError = err
+    }
+  })
+  createM3ForwardingPublicationClaim(plan, forwarding)
+
+  t.is(abortM3Install(plan), true)
+  t.is(destroys, 1, 'abort destroys the original staged forwarding facade once')
+  t.is(reentryClaim, null, 'destroy reentry cannot claim the aborting install plan')
+  t.ok(reentryError, 'destroy reentry observes a rejected install plan')
+  previous.runtime.destroy()
+  next.runtime.destroy()
+})
+
+test('revoking unpublished forwarding lease aborts install and destroys staged owners', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x7d),
+    peerIdentity: b4a.alloc(32, 0x7e),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const previousTail = takeM3TailCapability(previous.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  let forwardingDestroys = 0
+  let lifetimeDestroys = 0
+  const forwarding = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const publicationClaim = createM3ForwardingPublicationClaim(plan, forwarding)
+  const m3ForwardingLease = createM3TailForwardingLease(
+    previousTail.transportOwner,
+    previousTail.deadline,
+    () => {
+      lifetimeDestroys++
+    },
+    publicationClaim
+  )
+
+  t.is(revokeM3TailForwardingLease(m3ForwardingLease), true)
+  t.is(revokeM3TailForwardingLease(m3ForwardingLease), false)
+  t.is(lifetimeDestroys, 1, 'lease revocation spends forwarding lifetime once')
+  t.is(forwardingDestroys, 1, 'lease revocation destroys unpublished facade once')
+  previous.runtime.destroy()
+  next.runtime.destroy()
+})
+
+test('aborting a claimed forwarding install destroys the staged facade once', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousLink = syntheticLink({ initiator: false, wireExpiresAt: 2_000n })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x7f),
+    peerIdentity: b4a.alloc(32, 0x80),
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  let forwardingDestroys = 0
+  const forwarding = forwardingFacade(() => {
+    forwardingDestroys++
+  })
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  createM3ForwardingPublicationClaim(plan, forwarding)
+  t.exception(
+    () => createM3ForwardingPublicationClaim(plan, forwardingFacade()),
+    'one claim per install plan'
+  )
+  const legacyPreviousLink = syntheticLink({
+    initiator: false,
+    completeOfferDigest: b4a.alloc(32, 0x88),
+    peerIdentity: b4a.alloc(32, 0x89),
+    wireExpiresAt: 2_000n
+  })
+  const legacyNextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x88),
+    peerIdentity: b4a.alloc(32, 0x8a),
+    wireExpiresAt: 2_000n
+  })
+  const legacyPrevious = owner.adopt(legacyPreviousLink.handle)
+  const legacyNext = owner.adopt(legacyNextLink.handle)
+  const legacyPlan = beginM3Install(legacyPrevious.runtime, legacyNext.runtime)
+  validateM3Install(legacyPlan, legacyPreviousLink.state.localIdentity, 128, 1_000n)
+  t.exception(
+    () => commitM3Install(legacyPlan, 2_000n, forwarding),
+    'legacy commit cannot take a facade staged for publication'
+  )
+  t.is(forwardingDestroys, 0, 'legacy commit rejection does not spend the staged facade')
+  t.is(abortM3Install(plan), true)
+  t.is(abortM3Install(plan), false)
+  t.is(forwardingDestroys, 1, 'abort destroys the staged forwarding facade once')
+  const retryPreviousLink = syntheticLink({
+    initiator: false,
+    completeOfferDigest: b4a.alloc(32, 0x83),
+    peerIdentity: b4a.alloc(32, 0x84),
+    wireExpiresAt: 2_000n
+  })
+  const retryNextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0x83),
+    peerIdentity: b4a.alloc(32, 0x85),
+    wireExpiresAt: 2_000n
+  })
+  const retryPrevious = owner.adopt(retryPreviousLink.handle)
+  const retryNext = owner.adopt(retryNextLink.handle)
+  const retryPlan = beginM3Install(retryPrevious.runtime, retryNext.runtime)
+  validateM3Install(retryPlan, retryPreviousLink.state.localIdentity, 128, 1_000n)
+  t.exception(
+    () => createM3ForwardingPublicationClaim(retryPlan, forwarding),
+    'destroyed staged forwarding facade cannot be reused'
+  )
+  t.is(abortM3Install(retryPlan), true)
+  retryPrevious.runtime.destroy()
+  retryNext.runtime.destroy()
+  previous.runtime.destroy()
+  next.runtime.destroy()
 })
 
 test('M3 authority rejects extra and accessor-backed capabilities before retention', (t) => {

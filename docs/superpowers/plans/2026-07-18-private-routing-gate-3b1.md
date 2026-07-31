@@ -1468,7 +1468,7 @@ Add separate RED cases proving:
 3. Promise settlement alone does not commit: the handler validates the receiver
    and still-`DIALING` generation/deadlines, invokes no external callback
    between final check and the atomic install of `{ receiver,
-   pendingOfferLease, socketOwnerLease }`, then marks the authority
+pendingOfferLease, socketOwnerLease }`, then marks the authority
    `TRANSFERRED`;
 4. abort, destroy, or local/wire expiry while a genuine dial Promise is
    unsettled wins by detaching and tombstoning first, moving
@@ -1602,16 +1602,16 @@ The successor factory uses exact:
 
 ```js
 {
-  advertisement,
-  adjacencyAdopter,
-  extensionResponderSigner,
-  responderRouteEncryptionSecretKey,
-  wallNow,
-  monotonicNow,
-  schedule,
-  cancelScheduled,
-  offerReceiver,
-  randomBytes
+  ;(advertisement,
+    adjacencyAdopter,
+    extensionResponderSigner,
+    responderRouteEncryptionSecretKey,
+    wallNow,
+    monotonicNow,
+    schedule,
+    cancelScheduled,
+    offerReceiver,
+    randomBytes)
 }
 ```
 
@@ -1745,12 +1745,12 @@ Add one RED-then-GREEN case per exact `sealExtend` own-data field:
 
 ```js
 {
-  advertisement,
-  advertisementDigest,
-  extensionIndex,
-  requestedLimits,
-  absoluteDeadline,
-  randomBytes
+  ;(advertisement,
+    advertisementDigest,
+    extensionIndex,
+    requestedLimits,
+    absoluteDeadline,
+    randomBytes)
 }
 ```
 
@@ -1843,7 +1843,7 @@ uses discovery or is reusable, the lifetime is not shortened first, or cleanup
 reaches shared physical close. Implement only the production token-gated
 authority/admission path until this command is GREEN, then return to Step 5b.
 
-- [ ] **Step 8b: Finish responder transitions and move authenticated runtime ownership**
+- [x] **Step 8b: Finish responder transitions and move authenticated runtime ownership**
 
 Resume only after Step 5b consumes the honest admission synchronously before
 its first await and passes. Add RED cases for `RESPONDER_INSTALLING` and each
@@ -1914,8 +1914,7 @@ destroyTakenTailForwardingTransfer(taken)
 
 ```js
 {
-  transfer,
-  publicationClaim
+  ;(transfer, publicationClaim)
 }
 ```
 
@@ -1954,12 +1953,7 @@ The committer moves claim/facade into `tail-control.js`; it publishes neither.
 While the stable owner is `RESPONDER_INSTALLING`, `tail-control.js` invokes:
 
 ```js
-createM3TailForwardingLease(
-  transportOwner,
-  lifetime,
-  ownerDestroy,
-  publicationClaim
-)
+createM3TailForwardingLease(transportOwner, lifetime, ownerDestroy, publicationClaim)
 ```
 
 This atomically tombstones send/receive borrow facades and moves the predecessor
@@ -1977,10 +1971,7 @@ generation, and returns exactly:
 
 ```js
 {
-  tailControlOwner,
-  m3ForwardingLease,
-  publicationClaim,
-  forwarding
+  ;(tailControlOwner, m3ForwardingLease, publicationClaim, forwarding)
 }
 ```
 
@@ -1991,11 +1982,7 @@ The runtime registry then uses only:
 
 ```js
 publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
-takeM3TailForwardingPublication(
-  publication,
-  m3ForwardingLease,
-  publicationClaim
-)
+takeM3TailForwardingPublication(publication, m3ForwardingLease, publicationClaim)
 revokeM3TailForwardingLease(m3ForwardingLease)
 destroyM3TailForwardingPublication(publication)
 ```
@@ -2446,10 +2433,7 @@ The endpoint initiator forbids a READY signer:
 
 ```js
 const initiatorClaim = createFinalExitActivationClaim(initiatorHandoff)
-const initiatorOwner = claimFinalExitActivation(
-  initiatorHandoff,
-  initiatorClaim
-)
+const initiatorOwner = claimFinalExitActivation(initiatorHandoff, initiatorClaim)
 const initiatorSession = new FinalExitActivationSession(initiatorOwner, {
   branchId,
   circuitId,

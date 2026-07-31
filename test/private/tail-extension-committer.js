@@ -1,7 +1,12 @@
 const b4a = require('b4a')
 const test = require('brittle')
 
-const { createTailExtensionCommitter, destroyTailExtensionCommitter, enqueueTailExtended, installTailExtension } = require('../../lib/private/tail-extension-committer')
+const {
+  createTailExtensionCommitter,
+  destroyTailExtensionCommitter,
+  enqueueTailExtended,
+  installTailExtension
+} = require('../../lib/private/tail-extension-committer')
 const { M3_CONTEXT_ENVELOPE_SIZE } = require('../../lib/private/m3-context')
 
 function expectCode(t, operation, code, message) {
