@@ -46,7 +46,9 @@ const { createLinkSetupAuthority } = require('../../lib/private/link-setup')
 const { LinkDirectory, signTopologyGrant } = require('../../lib/private/topology-grant')
 const {
   RouteExtensionSession,
+  createRouteExtensionFactory,
   createRouteExtensionSessionRequest,
+  openRouteExtension,
   takeRouteExtensionTransfer
 } = require('../../lib/private/route-extension')
 const {
@@ -789,7 +791,17 @@ test('route extension uses registered M3 tail-control envelopes from a real inde
   try {
     tail = await createInitialTail(guard, clock)
     const trace = []
-    const request = createRouteExtensionSessionRequest({
+    const extensionFactory = createRouteExtensionFactory({
+      wallNow: clock.wallNow,
+      monotonicNow: clock.monotonicNow,
+      randomBytes: (() => {
+        const values = [seed(0x70), seed(0x71), seed(0x72)]
+        return () => values.shift()
+      })(),
+      schedule: clock.schedule,
+      cancelScheduled: clock.cancelScheduled
+    })
+    const opening = openRouteExtension(extensionFactory, {
       transaction: selected.transaction,
       selection: selected.middle,
       branchClass: BRANCH_CLASS.LOOKUP,
@@ -799,19 +811,9 @@ test('route extension uses registered M3 tail-control envelopes from a real inde
       limits: Object.freeze({}),
       absoluteDeadline: 15_000n,
       signedExpiry: 15_000n,
-      wallNow: clock.wallNow,
-      monotonicNow: clock.monotonicNow,
-      randomBytes: (() => {
-        const values = [seed(0x70), seed(0x71), seed(0x72)]
-        return () => values.shift()
-      })(),
-      schedule: clock.schedule,
-      cancelScheduled: clock.cancelScheduled,
       cancel() {},
       tailControl: tail.initiatorSession
     })
-    const session = new RouteExtensionSession(request)
-    const opening = session.open()
     await answerOneExtension(
       clock,
       tail.responderSession,

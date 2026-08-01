@@ -44,10 +44,11 @@ const {
 } = require('../../lib/private/tail-control')
 const { signRedactedResponderProof } = require('../../lib/private/redacted-responder-proof')
 const {
-  FinalExitActivationSession,
   claimFinalExitActivation,
   createFinalExitActivationClaim,
-  destroyFinalExitActivationOwner
+  createFinalExitActivationFactory,
+  destroyFinalExitActivationOwner,
+  openFinalExit
 } = require('../../lib/private/final-exit-activation')
 const {
   createDhtExitReadySigner,
@@ -502,13 +503,18 @@ function activationOwnerFixture(t) {
 
 function activationSession(t) {
   const fixture = activationOwnerFixture(t)
-  const session = new FinalExitActivationSession(fixture.activationOwner, {
-    now: fixture.clock.wallNow,
+  const factory = createFinalExitActivationFactory({
+    wallNow: fixture.clock.wallNow,
     monotonicNow: fixture.clock.monotonicNow,
+    randomBytes: (size) => seed(0x22, size),
     schedule: fixture.clock.schedule,
-    cancelScheduled: fixture.clock.cancelScheduled,
+    cancelScheduled: fixture.clock.cancelScheduled
+  })
+  const session = openFinalExit(factory, {
+    handoff: fixture.activationOwner,
     crypto: cryptoSuite,
-    payloadParameters: PAYLOAD_PARAMETERS
+    payloadParameters: PAYLOAD_PARAMETERS,
+    readySigner: undefined
   })
   return { ...fixture, session }
 }
@@ -523,11 +529,7 @@ test('FinalExitActivationSession initiator rejects wrong-role READY and activati
   const wrongRole = activationSession(t)
   expectCode(
     t,
-    () =>
-      wrongRole.session.sealReady({
-        identitySecretKey: seed(0x20, 64),
-        randomBytes: () => seed(0x21)
-      }),
+    () => wrongRole.session.sealReady(),
     'ERR_AUTHENTICATION',
     'initiator cannot seal READY'
   )
@@ -537,7 +539,7 @@ test('FinalExitActivationSession initiator rejects wrong-role READY and activati
   expired.clock.advance(16_000n)
   expectCode(
     t,
-    () => expired.session.sealActivate({ randomBytes: () => seed(0x22) }),
+    () => expired.session.sealActivate(),
     'ERR_PRIVACY_UNAVAILABLE',
     'activation cannot start after the moved monotonic final-exit deadline'
   )
@@ -547,18 +549,18 @@ test('FinalExitActivationSession initiator rejects wrong-role READY and activati
 test('FinalExitActivationSession retryActivate enforces frozen retry schedule', (t) => {
   const { clock, session } = activationSession(t)
   const basePending = clock.pending()
-  session.sealActivate({ randomBytes: (n) => seed(0xb0, n) })
+  session.sealActivate()
   t.is(clock.pending(), basePending + 1)
   t.ok(clock.delays().includes(250))
   expectCode(
     t,
-    () => session.retryActivate({ randomBytes: (n) => seed(0xb1, n) }),
+    () => session.retryActivate(),
     'ERR_PRIVACY_UNAVAILABLE',
     'retry cannot emit before 250ms ordinal'
   )
   t.ok(clock.delays().includes(250))
   clock.advance(10_250n)
-  session.retryActivate({ randomBytes: (n) => seed(0xb2, n) })
+  session.retryActivate()
   t.ok(clock.delays().includes(500))
   t.is(clock.pending(), basePending + 1)
   t.is(session.destroy(), true)
@@ -570,7 +572,7 @@ test('FinalExitActivationSession observes activation owner destruction after con
   t.is(destroyFinalExitActivationOwner(activationOwner), true)
   expectCode(
     t,
-    () => session.sealActivate({ randomBytes: () => seed(0x24) }),
+    () => session.sealActivate(),
     'ERR_DESTROYED',
     'destroyed activation owner invalidates the live session'
   )
@@ -608,31 +610,47 @@ test('FinalExitActivationSession completes ACTIVATE READY ACK OPEN with producti
   const handoff = tail.takeFinalExitHandoff()
   const claim = createFinalExitActivationClaim(handoff)
   const activationOwner = claimFinalExitActivation(handoff, claim)
-  const responder = new FinalExitActivationSession(activationOwner, {
-    now: clock.wallNow,
+  const responderFactory = createFinalExitActivationFactory({
+    wallNow: clock.wallNow,
     monotonicNow: clock.monotonicNow,
+    randomBytes: (size) => seed(0x74, size),
     schedule: clock.schedule,
-    cancelScheduled: clock.cancelScheduled,
+    cancelScheduled: clock.cancelScheduled
+  })
+  const responder = openFinalExit(responderFactory, {
+    handoff: activationOwner,
     crypto: cryptoSuite,
     payloadParameters: PAYLOAD_PARAMETERS,
     readySigner: dhtExitReadySigner
   })
 
-  const activate = initiator.session.sealActivate({ randomBytes: (n) => seed(0xa0, n) })
+  const activate = initiator.session.sealActivate()
   t.alike(responder.openActivate(activate).exitOriginCommandPolicyDigest.byteLength, 32)
-  let ready = responder.sealReady({ randomBytes: (n) => seed(0xa1, n) })
+  let ready = responder.sealReady()
   expectCode(
     t,
-    () => responder.retryReady({ randomBytes: (n) => seed(0xa4, n) }),
+    () => responder.retryReady(),
     'ERR_PRIVACY_UNAVAILABLE',
     'READY retry cannot emit before 250ms ordinal'
   )
-  t.alike(responder.diagnostics(), { state: 'FINALIZING' })
+  t.is(clock.delays().filter((delay) => delay === 250).length, 2)
   clock.advance(10_250n)
-  ready = responder.retryReady({ randomBytes: (n) => seed(0xa5, n) })
+  ready = responder.retryReady()
   t.alike(initiator.session.openReady(ready).exitIdentity, initiator.responderIdentity)
-  const ack = initiator.session.sealAck({ randomBytes: (n) => seed(0xa2, n) })
-  const openEnvelope = responder.openAck(ack, { randomBytes: (n) => seed(0xa3, n) })
+  expectCode(
+    t,
+    () => initiator.session.sealAck({ randomBytes: (n) => seed(0xa2, n) }),
+    'INVALID_ROUTE',
+    'final-exit facade rejects caller random bytes'
+  )
+  const ack = initiator.session.sealAck()
+  expectCode(
+    t,
+    () => responder.openAck(ack, { randomBytes: (n) => seed(0xa3, n) }),
+    'INVALID_ROUTE',
+    'final-exit facade injects responder random bytes'
+  )
+  const openEnvelope = responder.openAck(ack)
   t.alike(initiator.session.openOpen(openEnvelope).payloadParametersDigest.byteLength, 32)
   t.alike(initiator.session.diagnostics(), { state: 'OPEN' })
   t.alike(responder.diagnostics(), { state: 'OPEN' })

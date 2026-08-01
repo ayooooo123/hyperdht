@@ -196,6 +196,37 @@ v1.30.3:
 - Complete private aggregate `test/private-routing.js` passed independently in
   Node and Bare with 693/693 tests and 15,170/15,170 assertions.
 
+Local Task 9 Step 2 verification used Node v22.19.0, npm 11.10.0, and Bare
+v1.30.3:
+
+- `lib/private/branch-path-authority.js` builds an atomic initial lookup/
+  announce draft from one relay-directory transaction. It consumes exactly four
+  selected evidence objects, binds the directory scope to the pinned
+  `GuardLease`, rejects guard/candidate identity and subnet collisions, reserves
+  four shared-guard M3 slots, and aborts without committing on destroy or
+  failure.
+- `lib/private/route-extension.js` and `lib/private/final-exit-activation.js`
+  own the empty opaque route-extension/final-exit factory capabilities. The
+  wrappers `openRouteExtension(factory, exactOptions)` and
+  `openFinalExit(factory, exactOptions)` inject only the factory-owned wall
+  clock, monotonic clock, random source, scheduler, and cancellation function;
+  final-exit retry and retired/replayed OPEN helpers also reject caller RNG.
+  `lib/private/route-manager.js` validates those same factory capabilities and
+  still exposes only the initial `buildInitialPair()`, `branchCapability()`, and
+  `destroy()` manager surface until terminal OPEN publication lands.
+- Focused Task 9 Step 2 suite (`test/private/branch-path-authority.js`,
+  `test/private/route-manager.js`, `test/private/guard-lease.js`,
+  `test/private/udx-cell-endpoint.js`) passed independently in Node with 27/27
+  tests and 228/228 assertions. The new branch/manager tests also passed
+  independently in Bare with 8/8 tests and 95/95 assertions.
+- Focused Task 9 Step 3 suite (`test/private/route-manager.js`,
+  `test/private/route-extension-session.js`,
+  `test/private/final-exit-activation-session.js`,
+  `test/private/final-exit-activation.js`) passed in Node with 19/19 tests and
+  146/146 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 701/701 tests and 15,267/15,267 assertions.
+
 ### Gate 3A resource bounds
 
 Fragmentation is limited to eight fragments, eight concurrent messages, eight buffered fragments, and a five-second message deadline. Eight full fragments carry at most 8,424 bytes of application data. Including the twenty-byte header in each of eight route payloads produces at most 8,584 encoded bytes; 8,584 is not an application-data limit. Public duplex segmentation across multiple internal messages is intentionally absent.
