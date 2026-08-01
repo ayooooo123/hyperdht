@@ -223,9 +223,16 @@ v1.30.3:
   `test/private/route-extension-session.js`,
   `test/private/final-exit-activation-session.js`,
   `test/private/final-exit-activation.js`) passed in Node with 19/19 tests and
-  146/146 assertions.
+  157/157 assertions. The final-exit facade proof now consumes the authenticated
+  responder OPEN handoff and proves replay/revoke/destruction semantics.
+- `lib/private/dht-exit-seeds.js` freezes the DHT-only exit seed set as
+  signed `DHT_EXIT_DHT_SEEDS_V1` bytes. `test/private/dht-exit-seeds.js`
+  proves exact one- and three-reference encodings, strict 1..3 count
+  bounds, canonical set-digest input, canonical destination ordering,
+  branch/exit binding, clocked expiry rejection, hostile descriptor
+  rejection, signature verification, and zeroization.
 - Complete private aggregate `test/private-routing.js` passed independently in
-  Node and Bare with 701/701 tests and 15,267/15,267 assertions.
+  Node and Bare with 703/703 tests and 15,347/15,347 assertions.
 
 ### Gate 3A resource bounds
 

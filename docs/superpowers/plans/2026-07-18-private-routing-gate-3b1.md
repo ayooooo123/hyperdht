@@ -3001,7 +3001,7 @@ git commit -m "feat: manage two private route generations"
 - Modify: `test/private-routing.js`
 - Regenerate: `test/all.js`
 
-- [ ] **Step 1: Add failing minimum/maximum `0x0045` vectors**
+- [x] **Step 1: Add failing minimum/maximum `0x0045` vectors**
 
 Freeze one one-reference and one three-reference vector using the exact body:
 
@@ -3026,7 +3026,7 @@ npx brittle-node test/private/dht-exit-seeds.js
 
 Expected: FAIL because the codec does not exist.
 
-- [ ] **Step 2: Implement strict seed sign/encode/decode/verify**
+- [x] **Step 2: Implement strict seed sign/encode/decode/verify**
 
 Create exact exports:
 
@@ -3034,7 +3034,7 @@ Create exact exports:
 signDhtExitSeeds(value, exitSecretKey)
 encodeDhtExitSeeds(value)
 decodeDhtExitSeeds(encoded)
-verifyDhtExitSeeds(encoded, expected)
+verifyDhtExitSeeds(encoded, expected, now)
 clearDhtExitSeeds(value)
 ```
 
@@ -3046,7 +3046,7 @@ session, socket, or tuple; assign `CONFIGURED_BOOTSTRAP`; mint a handle; publish
 a destination; or claim server-table liveness. Correctly signed seed bytes are
 inert until Task 12 consumes them through a terminal-bound admission authority.
 
-- [ ] **Step 3: Prove the codec alone cannot publish authority**
+- [x] **Step 3: Prove the codec alone cannot publish authority**
 
 Assert none of the exports can mutate Task 1's live endpoint owner. Mutation,
 hostile accessors, allocation failure, wrong key/branch/generation, and trailing
@@ -3054,7 +3054,7 @@ data clear every owned copy and leave zero records. Task 12 adds the only
 production signing/delivery and atomic admission path after the exit table
 exists.
 
-- [ ] **Step 4: Run both runtimes and commit**
+- [x] **Step 4: Run both runtimes and commit**
 
 ```bash
 npx brittle-node test/private/dht-exit-seeds.js test/private/protocol.js
