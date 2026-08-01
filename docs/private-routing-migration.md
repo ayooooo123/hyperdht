@@ -175,6 +175,27 @@ Local Task 8 verification used Node v22.19.0, npm 11.10.0, and Bare v1.30.3:
 - Complete private aggregate `test/private-routing.js` passed independently in
   Node and Bare with 689/689 tests and 15,147/15,147 assertions.
 
+Local Task 9 Step 1 verification used Node v22.19.0, npm 11.10.0, and Bare
+v1.30.3:
+
+- `lib/private/guard-lease.js` adds the opaque GuardLease owner for a pinned
+  SHARED_GUARD bootstrap material record. Lease creation consumes the
+  `GuardLeaseMaterial`, binds the separately returned pinned guard identity and
+  endpoint tuple, and retains physical close authority without exposing raw
+  endpoint, established-link, or secret material.
+- `lib/private/udx-cell-endpoint.js` brands the OPEN record only during
+  bootstrap pinning, rejects preexisting generic M3 transfer ownership before
+  branding, and permits at most four live shared-guard M3 transfer issuer/
+  transfer slots. Destroying a shared logical transfer releases only its slot;
+  GuardLease destroy revokes every shared slot before closing the physical
+  owner once.
+- Focused Task 9 Step 1 suite (`test/private/guard-lease.js`,
+  `test/private/udx-cell-endpoint.js`, `test/private/guard-link.js`,
+  `test/private/m3-adjacency-runtime.js`) passed independently in Node with
+  102/102 tests and 1,419/1,419 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 693/693 tests and 15,170/15,170 assertions.
+
 ### Gate 3A resource bounds
 
 Fragmentation is limited to eight fragments, eight concurrent messages, eight buffered fragments, and a five-second message deadline. Eight full fragments carry at most 8,424 bytes of application data. Including the twenty-byte header in each of eight route payloads produces at most 8,584 encoded bytes; 8,584 is not an application-data limit. Public duplex segmentation across multiple internal messages is intentionally absent.

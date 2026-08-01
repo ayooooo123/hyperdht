@@ -26,6 +26,7 @@ require('./private/link-bootstrap-session')
 require('./private/link-control-session')
 require('./private/relay-service')
 require('./private/udx-cell-endpoint')
+require('./private/guard-lease')
 require('./private/udx-loopback')
 
 require('./private/extension-setup-channel')
