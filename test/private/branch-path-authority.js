@@ -46,15 +46,19 @@ test('InitialBranchDrafts reserve both branches and abort without commit', async
   const observed = inspectInitialBranchDrafts(drafts)
 
   t.is(observed.committed, false)
-  t.is(observed.issuerCount, 4)
+  t.is(observed.issuerCount, 2)
   t.is(observed.lookup.branchClass, BRANCH_CLASS.LOOKUP)
   t.is(observed.announce.branchClass, BRANCH_CLASS.ANNOUNCE)
   t.is(fixture.directory[kInspectRelayCandidateDirectory]().pendingCount, 2)
+  const extraOne = issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease)
+  const extraTwo = issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease)
   expectCode(
     t,
     () => issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease),
     'ERR_QUOTA_EXCEEDED'
   )
+  t.is(extraOne.destroy(), true)
+  t.is(extraTwo.destroy(), true)
 
   t.is(destroyInitialBranchDrafts(drafts), true)
   t.is(destroyInitialBranchDrafts(drafts), false)

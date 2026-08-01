@@ -164,6 +164,14 @@ function routeClock(start = NOW, monotonicStart = 10_000n) {
     cancelScheduled(handle) {
       return timers.delete(handle)
     },
+    fireNext() {
+      const nextTimer = timers.entries().next()
+      if (nextTimer.done) return false
+      const [handle, timer] = nextTimer.value
+      timers.delete(handle)
+      timer.callback()
+      return true
+    },
     advance(ms) {
       wall += BigInt(ms)
       monotonic += BigInt(ms)
@@ -459,23 +467,40 @@ async function pinnedMaterialFixture(
 async function liveTopologyFixture(
   leftPort = 47401,
   rightPort = 47402,
-  hosts = { left: '127.0.0.1', right: '127.0.0.2' }
+  hosts = { left: '127.0.0.1', right: '127.0.0.2' },
+  options = {}
 ) {
   const guard = await pinnedMaterialFixture(leftPort, rightPort, hosts)
-  const clock = routeClock()
-  const pinnedGuardRecord = {
-    identity: b4a.from(guard.links.b.publicKey),
-    canonicalEndpointBytes: canonicalEndpointForHost(hosts.right, rightPort),
-    digest: seed(0xda),
-    epoch: 1n,
-    expiresAt: NOW + 30_000n
-  }
-  const directory = directoryFixture(clock, { guard: pinnedGuardRecord })
+  const clock = options.clock || routeClock()
+  const pinnedGuardRecord = hosts.right.includes(':')
+    ? {
+        identity: b4a.from(guard.links.b.publicKey),
+        canonicalEndpointBytes: canonicalEndpointForHost(hosts.right, rightPort),
+        digest: seed(0xda),
+        epoch: 1n,
+        expiresAt: options.guardExpiresAt || NOW + 30_000n
+      }
+    : candidate(ROLE.SAFETY, 0, 90, {
+        endpointBytes: canonicalEndpointForHost(hosts.right, rightPort),
+        identityPair: guard.links.b,
+        validationNow: clock.wallNow(),
+        expiresAtMs: options.guardExpiresAt || NOW + 30_000n
+      })
+  const directory = directoryFixture(clock, { guard: pinnedGuardRecord, records: options.records })
   const guardLease = createGuardLease({
     guardLeaseMaterial: guard.material,
     pinnedGuard: {
       identity32: guard.links.b.publicKey,
-      endpoint: { host: hosts.right, port: rightPort }
+      endpoint: { host: hosts.right, port: rightPort },
+      ...(pinnedGuardRecord.canonicalBytes
+        ? {
+            canonicalEndpointBytes: pinnedGuardRecord.canonicalEndpointBytes,
+            advertisement: pinnedGuardRecord.canonicalBytes,
+            advertisementDigest: pinnedGuardRecord.digest,
+            epoch: pinnedGuardRecord.epoch,
+            expiresAt: pinnedGuardRecord.expiresAt
+          }
+        : {})
     },
     wallNow: () => Number(clock.wallNow()),
     monotonicNow: () => Number(clock.monotonicNow()),

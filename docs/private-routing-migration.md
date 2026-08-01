@@ -225,14 +225,61 @@ v1.30.3:
   `test/private/final-exit-activation.js`) passed in Node with 19/19 tests and
   157/157 assertions. The final-exit facade proof now consumes the authenticated
   responder OPEN handoff and proves replay/revoke/destruction semantics.
+- Focused Task 9 Step 4/5/6 suite (`test/private/route-manager.js`,
+  `test/private/guard-lease.js`, `test/private/branch-path-authority.js`,
+  `test/private/route-extension-session.js`,
+  `test/private/final-exit-activation.js`, and
+  `test/private/udx-cell-endpoint.js`) passed in Node and Bare with 42/42
+  tests and 354/354 assertions. The route manager now publishes the initial
+  lookup/announce OPEN pair transactionally, exposes only branch-local empty
+  capabilities after publication, rotates one branch make-before-break while
+  preserving the opposite branch capability, clamps replacement construction to
+  the directory guard/selected relay signed expiries, rolls failed rotation
+  attempts back without leaking consumed OPEN material, and suspends by revoking
+  manager operations, branch material, guard issuers, and the live socket while
+  retaining only a one-shot reconnect authority and sealed directory.
 - `lib/private/dht-exit-seeds.js` freezes the DHT-only exit seed set as
   signed `DHT_EXIT_DHT_SEEDS_V1` bytes. `test/private/dht-exit-seeds.js`
   proves exact one- and three-reference encodings, strict 1..3 count
   bounds, canonical set-digest input, canonical destination ordering,
   branch/exit binding, clocked expiry rejection, hostile descriptor
   rejection, signature verification, and zeroization.
-- Complete private aggregate `test/private-routing.js` passed independently in
-  Node and Bare with 703/703 tests and 15,347/15,347 assertions.
+- `lib/private/dht-exit-destination-table.js` admits only live,
+  ping-correlated configured bootstrap references, sorts seed refs by
+  canonical decoded id/handle order before signing, and exposes seed delivery
+  only through a revocable one-shot authority. Destroying the table revokes
+  unconsumed seed-delivery authorities.
+- `lib/private/dht-exit-wire.js` owns the client-only DHT-RPC packet subset
+  adapted from dht-rpc commit `fe04496196ea2ce42d1de27b0f770b02d2a87cd5`
+  under MIT provenance: `Request._encodeRequest`, `decodeReply`,
+  `validateId`, and the IPv4 peer codec only. `test/private/dht-exit-wire.js`
+  freezes command-0 PING and HyperDHT command-9 IMMUTABLE_GET request bytes,
+  response byte `0x13`, u16 transaction byte order, destination tuples,
+  empty/error/full reply flag mixes, invalid IDs, trailing bytes, and
+  request-packet rejection in Node and Bare.
+- `lib/private/dht-exit-reservation.js` and `lib/private/dht-exit-io.js`
+  add the exit-side one-socket reservation boundary. The endpoint OPEN
+  authority is a distinct handoff-carried capability, not accepted by the
+  exit reservation channel.
+- `requestDhtExitImmutableGet` accepts one validated routed immutable-get request,
+  reserves its ordinary UDP operation before send, and emits one normalized
+  `ROUTED_REPLY_V1`. Referral tuples are reply-correlated, bounded, probed before
+  admission, deduplicated against live destination IDs, and sorted by unsigned
+  XOR distance. The operation owns every pending TID and settlement authority;
+  cancellation, socket close, deadline expiry, table destruction, and
+  synchronous callback failure revoke all remaining authority without emitting
+  a duplicate reply. Raw immutable values remain bounded to 1,023 bytes before
+  any referral can be admitted.
+- Focused DHT-exit Task 13 suite (`test/private/dht-exit-wire.js`,
+  `test/private/dht-exit-destination-table.js`, `test/private/dht-exit-io.js`,
+  and `test/private/dht-exit-immutable-get.js`) passed in Node and Bare with
+  27/27 tests and 248/248 assertions.
+- Focused DHT-exit Task 12 suite (`test/private/dht-exit-seeds.js`,
+  `test/private/dht-exit-destination-table.js`,
+  `test/private/dht-exit-test-topology-grant.js`,
+  `test/private/dht-exit-wire.js`, `test/private/dht-exit-reservation.js`,
+  and `test/private/dht-exit-io.js`) passed in Node and Bare with 22/22 tests
+  and 240/240 assertions.
 
 ### Gate 3A resource bounds
 

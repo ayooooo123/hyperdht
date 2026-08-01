@@ -2868,9 +2868,9 @@ Expected GREEN: both empty factories accept only the exact dual-clock graph,
 perform no discovery/dialing, and carry one stable owner/lifetime/borrower from
 the shared guard current tail through extension and terminal activation.
 
-- [ ] **Step 4: Port path selection and publish both complete ownership graphs transactionally**
+- [x] **Step 4: Port path selection and publish both complete ownership graphs transactionally**
 
-- [ ] **Step 4a: Write the failing pair-publication and rollback tests**
+- [x] **Step 4a: Write the failing pair-publication and rollback tests**
 
 Before implementation, add RED cases in `test/private/route-manager.js` and
 `test/private/guard-lease.js` around the exact internal methods:
@@ -2903,7 +2903,7 @@ Expected RED: a draft publishes after structural readiness, resets state between
 extension/final activation, commits one branch alone, releases the shared slot
 early, or leaks one owner on pair failure.
 
-- [ ] **Step 4b: Implement one synchronous pair publication boundary**
+- [x] **Step 4b: Implement one synchronous pair publication boundary**
 
 Port only narrowed selection/reservation from prototype
 `branch-path-authority.js`/`route-manager.js`; exclude simulator/discovery.
@@ -2928,7 +2928,7 @@ only route payload/control authority and owned branch/circuit/generation/
 expiry/exit metadata. Revocation tombstones capability and stable branch owner
 before transport callbacks, then releases logical borrower accounting.
 
-- [ ] **Step 4c: Run the focused transactional GREEN proof**
+- [x] **Step 4c: Run the focused transactional GREEN proof**
 
 ```bash
 npx brittle-node test/private/route-manager.js test/private/guard-lease.js test/private/branch-path-authority.js test/private/route-extension-session.js test/private/final-exit-activation.js test/private/udx-cell-endpoint.js
@@ -2940,7 +2940,7 @@ returns both branch-build logical slots/charges while preserving the guard
 physical link; committed revocation tombstones before callback and leaves no
 usable branch authority.
 
-- [ ] **Step 5: Add failing make-before-break rotation tests**
+- [x] **Step 5: Add failing make-before-break rotation tests**
 
 Lose one middle or exit and reserve one replacement path against the committed
 opposite branch. New operations are blocked on the old generation with
@@ -2953,7 +2953,7 @@ keep a still-live old generation only until signed expiry; otherwise enter
 `UNAVAILABLE`. Repeated attempts cannot overlap, extend expiry, reuse a
 candidate generation, or retain failed state.
 
-- [ ] **Step 6: Prove suspend and complete teardown**
+- [x] **Step 6: Prove suspend and complete teardown**
 
 Ordinary suspend is controller-owned: it first prevents new manager operations,
 cancels pending operations/timers, destroys both branch generations, calls
@@ -2967,7 +2967,7 @@ routed work → branches → relay circuits → adjacent links → guard lease �
 → secrets/tombstones. Test-only snapshots must show zero callbacks, queues,
 timers, capabilities, links, routes, and secret buffers.
 
-- [ ] **Step 7: Run both runtimes and commit**
+- [x] **Step 7: Run both runtimes and commit**
 
 ```bash
 npx brittle-node test/private/guard-lease.js test/private/branch-path-authority.js test/private/route-manager.js
@@ -3427,7 +3427,7 @@ git commit -m "feat: admit private DHT exit seeds"
 - Regenerate: `test/all.js`
 - Modify: `docs/private-routing-migration.md`
 
-- [ ] **Step 1: Add failing immutable-get authority tests**
+- [x] **Step 1: Add failing immutable-get authority tests**
 
 `DHTExitIO` accepts only a validated `ROUTED_REQUEST_V1` whose live table handle,
 branch/circuit/generation, immutable-get policy tuple, 32-byte target, complete
@@ -3458,7 +3458,7 @@ Task 14 requires RoutedDHTIO to decode this exact body with
 `decodeImmutableGetResponse` before the local hash check. An absent body yields
 no query value; a present empty buffer remains present and is hash-checked.
 
-- [ ] **Step 2: Prove reservation-before-send and negative authority cases**
+- [x] **Step 2: Prove reservation-before-send and negative authority cases**
 
 Authority traps reject an unrecorded PING, immutable get to a probe-only tuple,
 valid-tag/missing-entry handle, wrong provenance/generation, expired reference,
@@ -3466,14 +3466,14 @@ transaction exhaustion/collision, and post-cancel request before socket send.
 Reentrant rotation after DHT reply correlation but before referral commit aborts
 all staged references and emits no routed reply.
 
-- [ ] **Step 3: Run focused tests and commit**
+- [x] **Step 3: Run focused tests and commit**
 
 ```bash
-npx brittle-node test/private/dht-exit-wire.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js
-bare node_modules/brittle/cmd.js test/private/dht-exit-wire.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js
+npx brittle-node test/private/dht-exit-wire.js test/private/dht-exit-destination-table.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js
+bare node_modules/brittle/cmd.js test/private/dht-exit-wire.js test/private/dht-exit-destination-table.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js
 npm run test:generate
 git diff --check
-git add lib/private/dht-exit-wire.js lib/private/dht-exit-io.js lib/private/dht-exit-destination-table.js test/private/dht-exit-wire.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js test/private-routing.js test/all.js docs/private-routing-migration.md
+git add lib/private/dht-exit-wire.js lib/private/dht-exit-io.js lib/private/dht-exit-destination-table.js test/private/dht-exit-wire.js test/private/dht-exit-destination-table.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js test/private-routing.js test/all.js docs/private-routing-migration.md
 git commit -m "feat: normalize private immutable exit IO"
 ```
 

@@ -51,6 +51,8 @@ const {
   destroyFinalExitActivationOwner,
   destroyOpenRouteMaterial,
   openFinalExit,
+  takeDhtExitOpenAuthority,
+  takeEndpointDhtExitOpenAuthority,
   revokeOpenRouteHandoff
 } = require('../../lib/private/final-exit-activation')
 const {
@@ -59,6 +61,12 @@ const {
   createRelayIdentitySigningAuthority,
   destroyRelayIdentitySigningAuthority
 } = require('../../lib/private/relay-identity-signer')
+const {
+  consumeDhtExitReservationIOConsumer,
+  consumeDhtExitReservationTableIssuer,
+  createDhtExitReservationChannel
+} = require('../../lib/private/dht-exit-reservation')
+const routedOpenHandoff = require('../../lib/private/open-route-handoff')
 
 const TEST_ONLY_M3_ESTABLISHED_ISSUER = Symbol.for(
   'hyperdht-private-routes/test-only-m3-established-issuer'
@@ -657,6 +665,36 @@ test('FinalExitActivationSession completes ACTIVATE READY ACK OPEN with producti
   t.alike(initiator.session.openOpen(openEnvelope).payloadParametersDigest.byteLength, 32)
   t.alike(initiator.session.diagnostics(), { state: 'OPEN' })
   t.alike(responder.diagnostics(), { state: 'OPEN' })
+  const exitChannel = createDhtExitReservationChannel(takeDhtExitOpenAuthority(responder))
+  const endpointAuthority = takeEndpointDhtExitOpenAuthority(initiator.session)
+  t.alike(Reflect.ownKeys(endpointAuthority), [])
+  t.ok(Object.isFrozen(endpointAuthority))
+  expectCode(
+    t,
+    () => createDhtExitReservationChannel(endpointAuthority),
+    'ERR_AUTHENTICATION',
+    'endpoint OPEN authority is not an exit reservation authority'
+  )
+  const endpointHandoff = initiator.session.takeOpenHandoff()
+  const endpointMaterial = routedOpenHandoff.consumeOpenRouteHandoff(endpointHandoff)
+  t.is(endpointMaterial.endpointOpenAuthority, endpointAuthority)
+  t.is(
+    routedOpenHandoff.consumeEndpointDhtExitOpenAuthority(endpointMaterial.endpointOpenAuthority)
+      .generation,
+    7n
+  )
+  expectCode(
+    t,
+    () =>
+      routedOpenHandoff.consumeEndpointDhtExitOpenAuthority(endpointMaterial.endpointOpenAuthority),
+    'ERR_REPLAY',
+    'endpoint authority is one-shot after handoff consumption'
+  )
+  t.is(routedOpenHandoff.destroyOpenRouteMaterial(endpointMaterial), true)
+  expectCode(t, () => takeDhtExitOpenAuthority(responder), 'ERR_REPLAY')
+  expectCode(t, () => takeEndpointDhtExitOpenAuthority(initiator.session), 'ERR_REPLAY')
+  t.is(consumeDhtExitReservationTableIssuer(exitChannel.tableIssuer).generation, 7n)
+  t.is(consumeDhtExitReservationIOConsumer(exitChannel.ioConsumer).generation, 7n)
   const openHandoff = responder.takeOpenHandoff()
   expectCode(t, () => responder.takeOpenHandoff(), 'ERR_REPLAY')
   const openMaterial = consumeOpenRouteHandoff(openHandoff)

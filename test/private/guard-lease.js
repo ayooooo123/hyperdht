@@ -417,6 +417,52 @@ test('GuardLease rejects pinned guard identity and endpoint substitution', async
   await closeFixture(endpointMismatch)
 })
 
+test('GuardLease rejects partial reconnect metadata at pin time', async (t) => {
+  const fixture = await pinnedMaterialFixture(47211, 47212)
+  let error = null
+  try {
+    createGuardLease(
+      leaseOptions(fixture, {
+        pinnedGuard: {
+          identity32: fixture.links.b.publicKey,
+          endpoint: { host: '127.0.0.2', port: fixture.rightPort },
+          advertisement: seed(0x21)
+        }
+      })
+    )
+  } catch (err) {
+    error = err
+  }
+
+  t.is(error && error.code, 'INVALID_ROUTE')
+
+  const malformed = await pinnedMaterialFixture(47213, 47214)
+  let malformedError = null
+  try {
+    createGuardLease(
+      leaseOptions(malformed, {
+        pinnedGuard: {
+          identity32: malformed.links.b.publicKey,
+          endpoint: { host: '127.0.0.2', port: malformed.rightPort },
+          advertisement: seed(0x31),
+          advertisementDigest: seed(0x32),
+          canonicalEndpointBytes: b4a.alloc(19, 0x33),
+          epoch: 0n,
+          expiresAt: 1
+        }
+      })
+    )
+  } catch (err) {
+    malformedError = err
+  }
+
+  t.is(malformedError && malformedError.code, 'INVALID_ROUTE')
+  await settles()
+  await closeFixture(malformed)
+  await settles()
+  await closeFixture(fixture)
+})
+
 function branchBinding(issuer) {
   return guardLink[TEST_ONLY_M3_ESTABLISHED_ISSUER].issueAuthenticatedBranchBinding(
     {

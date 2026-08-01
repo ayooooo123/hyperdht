@@ -154,7 +154,8 @@ function liveReplyAuthority(target = seed(0, 32), wallNow = () => 1_000n) {
     circuitId: seed(0x31, 16),
     generation: 7n,
     expiresAt: 5_000n,
-    wallNow
+    wallNow,
+    monotonicNow: wallNow
   })
   const seedDestination = issueLiveOpaqueDestination(owner, {
     id: seed(0x11, 32),

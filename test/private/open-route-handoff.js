@@ -18,7 +18,9 @@ function expectCode(t, operation, code, message) {
 
 test('open-route handoff deep import exposes no issuer surface', (t) => {
   t.alike(Object.keys(openRouteHandoff).sort(), [
+    'consumeEndpointDhtExitOpenAuthority',
     'consumeOpenRouteHandoff',
+    'destroyEndpointDhtExitOpenAuthority',
     'destroyOpenRouteMaterial',
     'revokeOpenRouteHandoff'
   ])
