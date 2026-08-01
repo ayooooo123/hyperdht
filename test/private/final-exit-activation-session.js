@@ -45,10 +45,13 @@ const {
 const { signRedactedResponderProof } = require('../../lib/private/redacted-responder-proof')
 const {
   claimFinalExitActivation,
+  consumeOpenRouteHandoff,
   createFinalExitActivationClaim,
   createFinalExitActivationFactory,
   destroyFinalExitActivationOwner,
-  openFinalExit
+  destroyOpenRouteMaterial,
+  openFinalExit,
+  revokeOpenRouteHandoff
 } = require('../../lib/private/final-exit-activation')
 const {
   createDhtExitReadySigner,
@@ -654,6 +657,19 @@ test('FinalExitActivationSession completes ACTIVATE READY ACK OPEN with producti
   t.alike(initiator.session.openOpen(openEnvelope).payloadParametersDigest.byteLength, 32)
   t.alike(initiator.session.diagnostics(), { state: 'OPEN' })
   t.alike(responder.diagnostics(), { state: 'OPEN' })
+  const openHandoff = responder.takeOpenHandoff()
+  expectCode(t, () => responder.takeOpenHandoff(), 'ERR_REPLAY')
+  const openMaterial = consumeOpenRouteHandoff(openHandoff)
+  t.is(revokeOpenRouteHandoff(openHandoff), false)
+  expectCode(t, () => consumeOpenRouteHandoff(openHandoff), 'ERR_REPLAY')
+  t.is(openMaterial.initiator, false)
+  t.is(openMaterial.branchClass, BRANCH_CLASS.LOOKUP)
+  t.is(openMaterial.branchId.byteLength, 16)
+  t.is(openMaterial.circuitId.byteLength, 16)
+  t.is(openMaterial.exitIdentity.byteLength, 32)
+  t.is(openMaterial.payloadForwardKey.byteLength, 32)
+  t.is(destroyOpenRouteMaterial(openMaterial), true)
+  t.is(destroyOpenRouteMaterial(openMaterial), false)
   t.is(responder.destroy(), true)
   t.is(destroyFinalExitActivationOwner(activationOwner), false)
   t.is(destroyRelayIdentitySigningAuthority(relayIdentity), true)
