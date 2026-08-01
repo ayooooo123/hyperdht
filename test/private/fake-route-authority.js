@@ -4,6 +4,9 @@ const b4a = require('b4a')
 
 const { BRANCH_CLASS } = require('../../lib/private/protocol')
 const { clearRoutedRequest, decodeRoutedRequest } = require('../../lib/private/routed-dht')
+const {
+  TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER
+} = require('../../lib/private/live-route-authority')
 
 class FakeRouteAuthority {
   constructor() {
@@ -97,20 +100,7 @@ class FakeRouteAuthority {
       }
     }
 
-    const response = this.response
-    return {
-      promise: Promise.resolve(response).then((value) => {
-        revoke(state)
-        return value
-      }),
-      cancel: (reason) => {
-        if (state.cancelled) return
-        state.cancelled = true
-        state.cancelReason = reason
-        revoke(state)
-        this.calls.cancel++
-      }
-    }
+    return operation(Promise.resolve(this.response), state, this)
   }
 
   #records(options) {
@@ -175,8 +165,13 @@ function operation(promise, state, authority) {
   return {
     promise: promise.then(
       (value) => {
+        const authenticated = TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.authenticateResponse(
+          authority,
+          state,
+          value
+        )
         revoke(state)
-        return value
+        return authenticated
       },
       (error) => {
         revoke(state)
