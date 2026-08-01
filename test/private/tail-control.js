@@ -280,6 +280,26 @@ function syntheticLink(overrides = {}) {
   const initiator = overrides.initiator === undefined ? true : overrides.initiator
   const completeOfferDigest = b4a.from(overrides.completeOfferDigest || OFFER_DIGEST)
   const ids = deriveM3CellIds(completeOfferDigest, { crypto: cryptoSuite })
+  const extensionIndex =
+    overrides.extensionIndex === undefined ? (initiator ? 2 : 1) : overrides.extensionIndex
+  const localIdentity = overrides.localIdentity || seed(0x51)
+  const tailControlTranscript =
+    overrides.tailControlTranscript ||
+    (!initiator && extensionIndex === 2
+      ? encodeTailControlTranscript({
+          branchClass: BRANCH_CLASS.LOOKUP,
+          branchId: seed(0x41, 16),
+          circuitId: seed(0x42, 16),
+          generation: 7n,
+          extensionIndex,
+          clientTailEphemeralPublicKey: seed(0x61),
+          advertisedTailRouteEncryptionPublicKey: seed(0x62),
+          candidateAdvertisementDigest: seed(0x63),
+          clientNonce: seed(0x64),
+          tailIdentity: localIdentity,
+          admittedLimitsDigest: seed(0x65)
+        })
+      : seed(0x64, 290))
   const state = {
     initiator,
     completeOfferDigest,
@@ -289,9 +309,8 @@ function syntheticLink(overrides = {}) {
     branchId: seed(0x41, 16),
     circuitId: seed(0x42, 16),
     generation: 7n,
-    extensionIndex:
-      overrides.extensionIndex === undefined ? (initiator ? 2 : 1) : overrides.extensionIndex,
-    localIdentity: seed(0x51),
+    extensionIndex,
+    localIdentity,
     peerIdentity: seed(0x52),
     expiresAt: overrides.wireExpiresAt === undefined ? 10_000n : overrides.wireExpiresAt,
     contexts: contexts(initiator),
@@ -299,7 +318,8 @@ function syntheticLink(overrides = {}) {
     clientTailEphemeralSecretKey: initiator
       ? overrides.clientTailEphemeralSecretKey || seed(0x63)
       : null,
-    tailControlTranscript: overrides.tailControlTranscript || seed(0x64, 290)
+    tailSharedSecret: initiator ? null : overrides.tailSharedSecret || seed(0x63),
+    tailControlTranscript
   }
   return guardLinks[TEST_ONLY_M3_ESTABLISHED_ISSUER].issue(state)
 }

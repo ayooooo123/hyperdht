@@ -106,6 +106,14 @@ Migration must preserve these compatibility rules:
    keeps `TAIL_CONTROL_OWNERS` lexical, verifies the live handoff,
    lifetime/callback/clocks/deadline/generation, and routes cleanup from either
    module without accepting an arbitrary destructor.
+8. Task 7 ports the terminal DHT-exit ACTIVATE/READY/ACK/OPEN codec and
+   derivation layer, binds READY signing to a relay-identity-owned
+   `DHT_EXIT_READY` one-shot signer, and keeps endpoint actors on claimed
+   activation owners instead of raw identity secrets, raw handoff material, or
+   arbitrary callbacks. `final-exit-activation.js` lexically issues the
+   terminal `OpenRouteHandoff` only after authenticated OPEN; the deep import
+   exposes only consume/revoke/destroy, and unconsumed handoffs are revoked by
+   activation-owner destruction.
 
 Task 6 changes no existing wire byte, message order, public HyperDHT API,
 direct-mode behavior, or address-authority boundary. One 1,101-byte M3 context
@@ -138,6 +146,16 @@ repository:
   explicit-keypair case with `ETIMEDOUT`; final TAP was 748/749 tests and
   15,263/15,264 assertions. This local full-suite run is not reported as
   green.
+
+Local Task 7 verification used Node v22.19.0, npm 11.10.0, and Bare v1.30.3:
+
+- Focused Task 7 suite
+  (`test/private/final-exit.js`, `test/private/final-exit-activation.js`,
+  `test/private/final-exit-handoff.js`, `test/private/open-route-handoff.js`,
+  and `test/private/relay-identity-signer.js`) passed independently in Node
+  and Bare with 27/27 tests and 273/273 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 675/675 tests and 15,054/15,054 assertions.
 
 ### Gate 3A resource bounds
 

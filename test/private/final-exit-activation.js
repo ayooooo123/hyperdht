@@ -6,6 +6,7 @@ const {
   consumeFinalExitHandoff
 } = require('../../lib/private/final-exit-handoff')
 const {
+  FinalExitActivationSession,
   claimFinalExitActivation,
   createFinalExitActivationClaim,
   revokeFinalExitActivationClaim
@@ -56,4 +57,33 @@ test('final-exit activation claim revoke preserves raw handoff for a fresh claim
     'raw replacement handoff has no tail bridge'
   )
   t.is(consumeFinalExitHandoff(handoff).tailControl, owner)
+})
+
+test('FinalExitActivationSession rejects unclaimed owners before takeOpenHandoff is reachable', (t) => {
+  t.is(typeof FinalExitActivationSession, 'function')
+  t.is(typeof FinalExitActivationSession.prototype.takeOpenHandoff, 'function')
+  const owner = Object.freeze({})
+  t.exception(
+    () =>
+      new FinalExitActivationSession(owner, {
+        now: () => 1_000n,
+        crypto: {
+          seal() {},
+          open() {},
+          sign() {},
+          verify() {}
+        },
+        payloadParameters: {
+          cellSize: 1200,
+          maxCellPayload: 1146,
+          contextEnvelopeSize: 1101,
+          routeFrameSize: 1100,
+          maxRoutePayload: 1073,
+          datagramReplayWindow: 64,
+          maxQueuedBytes: 65_536,
+          idleTimeoutMs: 5_000
+        }
+      }),
+    'unclaimed opaque owner cannot reach OPEN handoff issuance'
+  )
 })
