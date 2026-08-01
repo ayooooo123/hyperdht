@@ -24,6 +24,7 @@ require('./private/m3-context')
 require('./private/m3-adjacency-runtime')
 require('./private/link-bootstrap-session')
 require('./private/link-control-session')
+require('./private/relay-service')
 require('./private/udx-cell-endpoint')
 require('./private/udx-loopback')
 

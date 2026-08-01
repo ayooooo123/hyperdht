@@ -157,6 +157,24 @@ Local Task 7 verification used Node v22.19.0, npm 11.10.0, and Bare v1.30.3:
 - Complete private aggregate `test/private-routing.js` passed independently in
   Node and Bare with 675/675 tests and 15,054/15,054 assertions.
 
+Local Task 8 verification used Node v22.19.0, npm 11.10.0, and Bare v1.30.3:
+
+- `lib/private/relay-service.js` ports bounded opaque relay forwarding from
+  the reviewed prototype, retaining the canonical 128 global circuits, 32
+  circuits per observed neighbor, 256 KiB per-circuit queue, 8 MiB global
+  queue, five-second relay deadlines, replay tombstones, downward-only
+  negotiated limits, and `ERR_BUSY`/`ERR_QUOTA_EXCEEDED` failure split.
+- The relay service stores only opaque previous-hop and next-hop capabilities
+  plus local circuit/generation/accounting state. Queue accounting is reserved
+  before payload copies; allocation/callback failures roll back queue bytes and
+  replay counters, with the admission-boundary callback rollback covered
+  explicitly. Destroy tombstones routing state before closing adjacent
+  capabilities so reentrant callbacks see destroyed state.
+- Focused Task 8 suite (`test/private/relay-service.js`) passed independently
+  in Node and Bare with 12/12 tests and 73/73 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 689/689 tests and 15,147/15,147 assertions.
+
 ### Gate 3A resource bounds
 
 Fragmentation is limited to eight fragments, eight concurrent messages, eight buffered fragments, and a five-second message deadline. Eight full fragments carry at most 8,424 bytes of application data. Including the twenty-byte header in each of eight route payloads produces at most 8,584 encoded bytes; 8,584 is not an application-data limit. Public duplex segmentation across multiple internal messages is intentionally absent.
