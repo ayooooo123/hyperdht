@@ -2,17 +2,19 @@
 
 ## Status and scope
 
-This record describes the experimental, internal Gate 3A private-route substrate in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology.
+This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
 
-Direct mode remains the only public behavior. Gate 3A has no live route authority, routed-reply wire codec, public required-mode controller, post-readiness packet-capture proof, or anonymity claim. Its deterministic tests establish semantic and byte-vector conformance only; they do not establish a live route, resistance to traffic analysis, or suitability for protecting users.
+Direct mode remains the only public behavior. Gate 3B1 Task 15 has a package-private required-mode controller, authenticated native route authority, routed immutable-get request/reply path, rotation, suspension, and teardown; Tasks 16 and 17 add test-only process isolation and prove that path live across eleven separate Node or Bare role processes over native UDX. The root package still exposes no private-routing constructor or user-selectable required mode. No post-readiness packet-capture proof or anonymity claim exists; the deterministic, hosted, and eleven-process tests do not establish resistance to traffic analysis or suitability for protecting users.
 
 The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
 
-The owner-approved Gate 3B1 Task 5 authenticated-M3 transport and Task 6
-tail-control lifetime/ownership amendment is incorporated into the canonical
-design documents and implemented internally in this fork. This remains a
-package-private compatibility slice: it does not add a public constructor,
-export, required-mode controller, production route, or anonymity claim.
+The owner-approved Gate 3B1 Task 5 authenticated-M3 transport, Task 6
+tail-control lifetime/ownership amendment, and Tasks 7–17 live-route lifecycle
+are incorporated into the canonical design documents and implemented
+internally in this fork. This remains a package-private compatibility slice: it
+adds no root public constructor, export, user-selectable required mode, or
+anonymity claim, although its internal path uses the production UDX, relay,
+final-exit, and DHT-exit owners rather than a structural or fake transport.
 
 ## Reviewed prototype source
 
@@ -281,6 +283,104 @@ v1.30.3:
   and `test/private/dht-exit-io.js`) passed in Node and Bare with 22/22 tests
   and 240/240 assertions.
 
+### Gate 3B1 Task 15 live controller and lifecycle checkpoint
+
+Task 15 connects the previously reviewed package-private owners into one
+production-code, in-process lifecycle without changing HyperDHT's root public
+surface:
+
+- `lib/private/private-routing-controller.js` owns the exact `OFF`,
+  `BOOTSTRAPPING`, `GUARD_PINNED`, `BUILDING`, `READY`, `ROTATING`,
+  `SUSPENDED`, `UNAVAILABLE`, and `DESTROYED` state machine. Its frozen
+  capability exposes only `start`, `snapshot`, `immutableGet`, `suspend`,
+  `resume`, `networkChanged`, and `destroy`.
+- `lib/private/live-route-authority.js` and
+  `lib/private/opaque-destination.js` retain each branch's moved OPEN
+  route transport and payload codec, admit signed exit seeds, publish
+  generation-bound address-free destinations, and carry only the reviewed
+  immutable-get command. Failed live send/receive operations issue an exact
+  branch-loss signal; cancellation and intentional teardown do not.
+- The controller's `start` method consumes only `EndpointBootstrapAuthority`, then
+  drives production `BootstrapIO`, `GuardLease`, lookup/announce branch
+  construction, authenticated tail extension, final-exit
+  ACTIVATE/READY/ACK/OPEN, signed DHT-exit seed delivery, route admission, and
+  immutable lookup. No test-only controller issuer, raw socket, endpoint,
+  identity secret, or structural route authority participates in the hosted
+  success path.
+- Rotation is make-before-break and branch-local. Natural expiry, rejected
+  route IO, or authenticated `BRANCH_DESTROY_V1` propagation replaces only the
+  affected branch, advances its generation, preserves the other branch and
+  shared physical guard, and releases every retired logical M3 forwarding
+  owner. Candidate exhaustion or replacement failure closes owned resources and
+  enters `UNAVAILABLE`.
+- Suspend synchronously installs one shared in-flight result, revokes both live
+  branches and routed destinations, closes native route ownership, and retains
+  only the sealed directory plus one-shot guard reconnect capability. Resume
+  consumes that capability and builds fresh generations. Network change,
+  wall-clock rollback, guard loss, partial initial construction, and teardown
+  fail closed with deterministic ownership cleanup and key zeroization.
+- `test/private/live-immutable-get.js` exercises a fully hosted native
+  endpoint/guard/middle/exit/DHT-exit topology: READY, exact immutable value,
+  natural lookup rotation, idle downstream lookup replacement, idle announce
+  loss fail-closed behavior, shared-guard loss, suspend/resume, network change,
+  and negative absent-service startup. The relay actors are hosted in-process;
+  Task 16 process isolation remains required before the multi-process criterion
+  is complete.
+- Final Task 15 verification ran `test/private-routing.js` independently under
+  Node v22.19.0 and Bare v1.30.3: both passed 798/798 tests and
+  16,124/16,124 assertions. Focused native hosted lifecycle coverage passed
+  13/13 tests and 119/119 assertions under each runtime.
+
+### Gate 3B1 Task 17 live eleven-process scenario status
+
+`test/private/live-process-suite.js` drives eleven separate role processes over
+native UDX loopback. It is test infrastructure, not a public API, and carries no
+anonymity claim.
+
+On Linux (Ubuntu 24.04 under Colima, Node v22.19.0) the scenario passes all 125
+assertions deterministically with both Node and Bare role children. It proves,
+live and cross-process: ordered DHT role bind and the audited setup store;
+endpoint bootstrap, guard pinning, and separate lookup/announce branches built
+through authenticated adjacent links; an exact immutable get retrieved through
+the three-position route after the exit admits an isolated learned closer under a
+signed Task 12 grant; delayed-lookup cancellation; a physical lookup-A link fault
+that propagates `BRANCH_DESTROY` upstream and rotates the endpoint onto lookup B,
+followed by a second exact immutable get; exit accounting for referral probes and
+ordinary requests; endpoint suspend and resume, including a third exact immutable
+get over the rebuilt route; a terminal network change that leaves no endpoint
+socket and installs no fallback edge; an acknowledged guard physical link fault;
+and ordered teardown with zero residual operations, resources, and queued bytes in
+every role.
+
+Reaching resume, rotation, network-change, and guard-loss required four fixture
+and owner corrections, each of which is now part of the proof:
+
+- The fixture issues a per-generation pool of one-shot topology grants
+  (`LEARNED_GRANT_USES` referral, value, and seed grants per adjacency and
+  generation) because `LinkDirectory` keeps one link handle per grant and
+  `UdxCellEndpoint.openLink` refuses a consumed handle, so every rebuilt branch
+  must re-probe its learned closers with fresh grants.
+- Guard bootstrap acceptance and relay accept sessions are re-armable, so a
+  rebuilt branch can re-enter the same guard.
+- Exit grant requests are serialized: exits allow one outstanding isolated grant
+  request per exit and answer `COUNTER_EXHAUSTED` for a concurrent second, which
+  the DHT retries against later candidates.
+- `DHTExitIO` seeds its request TID from a random 16-bit counter rather than zero,
+  so a socket rebuilt on a reused host/port after suspend does not collide with
+  the TIDs of the pre-suspend session and have its replies dropped as duplicates.
+
+One environment boundary remains: macOS cannot bind the `127.64.x.1` role tuples,
+so both live suites stop at the first bind with `PROCESS_BIND_UNAVAILABLE` there
+(`866/868` tests, `18,079/18,081` assertions under Node on Darwin). Every other
+private suite is green on Darwin, and `test/private-routing.js` is fully green
+under both runtimes on Linux (`868/868` Node, `854/854` Bare).
+
+Role clocks are supplied by `test/private/process/runtime-clock.js`. Wall and
+monotonic time are derived from one cached sample of a single counter because the
+route protocol carries a wall expiry into a monotonic deadline and rejects any hop
+whose derived deadline exceeds the one it was handed; independent `Date.now()` and
+`hrtime` samples straddling a millisecond boundary produced exactly that rejection.
+
 ### Gate 3A resource bounds
 
 Fragmentation is limited to eight fragments, eight concurrent messages, eight buffered fragments, and a five-second message deadline. Eight full fragments carry at most 8,424 bytes of application data. Including the twenty-byte header in each of eight route payloads produces at most 8,584 encoded bytes; 8,584 is not an application-data limit. Public duplex segmentation across multiple internal messages is intentionally absent.
@@ -298,18 +398,30 @@ The following files were authored in this fork and were not migrated from the pr
 
 `test/private/fake-route-authority.js` and `test/private/routed-dht-traversal.js` are also newly authored, test-only conformance scaffolding. They exercise deterministic five-node lookup and announce traversal through base DHT-RPC without hosts, ports, sockets, UDX, or network traffic. They do not model a live three-position route and are not an anonymity test.
 
-## Intentionally not migrated into Gate 3A
+## Gate 3A-only and deferred scope
 
-Prototype implementations outside this reviewed slice are intentionally not migrated or accepted as production-ready merely because they exist in the prototype:
+The Gate 3A fake authority and traversal modules remain deterministic
+conformance scaffolding and are not authorized as substitutes for the
+package-private Gate 3B1 live owners. Gate 3B1 through Task 17 now includes M3
+context derivation, authenticated adjacent links, tail/final-exit state,
+guard pinning, separate lookup/announce routes, quotas, branch rotation,
+teardown, immutable-get request/reply encoding, provenance-qualified DHT-exit
+destinations, generation invalidation, and native DHT-exit socket ownership.
 
-- `m3-context.js`, `tail-control.js`, and the live route-state portions of `final-exit.js`;
-- `test/m3-vectors.test.js`, pending exact v1 role/branch/circuit/generation transcript constructors;
-- live adjacent-link authentication, relay discovery, guard pinning, route construction, quotas, rotation, teardown, and DHT exit socket ownership;
-- routed-reply wire encoding and the remaining exact per-command request/reply body codecs;
-- live provenance-qualified destination tables, generation expiry and rotation invalidation, public duplex segmentation, multi-process integration, and the packet-capture leak oracle;
-- public required-mode, Hyperswarm, mobile, and PearTube integration.
+The remaining deferred scope is explicit:
 
-Until those pieces pass the next reviewed gate, no Gate 3A internal module may be connected to an untrusted, remote, or live route authority.
+- private presence and the mutable get/put command bodies and live operations;
+- public duplex/peer-stream segmentation and stream backpressure;
+- privileged Linux network-namespace placement and the semantic leak oracle for
+  the eleven-process scenario (Task 17 sub-gate); the scenario currently runs on
+  the portable numeric-loopback plan, and `PROCESS_PLANS.LINUX_NAMESPACE` remains
+  unexercised because it needs privileged setup outside the test process;
+- root public required-mode integration, Hyperswarm, mobile, and PearTube
+  integration.
+
+Until the separately reviewed leak-oracle and privileged network-namespace gates
+pass, the Task 15 controller remains package-private and carries no anonymity
+claim.
 
 ## Gate 3B entry criteria
 
