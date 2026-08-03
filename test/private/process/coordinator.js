@@ -1,5 +1,6 @@
 'use strict'
 
+const fs = require('fs')
 const path = require('path')
 const { spawn } = require('child_process')
 const b4a = require('b4a')
@@ -594,27 +595,38 @@ function resolveRuntimeLaunch(runtime, options = {}) {
   throw new ProcessControlError('PROCESS_RUNTIME_INVALID')
 }
 
-function spawnRuntimeProcess(launch, args = launch.args, options = {}) {
-  const spawnOptions = {
-    ...options,
-    args,
-    stdio: options.stdio || ['pipe', 'pipe', 'pipe']
-  }
+function resolveExecution(launch, args) {
   if (launch.runtime === 'bare') {
-    if (launch.command !== require('bare-runtime')('bare')) {
-      throw new ProcessControlError('PROCESS_RUNTIME_INVALID')
+    const bin = require('bare-runtime')('bare')
+    if (launch.command !== bin) throw new ProcessControlError('PROCESS_RUNTIME_INVALID')
+    try {
+      fs.accessSync(bin, fs.constants.X_OK)
+    } catch {
+      fs.chmodSync(bin, 0o755)
     }
-    return require('bare-runtime/spawn')('bare', spawnOptions)
+    return { argv: args, command: bin }
   }
-  if (launch.runtime === 'node') {
-    delete spawnOptions.args
-    return spawn(launch.command, args, spawnOptions)
-  }
+  if (launch.runtime === 'node') return { argv: args, command: launch.command }
   throw new ProcessControlError('PROCESS_RUNTIME_INVALID')
+}
+
+function spawnRuntimeProcess(launch, args = launch.args, options = {}) {
+  const { enter = null, ...rest } = options
+  const resolved = resolveExecution(launch, args)
+  // `enter` wraps the resolved command so the role runs somewhere else, such as
+  // inside a network namespace. It never changes which runtime is executed.
+  const placed = enter === null ? resolved : enter(resolved.command, resolved.argv)
+  return spawn(placed.command, placed.argv, {
+    ...rest,
+    stdio: rest.stdio || ['pipe', 'pipe', 'pipe']
+  })
 }
 
 function spawnRoleProcesses(runtime, projections, options = {}) {
   if (!Array.isArray(projections) || projections.length !== 11) {
+    throw new ProcessControlError('PROCESS_CONTROL_INVALID')
+  }
+  if (options.enter !== undefined && typeof options.enter !== 'function') {
     throw new ProcessControlError('PROCESS_CONTROL_INVALID')
   }
   const launch = resolveRuntimeLaunch(runtime, options)
@@ -622,6 +634,9 @@ function spawnRoleProcesses(runtime, projections, options = {}) {
     projections.map((projection) => {
       const child = spawnRuntimeProcess(launch, launch.args, {
         cwd: options.cwd || path.join(__dirname, '..', '..', '..'),
+        enter: options.enter
+          ? (command, argv) => options.enter(projection.roleIndex, command, argv)
+          : null,
         env: Object.create(null),
         stdio: ['pipe', 'pipe', 'pipe']
       })

@@ -48,3 +48,7 @@ jobs:
         run: npm run test:private:process:node
       - name: Eleven-process live scenario (Bare roles)
         run: npm run test:private:process:bare
+      - name: Namespace projection enforcement (privileged)
+        run: |
+          sudo -n true
+          npm run test:private:namespace
