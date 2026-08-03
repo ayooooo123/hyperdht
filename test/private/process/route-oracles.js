@@ -265,6 +265,13 @@ function assertRouteCaptures(t, captures, oracle) {
   t.alike(summary.relayed, [], 'no cell payload is relayed unchanged across two hops')
 
   // Route cells are indistinguishable by length.
+  //
+  // KI-1 in docs/private-routing-migration.md: this removes length as a
+  // correlator and nothing more. These oracles say what crossed which edge,
+  // never that two edges cannot be linked. Per-edge timing and packet counts
+  // are plainly visible in the same captures, and v1 adds no padding, batching
+  // or cover traffic, so a two-edge observer can still correlate. Do not read
+  // a passing run as resistance to that.
   const cellSizes = new Set()
   for (const [key, edge] of summary.edges) {
     if (!summary.cellEdges.has(key)) continue
