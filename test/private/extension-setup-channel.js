@@ -1,7 +1,15 @@
 const b4a = require('b4a')
 const test = require('brittle')
 
-const { createExtensionOfferReceiver, createExtensionResponseReceiver, finishExtensionResponse, sendExtensionAccept, sendExtensionProof, takeExtensionOffer, takeExtensionResponse } = require('../../lib/private/extension-setup-channel')
+const {
+  createExtensionOfferReceiver,
+  createExtensionResponseReceiver,
+  finishExtensionResponse,
+  sendExtensionAccept,
+  sendExtensionProof,
+  takeExtensionOffer,
+  takeExtensionResponse
+} = require('../../lib/private/extension-setup-channel')
 const { LINK_ACCEPT_SIZE, LINK_OFFER_SIZE } = require('../../lib/private/guard-link')
 const { REDACTED_RESPONDER_PROOF_SIZE } = require('../../lib/private/redacted-responder-proof')
 const { encodeCanonicalEndpoint } = require('../../lib/private/relay-capability')
@@ -205,16 +213,20 @@ test('extension offer receiver invokes the accessor-validated channel destructor
   })
   const freeze = Object.freeze
 
-  expectCode(t, () => {
-    try {
-      Object.freeze = () => {
-        throw new Error('result freeze failed')
+  expectCode(
+    t,
+    () => {
+      try {
+        Object.freeze = () => {
+          throw new Error('result freeze failed')
+        }
+        takeExtensionOffer(receiver)
+      } finally {
+        Object.freeze = freeze
       }
-      takeExtensionOffer(receiver)
-    } finally {
-      Object.freeze = freeze
-    }
-  }, 'INVALID_ROUTE')
+    },
+    'INVALID_ROUTE'
+  )
   t.is(channelDestroyed, 1, 'invokes the originally validated destructor once')
   t.is(destroyThis, physicalChannel, 'invokes the destructor with the channel as receiver')
   t.is(destroyReads, 1, 'does not redispatch the destroy property')
@@ -222,11 +234,7 @@ test('extension offer receiver invokes the accessor-validated channel destructor
 })
 
 test('extension response receiver invokes the accessor-validated channel destructor without redispatch', (t) => {
-  const inbound = [
-    bytes(LINK_ACCEPT_SIZE, 0x37),
-    bytes(REDACTED_RESPONDER_PROOF_SIZE, 0x38),
-    null
-  ]
+  const inbound = [bytes(LINK_ACCEPT_SIZE, 0x37), bytes(REDACTED_RESPONDER_PROOF_SIZE, 0x38), null]
   const physicalChannel = {}
   let destroyReads = 0
   let channelDestroyed = 0
@@ -249,22 +257,25 @@ test('extension response receiver invokes the accessor-validated channel destruc
   })
   const freeze = Object.freeze
 
-  expectCode(t, () => {
-    try {
-      Object.freeze = () => {
-        throw new Error('result freeze failed')
+  expectCode(
+    t,
+    () => {
+      try {
+        Object.freeze = () => {
+          throw new Error('result freeze failed')
+        }
+        takeExtensionResponse(receiver)
+      } finally {
+        Object.freeze = freeze
       }
-      takeExtensionResponse(receiver)
-    } finally {
-      Object.freeze = freeze
-    }
-  }, 'INVALID_ROUTE')
+    },
+    'INVALID_ROUTE'
+  )
   t.is(channelDestroyed, 1, 'invokes the originally validated destructor once')
   t.is(destroyThis, physicalChannel, 'invokes the destructor with the channel as receiver')
   t.is(destroyReads, 1, 'does not redispatch the destroy property')
   t.is(receiverDestroyed, 0, 'does not also destroy the setup receiver')
 })
-
 
 test('extension response receiver transfers only exact ACCEPT then PROOF and no fourth object', (t) => {
   const accept = bytes(LINK_ACCEPT_SIZE, 0x31)
@@ -292,11 +303,7 @@ test('extension response receiver transfers only exact ACCEPT then PROOF and no 
 })
 
 test('extension response receiver retains ownership when channel transfer returns a truthy malformed candidate', (t) => {
-  const inbound = [
-    bytes(LINK_ACCEPT_SIZE, 0x33),
-    bytes(REDACTED_RESPONDER_PROOF_SIZE, 0x34),
-    null
-  ]
+  const inbound = [bytes(LINK_ACCEPT_SIZE, 0x33), bytes(REDACTED_RESPONDER_PROOF_SIZE, 0x34), null]
   const malformedCandidate = Object.freeze({ destroy: null })
   let destroyed = 0
   const receiver = createExtensionResponseReceiver({
@@ -310,11 +317,7 @@ test('extension response receiver retains ownership when channel transfer return
 })
 
 test('extension response receiver destroys a valid channel on a later non-transfer failure', (t) => {
-  const inbound = [
-    bytes(LINK_ACCEPT_SIZE, 0x35),
-    bytes(REDACTED_RESPONDER_PROOF_SIZE, 0x36),
-    null
-  ]
+  const inbound = [bytes(LINK_ACCEPT_SIZE, 0x35), bytes(REDACTED_RESPONDER_PROOF_SIZE, 0x36), null]
   let channelDestroyed = 0
   let receiverDestroyed = 0
   const physicalChannel = Object.freeze({

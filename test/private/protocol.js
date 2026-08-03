@@ -114,7 +114,7 @@ test('private route protocol versions and core enums are exact and frozen', (t) 
   }
 })
 
-test('private route message and routed-error IDs form the exact sorted 59-ID registry', (t) => {
+test('private route message and routed-error IDs form the exact sorted 60-ID registry', (t) => {
   const messages = {
     CAPABILITY_ADVERTISEMENT_V1: 0x0001,
     CAPS_QUERY_V1: 0x0002,
@@ -131,6 +131,7 @@ test('private route message and routed-error IDs form the exact sorted 59-ID reg
     EXTENDED_V1: 0x0023,
     TAIL_READY_V1: 0x0024,
     EXTEND_REQUEST_V1: 0x0025,
+    BRANCH_DESTROY_V1: 0x0026,
     DHT_EXIT_ACTIVATE_V1: 0x0040,
     DHT_EXIT_READY_V1: 0x0041,
     DHT_EXIT_READY_ACK_V1: 0x0042,
@@ -188,8 +189,8 @@ test('private route message and routed-error IDs form the exact sorted 59-ID reg
   t.is(M3_MESSAGE_ID.DHT_EXIT_SEEDS_V1, 0x0044)
   t.is(M3_MESSAGE_ID.DHT_EXIT_DHT_SEEDS_V1, 0x0045)
   t.is(M3_ID_REGISTRY.filter((id) => id === 0x0045).length, 1)
-  t.is(assigned.length, 59)
-  t.is(new Set(assigned).size, 59)
+  t.is(assigned.length, 60)
+  t.is(new Set(assigned).size, 60)
   t.alike(
     M3_ID_REGISTRY,
     assigned.slice().sort((left, right) => left - right)
@@ -472,6 +473,7 @@ test('canonical M3 object envelope enforces every standalone layout boundary', (
     [0x0023, 486, 486, 0],
     [0x0024, 210, 210, 64],
     [0x0025, 458, 746, 0],
+    [0x0026, 42, 42, 0],
     [0x0040, 96, 96, 0],
     [0x0041, 233, 233, 64],
     [0x0042, 105, 105, 0],

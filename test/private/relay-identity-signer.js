@@ -10,6 +10,7 @@ const signer = require('../../lib/private/relay-identity-signer')
 const {
   createRelayIdentitySigningAuthority,
   createLinkOfferSigner,
+  createDhtExitReadySigner,
   signLinkOffer,
   destroyLinkOfferSigner,
   createExtensionResponderSigner,
@@ -18,7 +19,9 @@ const {
   destroyExtensionResponderSigner,
   createTailReadySigner,
   signTailReady,
+  signDhtExitReady,
   destroyTailReadySigner,
+  destroyDhtExitReadySigner,
   destroyRelayIdentitySigningAuthority
 } = signer
 
@@ -42,6 +45,11 @@ const REGISTERED = Object.freeze({
     domain: 'hyperdht-private-routes/m3/tail-ready/v1',
     messageId: 0x0024,
     bodyLength: 210
+  }),
+  dhtExitReady: Object.freeze({
+    domain: 'hyperdht-private-routes/m3/dht-exit-ready/v1',
+    messageId: 0x0041,
+    bodyLength: 233
   })
 })
 
@@ -97,14 +105,17 @@ function fixture() {
 
 test('relay identity signer exposes only the approved private surface', (t) => {
   t.alike(Object.keys(signer).sort(), [
+    'createDhtExitReadySigner',
     'createExtensionResponderSigner',
     'createLinkOfferSigner',
     'createRelayIdentitySigningAuthority',
     'createTailReadySigner',
+    'destroyDhtExitReadySigner',
     'destroyExtensionResponderSigner',
     'destroyLinkOfferSigner',
     'destroyRelayIdentitySigningAuthority',
     'destroyTailReadySigner',
+    'signDhtExitReady',
     'signLinkAccept',
     'signLinkOffer',
     'signRedactedResponderProof',
@@ -201,14 +212,17 @@ test('relay identity owner and all child signers are empty frozen capabilities',
   const link = createLinkOfferSigner(f.authority)
   const extension = createExtensionResponderSigner(f.authority)
   const tail = createTailReadySigner(f.authority)
+  const dhtExitReady = createDhtExitReadySigner(f.authority)
 
   assertOpaque(t, f.authority, 'identity owner')
   assertOpaque(t, link, 'LINK_OFFER signer')
   assertOpaque(t, extension, 'extension responder signer')
   assertOpaque(t, tail, 'TAIL_READY signer')
+  assertOpaque(t, dhtExitReady, 'DHT_EXIT_READY signer')
   t.not(link, extension)
   t.not(extension, tail)
   t.not(link, tail)
+  t.not(tail, dhtExitReady)
 
   destroyRelayIdentitySigningAuthority(f.authority)
 })
@@ -218,11 +232,13 @@ test('relay identity signatures bind the four exact registry domains, ids, and b
   const link = createLinkOfferSigner(f.authority)
   const extension = createExtensionResponderSigner(f.authority)
   const tail = createTailReadySigner(f.authority)
+  const dhtExitReady = createDhtExitReadySigner(f.authority)
   const bodies = {
     linkOffer: bytes(REGISTERED.linkOffer.bodyLength, 0x21),
     linkAccept: bytes(REGISTERED.linkAccept.bodyLength, 0x22),
     redactedResponderProof: bytes(REGISTERED.redactedResponderProof.bodyLength, 0x23),
-    tailReady: bytes(REGISTERED.tailReady.bodyLength, 0x24)
+    tailReady: bytes(REGISTERED.tailReady.bodyLength, 0x24),
+    dhtExitReady: bytes(REGISTERED.dhtExitReady.bodyLength, 0x25)
   }
   const snapshots = Object.fromEntries(
     Object.entries(bodies).map(([name, body]) => [name, b4a.from(body)])
@@ -237,7 +253,8 @@ test('relay identity signatures bind the four exact registry domains, ids, and b
       bodies.redactedResponderProof,
       expectedIdentity
     ),
-    tailReady: signTailReady(tail, bodies.tailReady, expectedIdentity)
+    tailReady: signTailReady(tail, bodies.tailReady, expectedIdentity),
+    dhtExitReady: signDhtExitReady(dhtExitReady, bodies.dhtExitReady, expectedIdentity)
   }
 
   for (const [name, registration] of Object.entries(REGISTERED)) {
@@ -270,6 +287,7 @@ test('relay identity signing rejects wrong lengths and a 378-byte redacted objec
   const link = createLinkOfferSigner(f.authority)
   const extension = createExtensionResponderSigner(f.authority)
   const tail = createTailReadySigner(f.authority)
+  const dhtExitReady = createDhtExitReadySigner(f.authority)
 
   expectCode(
     t,
@@ -289,6 +307,12 @@ test('relay identity signing rejects wrong lengths and a 378-byte redacted objec
     'INVALID_ROUTE',
     'TAIL_READY requires exactly 210 body bytes'
   )
+  expectCode(
+    t,
+    () => signDhtExitReady(dhtExitReady, bytes(234, 0x39), f.identity.publicKey),
+    'INVALID_ROUTE',
+    'DHT_EXIT_READY requires exactly 233 body bytes'
+  )
 
   const accept = bytes(213, 0x34)
   signLinkAccept(extension, accept, f.identity.publicKey)
@@ -302,6 +326,7 @@ test('relay identity signing rejects wrong lengths and a 378-byte redacted objec
   t.is(signLinkOffer(link, bytes(302, 0x36), f.identity.publicKey).byteLength, 64)
   t.is(signRedactedResponderProof(extension, bytes(306, 0x37), f.identity.publicKey).byteLength, 64)
   t.is(signTailReady(tail, bytes(210, 0x38), f.identity.publicKey).byteLength, 64)
+  t.is(signDhtExitReady(dhtExitReady, bytes(233, 0x3a), f.identity.publicKey).byteLength, 64)
 
   destroyRelayIdentitySigningAuthority(f.authority)
 })
@@ -434,6 +459,12 @@ test('single-phase signers retry only the same owned semantic body and return fr
       registration: REGISTERED.tailReady,
       capability: createTailReadySigner(f.authority),
       sign: signTailReady
+    },
+    {
+      name: 'DHT_EXIT_READY',
+      registration: REGISTERED.dhtExitReady,
+      capability: createDhtExitReadySigner(f.authority),
+      sign: signDhtExitReady
     }
   ]
 
@@ -533,6 +564,7 @@ test('destroying one signer deeply invalidates it without invalidating siblings'
   const link = createLinkOfferSigner(f.authority)
   const extension = createExtensionResponderSigner(f.authority)
   const tail = createTailReadySigner(f.authority)
+  const dhtExitReady = createDhtExitReadySigner(f.authority)
 
   t.is(destroyLinkOfferSigner(link), true)
   t.is(destroyLinkOfferSigner(link), false, 'LINK_OFFER destroy is idempotent')
@@ -553,6 +585,7 @@ test('destroying one signer deeply invalidates it without invalidating siblings'
     'destroyed extension signer cannot finish'
   )
   t.is(signTailReady(tail, bytes(210, 0x74), f.identity.publicKey).byteLength, 64)
+  t.is(signDhtExitReady(dhtExitReady, bytes(233, 0x75), f.identity.publicKey).byteLength, 64)
 
   t.is(destroyTailReadySigner(tail), true)
   t.is(destroyTailReadySigner(tail), false, 'TAIL_READY destroy is idempotent')
@@ -561,6 +594,15 @@ test('destroying one signer deeply invalidates it without invalidating siblings'
     () => signTailReady(tail, bytes(210, 0x74), f.identity.publicKey),
     'ERR_DESTROYED',
     'destroyed TAIL_READY signer cannot retry'
+  )
+
+  t.is(destroyDhtExitReadySigner(dhtExitReady), true)
+  t.is(destroyDhtExitReadySigner(dhtExitReady), false, 'DHT_EXIT_READY destroy is idempotent')
+  expectCode(
+    t,
+    () => signDhtExitReady(dhtExitReady, bytes(233, 0x75), f.identity.publicKey),
+    'ERR_DESTROYED',
+    'destroyed DHT_EXIT_READY signer cannot retry'
   )
 
   destroyRelayIdentitySigningAuthority(f.authority)
@@ -578,6 +620,7 @@ test('authority destroy clears authority ownership and invalidates every live ch
   const link = createLinkOfferSigner(authority)
   const extension = createExtensionResponderSigner(authority)
   const tail = createTailReadySigner(authority)
+  const dhtExitReady = createDhtExitReadySigner(authority)
 
   t.is(signLinkOffer(link, bytes(302, 0x81), expectedIdentity).byteLength, 64)
   t.is(signLinkAccept(extension, bytes(213, 0x82), expectedIdentity).byteLength, 64)
@@ -618,5 +661,11 @@ test('authority destroy clears authority ownership and invalidates every live ch
     () => signTailReady(tail, bytes(210, 0x84), expectedIdentity),
     'ERR_DESTROYED',
     'authority destroy invalidates an unused TAIL_READY signer'
+  )
+  expectCode(
+    t,
+    () => signDhtExitReady(dhtExitReady, bytes(233, 0x85), expectedIdentity),
+    'ERR_DESTROYED',
+    'authority destroy invalidates an unused DHT_EXIT_READY signer'
   )
 })

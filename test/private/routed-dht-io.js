@@ -2,13 +2,19 @@
 
 const test = require('brittle')
 const b4a = require('b4a')
+const sodium = require('sodium-universal')
 
 const { COMMANDS } = require('../../lib/constants')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const { createQueryContexts } = require('../../lib/private/query-context')
 const { RoutedDHTIO } = require('../../lib/private/routed-dht-io')
+const { TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER } = require('../../lib/private/live-route-authority')
 const { decodeDestinationRef, encodeDestinationRef } = require('../../lib/private/destination-ref')
-const { decodeRoutedRequest, clearRoutedRequest } = require('../../lib/private/routed-dht')
+const {
+  clearRoutedRequest,
+  decodeRoutedRequest,
+  encodeRoutedRequest
+} = require('../../lib/private/routed-dht')
 const { BRANCH_CLASS, M3_MESSAGE_ID } = require('../../lib/private/protocol')
 const { FakeRouteAuthority } = require('./fake-route-authority')
 
@@ -43,6 +49,9 @@ function record(byte) {
 
 function fixture(overrides = {}) {
   const authority = overrides.authority || new FakeRouteAuthority()
+  if (authority instanceof FakeRouteAuthority) {
+    TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.register(authority)
+  }
   const contexts = overrides.contexts || createQueryContexts()
   const retained = []
   const io = new RoutedDHTIO({
@@ -269,31 +278,20 @@ test('request emits exact immutable-get routed bytes and normalizes logical repl
   t.ok(retained.every((buffer) => buffer.every((byte) => byte === 0)))
 })
 
-test('announce capability emits only the announce branch', async (t) => {
+test('announce request rejects before route IO', async (t) => {
   const { io, authority, contexts } = fixture()
-  const destinationRecord = record(0x73)
-  authority.announce = [destinationRecord]
-  authority.response = {
-    rtt: 1,
-    from: destinationRecord,
-    to: null,
-    token: null,
-    closerNodes: [],
-    error: 0,
-    value: null
-  }
+  authority.announce = [record(0x73)]
   const [to] = await io.bootstrap({
     target: bytes(1, 32),
     limit: 1,
     context: contexts.immutableGet.announce
   })
-  const operation = io.request(message(to, contexts.immutableGet.announce))
-  const decoded = decodeRoutedRequest(authority.requests[0].encodedRequest)
-  t.is(decoded.operationClass, BRANCH_CLASS.ANNOUNCE)
-  t.is(authority.requests[0].branch, BRANCH_CLASS.ANNOUNCE)
-  clearRoutedRequest(decoded)
-  const reply = await operation.promise
-  t.alike(io.id(reply.from), bytes(0x73, 32))
+  expectCode(
+    t,
+    () => io.request(message(to, contexts.immutableGet.announce)),
+    'ERR_PRIVATE_COMMAND_UNSUPPORTED'
+  )
+  t.is(authority.calls.request, 0)
 })
 
 test('request rejects wrong commands, branches, raw addresses, and stale destinations before authority', (t) => {
@@ -310,7 +308,7 @@ test('request rejects wrong commands, branches, raw addresses, and stale destina
       message(to, first.contexts.immutableGet.lookup, { command: COMMANDS.IMMUTABLE_PUT }),
       'ERR_PRIVATE_COMMAND_UNSUPPORTED'
     ],
-    [message(to, first.contexts.immutableGet.announce), 'ERR_AUTHENTICATION'],
+    [message(to, first.contexts.immutableGet.announce), 'ERR_PRIVATE_COMMAND_UNSUPPORTED'],
     [
       message({ host: '127.0.0.1', port: 49737 }, first.contexts.immutableGet.lookup),
       'INVALID_ROUTE'
@@ -418,7 +416,7 @@ test('request fails closed on sync throw, malformed operation, rejection, malfor
         mode === 'reject'
           ? 'ROUTE_UNAVAILABLE'
           : mode === 'reply'
-            ? 'INVALID_ROUTE'
+            ? 'ROUTE_UNAVAILABLE'
             : 'ERR_AUTHENTICATION'
       await expectRejectCode(t, operation.promise, expected)
     }
@@ -440,22 +438,30 @@ test('authority Promise is subscribed once through an adapter-owned bridge', asy
     error: 0,
     value: null
   }
-  const authorityPromise = Promise.resolve(current.authority.response)
   let constructorReads = 0
   let cancels = 0
-  Object.defineProperty(authorityPromise, 'constructor', {
-    get() {
-      constructorReads++
-      if (constructorReads === 1) return Promise
-      throw new Error('authority Promise was subscribed twice')
+  current.authority.requestHook = (options) => {
+    const authorityPromise = Promise.resolve(
+      TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.authenticateResponse(
+        current.authority,
+        options,
+        current.authority.response
+      )
+    )
+    Object.defineProperty(authorityPromise, 'constructor', {
+      get() {
+        constructorReads++
+        if (constructorReads === 1) return Promise
+        throw new Error('authority Promise was subscribed twice')
+      }
+    })
+    return {
+      promise: authorityPromise,
+      cancel() {
+        cancels++
+      }
     }
-  })
-  current.authority.requestHook = () => ({
-    promise: authorityPromise,
-    cancel() {
-      cancels++
-    }
-  })
+  }
   const [to] = current.io.closest({
     target: bytes(1, 32),
     limit: 1,
@@ -776,7 +782,7 @@ test('opaque destinations authenticate copied bytes, factories, and a fixed key 
   source.destinationRef.fill(0)
   t.alike(first.io.id(destination), bytes(3, 32))
   expectCode(t, () => first.io.key({}), 'INVALID_ROUTE')
-  expectCode(t, () => second.io.key(destination), 'INVALID_ROUTE')
+  expectCode(t, () => second.io.key(destination), 'ERR_AUTHENTICATION')
   expectCode(t, () => first.io.id(new Proxy(destination, {})), 'INVALID_ROUTE')
 
   const mismatched = record(4)
@@ -909,76 +915,67 @@ test('request validates exact address-free shape before route authority IO', (t)
   t.is(authority.calls.request, 0)
 })
 
-test('logical reply validation is exact, bounded, defensive, and branch preserving', async (t) => {
-  const malformed = [
-    { rtt: -1 },
-    {
-      rtt: 1,
-      from: { ...record(40), host: '127.0.0.1' },
-      to: null,
-      token: null,
-      closerNodes: [],
-      error: 0,
-      value: null
-    },
-    {
-      rtt: 1,
-      from: record(40),
-      to: {},
-      token: null,
-      closerNodes: [],
-      error: 0,
-      value: null
-    },
-    {
-      rtt: 1,
-      from: record(40),
-      to: null,
-      token: null,
-      closerNodes: new Array(21).fill(record(41)),
-      error: 0,
-      value: null
-    },
-    {
-      rtt: 1,
-      from: record(40),
-      to: null,
-      token: null,
-      closerNodes: [],
-      error: 0,
-      value: bytes(1, 4707)
-    }
-  ]
-  if (typeof SharedArrayBuffer === 'function') {
-    malformed.push({
-      rtt: 1,
-      from: record(40),
-      to: null,
-      token: null,
-      closerNodes: [],
-      error: 0,
-      value: new Uint8Array(new SharedArrayBuffer(32))
-    })
-  }
-
-  for (const response of malformed) {
+test('encoded reply validation rejects hostile shape, wrong digest, and value hash', async (t) => {
+  for (const mode of ['rtt', 'extra', 'digest']) {
     const current = fixture()
-    current.authority.lookup = [record(40)]
-    current.authority.response = response
+    const from = record(40)
+    current.authority.lookup = [from]
     const [to] = current.io.closest({
       target: bytes(1, 32),
       limit: 1,
       context: current.contexts.immutableGet.lookup
     })
+    current.authority.requestHook = (options) => {
+      const authenticated = TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.authenticateResponse(
+        current.authority,
+        options,
+        {
+          rtt: 1,
+          from,
+          to: null,
+          token: null,
+          closerNodes: [],
+          error: 0,
+          value: null
+        }
+      )
+      if (mode === 'rtt') {
+        return { promise: Promise.resolve({ ...authenticated, rtt: -1 }), cancel() {} }
+      }
+      if (mode === 'extra') {
+        return {
+          promise: Promise.resolve({ ...authenticated, extra: true }),
+          cancel() {}
+        }
+      }
+      const encodedReply = b4a.from(authenticated.encodedReply)
+      encodedReply[encodedReply.length - 1] ^= 1
+      return {
+        promise: Promise.resolve({
+          encodedReply,
+          authenticatedReplyAuthority: authenticated.authenticatedReplyAuthority,
+          rtt: authenticated.rtt
+        }),
+        cancel() {}
+      }
+    }
     const operation = current.io.request(message(to, current.contexts.immutableGet.lookup))
-    await expectRejectCode(t, operation.promise, 'INVALID_ROUTE')
+    await expectRejectCode(
+      t,
+      operation.promise,
+      mode === 'digest' ? 'ERR_AUTHENTICATION' : 'INVALID_ROUTE'
+    )
     t.is(current.authority.calls.request, 1)
   }
 
-  const current = fixture()
+  const authority = new FakeRouteAuthority()
+  TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.register(authority, { enforceHash: true })
+  const current = fixture({ authority })
   const from = record(42)
   const closer = record(43)
   const value = bytes(44, 64)
+  const target = b4a.alloc(32)
+  sodium.crypto_generichash(target, value)
   current.authority.lookup = [from]
   current.authority.response = {
     rtt: 1,
@@ -990,17 +987,42 @@ test('logical reply validation is exact, bounded, defensive, and branch preservi
     value
   }
   const [to] = current.io.closest({
-    target: bytes(1, 32),
+    target,
     limit: 1,
     context: current.contexts.immutableGet.lookup
   })
-  const reply = await current.io.request(message(to, current.contexts.immutableGet.lookup)).promise
-  from.id.fill(0)
-  closer.id.fill(0)
-  value.fill(0)
+  const reply = await current.io.request(
+    message(to, current.contexts.immutableGet.lookup, { target })
+  ).promise
   t.alike(current.io.id(reply.from), bytes(42, 32))
   t.alike(current.io.id(reply.closerNodes[0]), bytes(43, 32))
-  t.alike(reply.value, bytes(44, 64))
+  t.alike(reply.value, value)
+
+  const wrong = fixture({
+    authority: TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.register(new FakeRouteAuthority(), {
+      enforceHash: true
+    })
+  })
+  wrong.authority.lookup = [record(45)]
+  wrong.authority.response = {
+    rtt: 1,
+    from: wrong.authority.lookup[0],
+    to: null,
+    token: null,
+    closerNodes: [record(46)],
+    error: 0,
+    value
+  }
+  const [wrongTo] = wrong.io.closest({
+    target: bytes(0xee, 32),
+    limit: 1,
+    context: wrong.contexts.immutableGet.lookup
+  })
+  await expectRejectCode(
+    t,
+    wrong.io.request(message(wrongTo, wrong.contexts.immutableGet.lookup)).promise,
+    'ERR_AUTHENTICATION'
+  )
 })
 
 test('suspend and destroy revoke active operations before lifecycle delegation', async (t) => {
@@ -1090,7 +1112,14 @@ test('authority operation fields accept prototype data and reject accessors with
     error: 0,
     value: null
   }
-  current.authority.requestHook = () => new Operation(current.authority.response)
+  current.authority.requestHook = (options) =>
+    new Operation(
+      TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.authenticateResponse(
+        current.authority,
+        options,
+        current.authority.response
+      )
+    )
   const [to] = current.io.closest({
     target: bytes(1, 32),
     limit: 1,
@@ -1147,6 +1176,7 @@ test('clock, random, and authority reentry fail closed before request delivery',
   let io = null
   let contexts = null
   const authority = new FakeRouteAuthority()
+  TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.register(authority)
   contexts = createQueryContexts()
   authority.lookup = [record(61)]
   io = new RoutedDHTIO({
@@ -1171,6 +1201,7 @@ test('clock, random, and authority reentry fail closed before request delivery',
 
 test('random callback cannot redirect captured mutable intrinsics', async (t) => {
   const authority = new FakeRouteAuthority()
+  TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.register(authority)
   const contexts = createQueryContexts()
   const source = record(62)
   const response = {
@@ -1182,7 +1213,21 @@ test('random callback cannot redirect captured mutable intrinsics', async (t) =>
     error: 0,
     value: null
   }
-  const authorityPromise = Promise.resolve(response)
+  const encodedRequest = encodeRoutedRequest({
+    requestId: bytes(0x77, 16),
+    operationClass: BRANCH_CLASS.LOOKUP,
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    absoluteDeadlineMs: 4_000n,
+    destination: source.destinationRef,
+    encodedBody: bytes(0x31, 32)
+  })
+  const authorityPromise = Promise.resolve(
+    TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.authenticateResponse(
+      authority,
+      { branch: BRANCH_CLASS.LOOKUP, encodedRequest },
+      response
+    )
+  )
   authority.lookup = [source]
   authority.requestHook = () => ({ promise: authorityPromise, cancel() {} })
 
@@ -1376,14 +1421,26 @@ test('response reflection reentry poisons the outer request before issuing capab
     error: 0,
     value: null
   }
-  current.authority.response = new Proxy(logical, {
-    ownKeys(target) {
-      try {
-        transition = current.io.suspend()
-      } catch {}
-      return Reflect.ownKeys(target)
+  current.authority.requestHook = (options) => {
+    const authenticated = TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.authenticateResponse(
+      current.authority,
+      options,
+      logical
+    )
+    return {
+      promise: Promise.resolve(
+        new Proxy(authenticated, {
+          ownKeys(target) {
+            try {
+              transition = current.io.suspend()
+            } catch {}
+            return Reflect.ownKeys(target)
+          }
+        })
+      ),
+      cancel() {}
     }
-  })
+  }
   const [to] = current.io.closest({
     target: bytes(1, 32),
     limit: 1,
@@ -1509,24 +1566,25 @@ test('authority request throws are opaque ROUTE_UNAVAILABLE and clear actual enc
   }
 })
 
-test('actual encoded request argument is cleared immediately after successful authority return', async (t) => {
+test('actual encoded request remains owned through validation and clears on settlement', async (t) => {
   const authority = new FakeRouteAuthority()
   const source = record(79)
   let actual = null
   authority.request = (options) => {
     authority.calls.request++
-    b4a.from(options.encodedRequest)
     actual = options.encodedRequest
     return {
-      promise: Promise.resolve({
-        rtt: 1,
-        from: source,
-        to: null,
-        token: null,
-        closerNodes: [],
-        error: 0,
-        value: null
-      }),
+      promise: Promise.resolve(
+        TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.authenticateResponse(authority, options, {
+          rtt: 1,
+          from: source,
+          to: null,
+          token: null,
+          closerNodes: [],
+          error: 0,
+          value: null
+        })
+      ),
       cancel() {}
     }
   }
@@ -1538,8 +1596,9 @@ test('actual encoded request argument is cleared immediately after successful au
     context: current.contexts.immutableGet.lookup
   })
   const operation = current.io.request(message(to, current.contexts.immutableGet.lookup))
-  t.ok(allZero(actual))
+  t.absent(allZero(actual))
   t.is((await operation.promise).error, 0)
+  t.ok(allZero(actual))
 })
 
 test('value is copied before later hostile closer-record reflection', async (t) => {
