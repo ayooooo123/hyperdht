@@ -28,6 +28,10 @@ require('./private/guard-link')
 require('./private/relay-identity-signer')
 require('./private/bootstrap-envelope')
 require('./private/bootstrap-io')
+require('./private/caps-responder')
+require('./private/endpoint-bootstrap-authority')
+require('./private/private-routing-controller')
+require('./private/live-immutable-get')
 require('./private/guard-reconnect-authority')
 require('./private/m3-context')
 require('./private/m3-adjacency-runtime')
@@ -52,3 +56,16 @@ require('./private/final-exit')
 require('./private/open-route-handoff')
 require('./private/final-exit-activation')
 require('./private/final-exit-activation-session')
+
+require('./private/process-codec')
+require('./private/process-audit-event')
+require('./private/process-config-auditor')
+require('./private/dht-setup-audit-udx')
+// The coordinator spawns role processes with `child_process`, so the aggregate keeps
+// these Node-only. Bare role coverage runs through `npm run test:private:process:bare`,
+// where a Node coordinator launches Bare children.
+if (!global.Bare) {
+  require('./private/process-control')
+  require('./private/live-process-node')
+  require('./private/live-process-bare')
+}
