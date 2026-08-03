@@ -7,6 +7,9 @@ This record describes the experimental, internal Gate 3A substrate and the owner
 Direct mode remains the only public behavior. Gate 3B1 Task 15 has a package-private required-mode controller, authenticated native route authority, routed immutable-get request/reply path, rotation, suspension, and teardown; Tasks 16 and 17 add test-only process isolation and prove that path live across eleven separate Node or Bare role processes over native UDX, and, on Linux, with every role in its own network namespace under packet capture. The root package still exposes no private-routing constructor or user-selectable required mode. A post-readiness packet-capture proof now exists for the specific properties tabulated in [Task 17 wire-level privacy evidence](#gate-3b1-task-17-wire-level-privacy-evidence). It is not a general anonymity claim: a global passive observer and timing correlation by colluding guards and exits are out of scope for v1, no cover traffic exists, and these tests do not establish suitability for protecting users.
 
 The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
+Accepted limitations that are not scheduled for repair are tracked under
+[Known issues](#known-issues); the load-bearing one is
+[KI-1: routes are correlatable by timing and volume](#ki-1-routes-are-correlatable-by-timing-and-volume).
 
 The owner-approved Gate 3B1 Task 5 authenticated-M3 transport, Task 6
 tail-control lifetime/ownership amendment, and Tasks 7–17 live-route lifecycle
@@ -15,6 +18,48 @@ internally in this fork. This remains a package-private compatibility slice: it
 adds no root public constructor, export, user-selectable required mode, or
 anonymity claim, although its internal path uses the production UDX, relay,
 final-exit, and DHT-exit owners rather than a structural or fake transport.
+
+## Known issues
+
+### KI-1: routes are correlatable by timing and volume
+
+**Status: accepted for v1. Not fixed, not scheduled in this gate.**
+
+Every route cell is the same 1,200 bytes on every hop, so cell length is not a
+correlator. Nothing else about the traffic shape is concealed: an observer of
+two edges sees when each datagram was sent and how many there were, and the
+route relays each cell promptly. An adversary who can watch both the
+endpoint-to-guard edge and an exit-to-DHT edge can therefore link them by timing
+and volume alone, without breaking any cryptography and without any protocol
+error.
+
+This is a property of the v1 design, not a defect in its implementation. v1
+deliberately excludes
+[a global passive observer, timing correlation by colluding guards and exits,
+and constant-rate cover traffic](private-routing-v1.md#out-of-scope-for-v1),
+because the padding, batching, or cover traffic that would address it costs
+bandwidth and battery that v1 is not willing to spend, especially on mobile.
+
+The
+[Task 17 wire-level privacy evidence](#gate-3b1-task-17-wire-level-privacy-evidence)
+is scoped accordingly: it proves what crossed which edge, never that two edges
+cannot be linked. Any future claim of resistance to a two-edge observer requires
+a wire-format change and its own sub-gate, and must not be inferred from the
+current test results.
+
+### KI-2: the live process suites cannot run on macOS
+
+macOS cannot bind the `127.64.x.1` role tuples without per-address
+configuration, so both portable live suites stop at the first bind with
+`PROCESS_BIND_UNAVAILABLE`. They are green on Linux and their CI jobs are
+Linux-only. Every other private suite is green on Darwin.
+
+### KI-3: the namespace gates need privileged Linux
+
+`npm run test:private:namespace` and `npm run test:private:namespace:live`
+create network namespaces, veth pairs and iptables rules, and capture with
+`tcpdump`. They require Linux with non-interactive root and skip elsewhere with
+a stated reason. They are not part of the portable aggregate suite.
 
 ## Reviewed prototype source
 
@@ -426,9 +471,11 @@ global passive observer, timing correlation by colluding guards and exits, Sybil
 resistance, and query privacy from exits. Uniform cell size removes length as a
 correlator, but the capture records timing and packet counts per edge, and
 nothing in this gate pads, batches, or adds cover traffic. An adversary watching
-two edges can still correlate them. That is a v1 design boundary, not a test
-gap, and it is the reason this remains an experimental, package-private slice
-with no anonymity claim beyond the table above.
+two edges can still correlate them. That is tracked as
+[KI-1](#ki-1-routes-are-correlatable-by-timing-and-volume): a v1 design boundary
+accepted on purpose, not a test gap, and the reason this remains an
+experimental, package-private slice with no anonymity claim beyond the table
+above.
 
 Role clocks are supplied by `test/private/process/runtime-clock.js`. Wall and
 monotonic time are derived from one cached sample of a single counter because the
@@ -465,12 +512,9 @@ destinations, generation invalidation, and native DHT-exit socket ownership.
 
 The remaining deferred scope is explicit:
 
-- private presence and the mutable get/put command bodies and live operations;
-- public duplex/peer-stream segmentation and stream backpressure;
 - traffic-analysis defences: padding to a constant rate, batching, and cover
-  traffic. Cell size is already uniform, but per-edge timing and packet counts
-  are observable and nothing conceals them, so correlation by an adversary
-  watching two edges remains possible and out of scope;
+  traffic, tracked as
+  [KI-1](#ki-1-routes-are-correlatable-by-timing-and-volume);
 - root public required-mode integration, Hyperswarm, mobile, and PearTube
   integration.
 
