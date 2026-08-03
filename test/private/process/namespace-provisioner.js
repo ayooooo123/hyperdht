@@ -289,6 +289,19 @@ function provisionNamespaceProjection(namespace, options = {}) {
       if (!endpoint) invalid(`marker ${String(key)}`)
       return endpoint.namespace
     },
+    // Packets the kernel refused between our devices. A correct run never
+    // attempts a forbidden pair, so this is an independent leak signal that
+    // does not depend on reading any capture.
+    dropStatistics() {
+      const listing = run(['iptables', '-L', names.chain, '-v', '-n', '-x'])
+      let packets = 0
+      for (const line of String(listing).split('\n')) {
+        const fields = line.trim().split(/\s+/)
+        if (fields[2] !== 'DROP') continue
+        packets += Number(fields[0]) || 0
+      }
+      return packets
+    },
 
     // Wrap a command so it executes inside a role's namespace.
     enter(roleIndex, command, args) {

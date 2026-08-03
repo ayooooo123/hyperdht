@@ -52,3 +52,7 @@ jobs:
         run: |
           sudo -n true
           npm run test:private:namespace
+      - name: Namespace live route with capture oracles (privileged)
+        run: |
+          sudo -n apt-get install -y -q tcpdump
+          npm run test:private:namespace:live

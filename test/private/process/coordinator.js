@@ -604,9 +604,9 @@ function resolveExecution(launch, args) {
     } catch {
       fs.chmodSync(bin, 0o755)
     }
-    return { argv: args, command: bin }
+    return { args, command: bin }
   }
-  if (launch.runtime === 'node') return { argv: args, command: launch.command }
+  if (launch.runtime === 'node') return { args, command: launch.command }
   throw new ProcessControlError('PROCESS_RUNTIME_INVALID')
 }
 
@@ -615,8 +615,11 @@ function spawnRuntimeProcess(launch, args = launch.args, options = {}) {
   const resolved = resolveExecution(launch, args)
   // `enter` wraps the resolved command so the role runs somewhere else, such as
   // inside a network namespace. It never changes which runtime is executed.
-  const placed = enter === null ? resolved : enter(resolved.command, resolved.argv)
-  return spawn(placed.command, placed.argv, {
+  const placed = enter === null ? resolved : enter(resolved.command, resolved.args)
+  if (!placed || typeof placed.command !== 'string' || !Array.isArray(placed.args)) {
+    throw new ProcessControlError('PROCESS_CONTROL_INVALID')
+  }
+  return spawn(placed.command, placed.args, {
     ...rest,
     stdio: rest.stdio || ['pipe', 'pipe', 'pipe']
   })
