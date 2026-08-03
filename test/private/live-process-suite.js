@@ -46,15 +46,22 @@ function registerLiveProcessSuite(launch) {
     throw new Error('invalid runtime launch record')
   }
 
-  test(`live private route lifecycle in eleven ${launch.runtime} role processes`, async (t) => {
-    const plan = PROCESS_PLANS.PORTABLE_LOOPBACK
+  // `launch.placement` lets a caller run the same scenario somewhere other than
+  // portable loopback, such as one network namespace per role, and inspect what
+  // crossed the wire afterwards. Portable runs pass `null` and are unaffected.
+  const plan = launch.plan || PROCESS_PLANS.PORTABLE_LOOPBACK
+  const label = launch.label ? ` on ${launch.label}` : ''
+
+  test(`live private route lifecycle in eleven ${launch.runtime} role processes${label}`, async (t) => {
     const topology = createLiveProcessTopology({
       plan,
       ...capabilities(launch.runtime === 'node' ? 0x31 : 0x32)
     })
+    const placement = launch.createPlacement ? launch.createPlacement(topology) : null
     const auditor = createProcessConfigAuditor(topology.oracle)
     auditor.auditAll(topology.projections)
     const children = spawnRoleProcesses(launch.runtime, topology.projections, {
+      enter: placement ? placement.enter : undefined,
       nodePath: launch.nodePath
     })
     const control = createProcessControl({ auditor, children })
@@ -421,11 +428,15 @@ function registerLiveProcessSuite(launch) {
       }
       for (const result of exitResults) t.is(result.code, 0)
       await control.close()
+      // Every role has exited, so the capture is complete and the wire record
+      // covers the whole lifecycle including the failure paths.
+      if (placement) await placement.audit(t)
     } catch (err) {
       t.fail(err && typeof err.code === 'string' ? err.code : String(err))
     } finally {
       for (const responder of learnedGrantResponders) responder.stop()
       if (!control.closed) await control.cancel('TEARDOWN').catch(() => {})
+      if (placement) placement.teardown()
       topology.stop()
     }
   })

@@ -67,6 +67,12 @@ const ALLOW_EDGES = Object.freeze([
   Object.freeze([8, 10]),
   Object.freeze([8, 11]),
   Object.freeze([9, 10]),
+  // The three DHT roles are ordinary DHT nodes, not route positions. Kademlia
+  // gossips closer-node records, so a node will contact any peer it learns
+  // about; under real isolation a missing seed-to-value edge leaves that probe
+  // unroutable and stalls setup. Their mesh carries no route cells and no
+  // anonymity property depends on it.
+  Object.freeze([9, 11]),
   Object.freeze([10, 11])
 ])
 
@@ -449,6 +455,20 @@ function networkAuthority(tuples) {
   })
 }
 
+// An exit role owns two sockets: its cell endpoint on the tuple port, and a
+// dedicated DHT-exit socket on 43_000 + roleIndex that it uses to reach DHT
+// nodes. Pinning both in the firewall keeps the rule set an exact description
+// of which socket may reach which peer.
+const EXIT_ROLE_INDICES = Object.freeze(new Set([4, 6, 8]))
+const DHT_ROLE_INDICES = Object.freeze(new Set([9, 10, 11]))
+
+function socketPort(tuples, roleIndex, peerIndex) {
+  if (EXIT_ROLE_INDICES.has(roleIndex) && DHT_ROLE_INDICES.has(peerIndex)) {
+    return 43_000 + roleIndex
+  }
+  return tuples[roleIndex - 1].port
+}
+
 function namespaceProjection(tuples) {
   const neighbors = Array.from({ length: 11 }, () => [])
   for (const [left, right] of ALLOW_EDGES) {
@@ -487,12 +507,12 @@ function namespaceProjection(tuples) {
       firewall.push(
         Object.freeze({
           destination: tuples[destination - 1].host,
-          destinationPort: tuples[destination - 1].port,
+          destinationPort: socketPort(tuples, destination, source),
           egress: `pr-veth-${destination}`,
           ingress: `pr-veth-${source}`,
           protocol: 'udp',
           source: tuples[source - 1].host,
-          sourcePort: tuples[source - 1].port
+          sourcePort: socketPort(tuples, source, destination)
         })
       )
     }
