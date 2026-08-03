@@ -2,18 +2,19 @@
 
 ## Status and scope
 
-This record describes the experimental, internal Gate 3A private-route substrate in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology.
+This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
 
-Direct mode remains the only public behavior. Gate 3A has no live route authority, routed-reply wire codec, public required-mode controller, post-readiness packet-capture proof, or anonymity claim. Its deterministic tests establish semantic and byte-vector conformance only; they do not establish a live route, resistance to traffic analysis, or suitability for protecting users.
+Direct mode remains the only public behavior. Gate 3B1 Task 15 has a package-private required-mode controller, authenticated native route authority, routed immutable-get request/reply path, rotation, suspension, and teardown; Tasks 16 and 17 add test-only process isolation and prove that path live across eleven separate Node or Bare role processes over native UDX. The root package still exposes no private-routing constructor or user-selectable required mode. No post-readiness packet-capture proof or anonymity claim exists; the deterministic, hosted, and eleven-process tests do not establish resistance to traffic analysis or suitability for protecting users.
 
 The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
 
-The owner-approved Gate 3B1 Task 5 authenticated-M3 transport and Task 6
-tail-control lifetime/ownership amendment is now incorporated into the
-canonical design documents. This written repository revision awaits owner
-review. It records required migration compatibility only: it does not declare
-provisional implementation complete or accepted, and it does not change the
-implementation plan.
+The owner-approved Gate 3B1 Task 5 authenticated-M3 transport, Task 6
+tail-control lifetime/ownership amendment, and Tasks 7–17 live-route lifecycle
+are incorporated into the canonical design documents and implemented
+internally in this fork. This remains a package-private compatibility slice: it
+adds no root public constructor, export, user-selectable required mode, or
+anonymity claim, although its internal path uses the production UDX, relay,
+final-exit, and DHT-exit owners rather than a structural or fake transport.
 
 ## Reviewed prototype source
 
@@ -107,14 +108,278 @@ Migration must preserve these compatibility rules:
    keeps `TAIL_CONTROL_OWNERS` lexical, verifies the live handoff,
    lifetime/callback/clocks/deadline/generation, and routes cleanup from either
    module without accepting an arbitrary destructor.
+8. Task 7 ports the terminal DHT-exit ACTIVATE/READY/ACK/OPEN codec and
+   derivation layer, binds READY signing to a relay-identity-owned
+   `DHT_EXIT_READY` one-shot signer, and keeps endpoint actors on claimed
+   activation owners instead of raw identity secrets, raw handoff material, or
+   arbitrary callbacks. `final-exit-activation.js` lexically issues the
+   terminal `OpenRouteHandoff` only after authenticated OPEN; the deep import
+   exposes only consume/revoke/destroy, and unconsumed handoffs are revoked by
+   activation-owner destruction.
 
-This amendment changes no existing wire byte, message order, public HyperDHT
-API, direct-mode behavior, or address-authority boundary. One 1,101-byte M3
-context envelope still produces one 1,200-byte CONTROL cell. Task 6 remains
-blocked until the Task 5 production issuer, record-bound demultiplexing, and
-reservation accounting can satisfy the exact design; fake issuers, raw
-sockets, arbitrary callbacks, physical destructors, and direct dial authority
-are not compatibility substitutes.
+Task 6 changes no existing wire byte, message order, public HyperDHT API,
+direct-mode behavior, or address-authority boundary. One 1,101-byte M3 context
+envelope still produces one 1,200-byte CONTROL cell. The implementation depends
+on Task 5 production OPEN-record issuers, record-bound demultiplexing, and
+reservation accounting; fake issuers, raw sockets, arbitrary callbacks,
+physical destructors, and direct dial authority remain incompatible
+substitutes.
+
+Local Task 6 verification used Node v22.19.0, npm 11.10.0, and the exact Bare
+v1.30.3 runtime restored into `/tmp/hyperdht-bare-v1.30.3` outside the
+repository:
+
+- Focused Task 6 suite
+  (`test/private/route-extension.js`, `test/private/guard-link.js`,
+  `test/private/udx-cell-endpoint.js`, `test/private/m3-adjacency-runtime.js`,
+  `test/private/tail-control.js`, `test/private/tail-extension-committer.js`,
+  `test/private/final-exit-handoff.js`, and
+  `test/private/final-exit-activation.js`) passed independently in Node and
+  Bare with 135/135 tests and 1,660/1,660 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 662/662 tests and 14,937/14,937 assertions.
+- `npm test` passed its repository-wide Prettier check, then reproduced the
+  documented local host-topology exception in direct-mode
+  `createServer + connect - same-LAN explicit keypair opens server`: Node
+  observed `HOLEPUNCH_ABORTED` in top-level test 18 and timed out without a
+  final TAP summary. This local full-suite run is not reported as green.
+- Exact Bare v1.30.3 direct full-suite verification reached 749 top-level
+  tests and 15,264 assertions, failing only the same direct-mode same-LAN
+  explicit-keypair case with `ETIMEDOUT`; final TAP was 748/749 tests and
+  15,263/15,264 assertions. This local full-suite run is not reported as
+  green.
+
+Local Task 7 verification used Node v22.19.0, npm 11.10.0, and Bare v1.30.3:
+
+- Focused Task 7 suite
+  (`test/private/final-exit.js`, `test/private/final-exit-activation.js`,
+  `test/private/final-exit-handoff.js`, `test/private/open-route-handoff.js`,
+  and `test/private/relay-identity-signer.js`) passed independently in Node
+  and Bare with 27/27 tests and 273/273 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 675/675 tests and 15,054/15,054 assertions.
+
+Local Task 8 verification used Node v22.19.0, npm 11.10.0, and Bare v1.30.3:
+
+- `lib/private/relay-service.js` ports bounded opaque relay forwarding from
+  the reviewed prototype, retaining the canonical 128 global circuits, 32
+  circuits per observed neighbor, 256 KiB per-circuit queue, 8 MiB global
+  queue, five-second relay deadlines, replay tombstones, downward-only
+  negotiated limits, and `ERR_BUSY`/`ERR_QUOTA_EXCEEDED` failure split.
+- The relay service stores only opaque previous-hop and next-hop capabilities
+  plus local circuit/generation/accounting state. Queue accounting is reserved
+  before payload copies; allocation/callback failures roll back queue bytes and
+  replay counters, with the admission-boundary callback rollback covered
+  explicitly. Destroy tombstones routing state before closing adjacent
+  capabilities so reentrant callbacks see destroyed state.
+- Focused Task 8 suite (`test/private/relay-service.js`) passed independently
+  in Node and Bare with 12/12 tests and 73/73 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 689/689 tests and 15,147/15,147 assertions.
+
+Local Task 9 Step 1 verification used Node v22.19.0, npm 11.10.0, and Bare
+v1.30.3:
+
+- `lib/private/guard-lease.js` adds the opaque GuardLease owner for a pinned
+  SHARED_GUARD bootstrap material record. Lease creation consumes the
+  `GuardLeaseMaterial`, binds the separately returned pinned guard identity and
+  endpoint tuple, and retains physical close authority without exposing raw
+  endpoint, established-link, or secret material.
+- `lib/private/udx-cell-endpoint.js` brands the OPEN record only during
+  bootstrap pinning, rejects preexisting generic M3 transfer ownership before
+  branding, and permits at most four live shared-guard M3 transfer issuer/
+  transfer slots. Destroying a shared logical transfer releases only its slot;
+  GuardLease destroy revokes every shared slot before closing the physical
+  owner once.
+- Focused Task 9 Step 1 suite (`test/private/guard-lease.js`,
+  `test/private/udx-cell-endpoint.js`, `test/private/guard-link.js`,
+  `test/private/m3-adjacency-runtime.js`) passed independently in Node with
+  102/102 tests and 1,419/1,419 assertions.
+- Complete private aggregate `test/private-routing.js` passed independently in
+  Node and Bare with 693/693 tests and 15,170/15,170 assertions.
+
+Local Task 9 Step 2 verification used Node v22.19.0, npm 11.10.0, and Bare
+v1.30.3:
+
+- `lib/private/branch-path-authority.js` builds an atomic initial lookup/
+  announce draft from one relay-directory transaction. It consumes exactly four
+  selected evidence objects, binds the directory scope to the pinned
+  `GuardLease`, rejects guard/candidate identity and subnet collisions, reserves
+  four shared-guard M3 slots, and aborts without committing on destroy or
+  failure.
+- `lib/private/route-extension.js` and `lib/private/final-exit-activation.js`
+  own the empty opaque route-extension/final-exit factory capabilities. The
+  wrappers `openRouteExtension(factory, exactOptions)` and
+  `openFinalExit(factory, exactOptions)` inject only the factory-owned wall
+  clock, monotonic clock, random source, scheduler, and cancellation function;
+  final-exit retry and retired/replayed OPEN helpers also reject caller RNG.
+  `lib/private/route-manager.js` validates those same factory capabilities and
+  still exposes only the initial `buildInitialPair()`, `branchCapability()`, and
+  `destroy()` manager surface until terminal OPEN publication lands.
+- Focused Task 9 Step 2 suite (`test/private/branch-path-authority.js`,
+  `test/private/route-manager.js`, `test/private/guard-lease.js`,
+  `test/private/udx-cell-endpoint.js`) passed independently in Node with 27/27
+  tests and 228/228 assertions. The new branch/manager tests also passed
+  independently in Bare with 8/8 tests and 95/95 assertions.
+- Focused Task 9 Step 3 suite (`test/private/route-manager.js`,
+  `test/private/route-extension-session.js`,
+  `test/private/final-exit-activation-session.js`,
+  `test/private/final-exit-activation.js`) passed in Node with 19/19 tests and
+  157/157 assertions. The final-exit facade proof now consumes the authenticated
+  responder OPEN handoff and proves replay/revoke/destruction semantics.
+- Focused Task 9 Step 4/5/6 suite (`test/private/route-manager.js`,
+  `test/private/guard-lease.js`, `test/private/branch-path-authority.js`,
+  `test/private/route-extension-session.js`,
+  `test/private/final-exit-activation.js`, and
+  `test/private/udx-cell-endpoint.js`) passed in Node and Bare with 42/42
+  tests and 354/354 assertions. The route manager now publishes the initial
+  lookup/announce OPEN pair transactionally, exposes only branch-local empty
+  capabilities after publication, rotates one branch make-before-break while
+  preserving the opposite branch capability, clamps replacement construction to
+  the directory guard/selected relay signed expiries, rolls failed rotation
+  attempts back without leaking consumed OPEN material, and suspends by revoking
+  manager operations, branch material, guard issuers, and the live socket while
+  retaining only a one-shot reconnect authority and sealed directory.
+- `lib/private/dht-exit-seeds.js` freezes the DHT-only exit seed set as
+  signed `DHT_EXIT_DHT_SEEDS_V1` bytes. `test/private/dht-exit-seeds.js`
+  proves exact one- and three-reference encodings, strict 1..3 count
+  bounds, canonical set-digest input, canonical destination ordering,
+  branch/exit binding, clocked expiry rejection, hostile descriptor
+  rejection, signature verification, and zeroization.
+- `lib/private/dht-exit-destination-table.js` admits only live,
+  ping-correlated configured bootstrap references, sorts seed refs by
+  canonical decoded id/handle order before signing, and exposes seed delivery
+  only through a revocable one-shot authority. Destroying the table revokes
+  unconsumed seed-delivery authorities.
+- `lib/private/dht-exit-wire.js` owns the client-only DHT-RPC packet subset
+  adapted from dht-rpc commit `fe04496196ea2ce42d1de27b0f770b02d2a87cd5`
+  under MIT provenance: `Request._encodeRequest`, `decodeReply`,
+  `validateId`, and the IPv4 peer codec only. `test/private/dht-exit-wire.js`
+  freezes command-0 PING and HyperDHT command-9 IMMUTABLE_GET request bytes,
+  response byte `0x13`, u16 transaction byte order, destination tuples,
+  empty/error/full reply flag mixes, invalid IDs, trailing bytes, and
+  request-packet rejection in Node and Bare.
+- `lib/private/dht-exit-reservation.js` and `lib/private/dht-exit-io.js`
+  add the exit-side one-socket reservation boundary. The endpoint OPEN
+  authority is a distinct handoff-carried capability, not accepted by the
+  exit reservation channel.
+- `requestDhtExitImmutableGet` accepts one validated routed immutable-get request,
+  reserves its ordinary UDP operation before send, and emits one normalized
+  `ROUTED_REPLY_V1`. Referral tuples are reply-correlated, bounded, probed before
+  admission, deduplicated against live destination IDs, and sorted by unsigned
+  XOR distance. The operation owns every pending TID and settlement authority;
+  cancellation, socket close, deadline expiry, table destruction, and
+  synchronous callback failure revoke all remaining authority without emitting
+  a duplicate reply. Raw immutable values remain bounded to 1,023 bytes before
+  any referral can be admitted.
+- Focused DHT-exit Task 13 suite (`test/private/dht-exit-wire.js`,
+  `test/private/dht-exit-destination-table.js`, `test/private/dht-exit-io.js`,
+  and `test/private/dht-exit-immutable-get.js`) passed in Node and Bare with
+  27/27 tests and 248/248 assertions.
+- Focused DHT-exit Task 12 suite (`test/private/dht-exit-seeds.js`,
+  `test/private/dht-exit-destination-table.js`,
+  `test/private/dht-exit-test-topology-grant.js`,
+  `test/private/dht-exit-wire.js`, `test/private/dht-exit-reservation.js`,
+  and `test/private/dht-exit-io.js`) passed in Node and Bare with 22/22 tests
+  and 240/240 assertions.
+
+### Gate 3B1 Task 15 live controller and lifecycle checkpoint
+
+Task 15 connects the previously reviewed package-private owners into one
+production-code, in-process lifecycle without changing HyperDHT's root public
+surface:
+
+- `lib/private/private-routing-controller.js` owns the exact `OFF`,
+  `BOOTSTRAPPING`, `GUARD_PINNED`, `BUILDING`, `READY`, `ROTATING`,
+  `SUSPENDED`, `UNAVAILABLE`, and `DESTROYED` state machine. Its frozen
+  capability exposes only `start`, `snapshot`, `immutableGet`, `suspend`,
+  `resume`, `networkChanged`, and `destroy`.
+- `lib/private/live-route-authority.js` and
+  `lib/private/opaque-destination.js` retain each branch's moved OPEN
+  route transport and payload codec, admit signed exit seeds, publish
+  generation-bound address-free destinations, and carry only the reviewed
+  immutable-get command. Failed live send/receive operations issue an exact
+  branch-loss signal; cancellation and intentional teardown do not.
+- The controller's `start` method consumes only `EndpointBootstrapAuthority`, then
+  drives production `BootstrapIO`, `GuardLease`, lookup/announce branch
+  construction, authenticated tail extension, final-exit
+  ACTIVATE/READY/ACK/OPEN, signed DHT-exit seed delivery, route admission, and
+  immutable lookup. No test-only controller issuer, raw socket, endpoint,
+  identity secret, or structural route authority participates in the hosted
+  success path.
+- Rotation is make-before-break and branch-local. Natural expiry, rejected
+  route IO, or authenticated `BRANCH_DESTROY_V1` propagation replaces only the
+  affected branch, advances its generation, preserves the other branch and
+  shared physical guard, and releases every retired logical M3 forwarding
+  owner. Candidate exhaustion or replacement failure closes owned resources and
+  enters `UNAVAILABLE`.
+- Suspend synchronously installs one shared in-flight result, revokes both live
+  branches and routed destinations, closes native route ownership, and retains
+  only the sealed directory plus one-shot guard reconnect capability. Resume
+  consumes that capability and builds fresh generations. Network change,
+  wall-clock rollback, guard loss, partial initial construction, and teardown
+  fail closed with deterministic ownership cleanup and key zeroization.
+- `test/private/live-immutable-get.js` exercises a fully hosted native
+  endpoint/guard/middle/exit/DHT-exit topology: READY, exact immutable value,
+  natural lookup rotation, idle downstream lookup replacement, idle announce
+  loss fail-closed behavior, shared-guard loss, suspend/resume, network change,
+  and negative absent-service startup. The relay actors are hosted in-process;
+  Task 16 process isolation remains required before the multi-process criterion
+  is complete.
+- Final Task 15 verification ran `test/private-routing.js` independently under
+  Node v22.19.0 and Bare v1.30.3: both passed 798/798 tests and
+  16,124/16,124 assertions. Focused native hosted lifecycle coverage passed
+  13/13 tests and 119/119 assertions under each runtime.
+
+### Gate 3B1 Task 17 live eleven-process scenario status
+
+`test/private/live-process-suite.js` drives eleven separate role processes over
+native UDX loopback. It is test infrastructure, not a public API, and carries no
+anonymity claim.
+
+On Linux (Ubuntu 24.04 under Colima, Node v22.19.0) the scenario passes all 125
+assertions deterministically with both Node and Bare role children. It proves,
+live and cross-process: ordered DHT role bind and the audited setup store;
+endpoint bootstrap, guard pinning, and separate lookup/announce branches built
+through authenticated adjacent links; an exact immutable get retrieved through
+the three-position route after the exit admits an isolated learned closer under a
+signed Task 12 grant; delayed-lookup cancellation; a physical lookup-A link fault
+that propagates `BRANCH_DESTROY` upstream and rotates the endpoint onto lookup B,
+followed by a second exact immutable get; exit accounting for referral probes and
+ordinary requests; endpoint suspend and resume, including a third exact immutable
+get over the rebuilt route; a terminal network change that leaves no endpoint
+socket and installs no fallback edge; an acknowledged guard physical link fault;
+and ordered teardown with zero residual operations, resources, and queued bytes in
+every role.
+
+Reaching resume, rotation, network-change, and guard-loss required four fixture
+and owner corrections, each of which is now part of the proof:
+
+- The fixture issues a per-generation pool of one-shot topology grants
+  (`LEARNED_GRANT_USES` referral, value, and seed grants per adjacency and
+  generation) because `LinkDirectory` keeps one link handle per grant and
+  `UdxCellEndpoint.openLink` refuses a consumed handle, so every rebuilt branch
+  must re-probe its learned closers with fresh grants.
+- Guard bootstrap acceptance and relay accept sessions are re-armable, so a
+  rebuilt branch can re-enter the same guard.
+- Exit grant requests are serialized: exits allow one outstanding isolated grant
+  request per exit and answer `COUNTER_EXHAUSTED` for a concurrent second, which
+  the DHT retries against later candidates.
+- `DHTExitIO` seeds its request TID from a random 16-bit counter rather than zero,
+  so a socket rebuilt on a reused host/port after suspend does not collide with
+  the TIDs of the pre-suspend session and have its replies dropped as duplicates.
+
+One environment boundary remains: macOS cannot bind the `127.64.x.1` role tuples,
+so both live suites stop at the first bind with `PROCESS_BIND_UNAVAILABLE` there
+(`866/868` tests, `18,079/18,081` assertions under Node on Darwin). Every other
+private suite is green on Darwin, and `test/private-routing.js` is fully green
+under both runtimes on Linux (`868/868` Node, `854/854` Bare).
+
+Role clocks are supplied by `test/private/process/runtime-clock.js`. Wall and
+monotonic time are derived from one cached sample of a single counter because the
+route protocol carries a wall expiry into a monotonic deadline and rejects any hop
+whose derived deadline exceeds the one it was handed; independent `Date.now()` and
+`hrtime` samples straddling a millisecond boundary produced exactly that rejection.
 
 ### Gate 3A resource bounds
 
@@ -133,18 +398,30 @@ The following files were authored in this fork and were not migrated from the pr
 
 `test/private/fake-route-authority.js` and `test/private/routed-dht-traversal.js` are also newly authored, test-only conformance scaffolding. They exercise deterministic five-node lookup and announce traversal through base DHT-RPC without hosts, ports, sockets, UDX, or network traffic. They do not model a live three-position route and are not an anonymity test.
 
-## Intentionally not migrated into Gate 3A
+## Gate 3A-only and deferred scope
 
-Prototype implementations outside this reviewed slice are intentionally not migrated or accepted as production-ready merely because they exist in the prototype:
+The Gate 3A fake authority and traversal modules remain deterministic
+conformance scaffolding and are not authorized as substitutes for the
+package-private Gate 3B1 live owners. Gate 3B1 through Task 17 now includes M3
+context derivation, authenticated adjacent links, tail/final-exit state,
+guard pinning, separate lookup/announce routes, quotas, branch rotation,
+teardown, immutable-get request/reply encoding, provenance-qualified DHT-exit
+destinations, generation invalidation, and native DHT-exit socket ownership.
 
-- `m3-context.js`, `tail-control.js`, and the live route-state portions of `final-exit.js`;
-- `test/m3-vectors.test.js`, pending exact v1 role/branch/circuit/generation transcript constructors;
-- live adjacent-link authentication, relay discovery, guard pinning, route construction, quotas, rotation, teardown, and DHT exit socket ownership;
-- routed-reply wire encoding and the remaining exact per-command request/reply body codecs;
-- live provenance-qualified destination tables, generation expiry and rotation invalidation, public duplex segmentation, multi-process integration, and the packet-capture leak oracle;
-- public required-mode, Hyperswarm, mobile, and PearTube integration.
+The remaining deferred scope is explicit:
 
-Until those pieces pass the next reviewed gate, no Gate 3A internal module may be connected to an untrusted, remote, or live route authority.
+- private presence and the mutable get/put command bodies and live operations;
+- public duplex/peer-stream segmentation and stream backpressure;
+- privileged Linux network-namespace placement and the semantic leak oracle for
+  the eleven-process scenario (Task 17 sub-gate); the scenario currently runs on
+  the portable numeric-loopback plan, and `PROCESS_PLANS.LINUX_NAMESPACE` remains
+  unexercised because it needs privileged setup outside the test process;
+- root public required-mode integration, Hyperswarm, mobile, and PearTube
+  integration.
+
+Until the separately reviewed leak-oracle and privileged network-namespace gates
+pass, the Task 15 controller remains package-private and carries no anonymity
+claim.
 
 ## Gate 3B entry criteria
 

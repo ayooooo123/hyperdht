@@ -16,6 +16,7 @@ const {
   roleForIdentity
 } = require('../../lib/private/protocol')
 const { LinkDirectory, signTopologyGrant } = require('../../lib/private/topology-grant')
+const { deriveM3DhtNodeId, encodeCanonicalEndpoint } = require('../../lib/private/relay-capability')
 const { UDX_ENDPOINT_RESERVATION_STATS } = require('../../lib/private/udx-adapter')
 const {
   DEFAULT_MAX_UDX_INBOUND_BYTES,
@@ -27,12 +28,14 @@ const {
   admitBootstrapUdxGuard,
   bindBootstrapUdxOperation,
   createBootstrapUdxAuthority,
+  createBootstrapUdxGuardSessionOptions,
   createLocalIdentitySecretCapability,
   destroyBootstrapUdxAuthority,
   destroyGuardLeaseMaterial,
   isGuardLeaseMaterial,
   openBootstrapUdxGuard,
   pinBootstrapUdxGuard,
+  requestConfigured,
   sendConfigured,
   sendProspectiveGuard
 } = require('../../lib/private/udx-cell-endpoint')
@@ -258,7 +261,8 @@ function linkSessionOptions(links, side, deadline = 10_000) {
     cancel: clearTimeout,
     randomBytes: sequence(initiate ? 1 : 11),
     absoluteDeadline: deadline,
-    signedExpiry: 60_000
+    signedExpiry: 60_000,
+    authorizedExpiry: 60_000
   }
 }
 
@@ -305,12 +309,29 @@ async function pinnedMaterialFixture(leftPort, rightPort, observerOptions = {}) 
     host: '127.0.0.2',
     port: rightPort
   })
-  leftSession = openBootstrapUdxGuard(
+  const leftOptions = linkSessionOptions(links, 'left')
+  const leftSessionOptions = createBootstrapUdxGuardSessionOptions(
     authority,
     admission,
     links.left.handle,
-    linkSessionOptions(links, 'left')
+    {
+      circuitId: leftOptions.setup.circuitId,
+      epoch: leftOptions.setup.epoch,
+      initiatorLocalId: leftOptions.setup.initiatorLocalId,
+      responderLocalId: leftOptions.setup.responderLocalId,
+      expiresAt: leftOptions.setup.expiresAt,
+      responderStaticKey: leftOptions.setup.responderStaticKey,
+      now: leftOptions.now,
+      wallNow: leftOptions.now,
+      handleNow: leftOptions.now,
+      schedule: leftOptions.schedule,
+      cancel: leftOptions.cancel,
+      randomBytes: leftOptions.randomBytes,
+      absoluteDeadline: leftOptions.absoluteDeadline,
+      signedExpiry: leftOptions.signedExpiry
+    }
   )
+  leftSession = openBootstrapUdxGuard(authority, admission, links.left.handle, leftSessionOptions)
   rightSession = right.openLink(links.right.handle, linkSessionOptions(links, 'right'))
   const established = await leftSession.open()
   return {
@@ -323,6 +344,82 @@ async function pinnedMaterialFixture(leftPort, rightPort, observerOptions = {}) 
     material: pinBootstrapUdxGuard(authority, admission, established)
   }
 }
+
+test('BootstrapUdxAuthority correlates native responses by exact live direct source token', async (t) => {
+  const network = new Map()
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const leftObserver = {}
+  const rightObserver = {}
+  const wrongObserver = {}
+  const received = []
+  const left = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.1', 47101, received),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network, null, leftObserver))
+  )
+  const right = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.2', 47102, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network, null, rightObserver))
+  )
+  const wrong = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.3', 47103, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network, null, wrongObserver))
+  )
+  await left.bind()
+  await right.bind()
+  await wrong.bind()
+  const identity = cryptoSuite.keyPair(seed(119))
+  const authority = createBootstrapUdxAuthority({
+    endpoint: left,
+    configuredEndpoints: [{ host: '127.0.0.2', port: 47102 }],
+    localSecretCapability: createLocalIdentitySecretCapability({
+      localIdentity: identity.publicKey,
+      localSecretKey: identity.secretKey
+    }),
+    maxProspectiveGuards: 3,
+    monotonicDeadline: 10_000
+  })
+  bindBootstrapUdxOperation(authority, 10_000, Object.freeze({}))
+  const request = b4a.alloc(BOOTSTRAP_SIZE, 0x81)
+  const response = b4a.alloc(BOOTSTRAP_SIZE, 0x91)
+  let completed = false
+  const pending = requestConfigured(authority, 0, request).then((value) => {
+    completed = true
+    return value
+  })
+  await settles()
+
+  t.is(wrongObserver.socket.send(response, 47101, '127.0.0.1'), true)
+  await settles()
+  t.is(completed, false)
+
+  t.is(rightObserver.socket.send(response, 47101, '127.0.0.1'), true)
+  const owned = await pending
+  response.fill(0)
+  t.alike(owned, b4a.alloc(BOOTSTRAP_SIZE, 0x91))
+  t.is(received.length, 0)
+
+  t.is(rightObserver.socket.send(owned, 47101, '127.0.0.1'), true)
+  await settles()
+  t.is(received.length, 1)
+  t.alike(received[0].packet, owned)
+
+  const stale = requestConfigured(authority, 0, request)
+  await settles()
+  t.is(destroyBootstrapUdxAuthority(authority), true)
+  let staleError = null
+  try {
+    await stale
+  } catch (err) {
+    staleError = err
+  }
+  t.is(staleError && staleError.code, 'ERR_DESTROYED')
+  t.is(rightObserver.socket.send(owned, 47101, '127.0.0.1'), true)
+  await settles()
+  t.is(received.length, 1)
+
+  await right.close()
+  await wrong.close()
+})
 
 test('UDX test adapter authority is opaque, one-shot, and exact constructor rejects injection', async (t) => {
   const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
@@ -487,6 +584,60 @@ test('failed bootstrap authority creation consumes and clears its local-secret c
   await endpoint.close()
 })
 
+test('direct records canonically encode numeric IPv4 and expanded IPv6 endpoints', (t) => {
+  const canonicalDirectRecord = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER].canonicalDirectRecord
+  t.alike(
+    canonicalDirectRecord({ host: '192.0.2.44', port: 47120 }),
+    encodeCanonicalEndpoint({
+      addressFamily: 4,
+      addressBytes: b4a.from([192, 0, 2, 44]),
+      port: 47120
+    })
+  )
+  t.alike(
+    canonicalDirectRecord({ host: '2001:DB8::A:1', port: 47121 }),
+    encodeCanonicalEndpoint({
+      addressFamily: 6,
+      addressBytes: b4a.from([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a, 0, 1]),
+      port: 47121
+    })
+  )
+})
+
+test('direct record canonicalization rejects malformed and non-numeric hosts', (t) => {
+  const canonicalDirectRecord = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER].canonicalDirectRecord
+  for (const host of [
+    '192.0.2.999',
+    '192.0.2',
+    '2001:db8:::1',
+    '2001:db8::1::2',
+    '2001:db8:1',
+    'bootstrap.example'
+  ]) {
+    let error = null
+    try {
+      canonicalDirectRecord({ host, port: 47122 })
+    } catch (err) {
+      error = err
+    }
+    t.is(error && error.code, 'INVALID_ROUTE', host)
+  }
+})
+
+test('IPv6 relay advertisements remain incompatible at the HyperDHT compact-ID boundary', (t) => {
+  const endpoint = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER].canonicalDirectRecord({
+    host: '2001:db8::1',
+    port: 47122
+  })
+  let error = null
+  try {
+    deriveM3DhtNodeId(endpoint)
+  } catch (err) {
+    error = err
+  }
+  t.is(error && error.code, 'ERR_INCOMPATIBLE_RELAY')
+})
+
 test('destroying an unconsumed production guard lease closes its original owner once', async (t) => {
   const fixture = await pinnedMaterialFixture(47125, 47126)
   const socket = fixture.leftObserver.sockets[0]
@@ -546,67 +697,46 @@ test('bootstrap authority destroy waits held native direct ownership before sock
   t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), { packets: 0, bytes: 0 })
 })
 
-test('reconnect destroy during owner close and bind failure leave no live socket owner', async (t) => {
+test('detached reconnect transport is frozen exact and revokes during owner close', async (t) => {
   let releaseClose = null
   const closeHold = new Promise((resolve) => {
     releaseClose = resolve
   })
-  const closing = await pinnedMaterialFixture(47127, 47128, { closeHold })
-  const closingLease = closing.issuer.inspectGuardLeaseMaterial(closing.material)
-  const closingTransport = closingLease.reconnectTransportFactory()
-  t.is(closing.leftObserver.sockets.length, 1)
-  t.is(destroyGuardLeaseMaterial(closing.material), true)
-  t.is(closing.leftObserver.sockets.length, 1)
-  releaseClose(true)
-  await t.exception(closingTransport.send('127.0.0.2', 47128, b4a.alloc(BOOTSTRAP_SIZE)))
-  await settles()
-  t.is(closing.leftObserver.sockets.length, 1)
-  t.is(closing.leftObserver.sockets[0].closed, true)
-  t.is(closing.leftObserver.sockets[0].closeCalls, 1)
-  await closing.rightSession.close()
-  await closing.right.close()
-  closing.links.left.directory.destroy()
-  closing.links.right.directory.destroy()
-
-  const failing = await pinnedMaterialFixture(47129, 47130, { failBindAt: 2 })
-  const failingLease = failing.issuer.inspectGuardLeaseMaterial(failing.material)
-  const failingTransport = failingLease.reconnectTransportFactory()
-  await t.exception(failingTransport.send('127.0.0.2', 47130, b4a.alloc(BOOTSTRAP_SIZE)))
-  await settles()
-  t.is(failing.leftObserver.sockets.length, 2)
-  t.is(failing.leftObserver.sockets[0].closed, true)
-  t.is(failing.leftObserver.sockets[1].closed, true)
-  t.is(destroyGuardLeaseMaterial(failing.material), true)
-  await failing.rightSession.close()
-  await failing.right.close()
-  failing.links.left.directory.destroy()
-  failing.links.right.directory.destroy()
-})
-
-test('reconnect destroy waits held fresh native ownership before closing its socket', async (t) => {
-  let releaseNative = null
-  const sendHold = new Promise((resolve) => {
-    releaseNative = resolve
-  })
-  const fixture = await pinnedMaterialFixture(47135, 47136, {
-    holdSendAt: 2,
-    sendHold
-  })
+  const fixture = await pinnedMaterialFixture(47127, 47128, { closeHold })
   const lease = fixture.issuer.inspectGuardLeaseMaterial(fixture.material)
   const transport = lease.reconnectTransportFactory()
-  const sending = transport.send('127.0.0.2', 47136, b4a.alloc(BOOTSTRAP_SIZE))
-  while (fixture.leftObserver.sockets.length < 2) await settles()
+  t.alike(Reflect.ownKeys(transport).sort(), ['destroy', 'reconnect'])
+  t.is(Object.isFrozen(transport), true)
+  t.is(transport.send, undefined)
+  t.exception(() => lease.reconnectTransportFactory())
+  t.is(fixture.leftObserver.sockets.length, 1)
+  t.is(destroyGuardLeaseMaterial(fixture.material), true)
+  t.is(fixture.leftObserver.sockets.length, 1)
+  releaseClose(true)
+  await t.exception(transport.reconnect(Object.freeze({})))
   await settles()
-  const freshSocket = fixture.leftObserver.sockets[1]
+  t.is(fixture.leftObserver.sockets.length, 1)
+  t.is(fixture.leftObserver.sockets[0].closed, true)
+  t.is(fixture.leftObserver.sockets[0].closeCalls, 1)
+  await fixture.rightSession.close()
+  await fixture.right.close()
+  fixture.links.left.directory.destroy()
+  fixture.links.right.directory.destroy()
+})
+
+test('detached reconnect transport destroy is idempotent and blocks fresh ownership', async (t) => {
+  const fixture = await pinnedMaterialFixture(47135, 47136)
+  const lease = fixture.issuer.inspectGuardLeaseMaterial(fixture.material)
+  const transport = lease.reconnectTransportFactory()
+  t.alike(Reflect.ownKeys(transport).sort(), ['destroy', 'reconnect'])
+  t.is(Object.isFrozen(transport), true)
   t.is(transport.destroy(), true)
+  t.is(transport.destroy(), false)
+  await t.exception(transport.reconnect(Object.freeze({})))
   t.is(destroyGuardLeaseMaterial(fixture.material), true)
   await settles()
-  t.is(freshSocket.closed, false)
-  releaseNative(true)
-  await t.exception(sending)
-  await settles()
-  t.is(freshSocket.closed, true)
-  t.is(freshSocket.closeCalls, 1)
+  t.is(fixture.leftObserver.sockets.length, 1)
+  t.is(fixture.leftObserver.sockets[0].closed, true)
   await fixture.rightSession.close()
   await fixture.right.close()
   fixture.links.left.directory.destroy()
@@ -680,26 +810,28 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
     responderLocalId: b4a.alloc(16, 0x53),
     expiresAt: 60_000n
   }
-  leftSession = openBootstrapUdxGuard(authority, admission, links.left.handle, {
-    mode: 'initiate',
-    codec: new BootstrapEnvelopeCodec({
-      linkHandle: links.left.handle,
-      localIdentitySecretKey: links.a.secretKey,
-      padding: sequence(0x81)
-    }),
-    linkSetup: createLinkSetupAuthority({ now, randomBytes: sequence(0x61) }),
-    setup: {
-      ...common,
+  const leftSessionOptions = createBootstrapUdxGuardSessionOptions(
+    authority,
+    admission,
+    links.left.handle,
+    {
+      circuitId: common.circuitId,
+      epoch: common.epoch,
+      initiatorLocalId: common.initiatorLocalId,
+      responderLocalId: common.responderLocalId,
+      expiresAt: common.expiresAt,
       responderStaticKey: cryptoSuite.encryptionKeyPair(seed(98)).publicKey,
-      initiatorIdentitySecretKey: links.a.secretKey
-    },
-    now,
-    schedule: setTimeout,
-    cancel: clearTimeout,
-    randomBytes: sequence(1),
-    absoluteDeadline: 10_000,
-    signedExpiry: 60_000
-  })
+      now,
+      wallNow: now,
+      handleNow: now,
+      schedule: setTimeout,
+      cancel: clearTimeout,
+      randomBytes: sequence(1),
+      absoluteDeadline: 10_000,
+      signedExpiry: 60_000
+    }
+  )
+  leftSession = openBootstrapUdxGuard(authority, admission, links.left.handle, leftSessionOptions)
   const responderStatic = cryptoSuite.encryptionKeyPair(seed(98))
   rightSession = right.openLink(links.right.handle, {
     mode: 'accept',
@@ -719,7 +851,8 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
     cancel: clearTimeout,
     randomBytes: sequence(11),
     absoluteDeadline: 10_000,
-    signedExpiry: 60_000
+    signedExpiry: 60_000,
+    authorizedExpiry: 60_000
   })
   const otherLinks = linkPair('127.0.0.1', 47131, '127.0.0.4', 47134)
   const otherSession = left.openLink(otherLinks.left.handle, linkSessionOptions(otherLinks, 'left'))
@@ -777,23 +910,22 @@ test('bootstrap UDX authority consumes identity secret and revokes every direct 
   }
   t.is(reconnectError, null)
   if (reconnectTransport) {
-    t.is(leftObserver.sockets.length, 1, 'fresh owner waits for original owner close')
-    t.is(await reconnectTransport.send('127.0.0.2', 47132, probe), true)
+    t.alike(Reflect.ownKeys(reconnectTransport).sort(), ['destroy', 'reconnect'])
+    t.is(Object.isFrozen(reconnectTransport), true)
+    t.is(reconnectTransport.send, undefined)
+    t.is(leftObserver.sockets.length, 1, 'fresh owner waits for authenticated reconnect')
+    t.exception(() => lease.reconnectTransportFactory())
+    t.is(reconnectTransport.destroy(), true)
+    t.is(reconnectTransport.destroy(), false)
+    await t.exception(reconnectTransport.reconnect(Object.freeze({})))
+    await settles()
     t.is(originalSocket.closed, true)
     t.is(originalSocket.closeCalls, 1)
-    t.is(leftObserver.sockets.length, 2)
-    t.is(leftObserver.sockets[1] === originalSocket, false)
-    t.is(leftObserver.sockets[1].closed, false)
+    t.is(leftObserver.sockets.length, 1)
     t.alike(
       leftObserver.events.map(([event]) => event),
-      ['create', 'close', 'create']
+      ['create', 'close']
     )
-    await t.exception(reconnectTransport.send('127.0.0.2', 47139, probe))
-    reconnectTransport.destroy()
-    await settles()
-    t.is(leftObserver.sockets[1].closed, true)
-    await t.exception(reconnectTransport.send('127.0.0.2', 47132, probe))
-    t.exception(() => lease.reconnectTransportFactory())
   }
   t.is(otherSession.state, 'TOMBSTONE')
   await t.exception(issuer.sendBootstrapForTest(left, otherSession, probe))

@@ -25,12 +25,15 @@ const {
   kInspectRelayCandidateDirectory,
   revokeRelayCandidateDirectorySink
 } = require('../../lib/private/relay-candidate-directory')
+const bootstrapIOModule = require('../../lib/private/bootstrap-io')
 const {
   TEST_ONLY_BOOTSTRAP_IO_OBSERVER,
   BootstrapIO,
   consumeBootstrapGuardPin,
   revokeBootstrapGuardPin
-} = require('../../lib/private/bootstrap-io')
+} = bootstrapIOModule
+const createReconnectBootstrapIO =
+  bootstrapIOModule[Symbol.for('hyperdht-private-routes/reconnect-bootstrap-io-factory')]
 const endpointModule = require('../../lib/private/udx-cell-endpoint')
 const { TEST_ONLY_UDX_ADAPTER_ISSUER } = endpointModule
 
@@ -365,7 +368,9 @@ function fixture(options = {}) {
     localIdentity: local.publicKey,
     localSecretKey: local.secretKey,
     send: datagrams.send.bind(datagrams),
-    destroy: datagrams.destroy.bind(datagrams)
+    destroy: datagrams.destroy.bind(datagrams),
+    monotonicDeadline:
+      options.reconnectDeadline === undefined ? 10_000 : Number(options.reconnectDeadline)
   })
   const sink = createRelayCandidateDirectorySink({
     wallNow() {
@@ -377,7 +382,7 @@ function fixture(options = {}) {
       return clock.monotonicNow()
     }
   })
-  io = new BootstrapIO({
+  const ioOptions = {
     endpoints: configured,
     localIdentity: local.publicKey,
     localSecretKey: local.secretKey,
@@ -389,7 +394,11 @@ function fixture(options = {}) {
       return b4a.alloc(size, 0x44)
     },
     candidateDirectorySink: sink
-  })
+  }
+  io =
+    options.reconnectDeadline === undefined
+      ? new BootstrapIO(ioOptions)
+      : createReconnectBootstrapIO(ioOptions, options.reconnectDeadline)
   if (options.bootstrapTimers) {
     io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER]({
       setTimeout: options.bootstrapTimers.setTimeout,
@@ -532,17 +541,19 @@ test('cold start contacts sequentially, pins one guard, revokes generic send bef
     'circuitId',
     'epoch',
     'expiresAt',
+    'handleNow',
     'initiatorLocalId',
     'now',
     'randomBytes',
     'responderLocalId',
     'responderStaticKey',
     'schedule',
-    'signedExpiry'
+    'signedExpiry',
+    'wallNow'
   ])
   t.is(f.openedLinkOptions.absoluteDeadline, 10_000)
   t.is(f.openedLinkOptions.signedExpiry, 20_000)
-  t.is(f.openedLinkOptions.expiresAt, 20_000n)
+  t.is(f.openedLinkOptions.expiresAt, 21_000n)
   t.is(f.openedLinkOptions.epoch, 1n)
   t.is(f.openedLinkOptions.circuitId.byteLength, 16)
   t.is(f.openedLinkOptions.initiatorLocalId.byteLength, 16)
@@ -555,6 +566,7 @@ test('cold start contacts sequentially, pins one guard, revokes generic send bef
   const moved = consumeBootstrapGuardPin(transfer)
   t.alike(Object.keys(moved.guardLeaseMaterial), [])
   t.is(typeof moved.pinnedGuard.identity, 'object')
+  t.alike(moved.pinnedGuard.advertisement, f.guards[0].bytes)
   t.is('send' in moved, false)
   t.is('send' in moved.pinnedGuard, false)
   t.ok(moved.exposureReport.length <= 6)
@@ -782,6 +794,36 @@ test('one monotonic ten-second budget covers cookie, CAPS, challenge, and first 
   )
   t.ok(f.destroyed)
   f.cleanup()
+})
+
+test('reconnect keeps its original absolute deadline after socket turnover advances time', async (t) => {
+  const clock = fakeClock()
+  const scheduled = []
+  clock.advance(1_500)
+  const f = fixture({
+    clock,
+    reconnectDeadline: 5_000n,
+    bootstrapTimers: {
+      setTimeout(callback, delay) {
+        scheduled.push(delay)
+        return clock.setTimer(callback, delay)
+      },
+      clearTimeout: clock.clearTimer
+    }
+  })
+  let moved = null
+  try {
+    const transfer = await f.io.start()
+    t.is(scheduled[0], 3_500)
+    t.is(f.openedLinkOptions.absoluteDeadline, 5_000)
+    moved = consumeBootstrapGuardPin(transfer)
+  } finally {
+    if (moved) {
+      endpointModule.destroyGuardLeaseMaterial(moved.guardLeaseMaterial)
+      moved.candidateDirectory.destroy()
+    }
+    f.cleanup()
+  }
 })
 
 test('a CAPS response cannot make BootstrapIO retain or challenge more than sixteen candidates', async (t) => {
@@ -1058,8 +1100,8 @@ test('candidate projection clears every earlier owned copy at all five allocatio
   }
 })
 
-test('guard-pin publication clears every earlier owned copy at all three allocation positions', async (t) => {
-  for (let failurePosition = 1; failurePosition <= 3; failurePosition++) {
+test('guard-pin publication clears every earlier owned copy at all four allocation positions', async (t) => {
+  for (let failurePosition = 1; failurePosition <= 4; failurePosition++) {
     const original = b4a.allocUnsafeSlow
     const allocations = []
     let armed = false
@@ -1073,7 +1115,7 @@ test('guard-pin publication clears every earlier owned copy at all three allocat
           armed = true
         }
       })
-      const sizes = [32, 19, 32]
+      const sizes = [32, f.guards[0].bytes.byteLength, 19, 32]
       b4a.allocUnsafeSlow = (size) => {
         if (armed && size === sizes[position]) position++
         else if (armed) position = size === sizes[0] ? 1 : 0
@@ -1094,8 +1136,8 @@ test('guard-pin publication clears every earlier owned copy at all three allocat
   }
 })
 
-test('guard-pin consume clears sibling resources at all three pinned copy positions', async (t) => {
-  for (let failurePosition = 1; failurePosition <= 3; failurePosition++) {
+test('guard-pin consume clears sibling resources at all four pinned copy positions', async (t) => {
+  for (let failurePosition = 1; failurePosition <= 4; failurePosition++) {
     const f = fixture({ configuredCount: 1, onlyGuardAdvertisement: true })
     const transfer = await f.io.start()
     const original = b4a.allocUnsafeSlow

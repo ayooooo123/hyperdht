@@ -154,7 +154,8 @@ function liveReplyAuthority(target = seed(0, 32), wallNow = () => 1_000n) {
     circuitId: seed(0x31, 16),
     generation: 7n,
     expiresAt: 5_000n,
-    wallNow
+    wallNow,
+    monotonicNow: wallNow
   })
   const seedDestination = issueLiveOpaqueDestination(owner, {
     id: seed(0x11, 32),
@@ -1041,7 +1042,7 @@ test('authority revocation during verification cannot validate or reactivate', (
   expectCode(t, () => verifyRoutedReplyReferralAuthority(live.authority, fields), 'INVALID_ROUTE')
   callback = null
   t.is(callbackCalls, 1)
-  expectCode(t, () => verifyRoutedReplyReferralAuthority(live.authority, fields), 'INVALID_ROUTE')
+  expectCode(t, () => verifyRoutedReplyReferralAuthority(live.authority, fields), 'ERR_REPLAY')
   destroyLiveOpaqueDestinations(live.owner)
 })
 
@@ -1068,7 +1069,7 @@ test('authority revocation during staging cannot retain or publish a closer', (t
   )
   callback = null
   t.is(callbackCalls, 1)
-  expectCode(t, () => sealRoutedReplyAdmission(live.authority), 'INVALID_ROUTE')
+  expectCode(t, () => sealRoutedReplyAdmission(live.authority), 'ERR_REPLAY')
 
   const retryAuthority = createRoutedReplyReferralAuthority(live.owner, {
     from: live.seedDestination,
@@ -1115,7 +1116,7 @@ test('authority revocation during sealing cannot return an admission', (t) => {
   t.is(admission, null)
   t.is(callbackCalls, 1)
   if (admission !== null) abortRoutedReplyAdmission(admission)
-  expectCode(t, () => sealRoutedReplyAdmission(live.authority), 'INVALID_ROUTE')
+  expectCode(t, () => sealRoutedReplyAdmission(live.authority), 'ERR_REPLAY')
 
   const retryAuthority = createRoutedReplyReferralAuthority(live.owner, {
     from: live.seedDestination,

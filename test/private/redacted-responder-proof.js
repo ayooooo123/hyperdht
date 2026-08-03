@@ -14,7 +14,12 @@ const {
   verifyExpectedRedactedResponderProof,
   verifyRedactedResponderProof
 } = require('../../lib/private/redacted-responder-proof')
-const { BRANCH_CLASS, M3_MESSAGE_ID, M3_PROTOCOL_VERSION, decodeM3Object } = require('../../lib/private/protocol')
+const {
+  BRANCH_CLASS,
+  M3_MESSAGE_ID,
+  M3_PROTOCOL_VERSION,
+  decodeM3Object
+} = require('../../lib/private/protocol')
 const {
   createExtensionResponderSigner,
   createRelayIdentitySigningAuthority,

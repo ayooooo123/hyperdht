@@ -10,15 +10,18 @@ const {
 
 function material(owner) {
   return {
+    clockIdentity: owner,
     expiresAt: 5_000n,
     finalizeForwardKey: b4a.alloc(32, 1),
     finalizeForwardNoncePrefix: b4a.alloc(16, 2),
     finalizeReverseKey: b4a.alloc(32, 3),
     finalizeReverseNoncePrefix: b4a.alloc(16, 4),
     initiator: true,
+    localDeadline: 4_000n,
     sharedSecret: b4a.alloc(32, 5),
     tailControl: owner,
-    tailControlTranscript: b4a.alloc(290, 6)
+    tailControlTranscript: b4a.alloc(290, 6),
+    wireExpiresAt: 5_000n
   }
 }
 

@@ -1,6 +1,6 @@
 # Gate 3B1 Task 6: Private Tail Responder Authority
 
-**Status:** The responder-authority design and tail-control lifetime/authenticated-UDX transport amendment are owner-approved as of 2026-07-29. This written repository incorporation awaits owner review.
+**Status:** The responder-authority design and tail-control lifetime/authenticated-UDX transport amendment are owner-approved as of 2026-07-29 and incorporated in this fork's Gate 3B1 Task 6 implementation.
 
 **Date:** 2026-07-29
 
@@ -349,13 +349,13 @@ before any loan-coupled owner is released.
 The pending-offer lease has one ownership path:
 
 1. While dialing, the authority record owns `{ pendingOfferLease,
-   socketOwnerLease, endpointSettlementCapsule }`.
+socketOwnerLease, endpointSettlementCapsule }`.
 2. Promise settlement alone is not a commit. Its handler first validates
    `isExtensionResponseReceiver`, rechecks the still-`DIALING`
    authority/factory generation and both deadlines, and performs no external
    callback between the final state check and commit.
 3. Valid fulfillment commits only by atomically moving `{ receiver,
-   pendingOfferLease, socketOwnerLease }` into the still-live bound factory
+pendingOfferLease, socketOwnerLease }` into the still-live bound factory
    operation and marking the authority `TRANSFERRED`/spent. Only this install
    commit wins over a later abort.
 4. Abort or destroy that commits first, including after underlying Promise
@@ -393,7 +393,7 @@ The pending-offer lease has one ownership path:
    owns and only afterward spends `socketOwnerLease`. Successful
    `takeExtensionResponse` atomically replaces the terminal owner's receiver
    with `{ establishedLinkOwnership, m3CellLinkTransferIssuer,
-   socketOwnerLease }` in a factory-local post-take owner. After every proof
+socketOwnerLease }` in a factory-local post-take owner. After every proof
    and transcript binding is valid, lexical guard-link code creates the exact
    `M3AuthenticatedBranchBinding` and joins it with that issuer through
    `registerM3CellLinkTransfer`. Any validation/registration failure revokes
@@ -562,12 +562,7 @@ install result; neither is published to a registry consumer yet.
 While the stable owner is `RESPONDER_INSTALLING`, `tail-control.js` invokes:
 
 ```js
-createM3TailForwardingLease(
-  transportOwner,
-  lifetime,
-  ownerDestroy,
-  publicationClaim
-)
+createM3TailForwardingLease(transportOwner, lifetime, ownerDestroy, publicationClaim)
 ```
 
 This M3-owned operation verifies the exact live transport owner, lifetime,
@@ -593,8 +588,7 @@ payload:
 
 ```js
 {
-  transfer,
-  publicationClaim
+  ;(transfer, publicationClaim)
 }
 ```
 
@@ -623,10 +617,7 @@ package-private own-data value:
 
 ```js
 {
-  tailControlOwner,
-  m3ForwardingLease,
-  publicationClaim,
-  forwarding
+  ;(tailControlOwner, m3ForwardingLease, publicationClaim, forwarding)
 }
 ```
 
@@ -731,7 +722,7 @@ a public caller. On a successful capability take the M3 runtime atomically:
 2. creates and registers one lifetime against the exact runtime state and
    reservation;
 3. records the stable `ownerDestroy` identity, moved `{ wireExpiresAt,
-   localDeadline, clockIdentity }`, generation, and phase;
+localDeadline, clockIdentity }`, generation, and phase;
 4. arms the lifetime's own timer at `localDeadline` with the same
    M3-authority scheduler/canceller identities; and
 5. returns the owned tail material and opaque lifetime only after the timer is
@@ -1089,7 +1080,6 @@ calls `destroyTailControlSession` in `finally` on every pre-publication
 failure. Task 9 cannot synthesize a fresh deadline, timer, transport, tail
 lifetime, or second transport binding.
 
-
 ## Responder flow
 
 The current relay's authenticated transport delivers one exact registered
@@ -1272,8 +1262,7 @@ returns only this frozen package-private result:
 
 ```js
 {
-  transfer,
-  material
+  ;(transfer, material)
 }
 ```
 

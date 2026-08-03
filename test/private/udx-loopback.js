@@ -178,7 +178,8 @@ test('default UdxAdapter completes link bootstrap and established cells on loopb
     cancel: clearTimeout,
     randomBytes: sequence(1),
     absoluteDeadline: 10_000,
-    signedExpiry: 60_000
+    signedExpiry: 60_000,
+    authorizedExpiry: 60_000
   })
   rightSession = right.openLink(pair.right.handle, {
     mode: 'accept',
@@ -198,7 +199,8 @@ test('default UdxAdapter completes link bootstrap and established cells on loopb
     cancel: clearTimeout,
     randomBytes: sequence(11),
     absoluteDeadline: 10_000,
-    signedExpiry: 60_000
+    signedExpiry: 60_000,
+    authorizedExpiry: 60_000
   })
   const established = await leftSession.open()
   t.is(leftSession.state, 'OPEN')

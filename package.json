@@ -15,6 +15,10 @@
     "lib/**.js"
   ],
   "imports": {
+    "#private-route-process": {
+      "bare": "./test/private/process/runtime-bare.js",
+      "default": "./test/private/process/runtime-node.js"
+    },
     "events": {
       "bare": "bare-events",
       "default": "events"
@@ -48,6 +52,8 @@
   },
   "devDependencies": {
     "bare-node-child-process": "^1.0.1",
+    "bare-process": "4.5.1",
+    "bare-runtime": "1.30.3",
     "brittle": "^3.0.0",
     "graceful-goodbye": "^1.3.0",
     "newline-decoder": "^1.0.2",
@@ -60,6 +66,8 @@
     "test:bare": "bare test/all.js",
     "test:generate": "brittle -r test/all.js test/*.js",
     "integration": "brittle test/integration/*.js",
+    "test:private:process:node": "brittle-node test/private/live-process-node.js",
+    "test:private:process:bare": "brittle-node test/private/live-process-bare.js",
     "end-to-end": "brittle test/end-to-end/*.js"
   },
   "author": "Mathias Buus (@mafintosh)",

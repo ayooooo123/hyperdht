@@ -1,7 +1,12 @@
 const b4a = require('b4a')
 const test = require('brittle')
 
-const { createTailExtensionCommitter, destroyTailExtensionCommitter, enqueueTailExtended, installTailExtension } = require('../../lib/private/tail-extension-committer')
+const {
+  createTailExtensionCommitter,
+  destroyTailExtensionCommitter,
+  enqueueTailExtended,
+  installTailExtension
+} = require('../../lib/private/tail-extension-committer')
 const { M3_CONTEXT_ENVELOPE_SIZE } = require('../../lib/private/m3-context')
 
 function expectCode(t, operation, code, message) {
@@ -35,12 +40,13 @@ test('tail extension committer enforces enqueue before one atomic runtime instal
   const envelope = b4a.alloc(M3_CONTEXT_ENVELOPE_SIZE, 0x11)
   const nextRuntime = Object.freeze({})
   const installed = forwarding()
+  const expiresAt = 10n
   const committer = createTailExtensionCommitter({
     enqueue(value) {
       events.push(['enqueue', value])
     },
-    install(value) {
-      events.push(['install', value])
+    install(value, expiry) {
+      events.push(['install', value, expiry])
       return installed
     },
     destroy() {
@@ -48,15 +54,15 @@ test('tail extension committer enforces enqueue before one atomic runtime instal
     }
   })
 
-  expectCode(t, () => installTailExtension(committer, nextRuntime), 'ERR_REPLAY')
+  expectCode(t, () => installTailExtension(committer, nextRuntime, expiresAt), 'ERR_REPLAY')
   t.is(enqueueTailExtended(committer, envelope), true)
   expectCode(t, () => enqueueTailExtended(committer, envelope), 'ERR_REPLAY')
-  t.is(installTailExtension(committer, nextRuntime), installed)
+  t.is(installTailExtension(committer, nextRuntime, expiresAt), installed)
   t.alike(events, [
     ['enqueue', envelope],
-    ['install', nextRuntime]
+    ['install', nextRuntime, expiresAt]
   ])
-  expectCode(t, () => installTailExtension(committer, nextRuntime), 'ERR_REPLAY')
+  expectCode(t, () => installTailExtension(committer, nextRuntime, expiresAt), 'ERR_REPLAY')
   t.is(destroyTailExtensionCommitter(committer), false)
 })
 
@@ -93,6 +99,7 @@ test('caught enqueue reentry poisons the committer before runtime installation',
 test('caught install reentry destroys an unpublished forwarding record and branch owner', (t) => {
   const envelope = b4a.alloc(M3_CONTEXT_ENVELOPE_SIZE, 0x31)
   const nextRuntime = Object.freeze({})
+  const expiresAt = 20n
   let committer = null
   let nestedCode = null
   let forwardingDestroys = 0
@@ -101,7 +108,7 @@ test('caught install reentry destroys an unpublished forwarding record and branc
     enqueue() {},
     install() {
       try {
-        installTailExtension(committer, nextRuntime)
+        installTailExtension(committer, nextRuntime, expiresAt)
       } catch (err) {
         nestedCode = err && err.code
       }
@@ -113,7 +120,7 @@ test('caught install reentry destroys an unpublished forwarding record and branc
   })
   enqueueTailExtended(committer, envelope)
 
-  expectCode(t, () => installTailExtension(committer, nextRuntime), 'INVALID_ROUTE')
+  expectCode(t, () => installTailExtension(committer, nextRuntime, expiresAt), 'INVALID_ROUTE')
   t.is(nestedCode, 'ERR_BUSY')
   t.is(forwardingDestroys, 1)
   t.is(branchDestroys, 1)

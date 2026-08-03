@@ -1,6 +1,11 @@
 const test = require('brittle')
 
-const { createExtensionLinkCompletion, destroyExtensionLinkCompletion, destroyTakenExtensionLinkCompletion, takeExtensionLinkCompletion } = require('../../lib/private/extension-link-completion')
+const {
+  createExtensionLinkCompletion,
+  destroyExtensionLinkCompletion,
+  destroyTakenExtensionLinkCompletion,
+  takeExtensionLinkCompletion
+} = require('../../lib/private/extension-link-completion')
 const {
   adoptM3ResponderLink,
   createM3ResponderAdopter,

@@ -1468,7 +1468,7 @@ Add separate RED cases proving:
 3. Promise settlement alone does not commit: the handler validates the receiver
    and still-`DIALING` generation/deadlines, invokes no external callback
    between final check and the atomic install of `{ receiver,
-   pendingOfferLease, socketOwnerLease }`, then marks the authority
+pendingOfferLease, socketOwnerLease }`, then marks the authority
    `TRANSFERRED`;
 4. abort, destroy, or local/wire expiry while a genuine dial Promise is
    unsettled wins by detaching and tombstoning first, moving
@@ -1602,16 +1602,16 @@ The successor factory uses exact:
 
 ```js
 {
-  advertisement,
-  adjacencyAdopter,
-  extensionResponderSigner,
-  responderRouteEncryptionSecretKey,
-  wallNow,
-  monotonicNow,
-  schedule,
-  cancelScheduled,
-  offerReceiver,
-  randomBytes
+  ;(advertisement,
+    adjacencyAdopter,
+    extensionResponderSigner,
+    responderRouteEncryptionSecretKey,
+    wallNow,
+    monotonicNow,
+    schedule,
+    cancelScheduled,
+    offerReceiver,
+    randomBytes)
 }
 ```
 
@@ -1745,12 +1745,12 @@ Add one RED-then-GREEN case per exact `sealExtend` own-data field:
 
 ```js
 {
-  advertisement,
-  advertisementDigest,
-  extensionIndex,
-  requestedLimits,
-  absoluteDeadline,
-  randomBytes
+  ;(advertisement,
+    advertisementDigest,
+    extensionIndex,
+    requestedLimits,
+    absoluteDeadline,
+    randomBytes)
 }
 ```
 
@@ -1843,7 +1843,7 @@ uses discovery or is reusable, the lifetime is not shortened first, or cleanup
 reaches shared physical close. Implement only the production token-gated
 authority/admission path until this command is GREEN, then return to Step 5b.
 
-- [ ] **Step 8b: Finish responder transitions and move authenticated runtime ownership**
+- [x] **Step 8b: Finish responder transitions and move authenticated runtime ownership**
 
 Resume only after Step 5b consumes the honest admission synchronously before
 its first await and passes. Add RED cases for `RESPONDER_INSTALLING` and each
@@ -1914,8 +1914,7 @@ destroyTakenTailForwardingTransfer(taken)
 
 ```js
 {
-  transfer,
-  publicationClaim
+  ;(transfer, publicationClaim)
 }
 ```
 
@@ -1954,12 +1953,7 @@ The committer moves claim/facade into `tail-control.js`; it publishes neither.
 While the stable owner is `RESPONDER_INSTALLING`, `tail-control.js` invokes:
 
 ```js
-createM3TailForwardingLease(
-  transportOwner,
-  lifetime,
-  ownerDestroy,
-  publicationClaim
-)
+createM3TailForwardingLease(transportOwner, lifetime, ownerDestroy, publicationClaim)
 ```
 
 This atomically tombstones send/receive borrow facades and moves the predecessor
@@ -1977,10 +1971,7 @@ generation, and returns exactly:
 
 ```js
 {
-  tailControlOwner,
-  m3ForwardingLease,
-  publicationClaim,
-  forwarding
+  ;(tailControlOwner, m3ForwardingLease, publicationClaim, forwarding)
 }
 ```
 
@@ -1991,11 +1982,7 @@ The runtime registry then uses only:
 
 ```js
 publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
-takeM3TailForwardingPublication(
-  publication,
-  m3ForwardingLease,
-  publicationClaim
-)
+takeM3TailForwardingPublication(publication, m3ForwardingLease, publicationClaim)
 revokeM3TailForwardingLease(m3ForwardingLease)
 destroyM3TailForwardingPublication(publication)
 ```
@@ -2446,10 +2433,7 @@ The endpoint initiator forbids a READY signer:
 
 ```js
 const initiatorClaim = createFinalExitActivationClaim(initiatorHandoff)
-const initiatorOwner = claimFinalExitActivation(
-  initiatorHandoff,
-  initiatorClaim
-)
+const initiatorOwner = claimFinalExitActivation(initiatorHandoff, initiatorClaim)
 const initiatorSession = new FinalExitActivationSession(initiatorOwner, {
   branchId,
   circuitId,
@@ -2884,9 +2868,9 @@ Expected GREEN: both empty factories accept only the exact dual-clock graph,
 perform no discovery/dialing, and carry one stable owner/lifetime/borrower from
 the shared guard current tail through extension and terminal activation.
 
-- [ ] **Step 4: Port path selection and publish both complete ownership graphs transactionally**
+- [x] **Step 4: Port path selection and publish both complete ownership graphs transactionally**
 
-- [ ] **Step 4a: Write the failing pair-publication and rollback tests**
+- [x] **Step 4a: Write the failing pair-publication and rollback tests**
 
 Before implementation, add RED cases in `test/private/route-manager.js` and
 `test/private/guard-lease.js` around the exact internal methods:
@@ -2919,7 +2903,7 @@ Expected RED: a draft publishes after structural readiness, resets state between
 extension/final activation, commits one branch alone, releases the shared slot
 early, or leaks one owner on pair failure.
 
-- [ ] **Step 4b: Implement one synchronous pair publication boundary**
+- [x] **Step 4b: Implement one synchronous pair publication boundary**
 
 Port only narrowed selection/reservation from prototype
 `branch-path-authority.js`/`route-manager.js`; exclude simulator/discovery.
@@ -2944,7 +2928,7 @@ only route payload/control authority and owned branch/circuit/generation/
 expiry/exit metadata. Revocation tombstones capability and stable branch owner
 before transport callbacks, then releases logical borrower accounting.
 
-- [ ] **Step 4c: Run the focused transactional GREEN proof**
+- [x] **Step 4c: Run the focused transactional GREEN proof**
 
 ```bash
 npx brittle-node test/private/route-manager.js test/private/guard-lease.js test/private/branch-path-authority.js test/private/route-extension-session.js test/private/final-exit-activation.js test/private/udx-cell-endpoint.js
@@ -2956,7 +2940,7 @@ returns both branch-build logical slots/charges while preserving the guard
 physical link; committed revocation tombstones before callback and leaves no
 usable branch authority.
 
-- [ ] **Step 5: Add failing make-before-break rotation tests**
+- [x] **Step 5: Add failing make-before-break rotation tests**
 
 Lose one middle or exit and reserve one replacement path against the committed
 opposite branch. New operations are blocked on the old generation with
@@ -2969,7 +2953,7 @@ keep a still-live old generation only until signed expiry; otherwise enter
 `UNAVAILABLE`. Repeated attempts cannot overlap, extend expiry, reuse a
 candidate generation, or retain failed state.
 
-- [ ] **Step 6: Prove suspend and complete teardown**
+- [x] **Step 6: Prove suspend and complete teardown**
 
 Ordinary suspend is controller-owned: it first prevents new manager operations,
 cancels pending operations/timers, destroys both branch generations, calls
@@ -2983,7 +2967,7 @@ routed work → branches → relay circuits → adjacent links → guard lease �
 → secrets/tombstones. Test-only snapshots must show zero callbacks, queues,
 timers, capabilities, links, routes, and secret buffers.
 
-- [ ] **Step 7: Run both runtimes and commit**
+- [x] **Step 7: Run both runtimes and commit**
 
 ```bash
 npx brittle-node test/private/guard-lease.js test/private/branch-path-authority.js test/private/route-manager.js
@@ -3017,7 +3001,7 @@ git commit -m "feat: manage two private route generations"
 - Modify: `test/private-routing.js`
 - Regenerate: `test/all.js`
 
-- [ ] **Step 1: Add failing minimum/maximum `0x0045` vectors**
+- [x] **Step 1: Add failing minimum/maximum `0x0045` vectors**
 
 Freeze one one-reference and one three-reference vector using the exact body:
 
@@ -3042,7 +3026,7 @@ npx brittle-node test/private/dht-exit-seeds.js
 
 Expected: FAIL because the codec does not exist.
 
-- [ ] **Step 2: Implement strict seed sign/encode/decode/verify**
+- [x] **Step 2: Implement strict seed sign/encode/decode/verify**
 
 Create exact exports:
 
@@ -3050,7 +3034,7 @@ Create exact exports:
 signDhtExitSeeds(value, exitSecretKey)
 encodeDhtExitSeeds(value)
 decodeDhtExitSeeds(encoded)
-verifyDhtExitSeeds(encoded, expected)
+verifyDhtExitSeeds(encoded, expected, now)
 clearDhtExitSeeds(value)
 ```
 
@@ -3062,7 +3046,7 @@ session, socket, or tuple; assign `CONFIGURED_BOOTSTRAP`; mint a handle; publish
 a destination; or claim server-table liveness. Correctly signed seed bytes are
 inert until Task 12 consumes them through a terminal-bound admission authority.
 
-- [ ] **Step 3: Prove the codec alone cannot publish authority**
+- [x] **Step 3: Prove the codec alone cannot publish authority**
 
 Assert none of the exports can mutate Task 1's live endpoint owner. Mutation,
 hostile accessors, allocation failure, wrong key/branch/generation, and trailing
@@ -3070,7 +3054,7 @@ data clear every owned copy and leave zero records. Task 12 adds the only
 production signing/delivery and atomic admission path after the exit table
 exists.
 
-- [ ] **Step 4: Run both runtimes and commit**
+- [x] **Step 4: Run both runtimes and commit**
 
 ```bash
 npx brittle-node test/private/dht-exit-seeds.js test/private/protocol.js
@@ -3443,7 +3427,7 @@ git commit -m "feat: admit private DHT exit seeds"
 - Regenerate: `test/all.js`
 - Modify: `docs/private-routing-migration.md`
 
-- [ ] **Step 1: Add failing immutable-get authority tests**
+- [x] **Step 1: Add failing immutable-get authority tests**
 
 `DHTExitIO` accepts only a validated `ROUTED_REQUEST_V1` whose live table handle,
 branch/circuit/generation, immutable-get policy tuple, 32-byte target, complete
@@ -3474,7 +3458,7 @@ Task 14 requires RoutedDHTIO to decode this exact body with
 `decodeImmutableGetResponse` before the local hash check. An absent body yields
 no query value; a present empty buffer remains present and is hash-checked.
 
-- [ ] **Step 2: Prove reservation-before-send and negative authority cases**
+- [x] **Step 2: Prove reservation-before-send and negative authority cases**
 
 Authority traps reject an unrecorded PING, immutable get to a probe-only tuple,
 valid-tag/missing-entry handle, wrong provenance/generation, expired reference,
@@ -3482,14 +3466,14 @@ transaction exhaustion/collision, and post-cancel request before socket send.
 Reentrant rotation after DHT reply correlation but before referral commit aborts
 all staged references and emits no routed reply.
 
-- [ ] **Step 3: Run focused tests and commit**
+- [x] **Step 3: Run focused tests and commit**
 
 ```bash
-npx brittle-node test/private/dht-exit-wire.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js
-bare node_modules/brittle/cmd.js test/private/dht-exit-wire.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js
+npx brittle-node test/private/dht-exit-wire.js test/private/dht-exit-destination-table.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js
+bare node_modules/brittle/cmd.js test/private/dht-exit-wire.js test/private/dht-exit-destination-table.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js
 npm run test:generate
 git diff --check
-git add lib/private/dht-exit-wire.js lib/private/dht-exit-io.js lib/private/dht-exit-destination-table.js test/private/dht-exit-wire.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js test/private-routing.js test/all.js docs/private-routing-migration.md
+git add lib/private/dht-exit-wire.js lib/private/dht-exit-io.js lib/private/dht-exit-destination-table.js test/private/dht-exit-wire.js test/private/dht-exit-destination-table.js test/private/dht-exit-io.js test/private/dht-exit-immutable-get.js test/private-routing.js test/all.js docs/private-routing-migration.md
 git commit -m "feat: normalize private immutable exit IO"
 ```
 
