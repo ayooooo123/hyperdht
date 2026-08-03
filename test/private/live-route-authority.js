@@ -14,7 +14,9 @@ const {
   LiveRouteAuthority,
   bindOpenRouteTransport,
   createLiveRouteReferralAuthority,
+  destroyOpenRouteTransport,
   issueLiveRouteDestination,
+  receiveOpenRouteSeedPayload,
   snapshotLiveRouteDestination
 } = require('../../lib/private/live-route-authority')
 const {
@@ -354,9 +356,10 @@ async function productionAuthorityFixture(t, port = 47601) {
   })
   manager.buildInitialPair()
   const draft = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().draft
+  const materialOffset = port - 47601
   const branches = [
-    [BRANCH_CLASS.LOOKUP, 'lookup', 0x41],
-    [BRANCH_CLASS.ANNOUNCE, 'announce', 0x61]
+    [BRANCH_CLASS.LOOKUP, 'lookup', 0x41 + materialOffset],
+    [BRANCH_CLASS.ANNOUNCE, 'announce', 0x61 + materialOffset]
   ]
   const handoffs = {}
   const materials = {}
@@ -465,6 +468,37 @@ async function productionAuthorityFixture(t, port = 47601) {
   return { authority, manager, materials, pairs, topology }
 }
 
+function startProductionLookupRequest(authority, value) {
+  const id = b4a.alloc(32, value)
+  const destinationRef = encodeDestinationRef({
+    id,
+    handle: b4a.alloc(130, value + 1)
+  })
+  issueLiveRouteDestination(authority, {
+    branch: BRANCH_CLASS.LOOKUP,
+    id,
+    destinationRef
+  })
+  const encodedRequest = encodeRoutedRequest({
+    requestId: b4a.alloc(16, value + 2),
+    operationClass: BRANCH_CLASS.LOOKUP,
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    absoluteDeadlineMs: 14_000n,
+    destination: destinationRef,
+    encodedBody: b4a.alloc(32, value + 3)
+  })
+  return {
+    destinationRef,
+    encodedRequest,
+    operation: authority.request({
+      branch: BRANCH_CLASS.LOOKUP,
+      destinationRef,
+      encodedRequest,
+      attempt: 1
+    })
+  }
+}
+
 const AUTHORITY_METHODS = Object.freeze([
   'ready',
   'suspend',
@@ -498,6 +532,66 @@ test('OPEN transport moves fixed route frames through authenticated M3 cells', a
   t.is(destroyM3RouteTransport(pair.left), true)
   t.is(destroyM3RouteTransport(pair.right), true)
 })
+
+test('OPEN seed setup failure destroys and forgets a partially initialized binding', async (t) => {
+  const branch = {
+    branchClass: BRANCH_CLASS.LOOKUP,
+    branchId: b4a.alloc(16, 0x81),
+    circuitId: b4a.alloc(16, 0x82),
+    generation: 7n,
+    exit: { identity: b4a.alloc(32, 0x83) }
+  }
+  const created = openMaterialFor(branch, 0x84)
+  const failed = routeTransportPair([], branch)
+  bindOpenRouteTransport(created.material, {
+    transport: failed.left,
+    finalTranscriptDigest: created.finalTranscriptDigest
+  })
+  destroyM3RouteTransport(failed.left)
+
+  const setupError = await receiveOpenRouteSeedPayload(created.material, () => 10_000n).then(
+    () => null,
+    (error) => error
+  )
+  t.is(setupError && setupError.code, 'ERR_DESTROYED')
+  t.is(
+    destroyOpenRouteTransport(created.material),
+    false,
+    'failed reserve already destroys and forgets the binding'
+  )
+
+  destroyM3RouteTransport(failed.right)
+})
+
+for (const failurePoint of ['send', 'receive']) {
+  test(`LiveRouteAuthority reports lookup ${failurePoint} transport rejection before rethrow`, async (t) => {
+    const { authority, manager, pairs } = await productionAuthorityFixture(
+      t,
+      failurePoint === 'send' ? 47621 : 47631
+    )
+    if (failurePoint === 'send') destroyM3RouteTransport(pairs.lookup.left)
+    const request = startProductionLookupRequest(authority, failurePoint === 'send' ? 0xb1 : 0xc1)
+    if (failurePoint === 'receive') {
+      const frame = await receiveM3RouteFrame(pairs.lookup.right)
+      frame.fill(0)
+      destroyM3RouteTransport(pairs.lookup.left)
+    }
+
+    const transportError = await request.operation.promise.then(
+      () => null,
+      (error) => error
+    )
+    t.is(transportError && transportError.code, 'ERR_DESTROYED')
+    expectCode(
+      t,
+      () => manager.branchCapability(BRANCH_CLASS.LOOKUP),
+      'ERR_PRIVATE_BRANCH_ROTATING'
+    )
+    t.ok(manager.branchCapability(BRANCH_CLASS.ANNOUNCE), 'unfailed branch remains available')
+    request.destinationRef.fill(0)
+    request.encodedRequest.fill(0)
+  })
+}
 
 test('authenticated routed reply bind atomically joins and consumes both one-shot authorities', (t) => {
   const fixture = replyAuthorityFixture()
@@ -746,6 +840,10 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
   t.is(authority.ready(), false)
   expectCode(t, () => authority.resume(), 'ERR_DESTROYED')
   expectCode(t, () => snapshotLiveRouteDestination(authority, destination), 'ERR_DESTROYED')
+  t.ok(
+    manager.branchCapability(BRANCH_CLASS.LOOKUP),
+    'intentional suspend does not report transport destruction as branch loss'
+  )
   t.is(manager.destroy(), true)
   authority.destroy()
   expectCode(t, () => authority.ready(), 'ERR_AUTHENTICATION')

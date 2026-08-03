@@ -23,6 +23,12 @@ const {
   createGuardReconnectAuthority,
   revokeGuardReconnectAuthority
 } = require('../../lib/private/guard-reconnect-authority')
+const GUARD_RECONNECT_REQUEST_CONSUMER = Symbol.for(
+  'hyperdht-private-routes/guard-reconnect-request-consumer'
+)
+const consumeGuardReconnectRequest = require('../../lib/private/guard-reconnect-authority')[
+  GUARD_RECONNECT_REQUEST_CONSUMER
+]
 
 const NOW = 1_000n
 const RECONNECT_DEADLINE = 5_000n
@@ -276,7 +282,21 @@ function fixture(options = {}) {
       ? function exactTupleReconnectFactory() {
           if (arguments.length !== 0) throw new Error('factory arguments exposed')
           options.transportFactory.calls++
-          return datagrams
+          return Object.freeze({
+            async reconnect(request) {
+              const owned = consumeGuardReconnectRequest(request)
+              try {
+                return Object.freeze({})
+              } finally {
+                for (const value of Object.values(owned)) {
+                  if (b4a.isBuffer(value)) value.fill(0)
+                }
+              }
+            },
+            destroy() {
+              destroyed = true
+            }
+          })
         }
       : datagrams,
     wallNow: clock.wallNow,
@@ -318,8 +338,8 @@ test('reconnect obtains its exact-tuple transport from a zero-argument one-shot 
   const transportFactory = { calls: 0 }
   const f = fixture({ transportFactory })
   t.is(transportFactory.calls, 0)
-  const established = await f.authority.reconnect()
-  t.ok(established)
+  const transfer = await f.authority.reconnect()
+  t.alike(Reflect.ownKeys(transfer), [])
   t.is(transportFactory.calls, 1)
   let error = null
   try {
@@ -329,7 +349,8 @@ test('reconnect obtains its exact-tuple transport from a zero-argument one-shot 
   }
   t.is(error && error.code, 'ERR_REPLAY')
   t.is(transportFactory.calls, 1)
-  f.cleanup(established)
+  t.is(f.destroyed, true)
+  f.cleanup()
 })
 
 test('guard reconnect capability is opaque, zero-argument, and one-shot before first IO', async (t) => {

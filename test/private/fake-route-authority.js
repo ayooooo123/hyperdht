@@ -4,9 +4,7 @@ const b4a = require('b4a')
 
 const { BRANCH_CLASS } = require('../../lib/private/protocol')
 const { clearRoutedRequest, decodeRoutedRequest } = require('../../lib/private/routed-dht')
-const {
-  TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER
-} = require('../../lib/private/live-route-authority')
+const { TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER } = require('../../lib/private/live-route-authority')
 
 class FakeRouteAuthority {
   constructor() {

@@ -3,6 +3,7 @@
 const test = require('brittle')
 const b4a = require('b4a')
 
+const { consumeInitialBranchBuild } = require('../../lib/private/branch-path-authority')
 const activation = require('../../lib/private/final-exit-activation')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { encodeDestinationRef } = require('../../lib/private/destination-ref')
@@ -17,9 +18,11 @@ const {
   createFinalExitActivationFactory,
   createRouteExtensionFactory,
   createRouteManager,
+  readRouteManagerGenerations,
   isRouteManager
 } = require('../../lib/private/route-manager')
 const {
+  destroyGuardLease,
   issueGuardLeaseM3CellLinkTransferIssuer,
   readGuardLeaseScope
 } = require('../../lib/private/guard-lease')
@@ -268,6 +271,14 @@ test('RouteManager constructs an atomic initial lookup and announce pair', async
     observed.draft.announce.exit.identity
   ].map((identity) => b4a.toString(identity, 'hex'))
   t.is(new Set(selectedIdentities).size, 4)
+  const buildAuthority = manager.claimInitialBuild()
+  t.ok(Object.isFrozen(buildAuthority))
+  t.alike(Reflect.ownKeys(buildAuthority), [])
+  const build = consumeInitialBranchBuild(buildAuthority)
+  t.is(build.transaction !== null, true)
+  t.alike(Reflect.ownKeys(build.selections), ['lookup', 'announce'])
+  t.is(build.issuers.length, 2)
+  expectCode(t, () => consumeInitialBranchBuild(buildAuthority), 'ERR_REPLAY')
   const extraOne = issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease)
   const extraTwo = issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease)
   expectCode(
@@ -876,6 +887,10 @@ test('RouteManager rotates one branch make-before-break under signed expiry cap'
   )
   t.is(manager.publishRotationSeed(BRANCH_CLASS.LOOKUP, replacementCommitted.branchSeedReady), true)
   t.is(destroyed[0], initialLookup)
+  t.alike(readRouteManagerGenerations(manager), {
+    lookupGeneration: 2n,
+    announceGeneration: 1n
+  })
   t.is(manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().lookupGeneration, 2n)
   t.is(fixture.directory[kInspectRelayCandidateDirectory]().generationRecordCount, 2)
   t.not(manager.branchCapability(BRANCH_CLASS.LOOKUP), oldLookupCapability)
@@ -1097,9 +1112,22 @@ test('RouteManager suspend seals directory and leaves only one reconnect authori
   expectCode(t, () => issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease), 'ERR_DESTROYED')
   t.is(revokeGuardReconnectAuthority(reconnect, 'test-cleanup'), true)
   expectCode(t, () => reconnect.reconnect(), 'ERR_DESTROYED')
-  await Promise.resolve()
-  await Promise.resolve()
+  for (
+    let attempt = 0;
+    attempt < 100 && !fixture.guardFixture.leftObserver.sockets[0].closed;
+    attempt++
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
   t.is(fixture.guardFixture.leftObserver.sockets[0].closed, true)
 
   await fixture.close()
+
+  const failureFixture = await liveTopologyFixture(47429, 47430)
+  const failedManager = createRouteManager(managerOptions(failureFixture))
+  t.is(destroyGuardLease(failureFixture.guardLease), true)
+  expectCode(t, () => failedManager.suspend(), 'ERR_DESTROYED')
+  t.is(failureFixture.directory.destroy(), undefined)
+  t.is(failedManager.destroy(), false)
+  await failureFixture.close()
 })

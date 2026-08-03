@@ -24,7 +24,9 @@ const {
   verifyDhtExitSeeds
 } = require('../../lib/private/dht-exit-seeds')
 const {
-  TEST_ONLY_DHT_EXIT_TOPOLOGY_ISSUER
+  TEST_ONLY_DHT_EXIT_TOPOLOGY_ISSUER,
+  digestTestIsolatedAddressTuple,
+  encodeTestIsolatedAddressGrant
 } = require('../../lib/private/dht-exit-test-topology-grant')
 const {
   DHT_NODE_HANDLE_SIZE,
@@ -34,6 +36,7 @@ const {
   destroyDhtExitDestinationTable,
   reserveConfiguredBootstrapProbe,
   reserveReferralProbe,
+  reserveTestTopologyReferralProbe,
   reserveOrdinaryDhtRequest,
   settleExitDhtReservation,
   readDhtExitDestinationRef
@@ -174,9 +177,9 @@ test('DHT exit destination table admits one configured bootstrap after correlate
   t.alike(Reflect.ownKeys(reservation.sendAuthority), [])
   t.alike(Reflect.ownKeys(reservation.settlementAuthority), [])
   t.is(sendReservedExitDhtPacket(io, reservation.sendAuthority), true)
-  t.alike(fake.sends[0].packet.subarray(0, 4), b4a.from('03040000', 'hex'))
+  t.alike(fake.sends[0].packet.subarray(0, 2), b4a.from('0304', 'hex'))
 
-  fake.message(emptyPingReply(), { host: '8.8.8.8', port: 49737 })
+  fake.message(pingReplyFor(fake.sends[0].packet), { host: '8.8.8.8', port: 49737 })
   const destinationRef = settleExitDhtReservation(reservation.settlementAuthority, fake.replies[0])
   const decoded = readDhtExitDestinationRef(table, destinationRef)
 
@@ -278,7 +281,7 @@ test('DHT exit destination table gates ordinary requests on live admitted refere
   const { fake, table, io } = tableFixture()
   const probe = reserveConfiguredBootstrapProbe(table, 0, 2_000n)
   t.is(sendReservedExitDhtPacket(io, probe.sendAuthority), true)
-  fake.message(emptyPingReply(), { host: '8.8.8.8', port: 49737 })
+  fake.message(pingReplyFor(fake.sends[0].packet), { host: '8.8.8.8', port: 49737 })
   const destinationRef = settleExitDhtReservation(probe.settlementAuthority, fake.replies[0])
 
   const ordinary = reserveOrdinaryDhtRequest(
@@ -288,7 +291,7 @@ test('DHT exit destination table gates ordinary requests on live admitted refere
     2_000n
   )
   t.is(sendReservedExitDhtPacket(io, ordinary.sendAuthority), true)
-  t.alike(fake.sends[1].packet.subarray(0, 4), b4a.from('03080100', 'hex'))
+  t.alike(fake.sends[1].packet.subarray(0, 2), b4a.from('0308', 'hex'))
 
   t.is(destroyDhtExitDestinationTable(table), true)
   expectCode(
@@ -565,6 +568,121 @@ test('DHT exit test topology authority admits only its exact isolated tuple set'
       ),
     'ERR_AUTHENTICATION'
   )
+})
+
+test('DHT exit consumes isolated grant before reserving the normal referral PING', (t) => {
+  const fake = new FakeSocket()
+  const channel = createDhtExitReservationChannel(
+    TEST_ONLY_DHT_EXIT_OPEN_ISSUER.create(material({ generation: 7n }))
+  )
+  const table = createDhtExitDestinationTableForTest(
+    channel.tableIssuer,
+    {
+      local: { host: '10.1.2.3', port: 41234 },
+      configuredBootstrap: [{ host: '203.0.113.9', port: 49737 }],
+      monotonicNow: () => 1_000n,
+      randomBytes: seed
+    },
+    TEST_ONLY_DHT_EXIT_TOPOLOGY_ISSUER.create([{ host: '203.0.113.9', port: 49737 }])
+  )
+  const io = createDhtExitIOForTest(
+    {
+      host: '10.1.2.3',
+      port: 41234,
+      monotonicNow: () => 1_000n,
+      schedule: (callback) => callback,
+      cancelScheduled() {},
+      onReply: (replyAuthority) => fake.replies.push(replyAuthority)
+    },
+    TEST_ONLY_DHT_EXIT_SOCKET_ISSUER.create(() => fake),
+    consumeDhtExitReservationIOConsumer(channel.ioConsumer)
+  )
+  const bootstrap = reserveConfiguredBootstrapProbe(table, 0, 2_000n)
+  sendReservedExitDhtPacket(io, bootstrap.sendAuthority)
+  fake.message(pingReplyFor(fake.sends[0].packet), {
+    host: '203.0.113.9',
+    port: 49737
+  })
+  const bootstrapRef = settleExitDhtReservation(bootstrap.settlementAuthority, fake.replies[0])
+  const ordinary = reserveOrdinaryDhtRequest(
+    table,
+    bootstrapRef,
+    { command: 9, target: seed(0x90), token: null },
+    2_000n
+  )
+  sendReservedExitDhtPacket(io, ordinary.sendAuthority)
+  const candidate = {
+    id: peerId('127.64.10.1', 42_010),
+    host: '127.64.10.1',
+    port: 42_010
+  }
+  fake.message(closerReplyFor(fake.sends[1].packet, candidate), {
+    host: '203.0.113.9',
+    port: 49737
+  })
+  const completion = settleExitDhtReservation(ordinary.settlementAuthority, fake.replies[1])
+  const referralReply = createReferralReplyAuthority(completion)
+  const pair = cryptoSuite.keyPair(seed(0x91))
+  const tupleDigest = digestTestIsolatedAddressTuple({
+    tuple: { host: candidate.host, port: candidate.port },
+    id: candidate.id,
+    exitRole: 4,
+    generation: 7n
+  })
+  const grant = encodeTestIsolatedAddressGrant(
+    {
+      runNonce: seed(0x92, 16),
+      exitRole: 4,
+      generation: 7n,
+      grantSequence: 1n,
+      expiresAt: 5_000n,
+      tupleDigest
+    },
+    pair.secretKey
+  )
+  const grantAuthority = TEST_ONLY_DHT_EXIT_TOPOLOGY_ISSUER.referralGrant(grant, pair.publicKey, {
+    runNonce: seed(0x92, 16),
+    exitRole: 4,
+    generation: 7n,
+    tupleDigest,
+    now: 1_000n
+  })
+  const sendsBeforeGrant = fake.sends.length
+  expectCode(
+    t,
+    () =>
+      reserveTestTopologyReferralProbe(table, referralReply, candidate, 2_000n, grantAuthority, 6),
+    'ERR_AUTHENTICATION'
+  )
+  t.is(fake.sends.length, sendsBeforeGrant, 'cross-role grant fails before PING')
+  expectCode(
+    t,
+    () =>
+      reserveTestTopologyReferralProbe(table, referralReply, candidate, 2_000n, grantAuthority, 4),
+    'ERR_REPLAY'
+  )
+  t.is(fake.sends.length, sendsBeforeGrant, 'grant replay fails before PING')
+  const acceptedGrant = TEST_ONLY_DHT_EXIT_TOPOLOGY_ISSUER.referralGrant(grant, pair.publicKey, {
+    runNonce: seed(0x92, 16),
+    exitRole: 4,
+    generation: 7n,
+    tupleDigest,
+    now: 1_000n
+  })
+  const referral = reserveTestTopologyReferralProbe(
+    table,
+    referralReply,
+    candidate,
+    2_000n,
+    acceptedGrant,
+    4
+  )
+  t.ok(referral)
+  t.is(fake.sends.length, sendsBeforeGrant, 'grant only reserves before caller-owned PING')
+  t.is(sendReservedExitDhtPacket(io, referral.sendAuthority), true)
+  t.is(fake.sends.length, sendsBeforeGrant + 1)
+  destroyDhtExitDestinationTable(table)
+  closeDhtExitIO(io)
 })
 
 test('DHT exit destination table rejects only exact special-use IPv4 seed blocks', (t) => {

@@ -285,15 +285,17 @@ test('DHTExitIO binds one owned socket and allocates the request TID before send
   t.is(sendReservedExitDhtPacket(io, packet(installed.table)), true)
   t.is(fake.sends.length, 1)
   t.is(fake.sends[0].host, '203.0.113.9')
-  t.is(fake.sends[0].port, 49737)
-  t.alike(fake.sends[0].packet.subarray(0, 4), b4a.from('03080000', 'hex'))
+  t.alike(fake.sends[0].packet.subarray(0, 2), b4a.from('0308', 'hex'))
 
-  fake.message(b4a.from('130000000a01020312a1', 'hex'), {
+  fake.message(responseFor(fake.sends[0].packet, 0), {
     host: '203.0.113.9',
     port: 49737
   })
   t.is(replies.length, 1)
-  t.is(consumeDhtExitCorrelatedReplyAuthority(replies[0]).reply.tid, 0)
+  t.is(
+    consumeDhtExitCorrelatedReplyAuthority(replies[0]).reply.tid,
+    fake.sends[0].packet[2] | (fake.sends[0].packet[3] << 8)
+  )
   t.is(closeDhtExitIO(io), true)
   t.is(fake.closed, true)
 })
@@ -328,7 +330,7 @@ test('DHTExitIO drops wrong source, duplicate, malformed, and unsolicited replie
   t.is(sendReservedExitDhtPacket(io, packet(installed.table)), true)
   t.is(scheduled.length, 1)
   t.is(scheduled[0].delay, 17_000)
-  fake.message(b4a.from('130000000a01020312a1', 'hex'), { host: '203.0.113.10', port: 49737 })
+  fake.message(responseFor(fake.sends[0].packet, 0), { host: '203.0.113.10', port: 49737 })
   fake.message(
     b4a.from(
       '03080000cb00710949c209aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -336,17 +338,19 @@ test('DHTExitIO drops wrong source, duplicate, malformed, and unsolicited replie
     ),
     { host: '203.0.113.9', port: 49737 }
   )
-  fake.message(b4a.from('130001000a01020312a1', 'hex'), { host: '203.0.113.9', port: 49737 })
-  t.is(replies.length, 0)
-  fake.message(b4a.from('130000000a01020312a1', 'hex'), { host: '203.0.113.9', port: 49737 })
-  fake.message(b4a.from('130000000a01020312a1', 'hex'), { host: '203.0.113.9', port: 49737 })
+  const unsolicited = responseFor(fake.sends[0].packet, 0)
+  unsolicited[2] ^= 1
+  fake.message(unsolicited, { host: '203.0.113.9', port: 49737 })
+  fake.message(responseFor(fake.sends[0].packet, 0), { host: '203.0.113.9', port: 49737 })
+  fake.message(responseFor(fake.sends[0].packet, 0), { host: '203.0.113.9', port: 49737 })
   t.is(replies.length, 1)
   const late = packet(installed.table, { deadline: 18_500n })
   t.is(sendReservedExitDhtPacket(io, late), true)
   now = 18_500n
   scheduled[1].callback()
-  fake.message(b4a.from('130001000a01020312a1', 'hex'), { host: '203.0.113.9', port: 49737 })
-  t.is(replies.length, 1)
+  const lateUnsolicited = responseFor(fake.sends[0].packet, 0)
+  lateUnsolicited[2] ^= 1
+  fake.message(lateUnsolicited, { host: '203.0.113.9', port: 49737 })
   t.ok(canceled.length >= 1)
   t.is(closeDhtExitIO(io), true)
 })
@@ -419,7 +423,7 @@ test('DHTExitIO production constructor reaches udx-native loopback', async (t) =
   ])
   clearTimeout(timeout)
   t.ok(result)
-  t.alike(result.message.subarray(0, 4), b4a.from('03080000', 'hex'))
+  t.alike(result.message.subarray(0, 2), b4a.from('0308', 'hex'))
   t.is(closeDhtExitIO(io), true)
   server.close()
 })

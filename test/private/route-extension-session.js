@@ -306,7 +306,7 @@ test('M3 adjacency runtime derives exact actor-local cell IDs', (t) => {
   t.exception(() => deriveM3CellIds(OFFER_DIGEST, { crypto: { hash: () => b4a.alloc(32, 0x5a) } }))
 })
 
-test('route extension limits clamp to one exact five-second deadline', (t) => {
+test('route extension limits retain route lifetime beyond the operation deadline', (t) => {
   t.alike(
     createRouteExtensionLimits(Object.freeze({}), () => 1_000n, 9_000n),
     {
@@ -315,7 +315,7 @@ test('route extension limits clamp to one exact five-second deadline', (t) => {
       maxBytes: 65_536,
       maxCommands: 10,
       idleTimeoutMs: 5_000,
-      expiresAtMs: 6_000n
+      expiresAtMs: 9_000n
     }
   )
   t.is(
@@ -438,7 +438,7 @@ test('selected evidence opens through production TailControl client methods', as
   const selected = selectedMiddle()
   const clock = routeClock()
   const currentTail = candidate(ROLE.SAFETY, 0, 1)
-  const requestedLimits = createRouteExtensionLimits(Object.freeze({}), () => NOW, 10_000n)
+  const requestedLimits = createRouteExtensionLimits(Object.freeze({}), () => NOW, 8_000n)
   const currentTailPair = cryptoSuite.encryptionKeyPair(b4a.alloc(32, 0x61))
   const admittedLimitsDigest = digestAdmittedLimits(requestedLimits)
   const transcript = encodeTailControlTranscript({

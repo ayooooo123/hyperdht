@@ -35,6 +35,7 @@ const {
   admitBootstrapUdxGuard,
   bindBootstrapUdxOperation,
   createBootstrapUdxAuthority,
+  createBootstrapUdxGuardSessionOptions,
   createLocalIdentitySecretCapability,
   openBootstrapUdxGuard,
   pinBootstrapUdxGuard
@@ -176,6 +177,9 @@ function routeClock(start = NOW, monotonicStart = 10_000n) {
       wall += BigInt(ms)
       monotonic += BigInt(ms)
     },
+    rollbackWall(ms) {
+      wall -= BigInt(ms)
+    },
     pendingTimers() {
       return timers.size
     }
@@ -210,7 +214,7 @@ function directoryFixture(clock = routeClock(), options = {}) {
   }
 }
 
-function linkPair(hostA, portA, hostB, portB) {
+function linkPair(hostA, portA, hostB, portB, expiresAt = 60_000n) {
   const authority = cryptoSuite.keyPair(seed(90))
   const a = cryptoSuite.keyPair(seed(91))
   const b = identityFor(ROLE.SAFETY, 90)
@@ -236,7 +240,7 @@ function linkPair(hostA, portA, hostB, portB) {
       },
       epoch: 7n,
       notBefore: 0n,
-      expiresAt: 60_000n,
+      expiresAt,
       runId32
     },
     authority.secretKey
@@ -303,12 +307,12 @@ class FakeSocket {
   bind(port, host) {
     this.port = port
     this.host = host
-    this.network.set(`${host}:${port}`, this)
+    this.network.set(port, this)
     return true
   }
 
   send(packet, port, host) {
-    const peer = this.network.get(`${host}:${port}`)
+    const peer = this.network.get(port)
     if (!peer) return false
     queueMicrotask(() =>
       peer.emit('message', b4a.from(packet), { host: this.host, port: this.port })
@@ -319,7 +323,7 @@ class FakeSocket {
   close() {
     this.closeCalls++
     this.closed = true
-    this.network.delete(`${this.host}:${this.port}`)
+    this.network.delete(this.port)
     if (this.observer) this.observer.events.push(['close', this])
     return true
   }
@@ -348,13 +352,15 @@ function endpointOptions(host, port, overrides = {}) {
     host,
     port,
     onBootstrap() {},
-    onCell() {},
+    onCell() {
+      return true
+    },
     onLinkFailure() {},
     ...overrides
   }
 }
 
-function linkSessionOptions(links, side, deadline = 10_000) {
+function linkSessionOptions(links, side, expiresAt = 60_000n, deadline = 10_000) {
   const now = () => 1
   const responderStatic = cryptoSuite.encryptionKeyPair(seed(98))
   const common = {
@@ -364,7 +370,7 @@ function linkSessionOptions(links, side, deadline = 10_000) {
     responderIdentity: links.b.publicKey,
     initiatorLocalId: b4a.alloc(16, 0x52),
     responderLocalId: b4a.alloc(16, 0x53),
-    expiresAt: 60_000n
+    expiresAt
   }
   const initiate = side === 'left'
   return {
@@ -394,20 +400,23 @@ function linkSessionOptions(links, side, deadline = 10_000) {
     cancel: clearTimeout,
     randomBytes: sequence(initiate ? 1 : 11),
     absoluteDeadline: deadline,
-    signedExpiry: 60_000
+    signedExpiry: Number(expiresAt),
+    authorizedExpiry: Number(expiresAt)
   }
 }
 
 async function pinnedMaterialFixture(
   leftPort,
   rightPort,
-  hosts = { left: '127.0.0.1', right: '127.0.0.2' }
+  hosts = { left: '127.0.0.1', right: '127.0.0.2' },
+  expiresAt = 60_000n
 ) {
   const network = new Map()
   const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
-  const links = linkPair(hosts.left, leftPort, hosts.right, rightPort)
+  const links = linkPair(hosts.left, leftPort, hosts.right, rightPort, expiresAt)
   const leftObserver = {}
   let leftSession = null
+  let rightBootstrapHandler = null
   let rightSession = null
   const left = issuer.createUdxCellEndpointForTest(
     {
@@ -422,6 +431,7 @@ async function pinnedMaterialFixture(
     {
       ...endpointOptions(hosts.right, rightPort),
       onBootstrap(packet) {
+        if (rightBootstrapHandler) return rightBootstrapHandler(packet)
         if (rightSession) void rightSession.receive(packet)
       }
     },
@@ -445,20 +455,44 @@ async function pinnedMaterialFixture(
     host: hosts.right,
     port: rightPort
   })
-  leftSession = openBootstrapUdxGuard(
+  const leftOptions = linkSessionOptions(links, 'left', expiresAt)
+  const leftCapability = createBootstrapUdxGuardSessionOptions(
     authority,
     admission,
     links.left.handle,
-    linkSessionOptions(links, 'left')
+    {
+      circuitId: leftOptions.setup.circuitId,
+      epoch: leftOptions.setup.epoch,
+      initiatorLocalId: leftOptions.setup.initiatorLocalId,
+      responderLocalId: leftOptions.setup.responderLocalId,
+      expiresAt: leftOptions.setup.expiresAt,
+      responderStaticKey: leftOptions.setup.responderStaticKey,
+      handleNow: leftOptions.now,
+      now: leftOptions.now,
+      wallNow: leftOptions.now,
+      schedule: leftOptions.schedule,
+      cancel: leftOptions.cancel,
+      randomBytes: leftOptions.randomBytes,
+      absoluteDeadline: leftOptions.absoluteDeadline,
+      signedExpiry: leftOptions.signedExpiry
+    }
   )
-  rightSession = right.openLink(links.right.handle, linkSessionOptions(links, 'right'))
+  leftSession = openBootstrapUdxGuard(authority, admission, links.left.handle, leftCapability)
+  rightSession = right.openLink(links.right.handle, linkSessionOptions(links, 'right', expiresAt))
   const established = await leftSession.open()
+  for (let attempt = 0; attempt < 100 && !rightSession.established; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  if (!rightSession.established) throw new Error('responder guard link did not establish')
   return {
     left,
     right,
     leftObserver,
     links,
     rightPort,
+    setRightBootstrapHandler(handler) {
+      rightBootstrapHandler = handler
+    },
     rightSession,
     material: pinBootstrapUdxGuard(authority, admission, established)
   }
@@ -470,21 +504,22 @@ async function liveTopologyFixture(
   hosts = { left: '127.0.0.1', right: '127.0.0.2' },
   options = {}
 ) {
-  const guard = await pinnedMaterialFixture(leftPort, rightPort, hosts)
   const clock = options.clock || routeClock()
+  const guardExpiresAt = options.guardExpiresAt || NOW + 30_000n
+  const guard = await pinnedMaterialFixture(leftPort, rightPort, hosts, guardExpiresAt)
   const pinnedGuardRecord = hosts.right.includes(':')
     ? {
         identity: b4a.from(guard.links.b.publicKey),
         canonicalEndpointBytes: canonicalEndpointForHost(hosts.right, rightPort),
         digest: seed(0xda),
         epoch: 1n,
-        expiresAt: options.guardExpiresAt || NOW + 30_000n
+        expiresAt: guardExpiresAt
       }
     : candidate(ROLE.SAFETY, 0, 90, {
         endpointBytes: canonicalEndpointForHost(hosts.right, rightPort),
         identityPair: guard.links.b,
         validationNow: clock.wallNow(),
-        expiresAtMs: options.guardExpiresAt || NOW + 30_000n
+        expiresAtMs: guardExpiresAt
       })
   const directory = directoryFixture(clock, { guard: pinnedGuardRecord, records: options.records })
   const guardLease = createGuardLease({
@@ -492,9 +527,9 @@ async function liveTopologyFixture(
     pinnedGuard: {
       identity32: guard.links.b.publicKey,
       endpoint: { host: hosts.right, port: rightPort },
+      canonicalEndpointBytes: pinnedGuardRecord.canonicalEndpointBytes,
       ...(pinnedGuardRecord.canonicalBytes
         ? {
-            canonicalEndpointBytes: pinnedGuardRecord.canonicalEndpointBytes,
             advertisement: pinnedGuardRecord.canonicalBytes,
             advertisementDigest: pinnedGuardRecord.digest,
             epoch: pinnedGuardRecord.epoch,
@@ -512,6 +547,7 @@ async function liveTopologyFixture(
     ...directory,
     guardLease,
     guardFixture: guard,
+    guardRecord: pinnedGuardRecord,
     async close() {
       destroyGuardLease(guardLease)
       await guard.rightSession.close()

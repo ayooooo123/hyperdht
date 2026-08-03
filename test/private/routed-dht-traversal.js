@@ -14,7 +14,11 @@ const {
 } = require('../../lib/private/counters')
 const { encodeDestinationRef } = require('../../lib/private/destination-ref')
 const { encodeImmutableGetResponse } = require('../../lib/private/dht-exit-wire')
-const { encodeDhtExitSeeds, signDhtExitSeeds } = require('../../lib/private/dht-exit-seeds')
+const {
+  createDhtExitSeedsDeliveryAuthority,
+  encodeDhtExitSeeds,
+  signDhtExitSeeds
+} = require('../../lib/private/dht-exit-seeds')
 const {
   createDhtExitDestinationTable,
   destroyDhtExitDestinationTable,
@@ -28,6 +32,7 @@ const {
   closeDhtExitIO,
   createDhtExitIOForTest,
   installDhtExitRoute,
+  sendDhtExitSeeds,
   sendReservedExitDhtPacket
 } = require('../../lib/private/dht-exit-io')
 const {
@@ -47,7 +52,8 @@ const guardLinks = require('../../lib/private/guard-link')
 const {
   LiveRouteAuthority,
   bindOpenRouteTransport,
-  issueLiveRouteDestination
+  issueLiveRouteDestination,
+  receiveOpenRouteSeedPayload
 } = require('../../lib/private/live-route-authority')
 const {
   M3AdjacencyAuthority,
@@ -56,16 +62,16 @@ const {
   receiveM3RouteFrame,
   sendM3RouteFrame,
   takeM3RouteTransport,
-  takeM3TailCapability,
+  takeM3TailCapability
 } = require('../../lib/private/m3-adjacency-runtime')
+const {
+  consumeOpenRouteHandoff,
+  destroyOpenRouteMaterial
+} = require('../../lib/private/open-route-handoff')
 const opaqueDestination = require('../../lib/private/opaque-destination')
 const { signRedactedResponderProof } = require('../../lib/private/redacted-responder-proof')
 const { BRANCH_CLASS, CELL_CLASS, DIRECTION, M3_MESSAGE_ID } = require('../../lib/private/protocol')
-const {
-  RELAY_CAPABILITY,
-  ROLE,
-  encodeM3Object
-} = require('../../lib/private/protocol')
+const { RELAY_CAPABILITY, ROLE, encodeM3Object } = require('../../lib/private/protocol')
 const {
   decodeRelayCapabilityAdvertisement,
   digestRelayCapabilityAdvertisement
@@ -298,18 +304,13 @@ function installOpaqueForwarder(branch, options) {
 }
 
 function createBranchNetwork(branch, guardIdentity, clock, edges, digestSeed) {
-  const expiresAt = NOW + 4_500n
+  const expiresAt = NOW + 20_000n
   const branchName = branch.branchClass === BRANCH_CLASS.LOOKUP ? 'lookup' : 'announce'
   const endpointNode = `${branchName}:endpoint`
   const guardNode = 'shared:guard'
   const middleNode = `${branchName}:middle`
   const exitNode = `${branchName}:exit`
-  const endpointGuard = channelPair(
-    edges,
-    branch.branchClass,
-    endpointNode,
-    guardNode
-  )
+  const endpointGuard = channelPair(edges, branch.branchClass, endpointNode, guardNode)
   const guardMiddle = channelPair(edges, branch.branchClass, guardNode, middleNode)
   const middleExit = channelPair(edges, branch.branchClass, middleNode, exitNode)
   const endpointIdentity = seed(digestSeed + 10)
@@ -484,7 +485,7 @@ function createFinalOpenPair(branch, exitRecord, currentAdvertisement, clock, ne
     maxBytes: 65_536,
     maxCommands: 10,
     idleTimeoutMs: 5_000,
-    expiresAtMs: NOW + 5_000n
+    expiresAtMs: NOW + 20_000n
   })
   const completeOfferDigest = seed(0xe1)
   const currentTailPair = cryptoSuite.encryptionKeyPair(seed(0xe2))
@@ -509,22 +510,19 @@ function createFinalOpenPair(branch, exitRecord, currentAdvertisement, clock, ne
   )
   const endpointTail = createTailControlSession(
     endpointAdopted.tail,
-    tailSessionOptions(clock, branch.absoluteDeadline || 15_000n, cryptoSuite)
+    tailSessionOptions(clock, branch.absoluteDeadline || 30_000n, cryptoSuite)
   )
   const encodedExtend = endpointTail.sealExtend({
     advertisement: signedAdvertisement,
     advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
     extensionIndex: 2,
     requestedLimits,
-    absoluteDeadline: 15_000n,
+    absoluteDeadline: 30_000n,
     randomBytes: () => seed(0xe3)
   })
   const request = decodeExtendRequest(encodedExtend)
   const admittedLimitsDigest = digestAdmittedLimits(requestedLimits)
-  const transcriptDigest = cryptoSuite.hash([
-    TAIL_READY_TRANSCRIPT_DOMAIN,
-    initialTranscript
-  ])
+  const transcriptDigest = cryptoSuite.hash([TAIL_READY_TRANSCRIPT_DOMAIN, initialTranscript])
   const proofValue = {
     responderAdvertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
     initiatorIdentity: currentDecodedAdvertisement.relayIdentity,
@@ -538,7 +536,7 @@ function createFinalOpenPair(branch, exitRecord, currentAdvertisement, clock, ne
     clientNonce: request.clientNonce,
     advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
     admittedLimitsDigest,
-    expiresAtMs: NOW + 4_500n,
+    expiresAtMs: NOW + 20_000n,
     responderProofNonce: seed(0xe4)
   }
   const finalTailPair = cryptoSuite.encryptionKeyPair(seed(0xe3))
@@ -617,10 +615,7 @@ function createFinalOpenPair(branch, exitRecord, currentAdvertisement, clock, ne
       tailControlTranscript: finalTranscript
     })
   )
-  const exitTail = createTailControlSession(
-    exitAdopted.tail,
-    tailSessionOptions(clock, 15_000n)
-  )
+  const exitTail = createTailControlSession(exitAdopted.tail, tailSessionOptions(clock, 15_000n))
   createTailControlResponderAuthority(exitTail, exitAdopted.responderToken, {
     tailReadySigner,
     wallNow: clock.wallNow,
@@ -743,30 +738,45 @@ function openMaterialFor(branch, value) {
   }
 }
 
-async function liveAuthorityHarness() {
-  const topology = await liveTopologyFixture(47631, 47632)
-  const randomBytes = sequenceBytes(0xb1)
-  const manager = createRouteManager({
-    guardLease: topology.guardLease,
-    candidateDirectory: topology.directory,
-    extensionFactory: createRouteExtensionFactory({
-      wallNow: topology.clock.wallNow,
-      monotonicNow: topology.clock.monotonicNow,
-      randomBytes,
-      schedule: topology.clock.schedule,
-      cancelScheduled: topology.clock.cancelScheduled
-    }),
-    terminalFactory: createFinalExitActivationFactory({
-      wallNow: topology.clock.wallNow,
-      monotonicNow: topology.clock.monotonicNow,
-      randomBytes,
-      schedule: topology.clock.schedule,
-      cancelScheduled: topology.clock.cancelScheduled
-    }),
-    monotonicNow: topology.clock.monotonicNow,
-    randomBytes
-  })
-  manager.buildInitialPair()
+let externalHarnesses = 0
+
+async function liveAuthorityHarness(configurePublications = null, existing = null) {
+  const externalPublications = configurePublications !== null
+  const externalIndex = existing === null && externalPublications ? externalHarnesses++ : 0
+  const topology =
+    existing === null
+      ? await liveTopologyFixture(
+          externalPublications ? 47641 + externalIndex * 20 : 47631,
+          externalPublications ? 47642 + externalIndex * 20 : 47632
+        )
+      : existing.topology
+  const randomBytes = sequenceBytes(externalPublications ? 0xe1 + externalIndex * 8 : 0xb1)
+  const manager =
+    existing === null
+      ? createRouteManager({
+          guardLease: topology.guardLease,
+          candidateDirectory: topology.directory,
+          extensionFactory: createRouteExtensionFactory({
+            wallNow: topology.clock.wallNow,
+            monotonicNow: topology.clock.monotonicNow,
+            randomBytes,
+            schedule: topology.clock.schedule,
+            cancelScheduled: topology.clock.cancelScheduled
+          }),
+          terminalFactory: createFinalExitActivationFactory({
+            wallNow: topology.clock.wallNow,
+            monotonicNow: topology.clock.monotonicNow,
+            randomBytes,
+            schedule: topology.clock.schedule,
+            cancelScheduled: topology.clock.cancelScheduled
+          }),
+          monotonicNow: topology.clock.monotonicNow,
+          randomBytes
+        })
+      : existing.manager
+  const publications =
+    configurePublications === null ? manager : configurePublications(manager, topology)
+  if (existing === null) manager.buildInitialPair()
   const draft = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().draft
   const endpointEdges = []
   const lookupExitRecord = topology.records.find((record) =>
@@ -836,19 +846,20 @@ async function liveAuthorityHarness() {
 
   const announceCreated = openMaterialFor(draft.announce, 0xa1)
   const announcePair = routeTransportPair(draft.announce, announceNetwork, topology.clock)
-  announceCreated.material.endpointOpenAuthority =
-    finalExitActivation[TEST_ONLY_ENDPOINT_DHT_EXIT_OPEN_ISSUER].create({
-      branchClass: BRANCH_CLASS.ANNOUNCE,
-      branchId: draft.announce.branchId,
-      circuitId: draft.announce.circuitId,
-      generation: draft.announce.generation,
-      exitIdentity: draft.announce.exit.identity,
-      finalTranscriptDigest: announceCreated.finalTranscriptDigest,
-      expiresAt: announceCreated.material.expiresAt,
-      absoluteDeadline: draft.absoluteDeadline,
-      controlKey: seed(0xae),
-      controlNoncePrefix: seed(0xaf, 16)
-    })
+  announceCreated.material.endpointOpenAuthority = finalExitActivation[
+    TEST_ONLY_ENDPOINT_DHT_EXIT_OPEN_ISSUER
+  ].create({
+    branchClass: BRANCH_CLASS.ANNOUNCE,
+    branchId: draft.announce.branchId,
+    circuitId: draft.announce.circuitId,
+    generation: draft.announce.generation,
+    exitIdentity: draft.announce.exit.identity,
+    finalTranscriptDigest: announceCreated.finalTranscriptDigest,
+    expiresAt: announceCreated.material.expiresAt,
+    absoluteDeadline: draft.absoluteDeadline,
+    controlKey: seed(0xae),
+    controlNoncePrefix: seed(0xaf, 16)
+  })
   bindOpenRouteTransport(announceCreated.material, {
     transport: announcePair.endpoint,
     finalTranscriptDigest: announceCreated.finalTranscriptDigest
@@ -881,7 +892,7 @@ async function liveAuthorityHarness() {
     }
   })
   try {
-    manager.publishInitialPair({
+    publications.publishInitialPair({
       lookup: finalPair.endpointHandoff,
       announce: announceHandoff
     })
@@ -897,10 +908,7 @@ async function liveAuthorityHarness() {
     wallNow: topology.clock.wallNow,
     monotonicNow: topology.clock.monotonicNow
   })
-  const lookupSeedAdmission = manager.createDhtSeedAdmission(
-    BRANCH_CLASS.LOOKUP,
-    lookupOwner
-  )
+  const lookupSeedAdmission = publications.createDhtSeedAdmission(BRANCH_CLASS.LOOKUP, lookupOwner)
   const signedLookupSeeds = encodeDhtExitSeeds(
     signDhtExitSeeds(
       {
@@ -928,7 +936,7 @@ async function liveAuthorityHarness() {
     wallNow: topology.clock.wallNow,
     monotonicNow: topology.clock.monotonicNow
   })
-  manager.createDhtSeedAdmission(BRANCH_CLASS.ANNOUNCE, announceOwner)
+  publications.createDhtSeedAdmission(BRANCH_CLASS.ANNOUNCE, announceOwner)
   const announceReady = opaqueDestination[TEST_ONLY_BRANCH_SEED_READY_ISSUER].create({
     branchClass: BRANCH_CLASS.ANNOUNCE,
     branchId: draft.announce.branchId,
@@ -937,11 +945,14 @@ async function liveAuthorityHarness() {
     exitIdentity: draft.announce.exit.identity,
     expiresAt: announceCreated.material.expiresAt
   })
-  manager.publishInitialSeedPair({
+  publications.publishInitialSeedPair({
     lookup: lookupCommitted.branchSeedReady,
     announce: announceReady
   })
-  const authority = new LiveRouteAuthority({ routeManager: manager })
+  const authority =
+    existing === null && configurePublications === null
+      ? new LiveRouteAuthority({ routeManager: manager })
+      : null
   installDhtExitRoute(exitIO, table)
   return {
     authority,
@@ -954,10 +965,10 @@ async function liveAuthorityHarness() {
     announcePair,
     seedDestination,
     table,
-    topology
+    topology,
+    ownsTopology: existing === null
   }
 }
-
 
 function queryOptions(context) {
   return {
@@ -974,6 +985,20 @@ async function rejection(promise) {
     return error
   }
   return null
+}
+
+async function closeLiveAuthorityHarness(harness) {
+  closeDhtExitIO(harness.exitIO)
+  destroyDhtExitDestinationTable(harness.table)
+  harness.finalPair.close()
+  try {
+    harness.manager.destroy()
+  } catch {}
+  try {
+    destroyM3RouteTransport(harness.announcePair.exit)
+  } catch {}
+  for (const forwarder of harness.announcePair.forwarders) forwarder.destroy()
+  if (harness.ownsTopology) await harness.topology.close()
 }
 
 test('iterative immutable get uses live DHT exit route, qualified referral, and exact value', async (t) => {
@@ -999,10 +1024,10 @@ test('iterative immutable get uses live DHT exit route, qualified referral, and 
   const upstream = (async () => {
     await waitFor(() => harness.fakeSocket.sends.length >= 2)
     const closer = b4a.from([1, 1, 1, 1, 1, 0x49, 0xc2])
-    harness.fakeSocket.message(
-      dhtResponseFor(harness.fakeSocket.sends[1].packet, 0x04, closer),
-      { host: '8.8.8.8', port: 49737 }
-    )
+    harness.fakeSocket.message(dhtResponseFor(harness.fakeSocket.sends[1].packet, 0x04, closer), {
+      host: '8.8.8.8',
+      port: 49737
+    })
     await waitFor(() => harness.fakeSocket.sends.length >= 3)
     harness.fakeSocket.message(dhtResponseFor(harness.fakeSocket.sends[2].packet, 0), {
       host: '1.1.1.1',
@@ -1039,21 +1064,16 @@ test('iterative immutable get uses live DHT exit route, qualified referral, and 
     dhtSends.map(({ host }) => host),
     ['8.8.8.8', '1.1.1.1', '1.1.1.1']
   )
-  const lookupEdges = harness.endpointEdges.filter(
-    (edge) => edge.branch === BRANCH_CLASS.LOOKUP
-  )
+  const lookupEdges = harness.endpointEdges.filter((edge) => edge.branch === BRANCH_CLASS.LOOKUP)
   t.is(lookupEdges.length, 12)
-  t.alike(
-    Array.from(new Set(lookupEdges.map((edge) => `${edge.from}>${edge.to}`))).sort(),
-    [
-      'lookup:endpoint>shared:guard',
-      'lookup:exit>lookup:middle',
-      'lookup:middle>lookup:exit',
-      'lookup:middle>shared:guard',
-      'shared:guard>lookup:endpoint',
-      'shared:guard>lookup:middle'
-    ]
-  )
+  t.alike(Array.from(new Set(lookupEdges.map((edge) => `${edge.from}>${edge.to}`))).sort(), [
+    'lookup:endpoint>shared:guard',
+    'lookup:exit>lookup:middle',
+    'lookup:middle>lookup:exit',
+    'lookup:middle>shared:guard',
+    'shared:guard>lookup:endpoint',
+    'shared:guard>lookup:middle'
+  ])
   const endpointPhysicalEdges = lookupEdges.filter(
     (edge) => edge.from === 'lookup:endpoint' || edge.to === 'lookup:endpoint'
   )
@@ -1107,4 +1127,122 @@ test('Gate 3A exposes immutable get query contexts only', (t) => {
   const contexts = createQueryContexts()
   t.alike(Object.keys(contexts), ['immutableGet', 'classify'])
   t.alike(Object.keys(contexts.immutableGet), ['lookup', 'announce'])
+})
+
+module.exports = {
+  closeLiveAuthorityHarness,
+  dhtResponseFor,
+  liveAuthorityHarness,
+  waitFor
+}
+
+test('production exit seed delivery crosses the moved OPEN route into endpoint admission', async (t) => {
+  const topology = await liveTopologyFixture(47901, 47902)
+  const randomBytes = sequenceBytes(0x71)
+  const manager = createRouteManager({
+    guardLease: topology.guardLease,
+    candidateDirectory: topology.directory,
+    extensionFactory: createRouteExtensionFactory({
+      wallNow: topology.clock.wallNow,
+      monotonicNow: topology.clock.monotonicNow,
+      randomBytes,
+      schedule: topology.clock.schedule,
+      cancelScheduled: topology.clock.cancelScheduled
+    }),
+    terminalFactory: createFinalExitActivationFactory({
+      wallNow: topology.clock.wallNow,
+      monotonicNow: topology.clock.monotonicNow,
+      randomBytes,
+      schedule: topology.clock.schedule,
+      cancelScheduled: topology.clock.cancelScheduled
+    }),
+    monotonicNow: topology.clock.monotonicNow,
+    randomBytes
+  })
+  manager.buildInitialPair()
+  const draft = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().draft
+  const exitRecord = topology.records.find((record) =>
+    b4a.equals(record.identity, draft.lookup.exit.identity)
+  )
+  const safety = topology.records.find((record) => record.role === ROLE.SAFETY)
+  const network = createBranchNetwork(draft.lookup, safety.identity, topology.clock, [], 0x72)
+  const pair = createFinalOpenPair(
+    draft.lookup,
+    exitRecord,
+    safety.canonicalBytes,
+    topology.clock,
+    network
+  )
+  const material = consumeOpenRouteHandoff(pair.endpointHandoff)
+  const channel = createDhtExitReservationChannel(pair.exitAuthority)
+  const table = createDhtExitDestinationTable(channel.tableIssuer, {
+    local: { host: '10.1.2.3', port: 41234 },
+    configuredBootstrap: [{ host: '8.8.8.8', port: 49737 }],
+    monotonicNow: topology.clock.monotonicNow,
+    randomBytes: (size) => seed(0xf3, size)
+  })
+  const socket = new FakeDhtSocket()
+  const replies = []
+  const io = createDhtExitIOForTest(
+    {
+      host: '10.1.2.3',
+      port: 41234,
+      monotonicNow: topology.clock.monotonicNow,
+      schedule: topology.clock.schedule,
+      cancelScheduled: topology.clock.cancelScheduled,
+      onReply(authority) {
+        replies.push(authority)
+      }
+    },
+    TEST_ONLY_DHT_EXIT_SOCKET_ISSUER.create(() => socket),
+    consumeDhtExitReservationIOConsumer(channel.ioConsumer)
+  )
+  try {
+    const probe = reserveConfiguredBootstrapProbe(table, 0, topology.clock.monotonicNow() + 1_000n)
+    sendReservedExitDhtPacket(io, probe.sendAuthority)
+    socket.message(dhtResponseFor(socket.sends[0].packet, 0), {
+      host: '8.8.8.8',
+      port: 49737
+    })
+    await waitFor(() => replies.length === 1)
+    settleExitDhtReservation(probe.settlementAuthority, replies.shift())
+    installDhtExitRoute(io, table)
+    const receiving = receiveOpenRouteSeedPayload(material, topology.clock.monotonicNow)
+    const sent = sendDhtExitSeeds(
+      io,
+      createDhtExitSeedsDeliveryAuthority(table),
+      seed(0xf4),
+      privateIdentityPair(draft.lookup.exit.identity).secretKey
+    )
+    const encoded = await receiving
+    await sent
+    const owner = opaqueDestination.createLiveOpaqueDestinations({
+      branch: BRANCH_CLASS.LOOKUP,
+      circuitId: material.circuitId,
+      generation: material.generation,
+      expiresAt: material.expiresAt,
+      wallNow: topology.clock.wallNow,
+      monotonicNow: topology.clock.monotonicNow
+    })
+    const admission = opaqueDestination.createDhtSeedAdmissionAuthority(
+      owner,
+      material.endpointOpenAuthority
+    )
+    material.endpointOpenAuthority = null
+    opaqueDestination.stageDhtSeedAdmission(admission, encoded)
+    const committed = opaqueDestination.commitDhtSeedAdmission(
+      opaqueDestination.sealDhtSeedAdmission(admission)
+    )
+    t.ok(Object.isFrozen(committed.branchSeedReady))
+    t.is(committed.destinations.length, 1)
+    encoded.fill(0)
+    opaqueDestination.destroyLiveOpaqueDestinations(owner)
+  } finally {
+    closeDhtExitIO(io)
+    destroyDhtExitDestinationTable(table)
+    destroyOpenRouteMaterial(material)
+    pair.close()
+    manager.destroy()
+    await topology.close()
+  }
 })

@@ -33,6 +33,8 @@ const {
 // 0305df915b6a767093f9e75e6c06bc0a35da6169.
 
 const seed = (value) => b4a.alloc(32, value)
+const createDynamicResponderSetup =
+  linkBootstrapModule[Symbol.for('hyperdht-private-routes/dynamic-responder-setup-factory')]
 
 test('established links expose no raw endpoint reservation reader', (t) => {
   t.is('readEstablishedLinkReservation' in linkBootstrapModule, false)
@@ -139,6 +141,13 @@ function fixture({
   start = 0,
   absoluteDeadline = 10_000,
   signedExpiry = 60_000,
+  authorizedExpiry = 60_000,
+  transcriptExpiry = 60_000n,
+  dynamic = false,
+  dynamicSetup = null,
+  responderLinkSetup = null,
+  initiatorClaim = null,
+  commonEpoch = 9n,
   drop = false,
   dropFirstRight = false
 } = {}) {
@@ -147,7 +156,7 @@ function fixture({
   const initiator = cryptoSuite.keyPair(seed(251))
   const responder = roleIdentity(ROLE.SAFETY, 252)
   const responderStatic = cryptoSuite.encryptionKeyPair(seed(253))
-  const expiresAt = 60_000n
+  const expiresAt = transcriptExpiry
   const grant = signTopologyGrant(
     {
       version: PROTOCOL_VERSION,
@@ -196,8 +205,8 @@ function fixture({
   })
   const common = {
     circuitId: b4a.alloc(16, 0x51),
-    epoch: 9n,
-    initiatorIdentity: initiator.publicKey,
+    epoch: commonEpoch,
+    initiatorIdentity: initiatorClaim || initiator.publicKey,
     responderIdentity: responder.publicKey,
     initiatorLocalId: b4a.alloc(16, 0x52),
     responderLocalId: b4a.alloc(16, 0x53),
@@ -235,7 +244,8 @@ function fixture({
     schedule: time.schedule,
     cancel: time.cancel,
     absoluteDeadline,
-    signedExpiry
+    signedExpiry,
+    authorizedExpiry
   }
   leftSession = new LinkBootstrapSession({
     ...sessionOptions,
@@ -256,26 +266,51 @@ function fixture({
     },
     randomBytes: sequence(1)
   })
-  rightSession = new LinkBootstrapSession({
-    ...sessionOptions,
-    mode: 'accept',
-    endpoint: endpoint('right'),
-    sendHandle: rightHandle,
-    linkHandle: right.handle,
-    codec: new BootstrapEnvelopeCodec({
+  const responderSetup = dynamic
+    ? dynamicSetup ||
+      createDynamicResponderSetup({
+        responderStaticSecretKey: responderStatic.secretKey,
+        responderIdentitySecretKey: responder.secretKey
+      })
+    : {
+        ...common,
+        responderStaticSecretKey: responderStatic.secretKey,
+        responderIdentitySecretKey: responder.secretKey
+      }
+  try {
+    rightSession = new LinkBootstrapSession({
+      ...sessionOptions,
+      mode: 'accept',
+      endpoint: endpoint('right'),
+      sendHandle: rightHandle,
       linkHandle: right.handle,
-      localIdentitySecretKey: responder.secretKey,
-      padding: sequence(0x91)
-    }),
-    linkSetup: createLinkSetupAuthority({ now: time.now, randomBytes: sequence(0x71) }),
-    setup: {
-      ...common,
-      responderStaticSecretKey: responderStatic.secretKey,
-      responderIdentitySecretKey: responder.secretKey
-    },
-    randomBytes: sequence(11)
-  })
-  return { time, leftSession, rightSession, leftPackets, rightPackets, left, right }
+      codec: new BootstrapEnvelopeCodec({
+        linkHandle: right.handle,
+        localIdentitySecretKey: responder.secretKey,
+        padding: sequence(0x91)
+      }),
+      linkSetup:
+        responderLinkSetup ||
+        createLinkSetupAuthority({ now: time.now, randomBytes: sequence(0x71) }),
+      setup: responderSetup,
+      randomBytes: sequence(11)
+    })
+  } catch (err) {
+    void leftSession.close()
+    left.value.destroy()
+    right.value.destroy()
+    throw err
+  }
+  return {
+    time,
+    leftSession,
+    rightSession,
+    leftPackets,
+    rightPackets,
+    left,
+    right,
+    dynamicSetup: responderSetup
+  }
 }
 
 test('link bootstrap opens once and installs an opaque established link', async (t) => {
@@ -335,6 +370,7 @@ test('link CREATED is cached byte-for-byte and recovered by an exact CREATE retr
   const f = fixture({ dropFirstRight: true })
   const opening = f.leftSession.open()
   await Promise.resolve()
+
   await Promise.resolve()
   t.is(f.rightSession.state, 'OPEN')
   t.is(f.leftSession.state, 'CREATING')
@@ -346,6 +382,101 @@ test('link CREATED is cached byte-for-byte and recovered by an exact CREATE retr
   t.is(f.rightPackets.length, 2)
   t.alike(f.rightPackets[1], f.rightPackets[0])
   await f.leftSession.close()
+  await f.rightSession.close()
+  f.left.value.destroy()
+  f.right.value.destroy()
+})
+async function rejectDynamic(t, options) {
+  const { reachesResponder = false, ...fixtureOptions } = options
+  const f = fixture({ dynamic: true, ...fixtureOptions })
+  const opening = f.leftSession.open()
+  const rejected = t.exception(opening)
+  for (let i = 0; i < 20 && f.rightSession.state === 'IDLE'; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  t.is(f.rightSession.state, reachesResponder ? 'TOMBSTONE' : 'IDLE')
+  await f.leftSession.close()
+  await rejected
+  await f.rightSession.close()
+  f.left.value.destroy()
+  f.right.value.destroy()
+  return f.dynamicSetup
+}
+
+test('dynamic responder fails closed on claims, wall expiry, replay, and local expiry', async (t) => {
+  await rejectDynamic(t, { initiatorClaim: seed(7) })
+  await rejectDynamic(t, { commonEpoch: 10n })
+  const spent = await rejectDynamic(t, {
+    transcriptExpiry: 60_001n,
+    authorizedExpiry: 60_000,
+    reachesResponder: true
+  })
+  t.exception(() => fixture({ dynamic: true, dynamicSetup: spent }))
+  await rejectDynamic(t, { start: 1_000, signedExpiry: 1_000 })
+})
+
+test('closing before dynamic responder setup consumption zeroizes owned secrets', async (t) => {
+  const responderStaticSecretKey = b4a.alloc(32, 0xa1)
+  const responderIdentitySecretKey = b4a.alloc(64, 0xa2)
+  const captured = []
+  const originalFrom = b4a.from
+  let dynamicSetup
+  b4a.from = function trackedFrom(value, ...args) {
+    const copied = originalFrom(value, ...args)
+    if (value === responderStaticSecretKey || value === responderIdentitySecretKey) {
+      captured.push(copied)
+    }
+    return copied
+  }
+  try {
+    dynamicSetup = createDynamicResponderSetup({
+      responderStaticSecretKey,
+      responderIdentitySecretKey
+    })
+  } finally {
+    b4a.from = originalFrom
+  }
+  const f = fixture({ dynamic: true, dynamicSetup })
+  await f.rightSession.close()
+  t.is(captured.length, 2)
+  for (const secret of captured) t.alike(secret, b4a.alloc(secret.byteLength))
+  t.exception(() => fixture({ dynamic: true, dynamicSetup }))
+  await f.leftSession.close()
+  f.left.value.destroy()
+  f.right.value.destroy()
+})
+
+test('bad dynamic responder challenge zeroizes consumed setup secrets', async (t) => {
+  let consumedSetup = null
+  const time = clock()
+  const authority = createLinkSetupAuthority({ now: time.now, randomBytes: sequence(0x71) })
+  const responderLinkSetup = {
+    checker: authority.checker,
+    initiate: (...args) => authority.initiate(...args),
+    complete: (...args) => authority.complete(...args),
+    abort: (...args) => authority.abort(...args),
+    revoke: (...args) => authority.revoke(...args),
+    respond(message, setup) {
+      consumedSetup = setup
+      const malformed = b4a.from(message)
+      malformed[malformed.byteLength - 1] ^= 1
+      try {
+        return authority.respond(malformed, setup)
+      } finally {
+        b4a.fill(malformed, 0)
+      }
+    }
+  }
+  const f = fixture({ dynamic: true, responderLinkSetup })
+  const rejected = t.exception(f.leftSession.open())
+  for (let i = 0; i < 20 && consumedSetup === null; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+  t.ok(consumedSetup)
+  t.alike(consumedSetup.responderStaticSecretKey, b4a.alloc(32))
+  t.alike(consumedSetup.responderIdentitySecretKey, b4a.alloc(64))
+  await f.leftSession.close()
+  await rejected
   await f.rightSession.close()
   f.left.value.destroy()
   f.right.value.destroy()

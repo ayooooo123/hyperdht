@@ -8,8 +8,15 @@ const {
   OrderedReceiver,
   SenderCounter
 } = require('../../lib/private/counters')
+const { CellCodec } = require('../../lib/private/cell-codec')
 const guardLinks = require('../../lib/private/guard-link')
-const { BRANCH_CLASS, CELL_CLASS } = require('../../lib/private/protocol')
+const {
+  BRANCH_CLASS,
+  CELL_CLASS,
+  DIRECTION,
+  M3_MESSAGE_ID,
+  encodeM3Object
+} = require('../../lib/private/protocol')
 
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const {
@@ -18,6 +25,7 @@ const {
   abortM3Install,
   beginM3Install,
   commitM3Install,
+  createM3RelayForwardingFacade,
   createM3ForwardingPublicationClaim,
   createM3TailForwardingLease,
   destroyM3TailForwardingPublication,
@@ -127,6 +135,102 @@ function forwardingFacade(destroy = () => {}) {
     diagnostics: () => Object.freeze({ state: 'FORWARDING' }),
     destroy
   })
+}
+
+function relayChannel() {
+  const packets = []
+  const waiters = []
+  let receiveError = null
+  let sendError = null
+  let destroys = 0
+  const value = Object.freeze({
+    send(packet) {
+      packets.push(b4a.from(packet))
+      if (!sendError) return true
+      const error = sendError
+      sendError = null
+      return Promise.reject(error)
+    },
+    receive() {
+      if (receiveError) {
+        const error = receiveError
+        receiveError = null
+        return Promise.reject(error)
+      }
+      return new Promise((resolve, reject) => waiters.push({ resolve, reject }))
+    },
+    destroy() {
+      destroys++
+      for (const waiter of waiters.splice(0)) {
+        waiter.reject(new Error('logical relay channel destroyed'))
+      }
+    }
+  })
+  return {
+    value,
+    packets,
+    deliver(packet) {
+      const waiter = waiters.shift()
+      if (waiter) waiter.resolve(b4a.from(packet))
+      else throw new Error('relay receive is not pending')
+    },
+    fail(error) {
+      const waiter = waiters.shift()
+      if (waiter) waiter.reject(error)
+      else receiveError = error
+    },
+    failSend(error) {
+      sendError = error
+    },
+    get destroys() {
+      return destroys
+    }
+  }
+}
+
+function writeU64(target, value, offset) {
+  for (let index = 7; index >= 0; index--) {
+    target[offset + index] = Number(value & 0xffn)
+    value >>= 8n
+  }
+}
+
+function branchDestroyPacket(state) {
+  const body = b4a.alloc(42)
+  body[0] = state.branchClass
+  body.set(state.branchId, 1)
+  body.set(state.circuitId, 17)
+  writeU64(body, state.generation, 33)
+  body[41] = 1
+  const payload = encodeM3Object({
+    messageId: M3_MESSAGE_ID.BRANCH_DESTROY_V1,
+    body
+  })
+  const context = state.contexts[CELL_CLASS.DATAGRAM].rx
+  const codec = new CellCodec({ crypto: cryptoSuite, cellSize: 1200 })
+  const packet = codec.seal({
+    key: context.key,
+    noncePrefix: context.noncePrefix,
+    senderCounter: new SenderCounter(),
+    class: CELL_CLASS.DATAGRAM,
+    direction: state.initiator ? DIRECTION.REVERSE : DIRECTION.FORWARD,
+    epoch: state.generation,
+    circuitId: state.localId,
+    payload
+  })
+  body.fill(0)
+  payload.fill(0)
+  return packet
+}
+
+async function settleRelayLoss(previousChannel, nextChannel) {
+  for (
+    let attempt = 0;
+    attempt < 20 && (previousChannel.destroys === 0 || nextChannel.destroys === 0);
+    attempt++
+  ) {
+    await Promise.resolve()
+  }
 }
 
 function contexts(initiator) {
@@ -345,6 +449,117 @@ test('installed pair expiry consumes forwarding owner once and cancels both hand
   t.is(nextLink.channel.destroys, 1)
   t.is(clock.fireNext(), false, 'the cancelled sibling callback cannot fire')
   t.is(destroys, 1, 'a cancelled sibling cannot consume the owner again')
+})
+
+test('terminal relay loss retires every installed logical pair after upstream destroy', async (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const previousChannel = relayChannel()
+    const nextChannel = relayChannel()
+    const previousLink = syntheticLink({
+      initiator: false,
+      completeOfferDigest: b4a.alloc(32, 0x80 + attempt * 2),
+      channel: previousChannel,
+      wireExpiresAt: 2_000n
+    })
+    const nextLink = syntheticLink({
+      initiator: true,
+      completeOfferDigest: b4a.alloc(32, 0x81 + attempt * 2),
+      peerIdentity: b4a.alloc(32, 0x90 + attempt),
+      channel: nextChannel,
+      wireExpiresAt: 2_000n
+    })
+    const previous = owner.adopt(previousLink.handle)
+    const next = owner.adopt(nextLink.handle)
+    const forwarding = createM3RelayForwardingFacade(previous.runtime, next.runtime)
+    const plan = beginM3Install(previous.runtime, next.runtime)
+    validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+    const installed = commitM3Install(plan, 2_000n, forwarding)
+
+    nextChannel.fail(new Error('downstream terminal loss'))
+    await settleRelayLoss(previousChannel, nextChannel)
+
+    t.is(previousChannel.packets.length, 1, `loss ${attempt} sends one upstream destroy`)
+    t.is(previousChannel.destroys, 1, `loss ${attempt} releases upstream logical channel`)
+    t.is(nextChannel.destroys, 1, `loss ${attempt} releases downstream logical channel`)
+    t.exception(() => installed.diagnostics(), `loss ${attempt} retires the forwarding owner`)
+  }
+})
+
+test('received BRANCH_DESTROY retires the installed logical pair without a cascade', async (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousChannel = relayChannel()
+  const nextChannel = relayChannel()
+  const previousLink = syntheticLink({
+    initiator: false,
+    completeOfferDigest: b4a.alloc(32, 0xb1),
+    channel: previousChannel,
+    wireExpiresAt: 2_000n
+  })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0xb2),
+    peerIdentity: b4a.alloc(32, 0xb3),
+    channel: nextChannel,
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const forwarding = createM3RelayForwardingFacade(previous.runtime, next.runtime)
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const installed = commitM3Install(plan, 2_000n, forwarding)
+  const packet = branchDestroyPacket(nextLink.state)
+
+  nextChannel.deliver(packet)
+  packet.fill(0)
+  await settleRelayLoss(previousChannel, nextChannel)
+
+  t.is(previousChannel.packets.length, 1, 'received destroy is forwarded upstream once')
+  t.is(nextChannel.packets.length, 0, 'logical cleanup emits no downstream cascade')
+  t.is(previousChannel.destroys, 1)
+  t.is(nextChannel.destroys, 1)
+  t.exception(() => installed.diagnostics(), 'received destroy retires forwarding owner')
+})
+
+test('received BRANCH_DESTROY rejection still retires the installed logical pair', async (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousChannel = relayChannel()
+  const nextChannel = relayChannel()
+  const previousLink = syntheticLink({
+    initiator: false,
+    completeOfferDigest: b4a.alloc(32, 0xc1),
+    channel: previousChannel,
+    wireExpiresAt: 2_000n
+  })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0xc2),
+    peerIdentity: b4a.alloc(32, 0xc3),
+    channel: nextChannel,
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const forwarding = createM3RelayForwardingFacade(previous.runtime, next.runtime)
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const installed = commitM3Install(plan, 2_000n, forwarding)
+  const packet = branchDestroyPacket(nextLink.state)
+  previousChannel.failSend(new Error('upstream destroy propagation rejected'))
+
+  nextChannel.deliver(packet)
+  packet.fill(0)
+  await settleRelayLoss(previousChannel, nextChannel)
+
+  t.is(previousChannel.packets.length, 1, 'propagation is attempted exactly once')
+  t.is(nextChannel.packets.length, 0, 'failed propagation emits no cascade')
+  t.is(previousChannel.destroys, 1)
+  t.is(nextChannel.destroys, 1)
+  t.exception(() => installed.diagnostics(), 'rejected propagation retires forwarding owner')
 })
 
 test('forwarding publication claim and lease require object-identical synchronous take', (t) => {

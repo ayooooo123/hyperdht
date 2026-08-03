@@ -7,6 +7,8 @@ const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const {
   TEST_ISOLATED_ADDRESS_GRANT_SIZE,
+  TEST_ONLY_DHT_EXIT_TOPOLOGY_ISSUER,
+  consumeTestDhtExitReferralGrant,
   decodeTestIsolatedAddressGrant,
   digestTestIsolatedAddressTuple,
   encodeTestIsolatedAddressGrant,
@@ -130,4 +132,53 @@ test('test isolated address grant verification is exact and expires', (t) => {
       }),
     'ERR_AUTHENTICATION'
   )
+})
+
+test('test isolated referral grant capability consumes exact role generation and candidate once', (t) => {
+  const pair = cryptoSuite.keyPair(seed(0x11))
+  const candidate = {
+    tuple: { host: '127.64.10.1', port: 42_010 },
+    id: seed(0x12),
+    exitRole: 4,
+    generation: 3n
+  }
+  const tupleDigest = digestTestIsolatedAddressTuple(candidate)
+  const grant = encodeTestIsolatedAddressGrant(
+    {
+      runNonce: seed(0x13, 16),
+      exitRole: 4,
+      generation: 3n,
+      grantSequence: 5n,
+      expiresAt: 5_000n,
+      tupleDigest
+    },
+    pair.secretKey
+  )
+  const authority = TEST_ONLY_DHT_EXIT_TOPOLOGY_ISSUER.referralGrant(grant, pair.publicKey, {
+    runNonce: seed(0x13, 16),
+    exitRole: 4,
+    generation: 3n,
+    tupleDigest,
+    now: 1_000n
+  })
+  expectCode(
+    t,
+    () =>
+      consumeTestDhtExitReferralGrant(authority, {
+        ...candidate,
+        exitRole: 6
+      }),
+    'ERR_AUTHENTICATION'
+  )
+  expectCode(t, () => consumeTestDhtExitReferralGrant(authority, candidate), 'ERR_REPLAY')
+
+  const accepted = TEST_ONLY_DHT_EXIT_TOPOLOGY_ISSUER.referralGrant(grant, pair.publicKey, {
+    runNonce: seed(0x13, 16),
+    exitRole: 4,
+    generation: 3n,
+    tupleDigest,
+    now: 1_000n
+  })
+  t.is(consumeTestDhtExitReferralGrant(accepted, candidate), true)
+  expectCode(t, () => consumeTestDhtExitReferralGrant(accepted, candidate), 'ERR_REPLAY')
 })

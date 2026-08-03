@@ -456,7 +456,8 @@ function linkSessionOptions(links, side) {
     cancel: clearTimeout,
     randomBytes: sequence(initiate ? 1 : 11),
     absoluteDeadline: 10_000,
-    signedExpiry: 60_000
+    signedExpiry: 60_000,
+    authorizedExpiry: 60_000
   }
 }
 
@@ -810,7 +811,7 @@ test('route extension uses registered M3 tail-control envelopes from a real inde
       extensionIndex: 1,
       limits: Object.freeze({}),
       absoluteDeadline: 15_000n,
-      signedExpiry: 15_000n,
+      signedExpiry: 6_000n,
       cancel() {},
       tailControl: tail.initiatorSession
     })
@@ -931,7 +932,7 @@ test('route extension deadline rejects before a responder answer arrives', async
       extensionIndex: 1,
       limits: Object.freeze({}),
       absoluteDeadline: 15_000n,
-      signedExpiry: 15_000n,
+      signedExpiry: 6_000n,
       wallNow: clock.wallNow,
       monotonicNow: clock.monotonicNow,
       randomBytes: (() => {

@@ -3,6 +3,7 @@
 const test = require('brittle')
 const b4a = require('b4a')
 
+const { BootstrapEnvelopeCodec } = require('../../lib/private/bootstrap-envelope')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const {
   DatagramReplayWindow,
@@ -18,8 +19,16 @@ const {
   createExtensionResponseReceiver,
   destroyExtensionOfferReceiver
 } = require('../../lib/private/extension-setup-channel')
+const { createLinkSetupAuthority } = require('../../lib/private/link-setup')
 const { encodeM3ContextEnvelope } = require('../../lib/private/m3-context')
-const { M3AdjacencyAuthority, deriveM3CellIds } = require('../../lib/private/m3-adjacency-runtime')
+const {
+  M3AdjacencyAuthority,
+  beginM3Install,
+  commitM3Install,
+  createM3RelayForwardingFacade,
+  deriveM3CellIds,
+  validateM3Install
+} = require('../../lib/private/m3-adjacency-runtime')
 const { createM3ResponderAdopter } = require('../../lib/private/m3-adjacency-adopter')
 const {
   decodeRelayCapabilityAdvertisement,
@@ -45,16 +54,21 @@ const {
   M3_MESSAGE_ID,
   RELAY_CAPABILITY,
   ROLE,
+  LINK_OPERATION,
+  PROTOCOL_VERSION,
+  TOPOLOGY_ROLE,
   decodeM3Object,
   encodeM3Object,
   roleForIdentity
 } = require('../../lib/private/protocol')
 const {
   abortExtensionAdjacentLink,
+  abortExtensionLinkCompletion,
   abortIndexZeroGuardLink,
   answerAcceptedExtensionReplay,
   completeIndexZeroGuardLink,
   createExtensionAdjacentLinkFactory,
+  createExtensionLinkResponder,
   openExtensionAdjacentLink,
   createIndexZeroGuardLinkOffer,
   createIndexZeroGuardLinkResponder,
@@ -70,10 +84,14 @@ const {
   takeExtensionResponderAdjacency
 } = require('../../lib/private/guard-link')
 const extensionGuardLinks = require('../../lib/private/guard-link')
+const { LinkDirectory, signTopologyGrant } = require('../../lib/private/topology-grant')
+const { selectUdxLoopbackHosts } = require('../../lib/private/udx-adapter')
+const endpointModule = require('../../lib/private/udx-cell-endpoint')
 const {
   createExtensionResponderSigner,
   createLinkOfferSigner,
   createRelayIdentitySigningAuthority,
+  createTailReadySigner,
   destroyLinkOfferSigner,
   destroyRelayIdentitySigningAuthority,
   signLinkAccept
@@ -81,17 +99,26 @@ const {
 const {
   admitTailExtend,
   borrowTailControlTransport,
+  completeTailExtend,
   createTailControlResponderAuthority,
+  createSuccessorTailReadyContext,
   createTailControlSession,
   destroyTailControlResponderAuthority,
   destroyTailControlSession,
   encodeTailControlTranscript,
+  openTailAdjacentLink,
+  sealTailReady,
+  sealSuccessorTailReady,
   takeAdmittedExtendRequest
 } = require('../../lib/private/tail-control')
+const { createTailExtensionCommitter } = require('../../lib/private/tail-extension-committer')
 
 const TEST_ONLY_COUNTER_FACTORY = Symbol.for('hyperdht-private-routes/test-only-counter-factory')
 const TEST_ONLY_M3_ESTABLISHED_ISSUER = Symbol.for(
   'hyperdht-private-routes/test-only-m3-established-issuer'
+)
+const TAKE_STAGED_RELAY_ADJACENT_OFFER = Symbol.for(
+  'hyperdht-private-routes/relay-adjacent-staged-offer-taker'
 )
 
 const LINK_OFFER_SIZE = 374
@@ -322,6 +349,191 @@ function exactFactoryOptions(dialAuthority, linkOfferSigner, destroy, callbacks 
     destroy
   }
 }
+let nativeAdjacentPort = 49300
+
+async function nativeAdjacentPair(currentIdentity, nextIdentity) {
+  const platform = global.Bare ? Bare.platform : process.platform
+  const [leftHost, rightHost] = selectUdxLoopbackHosts({ platform })
+  const leftPort = nativeAdjacentPort
+  const rightPort = nativeAdjacentPort + 1
+  nativeAdjacentPort += 2
+  const grantAuthority = cryptoSuite.keyPair(seed(0xd1))
+  const runId32 = seed(0xd2)
+  const grant = signTopologyGrant(
+    {
+      version: PROTOCOL_VERSION,
+      format: 0,
+      grantId32: seed(0xd3),
+      endpointA: {
+        identity32: currentIdentity.publicKey,
+        role: TOPOLOGY_ROLE.SAFETY_FINAL,
+        host: leftHost,
+        port: leftPort,
+        operations: LINK_OPERATION.INITIATE
+      },
+      endpointB: {
+        identity32: nextIdentity.publicKey,
+        role: TOPOLOGY_ROLE.PRIVATE_ENTRY,
+        host: rightHost,
+        port: rightPort,
+        operations: LINK_OPERATION.ACCEPT
+      },
+      epoch: 1n,
+      notBefore: 0n,
+      expiresAt: 60_000n,
+      runId32
+    },
+    grantAuthority.secretKey
+  )
+  const makeHandle = (local, peer, localRole, peerRole, operation) => {
+    const directory = new LinkDirectory({
+      localIdentity32: local.publicKey,
+      localRole,
+      authorityPublicKey: grantAuthority.publicKey,
+      epoch: 1n,
+      runId32,
+      now: () => 1n,
+      schedule: setTimeout,
+      cancel: clearTimeout,
+      onClose() {}
+    })
+    const digest32 = directory.add(grant)
+    return {
+      directory,
+      handle: directory.authorize({
+        digest32,
+        operation,
+        localIdentity32: local.publicKey,
+        localRole,
+        peerIdentity32: peer.publicKey,
+        peerRole,
+        epoch: 1n,
+        runId32
+      })
+    }
+  }
+  const leftHandle = makeHandle(
+    currentIdentity,
+    nextIdentity,
+    TOPOLOGY_ROLE.SAFETY_FINAL,
+    TOPOLOGY_ROLE.PRIVATE_ENTRY,
+    LINK_OPERATION.INITIATE
+  )
+  const rightHandle = makeHandle(
+    nextIdentity,
+    currentIdentity,
+    TOPOLOGY_ROLE.PRIVATE_ENTRY,
+    TOPOLOGY_ROLE.SAFETY_FINAL,
+    LINK_OPERATION.ACCEPT
+  )
+  let leftSession = null
+  let rightSession = null
+  const left = new endpointModule.UdxCellEndpoint({
+    host: leftHost,
+    port: leftPort,
+    onBootstrap(packet) {
+      if (leftSession) void leftSession.receive(packet)
+    },
+    onCell() {
+      return true
+    },
+    onLinkFailure() {}
+  })
+  const right = new endpointModule.UdxCellEndpoint({
+    host: rightHost,
+    port: rightPort,
+    onBootstrap(packet) {
+      if (rightSession) void rightSession.receive(packet)
+    },
+    onCell() {
+      return true
+    },
+    onLinkFailure() {}
+  })
+  await left.bind()
+  await right.bind()
+  const responderStatic = cryptoSuite.encryptionKeyPair(seed(0xd4))
+  const started = Date.now()
+  const now = () => Date.now() - started
+  let random = 0xd5
+  const randomBytes = (size) => b4a.alloc(size, random++)
+  return {
+    endpoint: encodeCanonicalEndpoint({
+      addressFamily: rightHost.includes(':') ? 6 : 4,
+      addressBytes: rightHost.includes(':')
+        ? b4a.from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        : b4a.from(rightHost.split('.').map(Number)),
+      port: rightPort
+    }),
+    async open(branch) {
+      const common = {
+        circuitId: b4a.from(branch.circuitId),
+        epoch: 1n,
+        initiatorIdentity: currentIdentity.publicKey,
+        responderIdentity: nextIdentity.publicKey,
+        initiatorLocalId: b4a.alloc(16, 0xd6),
+        responderLocalId: b4a.alloc(16, 0xd7),
+        expiresAt: 60_000n
+      }
+      rightSession = right.openLink(rightHandle.handle, {
+        mode: 'accept',
+        codec: new BootstrapEnvelopeCodec({
+          linkHandle: rightHandle.handle,
+          localIdentitySecretKey: nextIdentity.secretKey,
+          padding: randomBytes
+        }),
+        linkSetup: createLinkSetupAuthority({ now, randomBytes }),
+        setup: {
+          ...common,
+          responderStaticSecretKey: responderStatic.secretKey,
+          responderIdentitySecretKey: nextIdentity.secretKey
+        },
+        now,
+        schedule: setTimeout,
+        cancel: clearTimeout,
+        randomBytes,
+        absoluteDeadline: 10_000,
+        signedExpiry: 60_000,
+        authorizedExpiry: 60_000
+      })
+      leftSession = left.openLink(leftHandle.handle, {
+        mode: 'initiate',
+        codec: new BootstrapEnvelopeCodec({
+          linkHandle: leftHandle.handle,
+          localIdentitySecretKey: currentIdentity.secretKey,
+          padding: randomBytes
+        }),
+        linkSetup: createLinkSetupAuthority({ now, randomBytes }),
+        setup: {
+          ...common,
+          responderStaticKey: responderStatic.publicKey,
+          initiatorIdentitySecretKey: currentIdentity.secretKey
+        },
+        now,
+        schedule: setTimeout,
+        cancel: clearTimeout,
+        randomBytes,
+        absoluteDeadline: 10_000,
+        signedExpiry: 60_000,
+        authorizedExpiry: 60_000
+      })
+      const leftEstablished = await leftSession.open()
+      if (!rightSession.established) throw new Error('native adjacent responder did not establish')
+      return {
+        initiator: endpointModule.createM3CellLinkTransferIssuer(left, leftEstablished),
+        responder: endpointModule.createM3CellLinkTransferIssuer(right, rightSession.established)
+      }
+    },
+    async destroy() {
+      if (leftSession) await leftSession.close().catch(() => {})
+      if (rightSession) await rightSession.close().catch(() => {})
+      await left.close().catch(() => {})
+      await right.close().catch(() => {})
+      leftHandle.directory.destroy()
+      rightHandle.directory.destroy()
+    }
+  }
+}
 
 function tailClock({ wall = NOW, monotonic = 10_000n } = {}) {
   let currentWall = wall
@@ -475,7 +687,7 @@ function issueTailLink(advertisement, requestedLimits, overrides = {}) {
       circuitId: b4a.alloc(16, 0x42),
       generation: 7n,
       extensionIndex: 1,
-      localIdentity: initiator ? b4a.alloc(32, 0x51) : decoded.relayIdentity,
+      localIdentity: initiator ? b4a.alloc(32, 0x51) : b4a.from(decoded.relayIdentity),
       peerIdentity: b4a.alloc(32, 0x52),
       expiresAt: 20_000n,
       contexts: context.values,
@@ -512,7 +724,7 @@ function tailControlEnvelope(encoded) {
   })
 }
 
-async function admittedExtensionFixture() {
+async function admittedExtensionFixture(options = {}) {
   const clock = tailClock()
   const currentIdentity = identityForRole(ROLE.SAFETY, 50)
   const nextIdentity = identityForRole(ROLE.PRIVATE, 80)
@@ -523,11 +735,13 @@ async function admittedExtensionFixture() {
     addressBytes: b4a.from([192, 0, 2, 51]),
     port: 44_051
   })
-  const nextEndpoint = encodeCanonicalEndpoint({
-    addressFamily: 4,
-    addressBytes: b4a.from([192, 0, 2, 80]),
-    port: 44_080
-  })
+  const nextEndpoint =
+    options.nextEndpoint ||
+    encodeCanonicalEndpoint({
+      addressFamily: 4,
+      addressBytes: b4a.from([192, 0, 2, 80]),
+      port: 44_080
+    })
   const currentAdvertisement = privateRouteAdvertisement(
     currentIdentity,
     currentRoute,
@@ -577,20 +791,24 @@ async function admittedExtensionFixture() {
     schedule: clock.schedule,
     cancelScheduled: clock.cancelScheduled
   })
+  const responderOptions =
+    typeof options.createResponderOptions === 'function'
+      ? options.createResponderOptions({ clock, owner, responder, responderSession })
+      : {
+          wallNow: clock.wallNow,
+          monotonicNow: clock.monotonicNow,
+          adjacencyAdopter: Object.freeze({}),
+          extensionCommitter: Object.freeze({}),
+          adjacentLinkFactory: Object.freeze({}),
+          tailReadySigner: Object.freeze({}),
+          randomBytes: () => b4a.alloc(32, 0x72),
+          schedule: clock.schedule,
+          cancelScheduled: clock.cancelScheduled
+        }
   const authority = createTailControlResponderAuthority(
     responderSession,
     responder.responderToken,
-    {
-      wallNow: clock.wallNow,
-      monotonicNow: clock.monotonicNow,
-      adjacencyAdopter: Object.freeze({}),
-      extensionCommitter: Object.freeze({}),
-      adjacentLinkFactory: Object.freeze({}),
-      tailReadySigner: Object.freeze({}),
-      randomBytes: () => b4a.alloc(32, 0x72),
-      schedule: clock.schedule,
-      cancelScheduled: clock.cancelScheduled
-    }
+    responderOptions
   )
   const encoded = initiatorSession.sealExtend({
     advertisement: nextAdvertisement,
@@ -605,8 +823,14 @@ async function admittedExtensionFixture() {
   const admitted = admitTailExtend(authority, received)
   return {
     admitted,
+    authority,
+    responder,
+    initiatorSession,
+    responderSession,
     clock,
     currentIdentity,
+    nextIdentity,
+    nextRoute,
     nextAdvertisement,
     nextEndpoint,
     cleanup() {
@@ -1215,6 +1439,8 @@ test('extension adjacent open consumes honest admission before dialing canonical
   let socketDestroyed = 0
   let factoryDestroyed = 0
   let replayDuringDial = null
+  let stagedOffer = null
+  let stagedReplay = null
   let dialEndpoint = null
   const socketOwner = Object.freeze({ tag: 'socket-owner' })
   const authority = createRelayAdjacentDialAuthority({
@@ -1223,6 +1449,10 @@ test('extension adjacent open consumes honest admission before dialing canonical
     dial(owner, endpoint) {
       t.is(owner, socketOwner, 'dial receives only the retained socket owner')
       dialEndpoint = b4a.from(endpoint)
+      stagedOffer = extensionGuardLinks[TAKE_STAGED_RELAY_ADJACENT_OFFER](owner, endpoint)
+      stagedReplay = errorCode(() =>
+        extensionGuardLinks[TAKE_STAGED_RELAY_ADJACENT_OFFER](owner, endpoint)
+      )
       replayDuringDial = errorCode(() => takeAdmittedExtendRequest(x.admitted)) !== null
       return Promise.reject(new Error('synthetic dial failure'))
     },
@@ -1250,9 +1480,294 @@ test('extension adjacent open consumes honest admission before dialing canonical
   }
   t.is(replayDuringDial, true, 'admission is consumed before the first external dial callback')
   t.alike(dialEndpoint, x.nextEndpoint, 'dial receives the advertisement canonical endpoint')
+  t.is(decodeM3Object(stagedOffer).messageId, M3_MESSAGE_ID.LINK_OFFER_V1)
+  t.is(stagedReplay, 'ERR_REPLAY', 'staged LINK_OFFER is exact-owner one-shot')
   t.is(code, 'ROUTE_UNAVAILABLE', 'post-invocation dial rejection is normalized')
   t.is(socketDestroyed, 1, 'dial failure spends the socket owner once')
   t.is(factoryDestroyed, 1, 'eventual factory destroy spends the factory owner once')
+})
+
+test('extension adjacent factory completes production responder proof over native UDX ownership', async (t) => {
+  const currentIdentity = identityForRole(ROLE.SAFETY, 50)
+  const nextIdentity = identityForRole(ROLE.PRIVATE, 80)
+  const native = await nativeAdjacentPair(currentIdentity, nextIdentity)
+  const x = await admittedExtensionFixture({ nextEndpoint: native.endpoint })
+  const currentSignerOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: x.currentIdentity.secretKey
+  })
+  const nextSignerOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: x.nextIdentity.secretKey
+  })
+  const linkOfferSigner = createLinkOfferSigner(currentSignerOwner)
+  const proofAuthority = createRedactedResponderProofAuthority({ now: x.clock.wallNow })
+  const responderAuthority = tailAuthority(x.clock)
+  let extensionResponder = null
+  let dialFailure = null
+  const socketOwner = Object.freeze({})
+  const dialAuthority = createRelayAdjacentDialAuthority({
+    socketOwner,
+    allowedRole: ROLE.PRIVATE,
+    async dial(owner, endpoint) {
+      try {
+        const offer = extensionGuardLinks[TAKE_STAGED_RELAY_ADJACENT_OFFER](owner, endpoint)
+        const channels = await native.open({
+          circuitId: b4a.alloc(16, 0x42),
+          generation: 7n
+        })
+        const responses = []
+        const inbound = [offer, null]
+        const offerReceiver = createExtensionOfferReceiver({
+          observedPredecessorEndpoint: encodeCanonicalEndpoint({
+            addressFamily: 4,
+            addressBytes: b4a.from([127, 0, 0, 1]),
+            port: 49_299
+          }),
+          receiveObject: () => inbound.shift(),
+          takePhysicalChannel: () => channels.responder,
+          sendObject: (value) => responses.push(b4a.from(value)),
+          finish: () => responses.push(null),
+          destroy() {}
+        })
+        extensionResponder = createExtensionLinkResponder({
+          advertisement: x.nextAdvertisement,
+          adjacencyAdopter: responderAuthority.responderAdopter(),
+          extensionResponderSigner: createExtensionResponderSigner(nextSignerOwner),
+          responderRouteEncryptionSecretKey: x.nextRoute.secretKey,
+          wallNow: x.clock.wallNow,
+          monotonicNow: x.clock.monotonicNow,
+          schedule: x.clock.schedule,
+          cancelScheduled: x.clock.cancelScheduled,
+          offerReceiver,
+          randomBytes: (size) => b4a.alloc(size, 0xe1)
+        })
+        const accepted = extensionResponder.accept()
+        t.ok(accepted.accepted, 'production responder adopts the native adjacent link')
+        return createExtensionResponseReceiver({
+          receiveObject: () => responses.shift(),
+          takePhysicalChannel: () => channels.initiator,
+          destroy() {}
+        })
+      } catch (err) {
+        dialFailure = err
+        throw err
+      }
+    },
+    destroy() {}
+  })
+  const factory = createExtensionAdjacentLinkFactory({
+    dialAuthority,
+    linkOfferSigner,
+    proofVerifier: proofAuthority.verifier,
+    proofConsumer: proofAuthority.consumer,
+    wallNow: x.clock.wallNow,
+    monotonicNow: x.clock.monotonicNow,
+    randomBytes: (size) => b4a.alloc(size, 0xe2),
+    schedule: x.clock.schedule,
+    cancelScheduled: x.clock.cancelScheduled,
+    destroy() {}
+  })
+  try {
+    let completion = null
+    try {
+      completion = await openExtensionAdjacentLink(factory, x.admitted)
+    } catch (err) {
+      throw dialFailure || err
+    }
+    t.is(abortExtensionLinkCompletion(completion), true, 'verified native completion is owned')
+  } finally {
+    destroyExtensionAdjacentLinkFactory(factory)
+    if (extensionResponder) extensionResponder.destroy()
+    destroyRelayIdentitySigningAuthority(currentSignerOwner)
+    destroyRelayIdentitySigningAuthority(nextSignerOwner)
+    x.cleanup()
+    await native.destroy()
+  }
+})
+
+test('TailControl responder installs a native next tail through production extension ownership', async (t) => {
+  const currentIdentity = identityForRole(ROLE.SAFETY, 50)
+  const nextIdentity = identityForRole(ROLE.PRIVATE, 80)
+  const native = await nativeAdjacentPair(currentIdentity, nextIdentity)
+  const currentSignerOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: currentIdentity.secretKey
+  })
+  const nextSignerOwner = createRelayIdentitySigningAuthority({
+    identitySecretKey: nextIdentity.secretKey
+  })
+  const proofAuthority = createRedactedResponderProofAuthority({ now: () => NOW })
+  let targetAuthority = null
+  let extensionResponder = null
+  let targetAdjacency = null
+  let replayOwner = null
+  let responderTransport = null
+  let successorAuthority = null
+  let successorTail = null
+  let successorTransport = null
+  let installFailure = null
+  const sends = []
+  const x = await admittedExtensionFixture({
+    nextEndpoint: native.endpoint,
+    createResponderOptions({ clock, owner, responder, responderSession }) {
+      targetAuthority = tailAuthority(clock)
+      responderTransport = borrowTailControlTransport(responderSession)
+      const socketOwner = Object.freeze({})
+      const dialAuthority = createRelayAdjacentDialAuthority({
+        socketOwner,
+        allowedRole: ROLE.PRIVATE,
+        async dial(socket, endpoint) {
+          try {
+            const offer = extensionGuardLinks[TAKE_STAGED_RELAY_ADJACENT_OFFER](socket, endpoint)
+            const channels = await native.open({
+              circuitId: b4a.alloc(16, 0x42),
+              generation: 7n
+            })
+            const inbound = [offer, null]
+            const responses = []
+            const offerReceiver = createExtensionOfferReceiver({
+              observedPredecessorEndpoint: encodeCanonicalEndpoint({
+                addressFamily: 4,
+                addressBytes: b4a.from([127, 0, 0, 1]),
+                port: 49_298
+              }),
+              receiveObject: () => inbound.shift(),
+              takePhysicalChannel: () => channels.responder,
+              sendObject: (value) => responses.push(b4a.from(value)),
+              finish: () => responses.push(null),
+              destroy() {}
+            })
+            extensionResponder = createExtensionLinkResponder({
+              advertisement: x.nextAdvertisement,
+              adjacencyAdopter: targetAuthority.responderAdopter(),
+              extensionResponderSigner: createExtensionResponderSigner(nextSignerOwner),
+              responderRouteEncryptionSecretKey: x.nextRoute.secretKey,
+              wallNow: clock.wallNow,
+              monotonicNow: clock.monotonicNow,
+              schedule: clock.schedule,
+              cancelScheduled: clock.cancelScheduled,
+              offerReceiver,
+              randomBytes: (size) => b4a.alloc(size, 0xe3)
+            })
+            const accepted = extensionResponder.accept()
+            const transfer = takeExtensionResponderAdjacency(extensionResponder, accepted.accepted)
+            const moved = takeAcceptedExtensionAdjacencyTransfer(transfer)
+            targetAdjacency = moved.adjacency
+            replayOwner = moved.replayOwner
+            successorTail = createTailControlSession(targetAdjacency.tail, {
+              wallNow: clock.wallNow,
+              monotonicNow: clock.monotonicNow,
+              crypto: cryptoSuite,
+              schedule: clock.schedule,
+              cancelScheduled: clock.cancelScheduled
+            })
+            successorAuthority = createTailControlResponderAuthority(
+              successorTail,
+              targetAdjacency.responderToken,
+              {
+                tailReadySigner: createTailReadySigner(nextSignerOwner),
+                wallNow: clock.wallNow,
+                monotonicNow: clock.monotonicNow,
+                randomBytes: (size) => b4a.alloc(size, 0xe6),
+                schedule: clock.schedule,
+                cancelScheduled: clock.cancelScheduled
+              }
+            )
+            successorTransport = borrowTailControlTransport(successorTail)
+            return createExtensionResponseReceiver({
+              receiveObject: () => responses.shift(),
+              takePhysicalChannel: () => channels.initiator,
+              destroy() {}
+            })
+          } catch (err) {
+            installFailure = err
+            throw err
+          }
+        },
+        destroy() {}
+      })
+      const adjacentLinkFactory = createExtensionAdjacentLinkFactory({
+        dialAuthority,
+        linkOfferSigner: createLinkOfferSigner(currentSignerOwner),
+        proofVerifier: proofAuthority.verifier,
+        proofConsumer: proofAuthority.consumer,
+        wallNow: clock.wallNow,
+        monotonicNow: clock.monotonicNow,
+        randomBytes: (size) => b4a.alloc(size, 0xe4),
+        schedule: clock.schedule,
+        cancelScheduled: clock.cancelScheduled,
+        destroy() {}
+      })
+      const extensionCommitter = createTailExtensionCommitter({
+        enqueue(envelope) {
+          sends.push(responderTransport.send(envelope))
+        },
+        install(nextRuntime) {
+          try {
+            const forwarding = createM3RelayForwardingFacade(responder.runtime, nextRuntime)
+            const plan = beginM3Install(responder.runtime, nextRuntime)
+            validateM3Install(plan, currentIdentity.publicKey, 128, clock.wallNow())
+            return commitM3Install(plan, 4_500n, forwarding)
+          } catch (err) {
+            installFailure = err
+            throw err
+          }
+        },
+        destroy() {}
+      })
+      return {
+        adjacencyAdopter: owner.responderAdopter(),
+        extensionCommitter,
+        adjacentLinkFactory,
+        tailReadySigner: null,
+        wallNow: clock.wallNow,
+        monotonicNow: clock.monotonicNow,
+        randomBytes: (size) => b4a.alloc(size, 0xe5),
+        schedule: clock.schedule,
+        cancelScheduled: clock.cancelScheduled
+      }
+    }
+  })
+  const successorReadyContext = createSuccessorTailReadyContext(x.authority, x.admitted)
+  try {
+    let completion = null
+    try {
+      completion = await openTailAdjacentLink(x.authority, x.admitted)
+    } catch (err) {
+      throw installFailure || err
+    }
+    let extended = null
+    try {
+      extended = completeTailExtend(x.authority, completion)
+    } catch (err) {
+      throw installFailure || err
+    }
+    t.alike(extended.byteLength, 1101)
+    await Promise.all(sends)
+    t.exception(
+      () => sealTailReady(x.authority),
+      'current relay cannot sign for the successor identity'
+    )
+    const ready = sealSuccessorTailReady(successorAuthority, successorReadyContext)
+    t.is(ready.byteLength, 282)
+    await successorTransport.send(tailControlEnvelope(ready))
+    const forwardedReady = await borrowTailControlTransport(x.initiatorSession).receive()
+    t.is(forwardedReady.byteLength, 1101, 'successor TAIL_READY traverses installed forwarding')
+    t.ok(targetAdjacency && targetAdjacency.tail, 'next relay owns the installed TailControl')
+    t.ok(targetAdjacency && targetAdjacency.runtime, 'next relay owns the installed runtime')
+  } finally {
+    x.cleanup()
+    if (successorAuthority) destroyTailControlResponderAuthority(successorAuthority)
+    if (successorTail) destroyTailControlSession(successorTail)
+    if (extensionResponder) extensionResponder.destroy()
+    destroyAcceptedExtensionAdjacencyOwner(replayOwner)
+    if (targetAdjacency) {
+      try {
+        targetAdjacency.runtime.destroy()
+      } catch {}
+    }
+    destroyRelayIdentitySigningAuthority(currentSignerOwner)
+    destroyRelayIdentitySigningAuthority(nextSignerOwner)
+    await native.destroy()
+  }
 })
 
 test('extension adjacent abort finalizes an unsettled relay dial', async (t) => {
