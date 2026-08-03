@@ -141,6 +141,11 @@ function tupleForRole(roleIndex) {
   }
   throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
 }
+// An exit reaches DHT nodes from its dedicated DHT-exit socket, so that is the
+// tuple a DHT node observes as the source, not the exit's cell endpoint.
+function exitDhtTupleForRole(roleIndex) {
+  return Object.freeze({ host: tupleForRole(roleIndex).host, port: 43_000 + roleIndex })
+}
 
 function planCapability() {
   if (projection.plan === PROCESS_PLANS.PORTABLE_LOOPBACK.name) {
@@ -492,7 +497,15 @@ async function createDhtOwner() {
       maximumCorrelations: 64,
       maximumEvents: 16,
       monotonicNow: runtime.monotonicNow,
-      permittedTuples: [tupleForRole(9), tupleForRole(11)],
+      // Seed and value are its DHT peers; the three exits reach it from their
+      // DHT-exit sockets, which ALLOW_EDGES already permits.
+      permittedTuples: [
+        tupleForRole(9),
+        tupleForRole(11),
+        exitDhtTupleForRole(4),
+        exitDhtTupleForRole(6),
+        exitDhtTupleForRole(8)
+      ],
       phaseSequence: () => phaseSequence,
       randomBytes,
       source: projection.bind,

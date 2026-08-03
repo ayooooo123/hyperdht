@@ -4,7 +4,7 @@
 
 This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
 
-Direct mode remains the only public behavior. Gate 3B1 Task 15 has a package-private required-mode controller, authenticated native route authority, routed immutable-get request/reply path, rotation, suspension, and teardown; Tasks 16 and 17 add test-only process isolation and prove that path live across eleven separate Node or Bare role processes over native UDX. The root package still exposes no private-routing constructor or user-selectable required mode. No post-readiness packet-capture proof or anonymity claim exists; the deterministic, hosted, and eleven-process tests do not establish resistance to traffic analysis or suitability for protecting users.
+Direct mode remains the only public behavior. Gate 3B1 Task 15 has a package-private required-mode controller, authenticated native route authority, routed immutable-get request/reply path, rotation, suspension, and teardown; Tasks 16 and 17 add test-only process isolation and prove that path live across eleven separate Node or Bare role processes over native UDX, and, on Linux, with every role in its own network namespace under packet capture. The root package still exposes no private-routing constructor or user-selectable required mode. A post-readiness packet-capture proof now exists for the specific properties tabulated in [Task 17 wire-level privacy evidence](#gate-3b1-task-17-wire-level-privacy-evidence). It is not a general anonymity claim: a global passive observer and timing correlation by colluding guards and exits are out of scope for v1, no cover traffic exists, and these tests do not establish suitability for protecting users.
 
 The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
 
@@ -370,10 +370,65 @@ and owner corrections, each of which is now part of the proof:
   the TIDs of the pre-suspend session and have its replies dropped as duplicates.
 
 One environment boundary remains: macOS cannot bind the `127.64.x.1` role tuples,
-so both live suites stop at the first bind with `PROCESS_BIND_UNAVAILABLE` there
-(`866/868` tests, `18,079/18,081` assertions under Node on Darwin). Every other
-private suite is green on Darwin, and `test/private-routing.js` is fully green
-under both runtimes on Linux (`868/868` Node, `854/854` Bare).
+so both portable live suites stop at the first bind with
+`PROCESS_BIND_UNAVAILABLE` there (`866/868` tests, `18,096/18,098` assertions
+under Node on Darwin). Every other private suite is green on Darwin, and
+`test/private-routing.js` is fully green under both runtimes on Linux
+(`868/868` Node, `854/854` Bare).
+
+### Gate 3B1 Task 17 wire-level privacy evidence
+
+`test/private/live-namespace-node.js` runs the same eleven-process scenario with
+every role in its own Linux network namespace, captures every packet on every
+veth, and decides the result from the captured bytes rather than from the
+implementation's own accounting. It passes `135/135` assertions on Linux.
+
+Isolation is structural, not asserted. Each role holds routes only to the peers
+named by `ALLOW_EDGES`, and the root namespace forwards under a dedicated
+iptables chain that ends in DROP for those devices. The endpoint's routing table
+contains exactly one destination, its guard, and no default route, so a datagram
+addressed anywhere else has no path rather than an unenforced prohibition.
+
+The scenario is the full lifecycle, including the failure paths: bootstrap,
+guard pinning, two branches, three exact immutable gets, a physical link fault
+with rotation, suspend and resume, a terminal network change, a guard fault, and
+ordered teardown. What the capture shows across all of it:
+
+| Observed on the wire                                                      | Assertion                                                         |
+| ------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| No datagram crossed a pair the topology forbids                           | `no datagram crosses a pair the topology forbids`                 |
+| The kernel refused nothing, so no role even addressed a forbidden pair    | `the kernel refused no packet between roles`                      |
+| The endpoint's only destination, for the entire run, is its guard         | `the endpoint only ever sends to its guard`                       |
+| The endpoint's encoded address never appears inside a cell past its guard | `the endpoint address never travels inside a cell past its guard` |
+| No identity key, route key, MAC key or sentinel appears in any payload    | `no leak marker appears on any edge that carries route cells`     |
+| No cell payload repeats on a second hop, so each hop re-encrypts          | `no cell payload is relayed unchanged across two hops`            |
+| Every route cell is 1,200 bytes on every hop, on every edge               | `every route cell is the same size on every hop`                  |
+
+The leak search is checked against itself. The retrieved value is deliberately
+visible where the design says it must be, between an exit and a DHT node, and
+`the value search is not vacuous` fails if the same search stops finding it. The
+auditor/decoy namespace pair plays the same role for the capture harness in
+`test/private/namespace-projection.js`: a capture that observes nothing there is
+a broken harness, not a private route.
+
+This supports a scoped claim and nothing wider. Under the
+[v1 active-relay adversary](private-routing-v1.md#active-relay-adversary), where
+any single guard, middle, exit or storage node may be malicious, these
+[protected properties](private-routing-v1.md#protected-properties) now have
+packet-level evidence: the endpoint has no direct send authority after
+readiness, no failure path produces direct fallback, and private-capable peers
+do not learn one another's addresses. The remaining protected properties are
+semantic and stay covered by the deterministic suites, not by capture.
+
+What this is still not. Every v1
+[out-of-scope](private-routing-v1.md#out-of-scope-for-v1) item is untouched: a
+global passive observer, timing correlation by colluding guards and exits, Sybil
+resistance, and query privacy from exits. Uniform cell size removes length as a
+correlator, but the capture records timing and packet counts per edge, and
+nothing in this gate pads, batches, or adds cover traffic. An adversary watching
+two edges can still correlate them. That is a v1 design boundary, not a test
+gap, and it is the reason this remains an experimental, package-private slice
+with no anonymity claim beyond the table above.
 
 Role clocks are supplied by `test/private/process/runtime-clock.js`. Wall and
 monotonic time are derived from one cached sample of a single counter because the
@@ -412,16 +467,17 @@ The remaining deferred scope is explicit:
 
 - private presence and the mutable get/put command bodies and live operations;
 - public duplex/peer-stream segmentation and stream backpressure;
-- privileged Linux network-namespace placement and the semantic leak oracle for
-  the eleven-process scenario (Task 17 sub-gate); the scenario currently runs on
-  the portable numeric-loopback plan, and `PROCESS_PLANS.LINUX_NAMESPACE` remains
-  unexercised because it needs privileged setup outside the test process;
+- traffic-analysis defences: padding to a constant rate, batching, and cover
+  traffic. Cell size is already uniform, but per-edge timing and packet counts
+  are observable and nothing conceals them, so correlation by an adversary
+  watching two edges remains possible and out of scope;
 - root public required-mode integration, Hyperswarm, mobile, and PearTube
   integration.
 
-Until the separately reviewed leak-oracle and privileged network-namespace gates
-pass, the Task 15 controller remains package-private and carries no anonymity
-claim.
+The Task 15 controller remains package-private. It carries no anonymity claim
+beyond the properties tabulated in
+[Task 17 wire-level privacy evidence](#gate-3b1-task-17-wire-level-privacy-evidence),
+which hold only under the v1 active-relay adversary.
 
 ## Gate 3B entry criteria
 

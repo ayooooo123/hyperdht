@@ -242,6 +242,7 @@ test('allow graph contains only frozen exact bidirectional role edges', (t) => {
     [8, 10],
     [8, 11],
     [9, 10],
+    [9, 11],
     [10, 11]
   ])
   t.ok(Object.isFrozen(ALLOW_EDGES))

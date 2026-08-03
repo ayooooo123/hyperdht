@@ -68,6 +68,8 @@
     "integration": "brittle test/integration/*.js",
     "test:private:process:node": "brittle-node test/private/live-process-node.js",
     "test:private:process:bare": "brittle-node test/private/live-process-bare.js",
+    "test:private:namespace": "brittle-node test/private/namespace-projection.js",
+    "test:private:namespace:live": "brittle-node test/private/live-namespace-node.js",
     "end-to-end": "brittle test/end-to-end/*.js"
   },
   "author": "Mathias Buus (@mafintosh)",

@@ -349,7 +349,9 @@ function exactFactoryOptions(dialAuthority, linkOfferSigner, destroy, callbacks 
     destroy
   }
 }
-let nativeAdjacentPort = 49300
+// A fixed start port collides with sockets a previous suite run has not yet
+// released, which surfaces as a spurious ROUTE_UNAVAILABLE on the first bind.
+let nativeAdjacentPort = 49300 + 2 * Math.floor(Math.random() * 100)
 
 async function nativeAdjacentPair(currentIdentity, nextIdentity) {
   const platform = global.Bare ? Bare.platform : process.platform
