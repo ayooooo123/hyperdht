@@ -67,35 +67,53 @@ create network namespaces, veth pairs and iptables rules, and capture with
 `tcpdump`. They require Linux with non-interactive root and skip elsewhere with
 a stated reason. They are not part of the portable aggregate suite.
 
-### KI-4: the eleven-role scenario fails intermittently on CI with ERR_AUTHENTICATION
+### KI-4: intermittent wall-clock deadline rejections on CI
 
-**Status: open, unresolved, instrumented. Not reproduced locally.**
+**Status: open, unresolved, instrumented. Never reproduced locally.**
 
-On the GitHub `ubuntu-latest` runner the scenario intermittently fails around
-the suspend step, roughly one run in four across the seven executions observed
-so far:
+Two failures on the GitHub `ubuntu-latest` runner, in three of the twelve
+`live-linux` executions observed so far, both fail-closed rejections tied to a
+wall-clock boundary and neither reproducible on the local arm64 Linux VM.
+
+Signature A, in the eleven-role scenario around the suspend step, seen in both
+the Node-roles and Bare-roles variant:
 
 ```
 not ok 62 - PROCESS_FAILURE (announce-middle/CONTROL): ERR_AUTHENTICATION
 ```
 
-It has been seen in both the Node-roles and the Bare-roles variant, and always
-near the same point in the lifecycle. It has never reproduced locally: 125/125
-on every one of more than a dozen runs on an arm64 Linux VM, including six under
-deliberate CPU contention.
+Signature B, in the Bare aggregate during the initial branch build:
 
-What is known. `announce-middle` reports the failure, so an authentication check
-on the announce branch rejects something while the endpoint is suspending. The
-failure is timing sensitive and appears only on a different architecture and
-scheduler than the local VM, which fits a deadline or expiry boundary rather
-than a wrong key. It is not a capture or namespace issue: the privileged
-namespace gates are unaffected, and the deterministic suites are green
-everywhere.
+```
+ERR_PRIVACY_UNAVAILABLE
+    at sealTailExtend (lib/private/tail-control.js:892)
+    at RouteExtensionSession.open (lib/private/route-extension.js:418)
+    at openInitialBranch (lib/private/private-routing-controller.js:586)
+```
 
-Do not assume this is only test flake. An intermittent authentication rejection
-during teardown could equally be a real race in the guard-lease or adjacent-link
-owners, which is the kind of defect this scenario exists to surface. It must be
-root-caused, not retried away, before the live path is relied on.
+Signature B has a concrete mechanism, and it is worth stating because it may
+also explain A. `sealTailExtend` rejects a requested wire expiry that exceeds
+either the relay advertisement's `expiresAtMs` or the tail's own
+`state.deadline.wireExpiresAt`. `RouteExtensionSession` clamps against the
+advertisement and the signed expiry when it is constructed, at wall time T0, and
+then `open()` re-derives the request at a later T1 as
+`min(T1 + MAX_ROUTE_LIFETIME_MS, wireExpiresAt)`. That covers the advertisement,
+but nothing in the session consults the tail's own wire deadline, which was
+fixed when the tail was created, earlier still. **[INFERENCE]** the margin is
+therefore the elapsed time between those points measured against the slack
+between the caps, which is microseconds on a fast host and large enough to cross
+on a loaded runner.
+
+If that reading is right the fix belongs in the caller, which should clamp its
+requested expiry to the tail deadline as well, and it is a change to
+owner-approved deadline semantics rather than something to patch opportunistically.
+
+Both rejections are fail-closed. The route build aborts rather than continuing
+with an expiry the relay never authorised, so this is an availability defect
+under load, not a privacy one. That is exactly why it must not be retried away:
+an intermittent authentication or deadline rejection in the live path is the
+class of defect this scenario exists to surface, and it needs a root cause
+before the path is relied on.
 
 Instrumentation is in place for the next occurrence. Setting `PR_ROLE_FATAL_LOG`
 makes each role append its stack to that file, the coordinator forwards that one
