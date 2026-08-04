@@ -46,6 +46,7 @@ const {
   createRelayIdentitySigningAuthority
 } = require('../../lib/private/relay-identity-signer')
 const { createHostedTailResponder } = require('./hosted-tail-fixture')
+const { createCoherentTestClock } = require('./coherent-clock')
 const { nativeAdjacentPair } = require('./native-adjacent-fixture')
 const {
   claimFinalExitActivation,
@@ -786,8 +787,7 @@ test('public start hosts both native branches, reaches READY, and returns exact 
   const hostedImmutableValue = b4a.from('hosted-public-controller-immutable-value')
   const hostedImmutableTarget = cryptoSuite.hash([hostedImmutableValue])
   const rightPort = 48992
-  const wallNow = () => BigInt(Date.now())
-  const monotonicNow = () => BigInt(Date.now())
+  const { monotonicNow, wallNow } = createCoherentTestClock()
   const guardIdentity = identityFor(ROLE.SAFETY, 90)
   const guardRoute = cryptoSuite.encryptionKeyPair(seed(218))
   const middleIdentities = [
@@ -1234,8 +1234,7 @@ test('public start enters UNAVAILABLE when the hosted guard service is absent', 
       localSecretKey: identity.secretKey,
       host: '127.0.0.1',
       port: 48998,
-      wallNow: () => BigInt(Date.now()),
-      monotonicNow: () => BigInt(Date.now()),
+      ...createCoherentTestClock(),
       schedule: setTimeout,
       cancelScheduled: clearTimeout,
       randomBytes: (size) => b4a.alloc(size, 0xf9)
