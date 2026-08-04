@@ -5,6 +5,8 @@ const b4a = require('b4a')
 const sodium = require('sodium-universal')
 
 const publicApi = require('../..')
+const { moduleCacheKey: resolveModuleCacheKey } = require('./module-cache')
+
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const {
@@ -69,10 +71,7 @@ async function expectCodeAsync(t, fn, code) {
 function trackedRelayCapability(cryptoOverrides = null) {
   const modulePath = require.resolve('../../lib/private/relay-capability')
   const cryptoSuitePath = require.resolve('../../lib/private/crypto-suite')
-  const cacheKey = (path) =>
-    require.cache[path] === undefined
-      ? Object.keys(require.cache).find((key) => key.endsWith(path))
-      : path
+  const cacheKey = (path) => resolveModuleCacheKey(require.cache, path)
   const moduleCacheKey = cacheKey(modulePath)
   const cryptoSuiteCacheKey = cacheKey(cryptoSuitePath)
   const cached = require.cache[moduleCacheKey]

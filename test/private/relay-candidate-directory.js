@@ -3,6 +3,8 @@
 const test = require('brittle')
 const b4a = require('b4a')
 
+const { moduleCacheKey: resolveModuleCacheKey } = require('./module-cache')
+
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const {
@@ -51,10 +53,7 @@ function expectCode(t, fn, code) {
 
 function trackedDirectoryModule() {
   const modulePath = require.resolve('../../lib/private/relay-candidate-directory')
-  const moduleCacheKey =
-    require.cache[modulePath] === undefined
-      ? Object.keys(require.cache).find((key) => key.endsWith(modulePath))
-      : modulePath
+  const moduleCacheKey = resolveModuleCacheKey(require.cache, modulePath)
   const cached = require.cache[moduleCacheKey]
   const BufferConstructor = b4a.alloc(0).constructor
   const originalB4a = b4a.allocUnsafeSlow
@@ -101,10 +100,7 @@ function trackedDirectoryModule() {
 function countedVerificationDirectoryModule() {
   const modulePath = require.resolve('../../lib/private/relay-candidate-directory')
   const relayPath = require.resolve('../../lib/private/relay-capability')
-  const cacheKey = (path) =>
-    require.cache[path] === undefined
-      ? Object.keys(require.cache).find((key) => key.endsWith(path))
-      : path
+  const cacheKey = (path) => resolveModuleCacheKey(require.cache, path)
   const moduleCacheKey = cacheKey(modulePath)
   const relayCacheKey = cacheKey(relayPath)
   const cached = require.cache[moduleCacheKey]
