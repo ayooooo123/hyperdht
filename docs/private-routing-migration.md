@@ -91,29 +91,62 @@ ERR_PRIVACY_UNAVAILABLE
     at openInitialBranch (lib/private/private-routing-controller.js:586)
 ```
 
-Signature B has a concrete mechanism, and it is worth stating because it may
-also explain A. `sealTailExtend` rejects a requested wire expiry that exceeds
-either the relay advertisement's `expiresAtMs` or the tail's own
-`state.deadline.wireExpiresAt`. `RouteExtensionSession` clamps against the
-advertisement and the signed expiry when it is constructed, at wall time T0, and
-then `open()` re-derives the request at a later T1 as
-`min(T1 + MAX_ROUTE_LIFETIME_MS, wireExpiresAt)`. That covers the advertisement,
-but nothing in the session consults the tail's own wire deadline, which was
-fixed when the tail was created, earlier still. **[INFERENCE]** the margin is
-therefore the elapsed time between those points measured against the slack
-between the caps, which is microseconds on a fast host and large enough to cross
-on a loaded runner.
+Both signatures have the same measured root cause, and an earlier reading of
+this record guessed wrong about it: the caller is **not** missing a clamp. The
+requests land exactly on the bound.
 
-If that reading is right the fix belongs in the caller, which should clamp its
-requested expiry to the tail deadline as well, and it is a change to
-owner-approved deadline semantics rather than something to patch opportunistically.
+Instrumenting every `sealTailExtend` in the private aggregate and recording the
+distance from the requested wire expiry to each bound gives, identically under
+Node and Bare, over 44 seals:
+
+| `tailWireExpiresAt - requested` | seals                                                                |
+| ------------------------------- | -------------------------------------------------------------------- |
+| -1 ms                           | 1, from a deliberate negative test in `test/private/tail-control.js` |
+| 0 ms                            | 21                                                                   |
+| 2,000 ms                        | 20                                                                   |
+| 4,000 ms                        | 1                                                                    |
+| 5,499 ms                        | 1                                                                    |
+
+Both real seals in `test/private/route-extension.js` sit at exactly 0. The
+advertisement is never the binding bound: its slack on the real-clock paths is
+about 45,000 ms.
+
+So the protocol routinely asks for precisely the tail's wire deadline, and
+passes only because the comparisons are strict `>`. Three sites share the shape,
+all against `state.deadline.wireExpiresAt`:
+
+- `sealTailExtend`, throwing `ERR_PRIVACY_UNAVAILABLE`, which is signature B;
+- `clampTailControlProofDeadline`, whose next line treats `===` as the normal
+  path and whose `>` calls `authentication()`, which is signature A;
+- the responder mirror in the extend-admission path.
+
+A single millisecond of divergence between the two independently derived wall
+values therefore turns a normal operation into a fail-closed rejection. That is
+the same hazard already recorded for the role clocks further down this document,
+where independent `Date.now()` and `hrtime` samples straddling a millisecond
+boundary produced exactly this rejection and were fixed by deriving both from
+one cached sample. The production path still has the hazard between the extend
+requester and the tail state.
 
 Both rejections are fail-closed. The route build aborts rather than continuing
 with an expiry the relay never authorised, so this is an availability defect
-under load, not a privacy one. That is exactly why it must not be retried away:
-an intermittent authentication or deadline rejection in the live path is the
-class of defect this scenario exists to surface, and it needs a root cause
-before the path is relied on.
+under load, not a privacy one. It must not be retried away: zero margin means
+the next perturbation reproduces it.
+
+The fix is a decision for the design owner, because it touches approved deadline
+semantics. In preference order:
+
+1. have the requester ask for strictly less than the bound. It only lowers a
+   requested value, so it cannot weaken any check, and it restores a margin by
+   construction;
+2. remove the second derivation, so the requester reads the tail's current wire
+   deadline at seal time instead of a value pinned earlier;
+3. add tolerance to the comparisons. This relaxes an authentication bound and
+   should be the last resort.
+
+The two bounds in `sealTailExtend` are now thrown separately so a stack
+attributes a future rejection to the one that fired. Same error, same
+fail-closed behaviour, no wire or semantic change.
 
 Instrumentation is in place for the next occurrence. Setting `PR_ROLE_FATAL_LOG`
 makes each role append its stack to that file, the coordinator forwards that one
