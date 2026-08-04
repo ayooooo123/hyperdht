@@ -61,11 +61,12 @@ require('./private/process-codec')
 require('./private/process-audit-event')
 require('./private/process-config-auditor')
 require('./private/dht-setup-audit-udx')
-// The coordinator spawns role processes with `child_process`, so the aggregate keeps
-// these Node-only. Bare role coverage runs through `npm run test:private:process:bare`,
-// where a Node coordinator launches Bare children.
-if (!global.Bare) {
-  require('./private/process-control')
-  require('./private/live-process-node')
-  require('./private/live-process-bare')
-}
+// The coordinator spawns role processes with `child_process`, so this stays
+// Node-only.
+if (!global.Bare) require('./private/process-control')
+
+// The eleven-role live scenarios bind the 127.64.x.1 tuples, which macOS and
+// Windows refuse without per-address configuration (KI-2). They are not part of
+// this portable aggregate; run them with `npm run test:private:process:node`
+// and `npm run test:private:process:bare`, as the Linux CI job does. The
+// privileged namespace gates are separated the same way.

@@ -432,7 +432,7 @@ function registerLiveProcessSuite(launch) {
       // covers the whole lifecycle including the failure paths.
       if (placement) await placement.audit(t)
     } catch (err) {
-      t.fail(err && typeof err.code === 'string' ? err.code : String(err))
+      t.fail(err && err.message ? err.message : String(err))
     } finally {
       for (const responder of learnedGrantResponders) responder.stop()
       if (!control.closed) await control.cancel('TEARDOWN').catch(() => {})

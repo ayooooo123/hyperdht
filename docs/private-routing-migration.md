@@ -47,12 +47,18 @@ cannot be linked. Any future claim of resistance to a two-edge observer requires
 a wire-format change and its own sub-gate, and must not be inferred from the
 current test results.
 
-### KI-2: the live process suites cannot run on macOS
+### KI-2: the eleven-role live scenarios only run on Linux
 
-macOS cannot bind the `127.64.x.1` role tuples without per-address
-configuration, so both portable live suites stop at the first bind with
-`PROCESS_BIND_UNAVAILABLE`. They are green on Linux and their CI jobs are
-Linux-only. Every other private suite is green on Darwin.
+macOS and Windows refuse to bind the `127.64.x.1` role tuples without
+per-address configuration, so the scenarios stop at the first bind with
+`PROCESS_BIND_UNAVAILABLE` there.
+
+They are therefore kept out of `test/private-routing.js`, which `test/all.js`
+and `npm test` run on every platform, and are invoked from
+`npm run test:private:process:node` and `npm run test:private:process:bare` in
+the Linux CI job instead. Anything that binds a role tuple belongs in a
+platform-gated script, never in the portable aggregate; putting it there turns
+a known platform limit into a red build on macOS and Windows.
 
 ### KI-3: the namespace gates need privileged Linux
 
@@ -60,6 +66,42 @@ Linux-only. Every other private suite is green on Darwin.
 create network namespaces, veth pairs and iptables rules, and capture with
 `tcpdump`. They require Linux with non-interactive root and skip elsewhere with
 a stated reason. They are not part of the portable aggregate suite.
+
+### KI-4: the eleven-role scenario fails intermittently on CI with ERR_AUTHENTICATION
+
+**Status: open, unresolved, instrumented. Not reproduced locally.**
+
+On the GitHub `ubuntu-latest` runner the scenario intermittently fails around
+the suspend step, roughly one run in four across the seven executions observed
+so far:
+
+```
+not ok 62 - PROCESS_FAILURE (announce-middle/CONTROL): ERR_AUTHENTICATION
+```
+
+It has been seen in both the Node-roles and the Bare-roles variant, and always
+near the same point in the lifecycle. It has never reproduced locally: 125/125
+on every one of more than a dozen runs on an arm64 Linux VM, including six under
+deliberate CPU contention.
+
+What is known. `announce-middle` reports the failure, so an authentication check
+on the announce branch rejects something while the endpoint is suspending. The
+failure is timing sensitive and appears only on a different architecture and
+scheduler than the local VM, which fits a deadline or expiry boundary rather
+than a wrong key. It is not a capture or namespace issue: the privileged
+namespace gates are unaffected, and the deterministic suites are green
+everywhere.
+
+Do not assume this is only test flake. An intermittent authentication rejection
+during teardown could equally be a real race in the guard-lease or adjacent-link
+owners, which is the kind of defect this scenario exists to surface. It must be
+root-caused, not retried away, before the live path is relied on.
+
+Instrumentation is in place for the next occurrence. Setting `PR_ROLE_FATAL_LOG`
+makes each role append its stack to that file, the coordinator forwards that one
+variable into the otherwise empty role environment, and the Linux CI job prints
+the file whenever a scenario step fails. The control channel still carries only
+a strict error code, so no diagnostic text reaches the wire.
 
 ## Reviewed prototype source
 
@@ -414,12 +456,19 @@ and owner corrections, each of which is now part of the proof:
   so a socket rebuilt on a reused host/port after suspend does not collide with
   the TIDs of the pre-suspend session and have its replies dropped as duplicates.
 
-One environment boundary remains: macOS cannot bind the `127.64.x.1` role tuples,
-so both portable live suites stop at the first bind with
-`PROCESS_BIND_UNAVAILABLE` there (`866/868` tests, `18,096/18,098` assertions
-under Node on Darwin). Every other private suite is green on Darwin, and
-`test/private-routing.js` is fully green under both runtimes on Linux
-(`868/868` Node, `854/854` Bare).
+The eleven-role scenarios are not part of the portable aggregate. They bind the
+`127.64.x.1` role tuples, which macOS and Windows refuse without per-address
+configuration (KI-2), so they run from their own scripts under the Linux CI job
+while `test/private-routing.js` stays green everywhere:
+
+| Suite                            | Command                                    | Result                                                       |
+| -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
+| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 866/866 tests, 18,094/18,094 assertions, on Linux and Darwin |
+| Private aggregate, Bare          | `bare test/private-routing.js`             | 854/854 tests, 18,045/18,045 assertions, on Linux and Darwin |
+| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 125/125 assertions, Linux                                    |
+| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 125/125 assertions, Linux                                    |
+| Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
+| Namespace live route and oracles | `npm run test:private:namespace:live`      | 135/135 assertions, privileged Linux                         |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
