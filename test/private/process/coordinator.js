@@ -64,6 +64,7 @@ function safeFailure(role, phase, code, detail) {
         : 'coordinator'
   })
 }
+
 // The code alone is often not enough to act on. Attach the role that failed and
 // any preserved detail so a failing run names its own cause.
 function describeFailure(failure) {
@@ -75,6 +76,13 @@ function describeFailure(failure) {
     ? `${failure.code} (${failure.role}/${failure.phase}): ${failure.detail}`
     : `${failure.code} (${failure.role}/${failure.phase})`
   return error
+}
+
+function roleEnvironment() {
+  const env = Object.create(null)
+  const fatalLog = process.env.PR_ROLE_FATAL_LOG
+  if (typeof fatalLog === 'string' && fatalLog.length > 0) env.PR_ROLE_FATAL_LOG = fatalLog
+  return env
 }
 
 function deferred() {
@@ -668,7 +676,10 @@ function spawnRoleProcesses(runtime, projections, options = {}) {
         enter: options.enter
           ? (command, argv) => options.enter(projection.roleIndex, command, argv)
           : null,
-        env: Object.create(null),
+        // Roles run with an empty environment on purpose. The one exception is
+        // the opt-in fatal trace path, forwarded by name so a diagnostic run
+        // does not become a hole for arbitrary inherited configuration.
+        env: roleEnvironment(),
         stdio: ['pipe', 'pipe', 'pipe']
       })
       return Object.freeze({
