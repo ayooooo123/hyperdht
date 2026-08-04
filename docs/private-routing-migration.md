@@ -67,6 +67,42 @@ create network namespaces, veth pairs and iptables rules, and capture with
 `tcpdump`. They require Linux with non-interactive root and skip elsewhere with
 a stated reason. They are not part of the portable aggregate suite.
 
+### KI-4: the eleven-role scenario fails intermittently on CI with ERR_AUTHENTICATION
+
+**Status: open, unresolved, instrumented. Not reproduced locally.**
+
+On the GitHub `ubuntu-latest` runner the scenario intermittently fails around
+the suspend step, roughly one run in four across the seven executions observed
+so far:
+
+```
+not ok 62 - PROCESS_FAILURE (announce-middle/CONTROL): ERR_AUTHENTICATION
+```
+
+It has been seen in both the Node-roles and the Bare-roles variant, and always
+near the same point in the lifecycle. It has never reproduced locally: 125/125
+on every one of more than a dozen runs on an arm64 Linux VM, including six under
+deliberate CPU contention.
+
+What is known. `announce-middle` reports the failure, so an authentication check
+on the announce branch rejects something while the endpoint is suspending. The
+failure is timing sensitive and appears only on a different architecture and
+scheduler than the local VM, which fits a deadline or expiry boundary rather
+than a wrong key. It is not a capture or namespace issue: the privileged
+namespace gates are unaffected, and the deterministic suites are green
+everywhere.
+
+Do not assume this is only test flake. An intermittent authentication rejection
+during teardown could equally be a real race in the guard-lease or adjacent-link
+owners, which is the kind of defect this scenario exists to surface. It must be
+root-caused, not retried away, before the live path is relied on.
+
+Instrumentation is in place for the next occurrence. Setting `PR_ROLE_FATAL_LOG`
+makes each role append its stack to that file, the coordinator forwards that one
+variable into the otherwise empty role environment, and the Linux CI job prints
+the file whenever a scenario step fails. The control channel still carries only
+a strict error code, so no diagnostic text reaches the wire.
+
 ## Reviewed prototype source
 
 Every migrated module below came from the reviewed private-routes prototype at exact commit `0305df915b6a767093f9e75e6c06bc0a35da6169`. The migration changed ESM imports and exports to HyperDHT's CommonJS module style, changed local import paths, and retained the listed focused/vector coverage. Subsequent fork review added defensive ownership, hostile-shape handling, intrinsic capture, bounded allocation, and clearing checks without intentionally changing the listed normative protocol bytes.
