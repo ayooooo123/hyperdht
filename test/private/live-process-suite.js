@@ -5,6 +5,7 @@ const b4a = require('b4a')
 const { digestTestIsolatedAddressTuple } = require('../../lib/private/dht-exit-test-topology-grant')
 const { deriveDhtExitPeerId } = require('../../lib/private/dht-exit-destination-table')
 
+const { createCoherentTestClock } = require('./coherent-clock')
 const { createProcessConfigAuditor } = require('./process/config-auditor')
 const { CODEC_VECTOR_DIGEST_HEX } = require('./process/codec-vectors')
 const { createProcessControl, spawnRoleProcesses } = require('./process/coordinator')
@@ -17,10 +18,7 @@ const {
 
 function capabilities(seed) {
   return {
-    clocks: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.clocks({
-      monotonicNow: () => BigInt(Date.now()),
-      wallNow: () => BigInt(Date.now())
-    }),
+    clocks: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.clocks(createCoherentTestClock()),
     entropy: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.entropy(b4a.alloc(32, seed))
   }
 }

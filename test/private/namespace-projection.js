@@ -17,6 +17,7 @@ const {
   TEST_ONLY_PROCESS_TOPOLOGY_ISSUER,
   createLiveProcessTopology
 } = require('./process/topology-fixture')
+const { createCoherentTestClock } = require('./coherent-clock')
 const {
   namespaceProvisioningAvailable,
   provisionNamespaceProjection
@@ -224,10 +225,7 @@ test('namespace projection is enforced by the kernel and observable by capture',
 
 function capabilitiesForNamespaceRun() {
   return {
-    clocks: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.clocks({
-      monotonicNow: () => BigInt(Date.now()),
-      wallNow: () => BigInt(Date.now())
-    }),
+    clocks: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.clocks(createCoherentTestClock()),
     entropy: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.entropy(b4a.alloc(32, 0x51))
   }
 }
