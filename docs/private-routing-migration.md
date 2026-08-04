@@ -133,14 +133,26 @@ with an expiry the relay never authorised, so this is an availability defect
 under load, not a privacy one. It must not be retried away: zero margin means
 the next perturbation reproduces it.
 
-The fix is a decision for the design owner, because it touches approved deadline
-semantics. In preference order:
+The obvious remedy does not work, and the reason narrows the fix usefully.
+Having the requester ask for slightly less than the bound was tried and
+reverted: `expiresAtMs` is not the requester's to choose. It is proposed by the
+peer in `LINK_ACCEPT`, hashed by `digestAdmittedLimits(accept.admittedLimits)`
+into `admittedLimitsDigest`, and bound into the M3 transcript, so
+`authenticateRequestedLimitsDigest` rejects any request that does not present
+exactly the accepted bytes. Lowering the value client-side fails authentication,
+correctly. That also explains why the zero margin is so consistent: the request
+is stable across derivations precisely because the deadline term binds it, which
+is load-bearing rather than accidental.
 
-1. have the requester ask for strictly less than the bound. It only lowers a
-   requested value, so it cannot weaken any check, and it restores a margin by
-   construction;
-2. remove the second derivation, so the requester reads the tail's current wire
-   deadline at seal time instead of a value pinned earlier;
+What remains is a decision for the design owner, because both options touch
+approved semantics:
+
+1. give the headroom at negotiation, so the admitted limits a responder accepts
+   sit strictly inside its own tail deadline. The margin then travels inside the
+   committed value and every later comparison inherits it;
+2. remove the second derivation, so the value the check compares against cannot
+   drift from the value that was committed. This is the production analogue of
+   the coherent-clock fix already applied to the role runtimes;
 3. add tolerance to the comparisons. This relaxes an authentication bound and
    should be the last resort.
 
