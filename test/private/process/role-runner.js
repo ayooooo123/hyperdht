@@ -983,9 +983,26 @@ async function handle(message) {
   }
 }
 
+// The control channel only carries a strict code, on purpose: a role must not
+// be able to put arbitrary text on it. When PR_ROLE_FATAL_LOG names a file, a
+// role additionally appends its stack there, which is how an intermittent
+// failure on a machine you cannot attach to gets diagnosed. Off by default, and
+// never on the wire.
+function traceFatal(err) {
+  const target = runtime.fatalLog
+  if (!target) return
+  try {
+    require('fs').appendFileSync(
+      target,
+      `${projection ? projection.role : 'unknown'} ${sanitizeCode(err)}\n${(err && err.stack) || String(err)}\n\n`
+    )
+  } catch {}
+}
+
 async function fatal(err) {
   if (stopped) return
   stopped = true
+  traceFatal(err)
   if (projection !== null) {
     try {
       await emit('error', { code: sanitizeCode(err) })

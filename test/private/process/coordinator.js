@@ -26,9 +26,24 @@ class ProcessControlError extends Error {
   }
 }
 
-function safeFailure(role, phase, code) {
+function sanitizeDetail(value) {
+  if (value === null || value === undefined) return null
+  const text = typeof value === 'string' ? value : String(value)
+  const cleaned = text
+    .replace(/[^\x20-\x7e]/g, ' ')
+    .trim()
+    .slice(0, 200)
+  return cleaned.length === 0 ? null : cleaned
+}
+
+function safeFailure(role, phase, code, detail) {
+  const known = /^PROCESS_[A-Z0-9_]{1,60}$/.test(code)
   return Object.freeze({
-    code: /^PROCESS_[A-Z0-9_]{1,60}$/.test(code) ? code : 'PROCESS_FAILURE',
+    code: known ? code : 'PROCESS_FAILURE',
+    // Normalising an unrecognised code to PROCESS_FAILURE loses the only
+    // description of what actually went wrong, which is precisely what a
+    // failing run needs. Keep a bounded, character-restricted copy.
+    detail: sanitizeDetail(detail !== undefined ? detail : known ? null : code),
     phase: typeof phase === 'string' && /^[A-Z][A-Z0-9_]{0,31}$/.test(phase) ? phase : 'CONTROL',
     role:
       role === 'coordinator' ||
@@ -48,6 +63,26 @@ function safeFailure(role, phase, code) {
         ? role
         : 'coordinator'
   })
+}
+
+// The code alone is often not enough to act on. Attach the role that failed and
+// any preserved detail so a failing run names its own cause.
+function describeFailure(failure) {
+  const error = new ProcessControlError(failure.code)
+  error.role = failure.role
+  error.phase = failure.phase
+  error.detail = failure.detail
+  error.message = failure.detail
+    ? `${failure.code} (${failure.role}/${failure.phase}): ${failure.detail}`
+    : `${failure.code} (${failure.role}/${failure.phase})`
+  return error
+}
+
+function roleEnvironment() {
+  const env = Object.create(null)
+  const fatalLog = process.env.PR_ROLE_FATAL_LOG
+  if (typeof fatalLog === 'string' && fatalLog.length > 0) env.PR_ROLE_FATAL_LOG = fatalLog
+  return env
 }
 
 function deferred() {
@@ -247,7 +282,8 @@ function createProcessControl(options) {
       fail(
         record.role,
         'CONTROL',
-        record.stderrBytes > STDERR_LIMIT_BYTES ? 'PROCESS_STDERR_FLOOD' : 'PROCESS_STDERR'
+        record.stderrBytes > STDERR_LIMIT_BYTES ? 'PROCESS_STDERR_FLOOD' : 'PROCESS_STDERR',
+        b4a.toString(chunk, 'utf8')
       )
     })
     input.child.once('exit', (code, signal) => {
@@ -255,11 +291,11 @@ function createProcessControl(options) {
       record.exitResult = Object.freeze({ code, signal })
       record.exitWaiter.resolve(record.exitResult)
       if (!closed && failure === null && !record.exitExpected) {
-        fail(record.role, 'CONTROL', 'PROCESS_EARLY_EXIT')
+        fail(record.role, 'CONTROL', 'PROCESS_EARLY_EXIT', `exit code ${code} signal ${signal}`)
       }
     })
-    input.child.once('error', () => {
-      fail(record.role, 'CONTROL', 'PROCESS_CHILD_ERROR')
+    input.child.once('error', (err) => {
+      fail(record.role, 'CONTROL', 'PROCESS_CHILD_ERROR', err && err.message)
     })
   }
 
@@ -498,10 +534,10 @@ function createProcessControl(options) {
     )
   }
 
-  function fail(role, phase, code) {
+  function fail(role, phase, code, detail) {
     if (failure !== null || closed) return
-    failure = safeFailure(role, phase, code)
-    failureSignal.reject(new ProcessControlError(failure.code))
+    failure = safeFailure(role, phase, code, detail)
+    failureSignal.reject(describeFailure(failure))
     shutdown().then(
       () => failed.resolve(failure),
       () => failed.resolve(failure)
@@ -640,7 +676,10 @@ function spawnRoleProcesses(runtime, projections, options = {}) {
         enter: options.enter
           ? (command, argv) => options.enter(projection.roleIndex, command, argv)
           : null,
-        env: Object.create(null),
+        // Roles run with an empty environment on purpose. The one exception is
+        // the opt-in fatal trace path, forwarded by name so a diagnostic run
+        // does not become a hole for arbitrary inherited configuration.
+        env: roleEnvironment(),
         stdio: ['pipe', 'pipe', 'pipe']
       })
       return Object.freeze({

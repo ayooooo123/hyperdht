@@ -45,9 +45,16 @@ jobs:
       - name: Aggregate private-routing suite (Bare)
         run: $(node -p "require('bare-runtime')('bare')") test/private-routing.js
       - name: Eleven-process live scenario (Node roles)
+        env:
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
         run: npm run test:private:process:node
       - name: Eleven-process live scenario (Bare roles)
+        env:
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
         run: npm run test:private:process:bare
+      - name: Role failure stacks
+        if: failure()
+        run: cat "${{ runner.temp }}/role-fatal.log" || echo "no role stacks recorded"
       - name: Namespace projection enforcement (privileged)
         run: |
           sudo -n true

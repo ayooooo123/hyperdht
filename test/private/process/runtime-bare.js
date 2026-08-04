@@ -9,6 +9,8 @@ const clock = createCoherentClock(
 )
 
 module.exports = Object.freeze({
+  // Diagnostic sink only; see traceFatal in role-runner.js.
+  fatalLog: process.env.PR_ROLE_FATAL_LOG || null,
   exit(code) {
     process.exit(code)
   },

@@ -218,6 +218,7 @@ test('process control preserves a sanitized configuration audit failure', async 
   t.is(waiterCode, 'PROCESS_CONFIG_INVALID')
   t.alike(await control.failed(), {
     code: 'PROCESS_CONFIG_INVALID',
+    detail: null,
     phase: 'CONTROL',
     role: 'endpoint'
   })
@@ -248,7 +249,12 @@ test('process control rejects duplicate and unexpected events then reaps every c
   await waiting
   endpoint.stdout.write(frame)
   const failure = await control.failed()
-  t.alike(failure, { code: 'PROCESS_UNEXPECTED_EVENT', phase: 'CONTROL', role: 'endpoint' })
+  t.alike(failure, {
+    code: 'PROCESS_UNEXPECTED_EVENT',
+    detail: null,
+    phase: 'CONTROL',
+    role: 'endpoint'
+  })
   t.ok(endpoint.stdin.writableEnded)
   t.ok(guard.stdin.writableEnded)
   t.alike(endpoint.kills, ['SIGTERM'])
@@ -261,17 +267,32 @@ test('process control rejects stdout flood, any stderr, and early exit with sani
     [
       'stdout',
       (child) => child.stdout.write(Buffer.alloc(131_073, 1)),
-      { code: 'PROCESS_STDOUT_FLOOD', phase: 'CONTROL', role: 'endpoint' }
+      {
+        code: 'PROCESS_STDOUT_FLOOD',
+        detail: null,
+        phase: 'CONTROL',
+        role: 'endpoint'
+      }
     ],
     [
       'stderr',
       (child) => child.stderr.write('forbidden'),
-      { code: 'PROCESS_STDERR', phase: 'CONTROL', role: 'endpoint' }
+      {
+        code: 'PROCESS_STDERR',
+        detail: 'forbidden',
+        phase: 'CONTROL',
+        role: 'endpoint'
+      }
     ],
     [
       'exit',
       (child) => child.emit('exit', 7, null),
-      { code: 'PROCESS_EARLY_EXIT', phase: 'CONTROL', role: 'endpoint' }
+      {
+        code: 'PROCESS_EARLY_EXIT',
+        detail: 'exit code 7 signal null',
+        phase: 'CONTROL',
+        role: 'endpoint'
+      }
     ]
   ]) {
     const { control, endpoint } = fixture()
@@ -311,6 +332,7 @@ test('process control cancellation closes stdin and sends SIGTERM exactly once',
   t.ok(guard.stdin.writableEnded)
   t.alike(await control.failed(), {
     code: 'PROCESS_CANCELLED',
+    detail: null,
     phase: 'ACTIVATION',
     role: 'coordinator'
   })
@@ -379,6 +401,7 @@ test('process control contains EPIPE and preserves the child early-exit failure'
   t.is(sendCode, 'PROCESS_EARLY_EXIT')
   t.alike(await control.failed(), {
     code: 'PROCESS_EARLY_EXIT',
+    detail: 'exit code 7 signal null',
     phase: 'CONTROL',
     role: 'lookup-exit-a'
   })
@@ -416,6 +439,7 @@ test('process control failure rejects a pending control write without an unhandl
   t.is(outcome.code, 'PROCESS_STDERR', 'first sanitized child failure rejects the blocked send')
   t.alike(await control.failed(), {
     code: 'PROCESS_STDERR',
+    detail: 'forbidden role detail',
     phase: 'CONTROL',
     role: 'lookup-exit-a'
   })
