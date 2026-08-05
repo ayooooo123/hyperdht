@@ -115,7 +115,23 @@ Eight consecutive `live-linux` runs passed after the fix, against roughly one
 failure in four before it. That is evidence, not proof: at the earlier rate,
 eight clean runs would happen by chance about one time in eight.
 
-**B remains open**, and it is a separate, structural cause. An earlier reading
+**B remains open**, but it is now reproducible on demand. `test/private/tail-control.js`
+carries a characterisation test, `TailControl sealExtend rejects limits committed
+before the tail was shortened`, that fails the seal deterministically with no
+clocks, no load and no CI runner: commit limits whose expiry equals the tail's
+wire deadline, shorten the tail by one millisecond, and the seal is rejected.
+
+The shortening is not exotic. `createTailControlSession` shortens whenever the
+`absoluteDeadline` it is handed is below the tail's local deadline, and
+`shortenM3TailLifetime` then moves `wireExpiresAt` down by the same delta. But
+the value `RouteExtensionSession` hands it is an _operation_ budget, bounded by
+`MAX_EXTENSION_MS`, not a statement about how long the route should live. So
+narrowing the window allowed for one extension also shortens the route's wire
+lifetime, and any limits already committed against the longer lifetime become
+unpresentable. Whether those two deadlines should be coupled at all is the real
+question behind B.
+
+B is a separate, structural cause. An earlier reading
 of this record guessed wrong about it: the caller is **not** missing a clamp.
 The requests land exactly on the bound.
 
