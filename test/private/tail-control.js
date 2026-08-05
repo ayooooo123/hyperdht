@@ -2480,3 +2480,65 @@ test('EXTEND_REQUEST_V1 and EXTENDED_V1 retain exact canonical bytes', (t) => {
   t.exception(() => decodeExtendRequest(encodedRequest.subarray(0, encodedRequest.byteLength - 1)))
   t.exception(() => decodeExtended(encodedExtended.subarray(0, EXTENDED_SIZE - 1)))
 })
+
+// Characterises KI-4 signature B in docs/private-routing-migration.md. This
+// pins today's behaviour so the mechanism is reproducible without a CI runner;
+// it is not an endorsement of it. Whoever fixes B should expect this test to
+// change, and should read the second assertion as the defect it documents.
+test('TailControl sealExtend rejects limits committed before the tail was shortened', (t) => {
+  const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
+  const signedAdvertisement = advertisementForRole(ROLE.PRIVATE)
+  // A peer commits these limits in LINK_ACCEPT and the transcript digest binds
+  // them, so the initiator must later present exactly this expiry. Measuring
+  // the private aggregate shows the committed value routinely equals the tail's
+  // wire deadline exactly, which leaves no room for the deadline to move.
+  const requestedLimits = Object.freeze({
+    cellSize: 1200,
+    maxCells: 64,
+    maxBytes: 65_536,
+    maxCommands: 10,
+    idleTimeoutMs: 5_000,
+    expiresAtMs: 20_000n
+  })
+
+  // The tail's local deadline is monotonicNow + (wireExpiresAt - wallNow), so
+  // 10_000 + (20_000 - 1_000) = 29_000. An absoluteDeadline below that shortens
+  // the tail, and shortenM3TailLifetime moves wireExpiresAt down by the same
+  // delta.
+  const sealWith = (absoluteDeadline) => {
+    const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+    const adopted = authority(clock).adopt(
+      initiatorSealLink(signedAdvertisement, requestedLimits, {
+        currentAdvertisement,
+        wireExpiresAt: 20_000n
+      })
+    )
+    const session = createTailControlSession(
+      adopted.tail,
+      tailSessionOptions(clock, { absoluteDeadline, crypto: cryptoSuite })
+    )
+    const randomSeeds = [seed(0x70), seed(0x71), seed(0x72)]
+    return session.sealExtend({
+      advertisement: signedAdvertisement,
+      advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+      extensionIndex: 2,
+      requestedLimits,
+      absoluteDeadline,
+      randomBytes: () => randomSeeds.shift()
+    })
+  }
+
+  t.ok(sealWith(29_000n), 'committed limits seal while the tail keeps its full lifetime')
+
+  let code = null
+  try {
+    sealWith(28_999n)
+  } catch (err) {
+    code = err.code
+  }
+  t.is(
+    code,
+    'ERR_PRIVACY_UNAVAILABLE',
+    'one millisecond of tail shortening invalidates already committed limits'
+  )
+})
