@@ -69,11 +69,11 @@ a stated reason. They are not part of the portable aggregate suite.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
-**Status: open, unresolved, instrumented. Never reproduced locally.**
+**Status: one cause fixed, one open. Never reproduced locally.**
 
-Two failures on the GitHub `ubuntu-latest` runner, in three of the twelve
-`live-linux` executions observed so far, both fail-closed rejections tied to a
-wall-clock boundary and neither reproducible on the local arm64 Linux VM.
+Three fail-closed rejections on the GitHub `ubuntu-latest` runner, in three of
+the twelve `live-linux` executions observed before the fix below, all tied to a
+wall-clock boundary and none reproducible on the local arm64 Linux VM.
 
 Signature A, in the eleven-role scenario around the suspend step, seen in both
 the Node-roles and Bare-roles variant:
@@ -91,9 +91,33 @@ ERR_PRIVACY_UNAVAILABLE
     at openInitialBranch (lib/private/private-routing-controller.js:586)
 ```
 
-Both signatures have the same measured root cause, and an earlier reading of
-this record guessed wrong about it: the caller is **not** missing a clamp. The
-requests land exactly on the bound.
+Signature C, in the Bare aggregate at adjacent-link setup, and the one that
+carried enough stack to be actionable:
+
+```
+ERR_AUTHENTICATION
+    at createExtensionLinkOffer (lib/private/guard-link.js:2199)
+    at openTailAdjacentLink (lib/private/tail-control.js:3050)
+    at Object.serve (test/private/hosted-tail-fixture.js:220)
+```
+
+**C is fixed, and it was a harness defect.** `createExtensionLinkOffer` converts
+a wall duration into the monotonic domain and rejects a derived deadline above
+the one it was handed. Four test sites supplied `wallNow` and `monotonicNow` as
+two independent `() => BigInt(Date.now())` calls, so a millisecond boundary
+falling between the samples inflated the derived deadline by exactly one
+millisecond. `test/private/coherent-clock.js` now derives both from a single
+cached sample, the same guarantee `runtime-clock.js` already gave the role
+runtimes. Signature A plausibly shared this cause, since the eleven-role fixture
+was one of the four sites, though that is not proven.
+
+Eight consecutive `live-linux` runs passed after the fix, against roughly one
+failure in four before it. That is evidence, not proof: at the earlier rate,
+eight clean runs would happen by chance about one time in eight.
+
+**B remains open**, and it is a separate, structural cause. An earlier reading
+of this record guessed wrong about it: the caller is **not** missing a clamp.
+The requests land exactly on the bound.
 
 Instrumenting every `sealTailExtend` in the private aggregate and recording the
 distance from the requested wire expiry to each bound gives, identically under
