@@ -1132,11 +1132,15 @@ test('public start hosts both native branches, reaches READY, and returns exact 
     t.alike(immutable.value, hostedImmutableValue)
     const initialGeneration = routing.snapshot()
     const lookupMiddle = hostedResources[1]
-    const lookupMiddleIndex = middleIdentities.findIndex((identity) =>
-      b4a.equals(identity.publicKey, lookupMiddle.identity.publicKey)
+    // Close the link belonging to the exit actually on this branch. Indexing
+    // exitPairs by the middle's index only worked while selection paired middle
+    // i with exit i, which it no longer does.
+    const lookupExit = hostedResources[2]
+    const lookupExitIndex = exitIdentities.findIndex((identity) =>
+      b4a.equals(identity.publicKey, lookupExit.identity.publicKey)
     )
-    t.ok(lookupMiddleIndex >= 0, 'lookup middle has a native downstream link')
-    await exitPairs[lookupMiddleIndex].closeLink()
+    t.ok(lookupExitIndex >= 0, 'lookup exit has a native downstream link')
+    await exitPairs[lookupExitIndex].closeLink()
     await waitHostedTimer(() => lookupMiddle.forwarding.diagnostics().state === 'DESTROYED', 1_000)
     t.is(lookupMiddle.forwarding.diagnostics().state, 'DESTROYED')
     const lookupGuard = hostedResources[0]
@@ -1166,12 +1170,12 @@ test('public start hosts both native branches, reaches READY, and returns exact 
     const rotatedImmutable = await routing.immutableGet(hostedImmutableTarget)
     t.alike(rotatedImmutable.value, hostedImmutableValue)
     t.is(rotatedGeneration.guardLease, true)
-    const announceMiddle = hostedResources[4]
-    const announceMiddleIndex = middleIdentities.findIndex((identity) =>
-      b4a.equals(identity.publicKey, announceMiddle.identity.publicKey)
+    const announceExit = hostedResources[5]
+    const announceExitIndex = exitIdentities.findIndex((identity) =>
+      b4a.equals(identity.publicKey, announceExit.identity.publicKey)
     )
-    t.ok(announceMiddleIndex >= 0, 'announce middle has a native downstream link')
-    await exitPairs[announceMiddleIndex].closeLink()
+    t.ok(announceExitIndex >= 0, 'announce exit has a native downstream link')
+    await exitPairs[announceExitIndex].closeLink()
     await waitHostedTimer(() => routing.snapshot().state === PRIVATE_ROUTING_STATE.ROTATING, 1_000)
     const rotatingAnnounce = routing.snapshot()
     t.is(rotatingAnnounce.guardLease, true)
