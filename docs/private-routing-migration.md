@@ -246,6 +246,42 @@ from elsewhere.
 Until relay identity has a cost, path diversity constrains the shape of an
 attack without bounding the attacker's share of the candidate set.
 
+### KI-6: hop selection is first-match, not random
+
+**Status: open. A fix was implemented, verified and reverted; the design below is
+known to work.**
+
+`choosePairs` returns the first combination that passes the diversity rule,
+walking candidates in `state.records` insertion order, and `chooseReplacementPair`
+does the same. Selection is therefore deterministic: the same directory always
+yields the same hops, and whoever is discovered earliest is chosen every time
+they are eligible rather than occasionally. An adversary who can influence
+discovery order converts that into permanent placement on the path.
+
+The remedy is to draw uniformly over the combinations that pass diversity.
+Counting the qualifying combinations and then walking to a drawn index keeps
+allocation flat, an injected `randomBytes` capability keeps the source testable,
+and rejection sampling avoids favouring low indices through modulo bias. With
+that in place the host suites were green at 877/877 under Node and 856/856 under
+Bare, including a deterministic test that feeds draws zero through three, obtains
+four distinct combinations, and confirms draw four wraps onto draw zero, which
+pins the count at exactly four rather than at least four.
+
+It was reverted because the eleven-role process fixture is wired to matched
+adjacencies at three separate layers: the link grants minted from `linkSpecs`,
+the per-role adjacency lists the config auditor checks, and role configuration in
+the runner. Widening `linkSpecs` and `ALLOW_EDGES` to admit any middle-to-exit
+pairing cleared the first layer and not the others, and the namespace live gate
+went red. Reddening the gates that carry the privacy evidence is not an
+acceptable trade for landing this, so the gap is recorded instead.
+
+Two smaller findings from the attempt are worth keeping. The reconnect request
+built by `consumeGuardReconnectRequest` carries clocks but no randomness, so a
+selection capability threaded through that path has to source it elsewhere. And
+`test/private/live-immutable-get.js` indexed `exitPairs` by a middle's index,
+which held only while selection paired middle i with exit i; that is corrected
+regardless, since it relied on a coincidence.
+
 ## Comparison with Veilid
 
 Reviewed `veilid-core/src/routing_table/route_spec_store` on `main`, since Veilid
@@ -273,16 +309,10 @@ Three things were checked against that design:
   small networks.
 - **Exclusion when rebuilding.** Present. `chooseReplacementPair` takes an
   exclusion set and diversity is revalidated at commit.
-- **Which qualifying hops get chosen.** This one was a genuine gap and is now
-  fixed. `choosePairs` returned the first combination that passed the diversity
-  rule, walking candidates in insertion order, so the same directory always
-  produced the same hops and whoever was discovered earliest held a permanent
-  advantage; an adversary able to influence discovery order would have been
-  selected every time rather than occasionally. Selection now draws uniformly
-  over the combinations that pass diversity, using an injected `randomBytes`
-  capability and rejection sampling so no index is favoured. Veilid round-robins
-  among its top tier, which distributes load but stays predictable; drawing
-  randomly costs the same and does not.
+- **Which qualifying hops get chosen.** A genuine gap, open, recorded as
+  [KI-6](#ki-6-hop-selection-is-first-match-not-random). Veilid round-robins
+  among its top tier, which distributes load but stays predictable. We take the
+  first match, which is worse: it is fixed rather than merely predictable.
 
 Two of Veilid's choices are deliberately not adopted. Latency-ranked selection
 prefers well-resourced relays, which is exactly what a funded adversary can most
