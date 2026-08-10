@@ -268,12 +268,36 @@ four distinct combinations, and confirms draw four wraps onto draw zero, which
 pins the count at exactly four rather than at least four.
 
 It was reverted because the eleven-role process fixture is wired to matched
-adjacencies at three separate layers: the link grants minted from `linkSpecs`,
-the per-role adjacency lists the config auditor checks, and role configuration in
-the runner. Widening `linkSpecs` and `ALLOW_EDGES` to admit any middle-to-exit
-pairing cleared the first layer and not the others, and the namespace live gate
-went red. Reddening the gates that carry the privacy evidence is not an
-acceptable trade for landing this, so the gap is recorded instead.
+adjacencies. Landing the fix means generalising that fixture so any middle can
+serve any exit, which is the more faithful model anyway, and a second attempt
+mapped the work completely. Four layers are involved:
+
+1. **Grants.** `linkSpecs` mints one grant per matched adjacency. Widening it to
+   all nine middle-to-exit pairs, and `ALLOW_EDGES` with them, is mechanical; the
+   namespace routes and firewall rules derive from `ALLOW_EDGES` automatically.
+2. **Middle downstreams.** A middle's projection carries `adjacencies[1]` and
+   `grants[1]` for one exit, chosen before any route exists. It needs all three,
+   selected by the identity the route names. `wire-services.js` already supports
+   this: `outgoing` may be `{ allowedRole, extensionIndex, resolve(selection) }`,
+   and `selection.relayIdentity` is the requested next hop, so no production
+   change is required.
+3. **Exit predecessors.** An exit pre-arms acceptance with a single
+   `middleGrant`. It needs one arm per possible middle, taking whichever the
+   route uses. `prearmAccept` opens an independent link per grant, so several
+   arms coexist.
+4. **Predecessor binding.** This is what stopped the second attempt.
+   `observedPredecessorEndpoint` is passed to `acceptProjectedExtension` when the
+   actor is constructed, and it must be the endpoint of the middle that actually
+   connects. With several arms that identity is not known until one resolves, so
+   the exit branch has to be restructured to race the arms first and construct
+   the actor afterwards, carrying the winning arm's endpoint and keeping the two
+   existing zeroization paths correct.
+
+Layer 4 is a lifecycle restructure inside the harness that produces the privacy
+evidence, and an earlier partial attempt turned the namespace live gate red.
+Reddening the gates that carry that evidence is not an acceptable trade for a fix
+whose practical impact begins only when a real relay population exists, so the
+gap stays recorded and the work is scoped for a deliberate change.
 
 Two smaller findings from the attempt are worth keeping. The reconnect request
 built by `consumeGuardReconnectRequest` carries clocks but no randomness, so a
