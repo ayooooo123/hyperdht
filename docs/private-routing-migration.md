@@ -131,7 +131,30 @@ lifetime, and any limits already committed against the longer lifetime become
 unpresentable. Whether those two deadlines should be coupled at all is the real
 question behind B.
 
-B is a separate, structural cause. An earlier reading
+B is a separate, structural cause.
+
+Choosing a remedy has an overhead dimension, so the shortening was measured
+across one aggregate run. It fires 48 times: 28 from `createTailControlSession`
+and 20 from the rearm path. Twenty-four of those lose 13,000 ms of wire lifetime
+each, and the granted lifetime at seal clusters at 4,000 ms where a shortening
+happened against roughly 14,990 ms on the one real-clock path where none did.
+Those absolute numbers are fixture-scale rather than production, but the ratio
+is the mechanism: narrowing the operation window shortens the route's wire
+lifetime one for one.
+
+That reverses the earlier preference order. Adding headroom at negotiation buys
+robustness by making every route permanently shorter, which raises the rotation
+rate and therefore the branch-build cost, the most expensive operation in the
+system. Decoupling instead is free and cuts overhead: how long a handshake may
+take and how long a route may live are different quantities, and only the first
+should be bounded by `MAX_EXTENSION_MS`. It also removes the shortening that
+invalidates committed limits, so the performance choice and the correctness
+choice coincide.
+
+The cost of decoupling is that `shortenM3TailLifetime` currently keeps the wall
+and monotonic views consistent by moving both together. Splitting them means
+carrying an operation deadline and a route deadline separately and keeping both
+coherent, which touches the M3 runtime and wants the design owner. An earlier reading
 of this record guessed wrong about it: the caller is **not** missing a clamp.
 The requests land exactly on the bound.
 
