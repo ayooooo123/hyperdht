@@ -229,6 +229,74 @@ variable into the otherwise empty role environment, and the Linux CI job prints
 the file whenever a scenario step fails. The control channel still carries only
 a strict error code, so no diagnostic text reaches the wire.
 
+### KI-5: subnet diversity is a weak proxy for operator diversity
+
+`validatePathDiversity` requires the guard and all four branch positions to
+differ by identity and by endpoint subnet, /24 for IPv4 and /48 for IPv6. That
+stops the naive case of several hops behind one address block, and it fails
+closed rather than relaxing.
+
+It does not stop an adversary who rents addresses across many blocks, which is
+cheap. Real diversity would key on autonomous system, hosting provider, or a
+declared operator family, none of which the advertisement carries today. Veilid
+uses the same IP-block proxy and additionally relaxes it away on small networks,
+so this is a shared limitation of the approach rather than something to copy
+from elsewhere.
+
+Until relay identity has a cost, path diversity constrains the shape of an
+attack without bounding the attacker's share of the candidate set.
+
+## Comparison with Veilid
+
+Reviewed `veilid-core/src/routing_table/route_spec_store` on `main`, since Veilid
+solves a closely related problem on a permissionless P2P network.
+
+Veilid composes a route from a sender-allocated safety route and a
+destination-published private route, one hop each by default. Allocation tries
+progressively looser passes, `UniqueIpblockDiverse` then `Unique` then
+`AllowDuplicateHops`, crossed with a relay-capability preference of all hops,
+last hop only, then none, over a high-pass-filtered slice of the routing table.
+Selection sorts candidate routes by whether they need testing, then stability,
+then latency, and round-robins among the top tier with an atomic counter.
+Allocated routes are persisted and reused, and a caller may pin a preferred one.
+
+Three things were checked against that design:
+
+- **Nodes learned through a route.** Veilid had to isolate nodes discovered only
+  via a private route so the general routing table does not ping them, which
+  would correlate a route participant with an IP. That exposure does not exist
+  here. `relay-candidate-directory.js` performs no network I/O at all, and after
+  readiness the endpoint holds no direct send authority, which the namespace
+  oracle already proves by observing that its only edge is its guard.
+- **Hop diversity.** Present, and stricter. Ours applies across the guard and
+  both branches at once and fails closed; Veilid's equivalent is dropped on
+  small networks.
+- **Exclusion when rebuilding.** Present. `chooseReplacementPair` takes an
+  exclusion set and diversity is revalidated at commit.
+- **Which qualifying hops get chosen.** This one was a genuine gap and is now
+  fixed. `choosePairs` returned the first combination that passed the diversity
+  rule, walking candidates in insertion order, so the same directory always
+  produced the same hops and whoever was discovered earliest held a permanent
+  advantage; an adversary able to influence discovery order would have been
+  selected every time rather than occasionally. Selection now draws uniformly
+  over the combinations that pass diversity, using an injected `randomBytes`
+  capability and rejection sampling so no index is favoured. Veilid round-robins
+  among its top tier, which distributes load but stays predictable; drawing
+  randomly costs the same and does not.
+
+Two of Veilid's choices are deliberately not adopted. Latency-ranked selection
+prefers well-resourced relays, which is exactly what a funded adversary can most
+cheaply supply. Silent relaxation of diversity trades a privacy property for
+availability without telling anyone; for this system "no route" is a better
+failure than "worse route".
+
+Two real differences remain in Veilid's favour or as future work. Veilid hides
+the destination as well as the sender, whereas here the exit performs an ordinary
+DHT operation and the capture shows the retrieved value plainly on that edge.
+Veilid also maintains a pool of routes and distributes across it, where this fork
+builds one set per generation; a pool would be the prerequisite for choosing
+among qualifying routes at all.
+
 ## Reviewed prototype source
 
 Every migrated module below came from the reviewed private-routes prototype at exact commit `0305df915b6a767093f9e75e6c06bc0a35da6169`. The migration changed ESM imports and exports to HyperDHT's CommonJS module style, changed local import paths, and retained the listed focused/vector coverage. Subsequent fork review added defensive ownership, hostile-shape handling, intrinsic capture, bounded allocation, and clearing checks without intentionally changing the listed normative protocol bytes.
