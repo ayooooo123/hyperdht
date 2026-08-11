@@ -1,8 +1,8 @@
 # Private Routing: Scoped Mixing + Cover Traffic (Candidate Gate B — forward note)
 
-**Status:** FORWARD-LOOKING / RESEARCH-GRADE — not a spec for current code, and the last
-of the four gates by priority. Captured so the design constraints are on record; depends
-on Gate C (decoupled DATAGRAM replies) and composes with, does not precede, A and C.
+**Status:** DEFERRED — opt-in high-anonymity ("mixnet") mode **beyond** the current
+Veilid-class target. Not scheduled. Captured so constraints are on record; depends on
+Gate C (decoupled DATAGRAM replies) and must never touch the STREAM fast path.
 **Date:** 2026-08-10
 **Relates to:** [`private-routing-v1.md`](../../private-routing-v1.md) (`Out of scope for
 v1`: global passive observer, guard+exit timing correlation, constant-rate cover traffic
