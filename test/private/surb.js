@@ -302,6 +302,7 @@ test('conformance vector — deterministic wire fields match the fixture byte-fo
     if (!r.terminal) {
       t.is(hex(r.forward.ephem), exp.nextEphem, 'hop ' + i + ' nextEphem')
       t.is(hex(r.forward.mac), exp.nextMac, 'hop ' + i + ' nextMac')
+      t.is(hex(r.forward.header), exp.nextHeader, 'hop ' + i + ' nextHeader (shifted β)')
       msg = {
         ephem: r.forward.ephem,
         header: r.forward.header,

@@ -1,5 +1,5 @@
 {
-  "note": "Deterministic SURB conformance vector. Feed the inputs; the header/routing outputs must match byte-for-byte. Payload is intentionally excluded: crypto_box_seal is randomized and not reproducible. MAX_HOPS=4, HOP=81, RHO=324.",
+  "note": "Deterministic SURB conformance vector. Feed the inputs; every listed output must match byte-for-byte. The reply payload is intentionally excluded: crypto_box_seal is randomized and not reproducible. MAX_HOPS=4, HOP=81, RHO=324. Per-hop processing uses a fixed 48-byte dummy payload.",
   "inputs": {
     "terminalId": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
     "ephemeralSeeds": [
@@ -37,14 +37,16 @@
         "nullifier": "c6958556c39abc038aecf02a0b347f072df032b5dd1e7b5ada7d3312ba16ba27",
         "terminal": false,
         "nextEphem": "dd3af5907a4a5cadb68f9eb074a5e56763439e5cc6af88f911ae8dc4a7490459",
-        "nextMac": "ddcc2262ef11da4db4f32e9235ccdec6"
+        "nextMac": "ddcc2262ef11da4db4f32e9235ccdec6",
+        "nextHeader": "14e491c61f5e39bd6a33dc2a28a64cec77821bb1bf33b7b89328d9e11c43f725af927cf9f690be09d99a55ae8ca7ceb1a14fe6d3498fa94bc5a17a9ab8db4aadd063edf212cb5572fdc7d973f4327594bfbbd9d2a42d7b4133195b51430ad9f64fa2fbe8d29c034370f8ac1dd7a947417ea746349f28b5dc4a6b13607ce295cda515a1deb2498ee955f67e3ad66a5d68060ba36e2c40e608e1bfa2228d0b21d4d42ab0065f4d6787ddd13a4e0934a81700ed59152d593b4fff6170abdbbe4eaed667a191fbeb384819faae911768d0e73e09f53d316ab71f6b28ffc975b73c303823b5ac4bc52f67f9975c4d41a507828435d67c13c2c491f32a6b613238d0a3ea87030737381d192d38327cda73fc341753dcd5cb66e57ff699dca1f047ef004d6a25afbc345a6fe993cf5cda4c3b62a1500071640ab881134581176c1d1ae3bdc8a9d6"
       },
       {
         "nextHop": "c6ae491a326e3686804fda9abedd12757df50c111009f51764734b3d740b1f87",
         "nullifier": "171ae569d19cdc88b9cecd4a38af2b8cd62852fec58f86dd28fe545c1fa5d153",
         "terminal": false,
         "nextEphem": "effd93113ac1606fc724ef81220d4fa6082925e9dd9437048b8f4ecfe16f0025",
-        "nextMac": "a7f97ca406dd1fdbfdb52f979379e507"
+        "nextMac": "a7f97ca406dd1fdbfdb52f979379e507",
+        "nextHeader": "32a9bde9b0e49b05b3d148fc60556d775028e9bcd9b3729fff61771db00adcd15bf46d9fcbd21cbac2a0a016f973430e277f66a0747805fae8689e9c243db6782e7ca1925e27c91bcc5a38fa77d9d61308a1a4ba7c6c2cb038ae6754883635320899ef541e6fd5120dd9c1cc9c88aeef814ceb2d19487891c407f474908786b437bf0b7f7dc42e20e0a59ab60564202c20d6393aad7d8af68566f1a61cb477894f077d59309bd6288de65947b3de1798f42793efc67596bcc69ea20951e9b48689085332022181ee17a4176468e86413d476e92debd71bf8a94f9c1ba6ae70416833b5197123bbae0d3638d03694fa7d34d124d49b1f96c9b134e89832a58f6f193cde47a44f457f402a7b5d315d38728887834c19ad81de0549bab56b29401cc85b3093c421043f555e57cbb2f4d1bcf921875666e3942eefe69494c72f76a28bdf100b"
       },
       {
         "nextHop": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
