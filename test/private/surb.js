@@ -10,7 +10,8 @@ const {
   buildSurb,
   sealReply,
   processSurbHop,
-  openSurbPayload
+  openSurbPayload,
+  createNullifierGuard
 } = require('../../lib/private/surb')
 
 function relay() {
@@ -160,4 +161,103 @@ test('malformed input is rejected fail-closed', (t) => {
     () => processSurbHop({ ...msg, payload: b4a.alloc(4) }, relays[0].routeSecretKey),
     'payload below the box-seal minimum -> reject'
   )
+})
+
+test('replay guard rejects a re-processed SURB and admits fresh ones', (t) => {
+  const relays = [relay(), relay(), relay()]
+  const terminalId = b4a.alloc(32, 11)
+  const { surb } = buildSurb(pathOf(relays), terminalId)
+  const guard = createNullifierGuard()
+
+  const r1 = processSurbHop(sealReply(surb, b4a.from('once')), relays[0].routeSecretKey)
+  t.ok(guard.admit(r1.nullifier), 'first sight of the nullifier is admitted')
+
+  // Same SURB replayed to the same hop -> identical nullifier -> rejected.
+  const r1again = processSurbHop(sealReply(surb, b4a.from('again')), relays[0].routeSecretKey)
+  t.alike(r1again.nullifier, r1.nullifier, 'same SURB+hop -> same nullifier')
+  t.absent(guard.admit(r1again.nullifier), 'replayed nullifier is rejected')
+
+  const fresh = buildSurb(pathOf(relays), terminalId)
+  const r2 = processSurbHop(sealReply(fresh.surb, b4a.from('new')), relays[0].routeSecretKey)
+  t.ok(guard.admit(r2.nullifier), 'a fresh SURB is admitted')
+
+  guard.reset()
+  t.ok(guard.admit(r1.nullifier), 'after epoch reset the old nullifier is admissible again')
+})
+
+test('replay guard is bounded (FIFO eviction)', (t) => {
+  const guard = createNullifierGuard(4)
+  const ns = []
+  for (let i = 0; i < 6; i++) {
+    const n = b4a.alloc(32, i)
+    ns.push(n)
+    t.ok(guard.admit(n), 'admit ' + i)
+  }
+  t.is(guard.size, 4, 'size capped at maxEntries')
+  t.ok(guard.admit(ns[0]), 'oldest was evicted, so it is admissible again')
+})
+
+test('fuzz: random path lengths and payload sizes round-trip', (t) => {
+  for (let iter = 0; iter < 200; iter++) {
+    const n = 1 + Math.floor(Math.random() * MAX_HOPS)
+    const relays = []
+    for (let i = 0; i < n; i++) relays.push(relay())
+    const terminalId = b4a.allocUnsafeSlow(32)
+    sodium.randombytes_buf(terminalId)
+    const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
+
+    const size = Math.floor(Math.random() * 1024)
+    const reply = b4a.allocUnsafeSlow(size)
+    sodium.randombytes_buf(reply)
+
+    let msg = sealReply(surb, reply)
+    for (let i = 0; i < n; i++) {
+      if (msg.header.byteLength !== RHO) t.fail('non-constant header at iter ' + iter)
+      const r = processSurbHop(msg, relays[i].routeSecretKey)
+      if (i < n - 1) msg = r.forward
+      else if (!b4a.equals(openSurbPayload(r.forward.payload, openKeys), reply)) {
+        t.fail('round-trip mismatch at iter ' + iter)
+      }
+    }
+  }
+  t.pass('200 random round-trips recovered exactly, header always RHO bytes')
+})
+
+test('fuzz: a single-byte flip anywhere in the message is rejected', (t) => {
+  for (let iter = 0; iter < 200; iter++) {
+    const relays = [relay(), relay(), relay()]
+    const terminalId = b4a.alloc(32, 1)
+    const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
+    const base = sealReply(surb, b4a.from('fuzz-target-payload'))
+
+    // Flip one random bit in header, mac, or payload, then drive the path; expect a reject
+    // somewhere (processSurbHop or the final open) — never a wrong-but-accepted plaintext.
+    const which = Math.floor(Math.random() * 3)
+    const field = which === 0 ? 'header' : which === 1 ? 'mac' : 'payload'
+    const msg0 = {
+      ephem: b4a.from(base.ephem),
+      header: b4a.from(base.header),
+      mac: b4a.from(base.mac),
+      payload: b4a.from(base.payload)
+    }
+    const buf = msg0[field]
+    buf[Math.floor(Math.random() * buf.byteLength)] ^= 1 << Math.floor(Math.random() * 8)
+
+    let rejected = false
+    let recovered = null
+    try {
+      let msg = msg0
+      for (let i = 0; i < relays.length; i++) {
+        const r = processSurbHop(msg, relays[i].routeSecretKey)
+        if (i < relays.length - 1) msg = r.forward
+        else recovered = openSurbPayload(r.forward.payload, openKeys)
+      }
+    } catch {
+      rejected = true
+    }
+    if (!rejected && !b4a.equals(recovered, b4a.from('fuzz-target-payload'))) {
+      t.fail('tamper produced a wrong-but-accepted plaintext at iter ' + iter)
+    }
+  }
+  t.pass('200 single-bit tampers each rejected or (payload-preserving) benign, never forged')
 })
