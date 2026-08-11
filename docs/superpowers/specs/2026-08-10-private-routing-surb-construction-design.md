@@ -131,9 +131,10 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
 
 ## Security invariants
 
-1. Header-layer integrity: each layer is AEAD (XChaCha20-Poly1305); a hop that cannot open
-   its layer (wrong key or tampered bytes) rejects. Integrity is the AEAD tag — no separate
-   MAC (the reference folds it into the layer AEAD).
+1. Header integrity: the routing area `β` is a fixed `RHO`-byte buffer encrypted with a PRG
+   keystream (`ρ` = BLAKE2b-CTR keyed by the hop DH secret) and authenticated by a
+   keyed-BLAKE2b MAC (`μ`) carried alongside it; a hop that fails the MAC (wrong key or
+   tampered `β`/MAC) rejects before doing anything else.
 2. Forward-path secrecy: the SURB is unreadable to every forward hop (inner AEAD).
 3. Reply secrecy from *all relays and any SURB holder*: the responder encapsulates to the
    SURB's public key `E_pub`; only the initiator, holding `E_priv` (which never travels),
@@ -145,10 +146,10 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
    use, expiry, or teardown.
 6. Group hygiene: X25519 DH via `crypto-suite.keyAgreement`, which rejects all-zero /
    low-order shared secrets.
-7. Size: **the reference does not implement Sphinx position-hiding filler** — the header
-   shrinks one layer per hop, so a relay can infer its position from length. Acceptable
-   given fixed roles (guard/safety/exit); constant-size filler is deferred to the reviewed
-   wire-format step.
+7. Constant size / position-hiding by length: every hop sees exactly `RHO` header bytes
+   (decrypt-and-shift with Sphinx filler). A relay cannot infer its index or the remaining
+   path length from header size. **Tested** — round-trip for path lengths 1..`MAX_HOPS` plus
+   a length-invariance assertion.
 8. Additive: absent a SURB, behavior is exactly today's correlated-reply / STREAM reply.
 
 ## Implementation gate (do not skip)
@@ -169,11 +170,14 @@ and fuzz tests (tampered β, wrong key, replayed nullifier, truncated payload, c
 
 ## Reference implementation (built + tested 2026-08-10)
 
-`lib/private/surb.js` + `test/private/surb.js` (brittle). Implements the per-hop X25519
-construction above on `crypto-suite` (`keyAgreement`, `seal`/`open`) + `crypto_box_seal` for
-the reply. **8/8 tests, 12/12 asserts pass** on the pinned sodium (Node 22): 1- and 3-hop
-round-trip recovers the reply; the first hop never sees plaintext; a hop learns only its
-immediate next hop; tampered header, tampered payload, and wrong route key are all rejected;
-nullifiers are deterministic per hop and fresh per SURB. NOT wired into the DHT and NOT
-wire-stable — header layers use nested AEAD (tag = integrity), no Sphinx filler yet, and the
-format still needs fixed test vectors + external cryptographic review (see the gate above).
+`lib/private/surb.js` + `test/private/surb.js` (brittle). Per-hop X25519 on `crypto-suite`
+(`keyAgreement`, `seal`/`open`) + `crypto_box_seal` for the reply; **fixed-size Sphinx
+header** (`MAX_HOPS = 4`, `HOP = 81`, `RHO = 324`) with filler, PRG = BLAKE2b-CTR, MAC =
+keyed BLAKE2b (16 B). **9/9 tests, 18/18 asserts pass** on the pinned sodium (Node 22):
+round-trip recovers the reply for **every path length 1..4**; every hop sees a constant
+`RHO`-byte header (length-invariance); first hop never sees plaintext; a hop learns only its
+next hop; tampered header, tampered MAC, tampered payload, and wrong route key all rejected;
+malformed input rejected fail-closed; nullifiers deterministic per hop and fresh per SURB.
+Still NOT wired into the DHT and NOT wire-stable — remaining before a format freeze: fixed
+cross-impl test vectors, statistical review of filler indistinguishability, payload-size
+budget vs the 1,200-byte cell, and external cryptographic review.
