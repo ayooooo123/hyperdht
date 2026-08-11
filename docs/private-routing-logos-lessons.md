@@ -27,41 +27,31 @@ networking stack (Waku-lineage libp2p mixnet + RLN) exists to solve:
 
 Logos is therefore the most relevant prior art for the properties we chose to defer.
 The Logos stack itself is pre-testnet, so these are design borrows, not code to lift.
-Reference implementations worth reading: `logos-co/nim-libp2p-mix` (Sphinx mixnet),
-`logos-co/mix-rln-spam-protection-plugin` (RLN for a libp2p mixnet), `vacp2p/zerokit`
-(RLN in Rust). Nym/Loopix and Tor v3 onion services are the upstream academic sources.
+Reference implementations for the mix ideas: `logos-co/nim-libp2p-mix` (Sphinx mixnet).
+Nym/Loopix and Tor v3 onion services are the upstream academic sources. Note:
+`vacp2p/zerokit` / `logos-co/mix-rln-spam-protection-plugin` (RLN) are **not** used — see
+Gate A below for why RLN is rejected.
 
-The four borrows below are ordered by value-to-disruption. **A** and **C** are the
-recommended near-term items.
+The items below kept their original value-to-disruption ordering, but that ordering was
+**revised once the deployment was pinned** as a closed hyperdht peer network with no exit
+(see each gate's status): **A is dropped**, **C is optional**, **D** and **B** remain
+forward-looking.
 
 ---
 
-## A. RLN / Zerokit anonymous rate-limiting — Sybil + abuse without deanonymization
+## A. Anonymous admission — DROPPED (not this protocol)
 
-**Gap.** v1 lists "complete Sybil resistance or relay incentives" as out of scope, and
-the active-relay section concedes that "one operator obtaining multiple path positions
-through distinct identities" remains open. `relay-capability.js` advertisements are
-*signed* but there is no anti-Sybil admission gate, and `relay-service` quotas
-(`maxCircuitsPerNeighbor`, `maxQueuedBytes`) are per-neighbor byte caps that identity
-churn defeats. Because the design's whole point is that a relay does **not** know which
-endpoint it is serving, we cannot rate-limit an abuser by identity without breaking the
-anonymity we just built.
+Superseded by the decision record:
+[`superpowers/specs/2026-08-10-private-routing-admission-analysis-note.md`](./superpowers/specs/2026-08-10-private-routing-admission-analysis-note.md).
 
-**Borrow.** A Rate-Limiting Nullifier (RLN): a zero-knowledge proof that a client may
-send up to rate R **anonymously**; exceeding R makes the offender's identity
-recoverable so the relay can evict it. DoS resistance without deanonymizing honest
-users — precisely the primitive our guard/exit model cannot express today.
-
-**Where it lands.**
-- RLN membership proof as an admission check inside relay-capability acceptance and
-  `dht-exit-reservation.js` (gate circuit construction and DHT-exit ops).
-- RLN group / membership state in a multi-writer log (Autobase/Hyperbee), **not** a
-  chain. This is a better answer to "relay incentives" than Logos's own token approach —
-  keep the network incentive-free but Sybil-gated.
-- Complements, does not replace, the existing signed advertisements and quotas.
-
-**Risk.** ZK proving cost on mobile clients; group-management/epoch rollover; membership
-bootstrapping. Prototype against `zerokit` before committing wire bytes.
+Short version: this protocol keeps everything inside the hyperdht peer network — there is
+no exit (that would be a separate VPN-service protocol). Admission control protects an
+exit; with none, the only abuse is volunteer-relay resource exhaustion, already bounded by
+`relay-service.js` quotas (global `MAX_RELAY_CIRCUITS`, per-neighbor cap, queue bytes;
+Sybil churn cycles slots but cannot exceed the ceiling). RLN was rejected regardless — it
+needs a zk-SNARK dependency (cannot be hand-rolled safely) and a replicated all-member
+Merkle tree (Autobase scales badly for many writers). VOPRF tokens were the no-dependency
+fallback but only protect an exit, so they are unnecessary here.
 
 ---
 
