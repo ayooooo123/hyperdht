@@ -138,3 +138,22 @@ test('nullifiers are deterministic per hop and distinct across hops', (t) => {
   t.unlike(a[0], a[1], 'distinct hops -> distinct nullifiers')
   t.unlike(a[0], b[0], 'fresh SURB -> fresh nullifier (single-use tracking works)')
 })
+
+test('malformed input is rejected fail-closed (short header / short payload)', (t) => {
+  const relays = [relay(), relay(), relay()]
+  const terminalId = b4a.alloc(32, 8)
+  const { surb } = buildSurb(pathOf(relays), terminalId)
+  const msg = sealReply(surb, b4a.from('m'))
+
+  const shortHeader = { ephem: msg.ephem, header: msg.header.subarray(0, 10), payload: msg.payload }
+  t.exception(
+    () => processSurbHop(shortHeader, relays[0].routeSecretKey),
+    'header below the minimum sealed-layer size -> reject before any DH/wrap'
+  )
+
+  const shortPayload = { ephem: msg.ephem, header: msg.header, payload: b4a.alloc(4) }
+  t.exception(
+    () => processSurbHop(shortPayload, relays[0].routeSecretKey),
+    'payload below the box-seal minimum -> reject before wrapping'
+  )
+})
