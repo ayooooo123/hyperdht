@@ -185,16 +185,25 @@ test('replay guard rejects a re-processed SURB and admits fresh ones', (t) => {
   t.ok(guard.admit(r1.nullifier), 'after epoch reset the old nullifier is admissible again')
 })
 
-test('replay guard is bounded (FIFO eviction)', (t) => {
+test('replay guard is fail-closed on overflow (no eviction, no silent re-admit)', (t) => {
   const guard = createNullifierGuard(4)
   const ns = []
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 4; i++) {
     const n = b4a.alloc(32, i)
     ns.push(n)
     t.ok(guard.admit(n), 'admit ' + i)
   }
-  t.is(guard.size, 4, 'size capped at maxEntries')
-  t.ok(guard.admit(ns[0]), 'oldest was evicted, so it is admissible again')
+  t.is(guard.size, 4, 'size at capacity')
+  t.absent(
+    guard.admit(ns[0]),
+    'an already-seen nullifier stays a replay (false) — never re-admitted'
+  )
+  t.exception(
+    () => guard.admit(b4a.alloc(32, 99)),
+    'a fresh nullifier at capacity fails closed (throws) instead of evicting'
+  )
+  guard.reset()
+  t.ok(guard.admit(ns[0]), 'after epoch reset the cache is clear')
 })
 
 test('fuzz: random path lengths and payload sizes round-trip', (t) => {
