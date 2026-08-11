@@ -122,12 +122,16 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
 
 ## Single-use / anti-replay
 
-- Each hop derives a **nullifier** `n_i = H("surb/nullifier" ‖ s_i)` and records it in a
-  per-epoch bounded set; a second SURB presenting the same `n_i` in the epoch is rejected
-  (reuse would let a hop link two replies). This reuses the epoch discipline already in
-  `crypto-suite`/`fragments.js` (`epochExpiresAt`); the set is cleared at rollover.
-- The initiator uses each SURB exactly once and issues fresh SURBs (fresh `x_1`) per request;
-  batch pre-issue is allowed, each single-use.
+- Each hop derives a **nullifier** `n_i = H("surb/nullifier" ‖ s_i)`. A relay feeds it to a
+  per-epoch replay cache (`createNullifierGuard`): a repeat in the epoch is rejected, and the
+  cache is **fail-closed** — it never evicts, so a nullifier is never silently re-admitted;
+  on overflow with a fresh nullifier it throws (`ERR_QUOTA_EXCEEDED`), forcing epoch rollover
+  or more capacity rather than opening a replay window. This is **strict single-use up to
+  capacity**, not a best-effort cache. Cleared at rollover (`reset()`); tie to the existing
+  `epochExpiresAt` discipline. (The flood-to-refuse DoS is bounded by the relay's circuit
+  quotas.)
+- The initiator uses each SURB exactly once and issues fresh SURBs per request; batch
+  pre-issue is allowed, each single-use.
 
 ## Security invariants
 
@@ -142,8 +146,9 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
    can recover plaintext; relays only wrap ciphertext. (Says nothing about the responder,
    which authored the plaintext — see invariant 4.)
 4. Locality: the responder learns only `H_1`; each hop learns only its next hop.
-5. Single-use: per-hop nullifier rejects replay within the epoch; keys/`openKeys` erased on
-   use, expiry, or teardown.
+5. Single-use: fresh per-hop DH secret per SURB ⇒ fresh nullifier; the relay's fail-closed
+   replay cache rejects any repeat within the epoch (strict up to capacity, no eviction).
+   Keys/`openKeys` erased on use, expiry, or teardown.
 6. Group hygiene: X25519 DH via `crypto-suite.keyAgreement`, which rejects all-zero /
    low-order shared secrets.
 7. Constant size / position-hiding by length: every hop sees exactly `RHO` header bytes
@@ -154,10 +159,12 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
 
 ## Implementation gate (do not skip)
 
-1. Confirm group ops (Step 0). 2. Implement `surb.js` + integration behind an off-by-default
-flag. 3. **Fixed test vectors** (adapt Sphinx/BOLT-04 vectors). 4. Substitution, property,
-and fuzz tests (tampered β, wrong key, replayed nullifier, truncated payload, cross-epoch).
-5. External cryptographic review. Only then is the wire format stable.
+1. Confirm group ops (Step 0) — **done**. 2. Implement `surb.js` — **done** (tested); DHT
+integration behind an off-by-default flag is **still pending**. 3. **Fixed cross-impl test
+vectors** — pending. 4. Substitution / property / fuzz — **done** (tamper header/MAC/payload,
+wrong key, malformed fail-closed, fail-closed replay guard, 200-iter random round-trips +
+single-bit tampers); cross-epoch vectors pending. 5. **External cryptographic review** —
+pending. The wire format is not stable until 3 + 5 are complete.
 
 ## Open questions
 
@@ -173,11 +180,13 @@ and fuzz tests (tampered β, wrong key, replayed nullifier, truncated payload, c
 `lib/private/surb.js` + `test/private/surb.js` (brittle). Per-hop X25519 on `crypto-suite`
 (`keyAgreement`, `seal`/`open`) + `crypto_box_seal` for the reply; **fixed-size Sphinx
 header** (`MAX_HOPS = 4`, `HOP = 81`, `RHO = 324`) with filler, PRG = BLAKE2b-CTR, MAC =
-keyed BLAKE2b (16 B). **9/9 tests, 18/18 asserts pass** on the pinned sodium (Node 22):
-round-trip recovers the reply for **every path length 1..4**; every hop sees a constant
-`RHO`-byte header (length-invariance); first hop never sees plaintext; a hop learns only its
-next hop; tampered header, tampered MAC, tampered payload, and wrong route key all rejected;
-malformed input rejected fail-closed; nullifiers deterministic per hop and fresh per SURB.
-Still NOT wired into the DHT and NOT wire-stable — remaining before a format freeze: fixed
-cross-impl test vectors, statistical review of filler indistinguishability, payload-size
-budget vs the 1,200-byte cell, and external cryptographic review.
+keyed BLAKE2b (16 B), plus a fail-closed per-epoch replay cache (`createNullifierGuard`).
+**13/13 tests, 33/33 asserts pass** on the pinned sodium (Node 22): round-trip for **every
+path length 1..4**; constant `RHO`-byte header (length-invariance); first hop never sees
+plaintext; a hop learns only its next hop; tampered header/MAC/payload + wrong key rejected;
+malformed input fail-closed; replay guard fail-closed (strict single-use up to capacity, no
+eviction); nullifiers deterministic per hop and fresh per SURB; 200-iter property/fuzz
+(random path lengths + payload sizes 0–1024 B, single-bit tampers). Still NOT wired into the
+DHT and NOT wire-stable — remaining before a format freeze: fixed cross-impl test vectors,
+statistical review of filler indistinguishability, payload-size budget vs the 1,200-byte
+cell, DHT wiring, and external cryptographic review.
