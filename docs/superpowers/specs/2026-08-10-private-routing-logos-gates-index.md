@@ -39,9 +39,11 @@ and metadata hardening.
 
 ## No new dependencies
 
-Everything hand-rolled (SURB construction, blinded keys) builds on the existing
-`crypto-suite` primitives (`sodium-universal`): a prime-order group op (ristretto255
-preferred; else ed25519 group), BLAKE2b (`crypto_generichash`), XChaCha20-Poly1305. No
-zk/SNARK, no libp2p, no chain. **Step 0 of any implementation: confirm the pinned
-`sodium-universal` exposes the required group ops.** Wire formats are not stable until fixed
-test vectors + external cryptographic review (the repo's existing bar).
+Everything hand-rolled builds on primitives the pinned deps already expose — **verified
+2026-08-10** (`sodium-universal@5.0.1` / `sodium-native@5.1.0`): X25519 `crypto_scalarmult`
+(+`_base`), `crypto_box_seal`, BLAKE2b (`crypto_generichash`), XChaCha20-Poly1305. No
+zk/SNARK, no libp2p, no chain. **ristretto255 is NOT available and
+`crypto_core_ed25519_scalar_mul` is missing**, so: **C** uses per-hop X25519 DH (no scalar
+arithmetic — clean fit); **D**'s private-key blinding (`a' = h·a mod L`) needs scalar×scalar
+and must supply a vetted mod-`L` multiply (or a newer sodium) when built. Wire formats are
+not stable until fixed test vectors + external cryptographic review.
