@@ -69,9 +69,12 @@ real encode/decode functions and test vectors.
 
 ## Concrete derivation (ready to fold into the presence-record gate)
 
-Tor rend-spec-v3 key blinding, on the **same prime-order group as the Gate C SURB
-construction** (ristretto255 preferred; ed25519 with Tor's clamping as fallback) — one
-group dependency for both gates, no new library.
+Tor rend-spec-v3 key blinding. **Group-op note (Step 0, 2026-08-10):** ristretto255 is not
+available in the pinned sodium, and `crypto_core_ed25519_scalar_mul` is missing. Public
+blinding `A' = h·A` is point×scalar (`crypto_scalarmult_ed25519`, available); private
+blinding `a' = h·a mod L` is scalar×scalar with **no** primitive — the future gate must
+supply a vetted constant-time mod-`L` multiply (or bump sodium), plus Tor's clamping-aware
+derivation for ed25519.
 
 Let `(A, a)` be the destination's stable identity keypair (`A = a·B`). For epoch `e` with
 public period parameters `P_e` (period number + length), `H_s` = BLAKE2b reduced mod `L`,
@@ -98,8 +101,8 @@ not decrypt it. A storage node holding `{k_e, A', body}` cannot recover `A`, can
 services it stores.
 
 Notes:
-- ristretto255 gives a clean `h·A`; the ed25519 fallback must follow Tor's clamping-aware
-  blinding (rend-spec-v3 §A.2) — prefer ristretto.
+- The ed25519 blinding must follow Tor's clamping-aware derivation (rend-spec-v3 §A.2);
+  ristretto255 (which would be cleaner) is **unavailable** in the pinned sodium.
 - Rotation is automatic (new epoch ⇒ new key); early revocation uses an identity-signed
   tombstone, consistent with v1's existing capability-store downgrade-tombstone model.
 - Still gated: implement inside the future presence-record gate with its own encode/decode,

@@ -6,48 +6,50 @@ Step 0 (confirm group ops) → fixed test vectors → substitution/property/fuzz
 cryptographic review, per the repo's standing bar.
 **Date:** 2026-08-10
 **Parent:** [`2026-08-10-private-routing-datagram-surb-design.md`](./2026-08-10-private-routing-datagram-surb-design.md)
-**Construction:** Sphinx (Danezis–Goldberg) reply blocks. Reference implementations to
-follow for vectors/shape: the Sphinx paper, Lightning BOLT-04 onion (forward direction),
-Nym SURBs (reply direction).
+**Construction:** onion reply blocks with **per-hop independent X25519 DH** (not Sphinx
+scalar-blinding — see Step 0). Layered-header + payload discipline follows Sphinx / Nym
+SURBs and Lightning BOLT-04.
 
-## Step 0 — primitive availability (blocking)
+## Step 0 — primitive availability (RESOLVED 2026-08-10)
 
-The construction needs a **prime-order group** with scalar/point ops plus hash-to-scalar.
-Confirm the pinned `sodium-universal` exposes, in order of preference:
+Verified against the pinned deps (`sodium-universal@5.0.1` over `sodium-native@5.1.0`,
+Node 22):
 
-1. **ristretto255** (preferred — prime order, no cofactor pitfalls): `crypto_scalarmult_ristretto255`,
-   `crypto_scalarmult_ristretto255_base`, `crypto_core_ristretto255_scalar_{reduce,mul,add}`,
-   `crypto_core_ristretto255_from_hash`.
-2. **ed25519 group** (fallback): `crypto_scalarmult_ed25519[_base]`,
-   `crypto_core_ed25519_scalar_{reduce,mul}`, `crypto_core_ed25519_from_uniform` — with
-   explicit cofactor clearing and identity/low-order-point rejection (the ristretto option
-   avoids this class of bug; prefer it).
+- **Available:** X25519 `crypto_scalarmult` + `crypto_scalarmult_base`; `crypto_box_seal` /
+  `crypto_box_seal_open`; `crypto_generichash` (BLAKE2b); XChaCha20-Poly1305 AEAD; ed25519
+  point `crypto_scalarmult_ed25519[_base]`, `crypto_core_ed25519_scalar_reduce`,
+  `crypto_core_ed25519_add`.
+- **NOT available:** ristretto255 (nothing); `crypto_core_ed25519_scalar_mul` (scalar×scalar).
 
-`crypto-suite` already uses `crypto_scalarmult` (X25519), `crypto_generichash` (BLAKE2b),
-and XChaCha20-Poly1305 — reuse those for the KDF and per-layer AEAD. **Do not** attempt the
-Sphinx scalar blinding on raw X25519 (Montgomery); it lacks clean scalar arithmetic.
+Consequence: the classic Sphinx per-hop **blinding chain** (`x_{i+1} = b_i · x_i mod L`) is
+**not implementable** on these deps — it needs scalar×scalar mult. The construction instead
+uses **per-hop independent X25519 ephemerals**: only point DH (`crypto_scalarmult`), which
+exists and which `crypto-suite` already uses. No new dependency, no scalar arithmetic, no
+ristretto/cofactor handling (X25519 clamps/handles cofactor for DH).
 
 ## Keys the initiator already has
 
-Return-path relays are chosen from their **signed capability advertisements**
-(`relay-capability.js`), which carry each relay's route-encryption public key. Treat that as
-the relay's static group element `Y_i`. (If it is an X25519 key today, add a ristretto/edwards
-route-key to the advertisement; note as a wire dependency.)
+Return-path relays are chosen from their signed capability advertisements
+(`relay-capability.js`); each carries a route-encryption public key that is **already
+X25519** (`caps-responder.js` derives it via `crypto_scalarmult_base` from the relay's route
+secret). Use it directly as the relay DH key `Y_i` — no new key type, no advertisement wire
+change.
 
-## Per-hop key schedule (Sphinx blinding)
+## Per-hop key schedule (per-hop X25519 ephemerals)
 
-Return path `H_1 … H_m` (initiator is the terminal reader). `B` = group base point,
-`L` = group order, `H_s` = BLAKE2b reduced to a scalar, domain-separated.
+Return path `H_1 … H_m` (initiator is the terminal reader). Per hop, one fresh ephemeral +
+one X25519 DH:
 
 ```
-x_1   = random scalar
-α_1   = x_1 · B                       # ephemeral group element for hop 1
 for i in 1..m:
-    s_i     = x_i · Y_i               # DH shared secret with hop i  (relay computes s_i = y_i · α_i)
-    b_i     = H_s("surb/blind" ‖ α_i ‖ s_i)
-    α_{i+1} = b_i · α_i
-    x_{i+1} = b_i · x_i  (mod L)
+    e_i  = random X25519 scalar
+    E_i  = crypto_scalarmult_base(e_i)      # ephemeral pubkey, carried in header layer i
+    s_i  = crypto_scalarmult(e_i, Y_i)      # DH secret (relay recomputes s_i = crypto_scalarmult(y_i, E_i))
 ```
+
+Ephemerals are independent per hop (no blinding chain). Each hop receives its `E_i` **in the
+clear**: the SURB head carries `E_1`, and decrypting layer `i` reveals the next hop's clear
+`E_{i+1}`. At `m_max = 3` that is 3×32 B of ephemerals — within the cell budget.
 
 From each `s_i` derive, via domain-separated BLAKE2b:
 - `k_mac_i`   — header MAC key
@@ -63,13 +65,15 @@ secret is ever put in the SURB.
 
 ## SURB structure (fixed size)
 
-- **Header β**: fixed-length, `m_max` slots (recommend `m_max = 3` to mirror the forward
-  3-hop path and fit the cell). Each layer, encrypted under `k_hdr_i`, contains: next-hop id,
-  `α`-advance is implicit via blinding (Sphinx carries per-hop routing info + the next MAC).
-  Padded with PRG output so every hop sees a constant-size β.
+- **Per-hop header unit** handed to hop `i`: `{ E_i (clear), β_i (encrypted under
+  `k_hdr_i`), γ_i }`. The hop computes `s_i = crypto_scalarmult(y_i, E_i)` from the
+  **clear** `E_i`, derives `k_mac_i`/`k_hdr_i`/`k_wrap_i`, verifies `γ_i` over `β_i`, then
+  decrypts `β_i` to obtain `{ nextHop, E_{i+1} (clear), β_{i+1}, γ_{i+1} }` for the next
+  hop. `β` is fixed-length (`m_max = 3`) and PRG-padded so every hop sees a constant size.
+  `E_i` **must** be clear — a hop needs it to derive the very key that decrypts its own layer.
 - **Per-layer MAC γ_i** over β_i under `k_mac_i` (integrity; a hop rejects a tampered header).
 - **Payload slot**: fixed size, holds the responder-sealed **ciphertext** (see Reply
-  direction), then relay wrap layers. Sized so `|β| + |γ| + |α_1| + |payload|` ≤ the
+  direction), then relay wrap layers. Sized so `|β| (each layer carries E_i) + |γ_1| + |payload|` ≤ the
   1,200-byte outer cell budget; if it does not fit at `m_max=3`, reduce payload and
   fragment via `fragments.js`.
 
@@ -95,7 +99,7 @@ location and the return path (the responder learns only `H_1`).
 
 ```
 buildSurb({ returnPath: [Y_1..Y_m], epoch, now })
-    → { surb: { firstHop: H_1, alpha: α_1, header: β, mac: γ_1,
+    → { surb: { firstHop: H_1, ephem: E_1, header: β_1, mac: γ_1,
                 replyPubKey: E_pub /* public; safe anywhere */ },
         openKeys: { E_priv, k_wrap_1..m } }        // E_priv stays with the initiator
 
@@ -103,7 +107,7 @@ buildSurb({ returnPath: [Y_1..Y_m], epoch, now })
 sealReply(surb, plaintext) → P_0                  // crypto_box_seal to surb.replyPubKey
 
 processSurbHop(surb, hopRouteSecretKey)           // relay side — CIPHERTEXT ONLY
-    → { nextHop, surb: { alpha: α_{i+1}, header: β_{i+1}, mac: γ_{i+1} },
+    → { nextHop, surb: { ephem: E_{i+1}, header: β_{i+1}, mac: γ_{i+1} },
         wrapCiphertext(P) }                        // applies k_wrap_i to ciphertext P
     // rejects on: bad MAC, replayed nullifier, expired epoch
 
