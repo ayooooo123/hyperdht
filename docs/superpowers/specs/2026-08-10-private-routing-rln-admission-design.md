@@ -135,9 +135,14 @@ verifyingKey }` and the proof, and returns accept/reject.
   bytes. Confirm it fits the reservation control message without breaking the fixed
   1,200-byte outer cell discipline; a dedicated control message type is likely, not an
   extension of the 188-byte fixed advertisement body (`CAPABILITY_ADVERTISEMENT_FIXED_BODY`).
-- **Proving cost on mobile.** RLN proof generation per circuit-open may be too slow on
-  low-end/mobile initiators; measure, and consider proof reuse within an epoch or a
-  lighter membership scheme.
+- **Proving cost on mobile.** RLN proof generation per reservation may be too slow on
+  low-end/mobile initiators; measure, and mitigate by **precomputing a batch of fresh
+  per-message proofs** ahead of time (each with a distinct in-epoch message index /
+  nullifier slot) and/or batch proving to amortize cost. NEVER reuse a proof: every
+  reservation MUST carry a fresh proof at its own message index — reusing one replays a
+  nullifier slot and collapses the rate guarantee (it is indistinguishable from, or
+  worse than, an over-rate event). A lighter membership scheme is an alternative only if
+  it preserves one-proof-per-message.
 - **Root distribution & freshness.** How relays obtain and agree on a recent membership
   root; tolerance window for root skew; behavior on root disagreement.
 - **Revocation / slashing propagation.** How an eviction proof reaches the group and how
