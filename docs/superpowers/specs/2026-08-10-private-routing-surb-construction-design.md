@@ -52,7 +52,14 @@ for i in 1..m:
 From each `s_i` derive, via domain-separated BLAKE2b:
 - `k_mac_i`   — header MAC key
 - `k_hdr_i`   — header stream-cipher key (layer of β)
-- `k_pay_i`   — payload AEAD key + nonce prefix (XChaCha20-Poly1305)
+- `k_wrap_i`  — payload **wrap** key + nonce prefix (XChaCha20-Poly1305); relay hop `i`
+  applies it to **ciphertext only**, never plaintext
+
+Separately, the initiator generates a fresh **one-time reply keypair** `(E_pub, E_priv)`
+and embeds **only `E_pub`** (a public encapsulation target) in the SURB. `E_pub` is safe to
+place anywhere — a relay or any SURB holder learns nothing exploitable from it. The matching
+secret `E_priv` **never travels**; the initiator keeps it in `openKeys`. No symmetric reply
+secret is ever put in the SURB.
 
 ## SURB structure (fixed size)
 
@@ -61,35 +68,46 @@ From each `s_i` derive, via domain-separated BLAKE2b:
   `α`-advance is implicit via blinding (Sphinx carries per-hop routing info + the next MAC).
   Padded with PRG output so every hop sees a constant-size β.
 - **Per-layer MAC γ_i** over β_i under `k_mac_i` (integrity; a hop rejects a tampered header).
-- **Payload slot**: fixed size, sized so `|β| + |γ| + |α_1| + |payload|` ≤ the 1,200-byte
-  outer cell budget (compute against `CAPABILITY_ADVERTISEMENT`/cell constants; if it does
-  not fit at `m_max=3`, reduce payload and fragment via `fragments.js`).
+- **Payload slot**: fixed size, holds the responder-sealed **ciphertext** (see Reply
+  direction), then relay wrap layers. Sized so `|β| + |γ| + |α_1| + |payload|` ≤ the
+  1,200-byte outer cell budget; if it does not fit at `m_max=3`, reduce payload and
+  fragment via `fragments.js`.
 
-The initiator retains `openKeys = {k_pay_1 … k_pay_m}` (the "reply secrets").
+The initiator retains `openKeys = { E_priv, k_wrap_1 … k_wrap_m }` — `E_priv` never leaves
+the initiator.
 
 ## Reply direction (why hops *encrypt*)
 
-A SURB is the reply path, so the direction is inverted vs a forward onion: the responder
-puts its plaintext in the payload slot; **each hop adds one AEAD layer** under its `k_pay_i`;
-the initiator, holding all `k_pay_i`, peels all layers at the end. **Intermediate return
-hops cannot read the reply** (each only wraps; none holds all keys). A SURB does **not**
-hide the reply from the responder — the responder authored the plaintext, so claiming
-secrecy from it is meaningless. What the SURB hides *from the responder* is the initiator's
-network location and the return path: the responder learns only the first hop `H_1`.
+A SURB is the reply path, so the direction is inverted vs a forward onion — **but no relay
+(including the first hop `H_1`) and no SURB holder may ever recover plaintext.** The
+responder MUST first **encapsulate its plaintext to the SURB's one-time public key `E_pub`**
+— concretely `crypto_box_seal(plaintext, E_pub)` (X25519 sealed box; available in
+`sodium-universal`, no exotic group op needed for the reply seal) — producing ciphertext
+`P_0`. Only the initiator, holding `E_priv`, can open it; not the responder afterward, and
+not any relay. Only `P_0` (never plaintext) is handed to `H_1`. Each return hop `i` then
+applies its `k_wrap_i` transform to the **ciphertext** (bitwise unlinkability across links,
+so the reply is not correlatable hop-to-hop); the initiator strips every wrap layer with
+`k_wrap_1..m` and decapsulates with `E_priv`. A SURB does not hide *that* a reply exists
+from the responder — it authored the plaintext — but it hides the initiator's network
+location and the return path (the responder learns only `H_1`).
 
 ## API (`lib/private/surb.js`)
 
 ```
 buildSurb({ returnPath: [Y_1..Y_m], epoch, now })
-    → { surb: { firstHop: H_1, alpha: α_1, header: β, mac: γ_1 }, openKeys }
+    → { surb: { firstHop: H_1, alpha: α_1, header: β, mac: γ_1,
+                replyPubKey: E_pub /* public; safe anywhere */ },
+        openKeys: { E_priv, k_wrap_1..m } }        // E_priv stays with the initiator
 
-processSurbHop(surb, hopRouteSecretKey)          // relay side, one hop
+// responder side — MUST run before sending to H_1; encapsulates to E_pub, never exposes plaintext
+sealReply(surb, plaintext) → P_0                  // crypto_box_seal to surb.replyPubKey
+
+processSurbHop(surb, hopRouteSecretKey)           // relay side — CIPHERTEXT ONLY
     → { nextHop, surb: { alpha: α_{i+1}, header: β_{i+1}, mac: γ_{i+1} },
-        wrapPayload(payload) }                    // adds this hop's AEAD layer
-    // rejects on: bad MAC, replayed nullifier (below), expired epoch
+        wrapCiphertext(P) }                        // applies k_wrap_i to ciphertext P
+    // rejects on: bad MAC, replayed nullifier, expired epoch
 
-openSurbPayload(wrappedPayload, openKeys)         // initiator side
-    → plaintext | throws on AEAD failure
+openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, then crypto_box_seal_open with E_priv
 ```
 
 - The SURB is carried inside the forward request's **source→destination inner AEAD**
@@ -111,10 +129,11 @@ openSurbPayload(wrappedPayload, openKeys)         // initiator side
 
 1. Header integrity: a hop rejects any β it cannot MAC-verify under `k_mac_i`.
 2. Forward-path secrecy: the SURB is unreadable to every forward hop (inner AEAD).
-3. Reply secrecy from *relays*: no intermediate return hop can read the reply payload; only
-   the initiator (holding all `openKeys`) can. This says nothing about the responder, which
-   authored the plaintext — a SURB does not hide the reply from its author, only the
-   initiator's location/return path (see invariant 4).
+3. Reply secrecy from *all relays and any SURB holder*: the responder encapsulates to the
+   SURB's public key `E_pub`; only the initiator, holding `E_priv` (which never travels),
+   can decrypt. No return relay — including `H_1` — and no party that merely holds the SURB
+   can recover plaintext; relays only wrap ciphertext. (Says nothing about the responder,
+   which authored the plaintext — see invariant 4.)
 4. Locality: the responder learns only `H_1`; each hop learns only its next hop.
 5. Single-use: per-hop nullifier rejects replay within the epoch; keys/`openKeys` erased on
    use, expiry, or teardown.
