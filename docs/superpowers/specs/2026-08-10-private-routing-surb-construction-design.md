@@ -52,9 +52,10 @@ clear**: the SURB head carries `E_1`, and decrypting layer `i` reveals the next 
 `E_{i+1}`. At `m_max = 3` that is 3×32 B of ephemerals — within the cell budget.
 
 From each `s_i` derive, via domain-separated BLAKE2b:
-- `k_mac_i`   — header MAC key
-- `k_hdr_i`   — header stream-cipher key (layer of β)
-- `k_wrap_i`  — payload **wrap** key + nonce prefix (XChaCha20-Poly1305); relay hop `i`
+
+- `k_mac_i` — header MAC key
+- `k_hdr_i` — header stream-cipher key (layer of β)
+- `k_wrap_i` — payload **wrap** key + nonce prefix (XChaCha20-Poly1305); relay hop `i`
   applies it to **ciphertext only**, never plaintext
 
 Separately, the initiator generates a fresh **one-time reply keypair** `(E_pub, E_priv)`
@@ -66,7 +67,7 @@ secret is ever put in the SURB.
 ## SURB structure (fixed size)
 
 - **Per-hop header unit** handed to hop `i`: `{ E_i (clear), β_i (encrypted under
-  `k_hdr_i`), γ_i }`. The hop computes `s_i = crypto_scalarmult(y_i, E_i)` from the
+`k_hdr_i`), γ_i }`. The hop computes `s_i = crypto_scalarmult(y_i, E_i)` from the
   **clear** `E_i`, derives `k_mac_i`/`k_hdr_i`/`k_wrap_i`, verifies `γ_i` over `β_i`, then
   decrypts `β_i` to obtain `{ nextHop, E_{i+1} (clear), β_{i+1}, γ_{i+1} }` for the next
   hop. `β` is fixed-length (`m_max = 3`) and PRG-padded so every hop sees a constant size.
@@ -80,7 +81,7 @@ secret is ever put in the SURB.
 The initiator retains `openKeys = { E_priv, k_wrap_1 … k_wrap_m }` — `E_priv` never leaves
 the initiator.
 
-## Reply direction (why hops *encrypt*)
+## Reply direction (why hops _encrypt_)
 
 A SURB is the reply path, so the direction is inverted vs a forward onion — **but no relay
 (including the first hop `H_1`) and no SURB holder may ever recover plaintext.** The
@@ -91,7 +92,7 @@ responder MUST first **encapsulate its plaintext to the SURB's one-time public k
 not any relay. Only `P_0` (never plaintext) is handed to `H_1`. Each return hop `i` then
 applies its `k_wrap_i` transform to the **ciphertext** (bitwise unlinkability across links,
 so the reply is not correlatable hop-to-hop); the initiator strips every wrap layer with
-`k_wrap_1..m` and decapsulates with `E_priv`. A SURB does not hide *that* a reply exists
+`k_wrap_1..m` and decapsulates with `E_priv`. A SURB does not hide _that_ a reply exists
 from the responder — it authored the plaintext — but it hides the initiator's network
 location and the return path (the responder learns only `H_1`).
 
@@ -140,7 +141,7 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
    keyed-BLAKE2b MAC (`μ`) carried alongside it; a hop that fails the MAC (wrong key or
    tampered `β`/MAC) rejects before doing anything else.
 2. Forward-path secrecy: the SURB is unreadable to every forward hop (inner AEAD).
-3. Reply secrecy from *all relays and any SURB holder*: the responder encapsulates to the
+3. Reply secrecy from _all relays and any SURB holder_: the responder encapsulates to the
    SURB's public key `E_pub`; only the initiator, holding `E_priv` (which never travels),
    can decrypt. No return relay — including `H_1` — and no party that merely holds the SURB
    can recover plaintext; relays only wrap ciphertext. (Says nothing about the responder,
@@ -160,16 +161,25 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
 ## Implementation gate (do not skip)
 
 1. Confirm group ops (Step 0) — **done**. 2. Implement `surb.js` — **done** (tested); DHT
-integration behind an off-by-default flag is **still pending**. 3. **Fixed cross-impl test
-vectors** — pending. 4. Substitution / property / fuzz — **done** (tamper header/MAC/payload,
-wrong key, malformed fail-closed, fail-closed replay guard, 200-iter random round-trips +
-single-bit tampers); cross-epoch vectors pending. 5. **External cryptographic review** —
-pending. The wire format is not stable until 3 + 5 are complete.
+   integration behind an off-by-default flag is **still pending**. 3. Conformance vectors —
+   **done for the deterministic wire fields**: `test/private/fixtures/surb-vector-v1.json` pins
+   every deterministic field byte-for-byte (`ephem`, full `header`, `mac`, `replyPub`, and per
+   hop `nextHop`/`nullifier`/`nextEphem`/`nextMac`/`nextHeader`), so a second implementation can
+   conform. The **reply payload is NOT vectored** — `crypto_box_seal` is randomized; a payload
+   conformance vector needs a deterministic seal (future). 4. Substitution / property / fuzz —
+   **done** (tamper header/MAC/payload, wrong key, malformed fail-closed, fail-closed replay
+   guard, 200-iter random round-trips + single-bit tampers). 5. **External cryptographic
+   review** — pending (a human gate; not self-certifiable). Wire format is not stable until a
+   second impl conforms to the vectors + review passes.
 
 ## Open questions
 
-- Exact `m_max` and payload size against the 1,200-byte cell (and stacked with anything the
-  request already carries); fragmenting large replies.
+- Payload size vs the 1,200-byte cell: **OPEN.** A _provisional SURB-only_ cap
+  `MAX_REPLY_BYTES = 512` is guarded in `sealReply`. Worst-case SURB message on a full-header
+  leg = `pt + 468` (ephem 32 + header 324 + mac 16 + box 48 + 3×16 wrap tags) ≈ 980 B at the
+  cap, leaving ~220 B for Noise/UDX/cell framing — **which is not yet measured**. Re-derive
+  the cap against real framing overhead when the DATAGRAM path is wired; replies over the cap
+  need fragmentation or a multi-SURB batch.
 - Route-key type: **resolved** — relays already publish X25519 route keys, used directly for
   per-hop DH; no advertisement wire change.
 - Whether the responder needs > 1 reply (multi-SURB batch) for `get` responses that exceed
@@ -180,13 +190,15 @@ pending. The wire format is not stable until 3 + 5 are complete.
 `lib/private/surb.js` + `test/private/surb.js` (brittle). Per-hop X25519 on `crypto-suite`
 (`keyAgreement`, `seal`/`open`) + `crypto_box_seal` for the reply; **fixed-size Sphinx
 header** (`MAX_HOPS = 4`, `HOP = 81`, `RHO = 324`) with filler, PRG = BLAKE2b-CTR, MAC =
-keyed BLAKE2b (16 B), plus a fail-closed per-epoch replay cache (`createNullifierGuard`).
-**13/13 tests, 33/33 asserts pass** on the pinned sodium (Node 22): round-trip for **every
+keyed BLAKE2b (16 B), fail-closed per-epoch replay cache (`createNullifierGuard`),
+`MAX_REPLY_BYTES = 512` (provisional) budget guard, and an optional deterministic seed seam for vectors.
+**16/16 tests, 58/58 asserts pass** on the pinned sodium (Node 22): round-trip for **every
 path length 1..4**; constant `RHO`-byte header (length-invariance); first hop never sees
 plaintext; a hop learns only its next hop; tampered header/MAC/payload + wrong key rejected;
-malformed input fail-closed; replay guard fail-closed (strict single-use up to capacity, no
-eviction); nullifiers deterministic per hop and fresh per SURB; 200-iter property/fuzz
-(random path lengths + payload sizes 0–1024 B, single-bit tampers). Still NOT wired into the
-DHT and NOT wire-stable — remaining before a format freeze: fixed cross-impl test vectors,
-statistical review of filler indistinguishability, payload-size budget vs the 1,200-byte
-cell, DHT wiring, and external cryptographic review.
+malformed input fail-closed; fail-closed replay guard (strict single-use up to capacity);
+nullifiers deterministic per hop, fresh per SURB; 200-iter property/fuzz; a **byte-for-byte
+conformance fixture** over all deterministic wire fields; payload-budget enforcement; and a
+(weak) filler non-degeneracy sanity check. Still NOT wired into the DHT and NOT wire-stable —
+remaining: a **deterministic-seal payload vector** (box_seal is randomized), statistical
+review of filler indistinguishability, DHT wiring into the DATAGRAM reply path, and external
+cryptographic review.
