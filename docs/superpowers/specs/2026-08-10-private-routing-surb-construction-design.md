@@ -131,7 +131,9 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
 
 ## Security invariants
 
-1. Header integrity: a hop rejects any β it cannot MAC-verify under `k_mac_i`.
+1. Header-layer integrity: each layer is AEAD (XChaCha20-Poly1305); a hop that cannot open
+   its layer (wrong key or tampered bytes) rejects. Integrity is the AEAD tag — no separate
+   MAC (the reference folds it into the layer AEAD).
 2. Forward-path secrecy: the SURB is unreadable to every forward hop (inner AEAD).
 3. Reply secrecy from *all relays and any SURB holder*: the responder encapsulates to the
    SURB's public key `E_pub`; only the initiator, holding `E_priv` (which never travels),
@@ -141,9 +143,12 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
 4. Locality: the responder learns only `H_1`; each hop learns only its next hop.
 5. Single-use: per-hop nullifier rejects replay within the epoch; keys/`openKeys` erased on
    use, expiry, or teardown.
-6. Group hygiene: reject identity / low-order elements (moot under ristretto); constant-time
-   scalar ops.
-7. Fixed size: β and payload are constant-length with PRG padding — no length leak.
+6. Group hygiene: X25519 DH via `crypto-suite.keyAgreement`, which rejects all-zero /
+   low-order shared secrets.
+7. Size: **the reference does not implement Sphinx position-hiding filler** — the header
+   shrinks one layer per hop, so a relay can infer its position from length. Acceptable
+   given fixed roles (guard/safety/exit); constant-size filler is deferred to the reviewed
+   wire-format step.
 8. Additive: absent a SURB, behavior is exactly today's correlated-reply / STREAM reply.
 
 ## Implementation gate (do not skip)
@@ -157,7 +162,18 @@ and fuzz tests (tampered β, wrong key, replayed nullifier, truncated payload, c
 
 - Exact `m_max` and payload size against the 1,200-byte cell (and stacked with anything the
   request already carries); fragmenting large replies.
-- Route-key type in the capability advertisement (ristretto/edwards vs current X25519) — a
-  wire dependency if the current key is X25519-only.
+- Route-key type: **resolved** — relays already publish X25519 route keys, used directly for
+  per-hop DH; no advertisement wire change.
 - Whether the responder needs > 1 reply (multi-SURB batch) for `get` responses that exceed
   one payload slot.
+
+## Reference implementation (built + tested 2026-08-10)
+
+`lib/private/surb.js` + `test/private/surb.js` (brittle). Implements the per-hop X25519
+construction above on `crypto-suite` (`keyAgreement`, `seal`/`open`) + `crypto_box_seal` for
+the reply. **8/8 tests, 12/12 asserts pass** on the pinned sodium (Node 22): 1- and 3-hop
+round-trip recovers the reply; the first hop never sees plaintext; a hop learns only its
+immediate next hop; tampered header, tampered payload, and wrong route key are all rejected;
+nullifiers are deterministic per hop and fresh per SURB. NOT wired into the DHT and NOT
+wire-stable — header layers use nested AEAD (tag = integrity), no Sphinx filler yet, and the
+format still needs fixed test vectors + external cryptographic review (see the gate above).
