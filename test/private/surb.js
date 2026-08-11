@@ -3,7 +3,6 @@
 const test = require('brittle')
 const b4a = require('b4a')
 const sodium = require('sodium-universal')
-const crypto = require('crypto')
 
 const {
   MAX_HOPS,
@@ -273,72 +272,44 @@ test('fuzz: a single-byte flip anywhere in the message is rejected', (t) => {
   t.pass('200 single-bit tampers each rejected or (payload-preserving) benign, never forged')
 })
 
-function vseed(tag) {
-  return crypto
-    .createHash('sha256')
-    .update('surb-vector/' + tag)
-    .digest()
-}
+test('conformance vector — deterministic wire fields match the fixture byte-for-byte', (t) => {
+  const fix = require('./fixtures/surb-vector-v1.json')
+  const h2b = (s) => b4a.from(s, 'hex')
+  const hex = (b) => b4a.toString(b, 'hex')
 
-test('fixed vector — deterministic SURB reproduces frozen bytes (format-freeze guard)', (t) => {
-  const relays = ['a', 'b', 'c'].map((tag) => {
-    const pk = b4a.alloc(32)
-    const sk = b4a.alloc(32)
-    sodium.crypto_box_seed_keypair(pk, sk, vseed('relay/' + tag))
-    return {
-      id: crypto
-        .createHash('sha256')
-        .update('id/' + tag)
-        .digest(),
-      routeKey: pk,
-      routeSecretKey: sk
-    }
+  const hops = fix.inputs.hops.map((h) => ({ id: h2b(h.id), routeKey: h2b(h.routeKey) }))
+  const { surb } = buildSurb(hops, h2b(fix.inputs.terminalId), {
+    ephemeralSeeds: fix.inputs.ephemeralSeeds.map(h2b),
+    replySeed: h2b(fix.inputs.replySeed)
   })
-  const terminalId = b4a.alloc(32, 0x5a)
-  const ephemeralSeeds = [vseed('e0'), vseed('e1'), vseed('e2')]
-  const replySeed = vseed('reply')
-  const plaintext = b4a.from('vector reply payload v1')
 
-  const { surb, openKeys } = buildSurb(
-    relays.map((r) => ({ id: r.id, routeKey: r.routeKey })),
-    terminalId,
-    { ephemeralSeeds, replySeed }
-  )
-  const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
-
-  t.is(
-    b4a.toString(surb.ephem, 'hex'),
-    '343c7e54305856aac5a04127020514ab6cb3f2ee3d5766ac6d50b0ff2442bd28',
-    'E_1 frozen'
-  )
+  t.is(hex(surb.ephem), fix.outputs.ephem, 'E_1')
   t.is(surb.header.byteLength, RHO, 'header is RHO bytes')
-  t.is(
-    sha(surb.header),
-    'ca6be050156e3115e4aa79a2601573a3cfcee0247e4e43f0f361c68fd641d5be',
-    'header bytes frozen'
-  )
-  t.is(b4a.toString(surb.mac, 'hex'), '4fe356e1543a88b9af9bf35dd38807f9', 'header MAC frozen')
-  t.is(
-    b4a.toString(surb.replyPubKey, 'hex'),
-    'bdf2c752a1e43147fdafe6b4d921883ba085d2dff3d68070ad57741394f94715',
-    'reply pubkey frozen'
-  )
+  t.is(hex(surb.header), fix.outputs.header, 'full header bytes match fixture')
+  t.is(hex(surb.mac), fix.outputs.mac, 'header MAC')
+  t.is(hex(surb.replyPubKey), fix.outputs.replyPub, 'reply pubkey')
 
-  let msg = sealReply(surb, plaintext)
-  let recovered = null
-  const nulls = []
-  for (let i = 0; i < relays.length; i++) {
-    const r = processSurbHop(msg, relays[i].routeSecretKey)
-    nulls.push(r.nullifier)
-    if (i < relays.length - 1) msg = r.forward
-    else recovered = openSurbPayload(r.forward.payload, openKeys)
+  // Walk the header with a fixed dummy payload — the payload path uses crypto_box_seal
+  // (randomized) so its wire bytes are intentionally NOT part of the conformance fixture.
+  const secrets = fix.inputs.hops.map((h) => h2b(h.routeSecretKey))
+  let msg = { ephem: surb.ephem, header: surb.header, mac: surb.mac, payload: b4a.alloc(48) }
+  for (let i = 0; i < fix.outputs.hops.length; i++) {
+    const r = processSurbHop(msg, secrets[i])
+    const exp = fix.outputs.hops[i]
+    t.is(hex(r.nextHop), exp.nextHop, 'hop ' + i + ' nextHop')
+    t.is(hex(r.nullifier), exp.nullifier, 'hop ' + i + ' nullifier')
+    t.is(r.terminal, exp.terminal, 'hop ' + i + ' terminal flag')
+    if (!r.terminal) {
+      t.is(hex(r.forward.ephem), exp.nextEphem, 'hop ' + i + ' nextEphem')
+      t.is(hex(r.forward.mac), exp.nextMac, 'hop ' + i + ' nextMac')
+      msg = {
+        ephem: r.forward.ephem,
+        header: r.forward.header,
+        mac: r.forward.mac,
+        payload: b4a.alloc(48)
+      }
+    }
   }
-  t.is(
-    b4a.toString(nulls[0], 'hex'),
-    'c6958556c39abc038aecf02a0b347f072df032b5dd1e7b5ada7d3312ba16ba27',
-    'first-hop nullifier frozen'
-  )
-  t.alike(recovered, plaintext, 'vector round-trip recovers plaintext')
 })
 
 test('reply payload budget is enforced', (t) => {
