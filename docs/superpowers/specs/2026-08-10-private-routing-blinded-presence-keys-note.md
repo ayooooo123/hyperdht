@@ -40,6 +40,13 @@ by DHT storage nodes** MUST use **blinded, epoch-rotating keys**, not mere rotat
 - The blinding scheme must let a legitimate looker-up who knows the destination's stable
   identity compute the current blinded key and locate/verify the record, while a storage
   node holding the record cannot.
+- **Separate concern — body confidentiality.** Blinding hides *identity and linkage* from
+  the storage node; it does **not** control who may *read* the descriptor. The public
+  stable key `A` is not a confidentiality boundary (it may be widely known). Restricting
+  readers requires a separate **reader credential** — a shared secret or the looker's own
+  keypair (Tor v3 "client authorization" style) — used to derive the body-encryption key.
+  If no reader restriction is intended, say plainly that the body is enumeration-protected
+  from the storage node but not access-controlled.
 
 ## Why not now
 
@@ -77,14 +84,18 @@ a'   = h · a  (mod L)                            # blinded private key (signer)
 k_e  = H("presence/addr" ‖ A' ‖ P_e)             # DHT storage key (record address)
 ```
 
-The record is published at `k_e`, signed with `a'`, its body (the route descriptor)
-encrypted to lookers who know `A` (or a shared secret). The storage node stores opaque
-bytes at an address it cannot attribute.
+The record is published at `k_e`, signed with `a'`. Its body (the route descriptor) is
+encrypted under a key derived from a **separate reader credential** — a shared secret or a
+recipient/looker keypair (client-authorization) — **not** from the public `A` (a public key
+is not a confidentiality boundary). The storage node stores opaque bytes at an address it
+cannot attribute.
 
 **Lookup:** a peer that knows `A` recomputes `h, A', k_e` from public `P_e`, fetches `k_e`,
-verifies the signature under `A'`, and decrypts. A storage node holding `{k_e, A', body}`
-cannot recover `A`, cannot link `A'` across epochs (different `h` ⇒ different `A'`, `k_e`),
-and cannot enumerate which services it stores.
+and verifies the signature under `A'`. It can **read** the body only if it also holds the
+reader credential above — knowing `A` alone locates and authenticates the record but does
+not decrypt it. A storage node holding `{k_e, A', body}` cannot recover `A`, cannot link
+`A'` across epochs (different `h` ⇒ different `A'`, `k_e`), and cannot enumerate which
+services it stores.
 
 Notes:
 - ristretto255 gives a clean `h·A`; the ed25519 fallback must follow Tor's clamping-aware

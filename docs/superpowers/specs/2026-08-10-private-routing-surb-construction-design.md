@@ -71,8 +71,11 @@ The initiator retains `openKeys = {k_pay_1 … k_pay_m}` (the "reply secrets").
 
 A SURB is the reply path, so the direction is inverted vs a forward onion: the responder
 puts its plaintext in the payload slot; **each hop adds one AEAD layer** under its `k_pay_i`;
-the initiator, holding all `k_pay_i`, peels all layers at the end. No hop can read the reply;
-the responder cannot read it after the first hop wraps it.
+the initiator, holding all `k_pay_i`, peels all layers at the end. **Intermediate return
+hops cannot read the reply** (each only wraps; none holds all keys). A SURB does **not**
+hide the reply from the responder — the responder authored the plaintext, so claiming
+secrecy from it is meaningless. What the SURB hides *from the responder* is the initiator's
+network location and the return path: the responder learns only the first hop `H_1`.
 
 ## API (`lib/private/surb.js`)
 
@@ -108,8 +111,10 @@ openSurbPayload(wrappedPayload, openKeys)         // initiator side
 
 1. Header integrity: a hop rejects any β it cannot MAC-verify under `k_mac_i`.
 2. Forward-path secrecy: the SURB is unreadable to every forward hop (inner AEAD).
-3. Reply secrecy: no return hop and not the responder can read the reply payload; only the
-   initiator (holding `openKeys`) can.
+3. Reply secrecy from *relays*: no intermediate return hop can read the reply payload; only
+   the initiator (holding all `openKeys`) can. This says nothing about the responder, which
+   authored the plaintext — a SURB does not hide the reply from its author, only the
+   initiator's location/return path (see invariant 4).
 4. Locality: the responder learns only `H_1`; each hop learns only its next hop.
 5. Single-use: per-hop nullifier rejects replay within the epoch; keys/`openKeys` erased on
    use, expiry, or teardown.
