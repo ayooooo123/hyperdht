@@ -5,11 +5,12 @@ const b4a = require('b4a')
 const sodium = require('sodium-universal')
 
 const {
+  MAX_HOPS,
+  RHO,
   buildSurb,
   sealReply,
   processSurbHop,
-  openSurbPayload,
-  nullifierOf
+  openSurbPayload
 } = require('../../lib/private/surb')
 
 function relay() {
@@ -26,10 +27,13 @@ function pathOf(relays) {
 }
 
 // Drive a reply from the responder back through every relay to the initiator.
+// Records the header length each hop observed (for the length-invariance property).
 function roundTrip(relays, terminalId, surb, openKeys, plaintext) {
   let msg = sealReply(surb, plaintext)
   const nullifiers = []
+  const headerLengths = []
   for (let i = 0; i < relays.length; i++) {
+    headerLengths.push(msg.header.byteLength)
     const r = processSurbHop(msg, relays[i].routeSecretKey)
     nullifiers.push(r.nullifier)
     const expectedNext = i < relays.length - 1 ? relays[i + 1].id : terminalId
@@ -39,32 +43,29 @@ function roundTrip(relays, terminalId, surb, openKeys, plaintext) {
       msg = r.forward
     } else {
       if (!r.terminal) throw new Error('missing terminal at last hop')
-      return {
-        plaintext: openSurbPayload(r.forward.payload, openKeys),
-        nullifiers,
-        lastPayload: r.forward.payload
-      }
+      return { plaintext: openSurbPayload(r.forward.payload, openKeys), nullifiers, headerLengths }
     }
   }
 }
 
-test('surb round-trip through 3 hops recovers the reply', (t) => {
-  const relays = [relay(), relay(), relay()]
-  const terminalId = b4a.alloc(32, 7)
-  const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
-
-  const reply = b4a.from('hello from the responder, only the initiator reads this')
-  const out = roundTrip(relays, terminalId, surb, openKeys, reply)
-  t.alike(out.plaintext, reply, 'initiator recovers the exact plaintext')
-})
-
-test('single-hop path works', (t) => {
-  const relays = [relay()]
-  const terminalId = b4a.alloc(32, 3)
-  const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
-  const reply = b4a.from('one hop')
-  const out = roundTrip(relays, terminalId, surb, openKeys, reply)
-  t.alike(out.plaintext, reply)
+test('round-trip recovers the reply for every path length 1..MAX_HOPS', (t) => {
+  const all = []
+  for (let n = 1; n <= MAX_HOPS; n++) {
+    const relays = []
+    for (let i = 0; i < n; i++) relays.push(relay())
+    const terminalId = b4a.alloc(32, n)
+    const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
+    const reply = b4a.from('reply over ' + n + ' hop(s) — only the initiator reads this')
+    const out = roundTrip(relays, terminalId, surb, openKeys, reply)
+    t.alike(out.plaintext, reply, n + '-hop round-trip')
+    all.push(out.headerLengths)
+  }
+  // Length-invariance: every hop on every path sees exactly RHO header bytes.
+  const flat = all.flat()
+  t.ok(
+    flat.every((len) => len === RHO),
+    'every hop sees a constant RHO-byte header (position not leaked by length)'
+  )
 })
 
 test('the first hop never sees plaintext', (t) => {
@@ -87,7 +88,6 @@ test('a hop learns only its immediate next hop, not the whole path', (t) => {
 
   const r1 = processSurbHop(msg, relays[0].routeSecretKey)
   t.alike(r1.nextHop, relays[1].id, 'hop 1 sees hop 2 as next')
-  // Hop 1 cannot process as if it were a later hop: it holds no key for E_2's layer.
   t.exception(
     () => processSurbHop(r1.forward, relays[0].routeSecretKey),
     'hop 1 key cannot open hop 2 layer'
@@ -103,11 +103,20 @@ test('tampered header is rejected', (t) => {
   t.exception(() => processSurbHop(msg, relays[0].routeSecretKey), 'header tamper -> reject')
 })
 
+test('tampered header MAC is rejected', (t) => {
+  const relays = [relay(), relay(), relay()]
+  const terminalId = b4a.alloc(32, 3)
+  const { surb } = buildSurb(pathOf(relays), terminalId)
+  const msg = sealReply(surb, b4a.from('y2'))
+  msg.mac[0] ^= 0x01
+  t.exception(() => processSurbHop(msg, relays[0].routeSecretKey), 'mac tamper -> reject')
+})
+
 test('tampered payload is rejected at open', (t) => {
   const relays = [relay(), relay(), relay()]
   const terminalId = b4a.alloc(32, 4)
   const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
-  let msg = sealReply(surb, b4a.from('z'))
+  const msg = sealReply(surb, b4a.from('z'))
   const r1 = processSurbHop(msg, relays[0].routeSecretKey)
   const r2 = processSurbHop(r1.forward, relays[1].routeSecretKey)
   const r3 = processSurbHop(r2.forward, relays[2].routeSecretKey)
@@ -124,36 +133,31 @@ test('wrong route key cannot process the hop', (t) => {
   t.exception(() => processSurbHop(msg, wrong.routeSecretKey), 'wrong key -> reject')
 })
 
-test('nullifiers are deterministic per hop and distinct across hops', (t) => {
+test('nullifiers are deterministic per hop and fresh per SURB', (t) => {
   const relays = [relay(), relay(), relay()]
   const terminalId = b4a.alloc(32, 6)
-  const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
-  const a = roundTrip(relays, terminalId, surb, openKeys, b4a.from('a')).nullifiers
-
-  // Rebuild a fresh SURB over the SAME relays: fresh ephemerals -> different nullifiers.
-  const built2 = buildSurb(pathOf(relays), terminalId)
-  const b = roundTrip(relays, terminalId, built2.surb, built2.openKeys, b4a.from('b')).nullifiers
+  const first = buildSurb(pathOf(relays), terminalId)
+  const a = roundTrip(relays, terminalId, first.surb, first.openKeys, b4a.from('a')).nullifiers
+  const second = buildSurb(pathOf(relays), terminalId)
+  const b = roundTrip(relays, terminalId, second.surb, second.openKeys, b4a.from('b')).nullifiers
 
   t.is(a.length, 3)
   t.unlike(a[0], a[1], 'distinct hops -> distinct nullifiers')
   t.unlike(a[0], b[0], 'fresh SURB -> fresh nullifier (single-use tracking works)')
 })
 
-test('malformed input is rejected fail-closed (short header / short payload)', (t) => {
+test('malformed input is rejected fail-closed', (t) => {
   const relays = [relay(), relay(), relay()]
   const terminalId = b4a.alloc(32, 8)
   const { surb } = buildSurb(pathOf(relays), terminalId)
   const msg = sealReply(surb, b4a.from('m'))
 
-  const shortHeader = { ephem: msg.ephem, header: msg.header.subarray(0, 10), payload: msg.payload }
   t.exception(
-    () => processSurbHop(shortHeader, relays[0].routeSecretKey),
-    'header below the minimum sealed-layer size -> reject before any DH/wrap'
+    () => processSurbHop({ ...msg, header: msg.header.subarray(0, 10) }, relays[0].routeSecretKey),
+    'wrong-size header -> reject'
   )
-
-  const shortPayload = { ephem: msg.ephem, header: msg.header, payload: b4a.alloc(4) }
   t.exception(
-    () => processSurbHop(shortPayload, relays[0].routeSecretKey),
-    'payload below the box-seal minimum -> reject before wrapping'
+    () => processSurbHop({ ...msg, payload: b4a.alloc(4) }, relays[0].routeSecretKey),
+    'payload below the box-seal minimum -> reject'
   )
 })
