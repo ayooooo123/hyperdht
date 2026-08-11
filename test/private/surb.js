@@ -3,10 +3,12 @@
 const test = require('brittle')
 const b4a = require('b4a')
 const sodium = require('sodium-universal')
+const crypto = require('crypto')
 
 const {
   MAX_HOPS,
   RHO,
+  MAX_REPLY_BYTES,
   buildSurb,
   sealReply,
   processSurbHop,
@@ -215,7 +217,7 @@ test('fuzz: random path lengths and payload sizes round-trip', (t) => {
     sodium.randombytes_buf(terminalId)
     const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
 
-    const size = Math.floor(Math.random() * 1024)
+    const size = Math.floor(Math.random() * (MAX_REPLY_BYTES + 1)) // 0..MAX_REPLY_BYTES
     const reply = b4a.allocUnsafeSlow(size)
     sodium.randombytes_buf(reply)
 
@@ -269,4 +271,103 @@ test('fuzz: a single-byte flip anywhere in the message is rejected', (t) => {
     }
   }
   t.pass('200 single-bit tampers each rejected or (payload-preserving) benign, never forged')
+})
+
+function vseed(tag) {
+  return crypto
+    .createHash('sha256')
+    .update('surb-vector/' + tag)
+    .digest()
+}
+
+test('fixed vector — deterministic SURB reproduces frozen bytes (format-freeze guard)', (t) => {
+  const relays = ['a', 'b', 'c'].map((tag) => {
+    const pk = b4a.alloc(32)
+    const sk = b4a.alloc(32)
+    sodium.crypto_box_seed_keypair(pk, sk, vseed('relay/' + tag))
+    return {
+      id: crypto
+        .createHash('sha256')
+        .update('id/' + tag)
+        .digest(),
+      routeKey: pk,
+      routeSecretKey: sk
+    }
+  })
+  const terminalId = b4a.alloc(32, 0x5a)
+  const ephemeralSeeds = [vseed('e0'), vseed('e1'), vseed('e2')]
+  const replySeed = vseed('reply')
+  const plaintext = b4a.from('vector reply payload v1')
+
+  const { surb, openKeys } = buildSurb(
+    relays.map((r) => ({ id: r.id, routeKey: r.routeKey })),
+    terminalId,
+    { ephemeralSeeds, replySeed }
+  )
+  const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
+
+  t.is(
+    b4a.toString(surb.ephem, 'hex'),
+    '343c7e54305856aac5a04127020514ab6cb3f2ee3d5766ac6d50b0ff2442bd28',
+    'E_1 frozen'
+  )
+  t.is(surb.header.byteLength, RHO, 'header is RHO bytes')
+  t.is(
+    sha(surb.header),
+    'ca6be050156e3115e4aa79a2601573a3cfcee0247e4e43f0f361c68fd641d5be',
+    'header bytes frozen'
+  )
+  t.is(b4a.toString(surb.mac, 'hex'), '4fe356e1543a88b9af9bf35dd38807f9', 'header MAC frozen')
+  t.is(
+    b4a.toString(surb.replyPubKey, 'hex'),
+    'bdf2c752a1e43147fdafe6b4d921883ba085d2dff3d68070ad57741394f94715',
+    'reply pubkey frozen'
+  )
+
+  let msg = sealReply(surb, plaintext)
+  let recovered = null
+  const nulls = []
+  for (let i = 0; i < relays.length; i++) {
+    const r = processSurbHop(msg, relays[i].routeSecretKey)
+    nulls.push(r.nullifier)
+    if (i < relays.length - 1) msg = r.forward
+    else recovered = openSurbPayload(r.forward.payload, openKeys)
+  }
+  t.is(
+    b4a.toString(nulls[0], 'hex'),
+    'c6958556c39abc038aecf02a0b347f072df032b5dd1e7b5ada7d3312ba16ba27',
+    'first-hop nullifier frozen'
+  )
+  t.alike(recovered, plaintext, 'vector round-trip recovers plaintext')
+})
+
+test('reply payload budget is enforced', (t) => {
+  const relays = [relay(), relay(), relay()]
+  const { surb } = buildSurb(pathOf(relays), b4a.alloc(32, 1))
+  t.execution(() => sealReply(surb, b4a.alloc(MAX_REPLY_BYTES)), 'max-size reply accepted')
+  t.exception(() => sealReply(surb, b4a.alloc(MAX_REPLY_BYTES + 1)), 'oversize reply rejected')
+})
+
+test('filler sanity — header padding is not degenerate (WEAK proxy, not a stat review)', (t) => {
+  // 1-hop SURB: most of beta is pad/filler. Sanity floor only — NOT a substitute for the
+  // statistical indistinguishability review the spec still gates on.
+  const { surb } = buildSurb(pathOf([relay()]), b4a.alloc(32, 1))
+  const h = surb.header
+  let zeros = 0
+  let run = 0
+  let maxRun = 0
+  const hist = new Array(256).fill(0)
+  for (let i = 0; i < h.byteLength; i++) {
+    hist[h[i]]++
+    if (h[i] === 0) {
+      zeros++
+      run++
+      maxRun = Math.max(maxRun, run)
+    } else {
+      run = 0
+    }
+  }
+  t.ok(maxRun < 16, 'no long zero run')
+  t.ok(zeros < h.byteLength / 4, 'header is not mostly zeros')
+  t.ok(hist.filter((c) => c > 0).length > 128, 'wide byte-value range')
 })
