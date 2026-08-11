@@ -1,7 +1,8 @@
 # Private Routing: DATAGRAM SURB Reply Path (Candidate Gate C)
 
-**Status:** DRAFT — proposed design, NOT owner-approved. No wire bytes or public
-API are frozen by this document.
+**Status:** NEAR-TERM for the Veilid-class target — completes receiver anonymity (Veilid
+"private routes"). Design not owner-approved; no wire bytes/API frozen. Concrete
+construction in [`2026-08-10-private-routing-surb-construction-design.md`](./2026-08-10-private-routing-surb-construction-design.md).
 **Date:** 2026-08-10
 **Relates to:** [`private-routing-v1.md`](../../private-routing-v1.md) (the mixnet
 "carries both fire-and-forget messages and request-response interactions"; `Out of

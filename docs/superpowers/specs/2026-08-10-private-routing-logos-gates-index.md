@@ -1,41 +1,47 @@
-# Private Routing: Logos-Lessons Gate Set — Index
+# Private Routing: Anonymity Roadmap — Index
 
 **Date:** 2026-08-10
 **Source analysis:** [`../../private-routing-logos-lessons.md`](../../private-routing-logos-lessons.md)
 
-Four candidate hardening ideas were derived from the Logos/Nym/Loopix/Tor-v3 prior art and
-mapped onto v1's `Out of scope` list. **Important scope correction:** this protocol keeps
-everything inside the hyperdht peer network — there is **no exit from the DHT** (that would
-be a separate VPN-service protocol, not this one). That closed-world reality prunes the set
-substantially. None is owner-approved; anything that survives is gated behind the existing
-testnet + external-review bar.
+**Target (decided):** **Veilid-class anonymity inside hyperdht** — low-latency onion
+routing, everything in-network, **no exit** (a clearnet/VPN exit would be a separate
+protocol). Tor/Veilid-class, *not* a Nym/Logos mixnet: resists local and single-relay
+adversaries, not a global passive observer / traffic correlation. Mixnet-class resistance
+(Gate B) is deferred as an opt-in high-anonymity mode; always-on mixing would make
+interactive hyperdht use painful.
 
-| Gate | Property | Status | Notes |
+## The core is already Veilid-class
+
+The existing design — guard-pinned 3-hop circuits, fixed 1,200-byte padded cells,
+per-direction/class/circuit AEAD, private route descriptors (`opaque-destination` /
+`destination-ref` / `redacted-responder-proof`) — is architecturally a Veilid-style overlay:
+circuits ≈ Veilid **safety routes** (sender anonymity), descriptors ≈ Veilid **private
+routes** (receiver anonymity). The floor is built. The gates below finish the receiver half
+and metadata hardening.
+
+| Gate | Property | Status vs target | Doc |
 |---|---|---|---|
-| **A** | Anonymous admission (Sybil/abuse control) | **DROPPED — not this protocol** | No exit ⇒ only abuse is relay resource exhaustion, already bounded by `relay-service.js` quotas. [analysis/decision record](./2026-08-10-private-routing-admission-analysis-note.md) |
-| **C** | DATAGRAM SURB reply path | OPTIONAL — optimization | STREAM circuits already carry bidirectional replies; SURBs add connectionless / timing-decoupled / private-peer request-response. Not required for a closed peer network. [datagram-surb](./2026-08-10-private-routing-datagram-surb-design.md) |
-| **D** | Blinded, epoch-rotating presence-record keys | FORWARD NOTE — requirement | Still relevant: private presence records stored on DHT nodes need enumeration resistance. Fold into the future presence-record gate. [blinded-presence-keys](./2026-08-10-private-routing-blinded-presence-keys-note.md) |
-| **B** | Scoped mixing + cover traffic | FORWARD NOTE — research-grade | Still the only thing addressing timing correlation / passive observers inside the network. Later gate. [scoped-mixing](./2026-08-10-private-routing-scoped-mixing-note.md) |
+| **C** | SURB reply path = Veilid "private routes" done right | **NEAR-TERM — completes receiver anonymity** | [datagram-surb](./2026-08-10-private-routing-datagram-surb-design.md) + [construction](./2026-08-10-private-routing-surb-construction-design.md) |
+| **D** | Blinded, epoch-rotating published-route/presence keys | **REQUIRED for the receiver side** — fold into the presence/route-record gate | [blinded-presence-keys](./2026-08-10-private-routing-blinded-presence-keys-note.md) |
+| **B** | Scoped mixing + cover traffic | **DEFERRED — opt-in high-anonymity mode** (only path to Nym/mixnet-class; latency cost) | [scoped-mixing](./2026-08-10-private-routing-scoped-mixing-note.md) |
+| **A** | Anonymous admission | **DROPPED — not this protocol** | [admission decision](./2026-08-10-private-routing-admission-analysis-note.md) |
 
-## What actually applies to a closed peer network
+## Sequencing for the Veilid-class target
 
-The core private-routing design (guards, 3-hop circuits, fixed padded cells, per-context
-AEAD) already provides the privacy this protocol needs. Of the imported extras:
+1. **C (SURBs / private routes)** — near-term. Sender anonymity (safety routes) already
+   exists via circuits; C completes *receiver* anonymity for connectionless and private-peer
+   request/response, and makes routes mixable later. Additive alongside existing
+   correlated-reply / STREAM reply.
+2. **D (blinded route keys)** — a required property to design into the presence/route-record
+   gate whenever address-free `announce`/`lookup` records are built.
+3. **B (mixing + cover)** — later, opt-in, CONTROL/DATAGRAM only, never STREAM.
+4. **A** — not planned; recorded as a decision only.
 
-1. **A is out** — admission control protects an exit; there is no exit. Relay resource
-   limits are the existing quotas.
-2. **C is optional** — an optimization for connectionless / mix-compatible replies and
-   lightweight private-peer request/response; not needed while STREAM circuits handle
-   replies.
-3. **D** remains a real requirement for whenever address-free presence records
-   (`lookup`/`announce`) are built — storage nodes must not enumerate/link private services.
-4. **B** remains the only route to timing-correlation / passive-observer resistance; hard,
-   research-grade, and it must stay off the STREAM fast path (mix the signaling, not the
-   payload).
+## No new dependencies
 
-## Not borrowed from Logos
-
-Blockchain / consensus / token layer; mix-everything-by-default; libp2p/nim-libp2p
-transport; **zk-RLN and any anonymous-admission scheme** (no exit to protect, and RLN needs
-a proving-system dependency + a poorly-scaling replicated membership set). hyperdht stays
-native on UDX/dht-rpc, no new dependencies.
+Everything hand-rolled (SURB construction, blinded keys) builds on the existing
+`crypto-suite` primitives (`sodium-universal`): a prime-order group op (ristretto255
+preferred; else ed25519 group), BLAKE2b (`crypto_generichash`), XChaCha20-Poly1305. No
+zk/SNARK, no libp2p, no chain. **Step 0 of any implementation: confirm the pinned
+`sodium-universal` exposes the required group ops.** Wire formats are not stable until fixed
+test vectors + external cryptographic review (the repo's existing bar).

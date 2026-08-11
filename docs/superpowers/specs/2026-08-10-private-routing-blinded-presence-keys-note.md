@@ -59,3 +59,37 @@ real encode/decode functions and test vectors.
   record; a node without it cannot.
 - Extends the existing domain-separated `crypto_generichash` derivation discipline; no
   weakening of the Noise-identity/route-key separation.
+
+## Concrete derivation (ready to fold into the presence-record gate)
+
+Tor rend-spec-v3 key blinding, on the **same prime-order group as the Gate C SURB
+construction** (ristretto255 preferred; ed25519 with Tor's clamping as fallback) — one
+group dependency for both gates, no new library.
+
+Let `(A, a)` be the destination's stable identity keypair (`A = a·B`). For epoch `e` with
+public period parameters `P_e` (period number + length), `H_s` = BLAKE2b reduced mod `L`,
+domain-separated:
+
+```
+h    = H_s("presence/route-blind" ‖ A ‖ P_e)     # blinding scalar
+A'   = h · A                                     # blinded public key (published)
+a'   = h · a  (mod L)                            # blinded private key (signer)
+k_e  = H("presence/addr" ‖ A' ‖ P_e)             # DHT storage key (record address)
+```
+
+The record is published at `k_e`, signed with `a'`, its body (the route descriptor)
+encrypted to lookers who know `A` (or a shared secret). The storage node stores opaque
+bytes at an address it cannot attribute.
+
+**Lookup:** a peer that knows `A` recomputes `h, A', k_e` from public `P_e`, fetches `k_e`,
+verifies the signature under `A'`, and decrypts. A storage node holding `{k_e, A', body}`
+cannot recover `A`, cannot link `A'` across epochs (different `h` ⇒ different `A'`, `k_e`),
+and cannot enumerate which services it stores.
+
+Notes:
+- ristretto255 gives a clean `h·A`; the ed25519 fallback must follow Tor's clamping-aware
+  blinding (rend-spec-v3 §A.2) — prefer ristretto.
+- Rotation is automatic (new epoch ⇒ new key); early revocation uses an identity-signed
+  tombstone, consistent with v1's existing capability-store downgrade-tombstone model.
+- Still gated: implement inside the future presence-record gate with its own encode/decode,
+  fixed test vectors, and review. Not implementable now — no host path exists.
