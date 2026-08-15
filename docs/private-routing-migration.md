@@ -137,6 +137,32 @@ Mbit/s, across five distinct runner addresses, 12/12 assertions. The spread is
 the point of measuring peers concurrently: a single peer would have reported one
 region's latency as though it were the number.
 
+#### Runner-to-runner links
+
+A single prober only proves workstation-to-peer reachability, which is not what a
+private route needs: a guard must reach a middle and a middle an exit.
+`.github/workflows/remote-mesh.yml` and `scripts/remote-mesh.sh` hold a mesh of
+up to twelve runner members open. Every member derives every other member's key,
+dials each higher index once, and answers a report request, so one collector
+assembles the whole matrix. Success is a required link ratio plus a minimum
+per-member degree, both defaulting to a full mesh, so a mostly-broken mesh cannot
+pass.
+
+Run 31910815472, ten `ubuntu-latest` members, 600s, 60s settle: 45/45 pairs
+formed, every one on the first attempt, every member holding degree 9, 94/94
+assertions. Connect p50 759ms, round trip p50 31.7ms, reconnect p50 276ms with a
+worst case of 1,406ms. Reconnect is measured per pair because route rotation
+depends on a link returning after a drop.
+
+Two facts follow. Peer-to-peer links between NAT'd runners are reliable enough to
+carry a distributed route topology, and a runner mesh can supply the two endpoint
+peers plus eight or more route candidates that route choice needs. What it does
+not yet do is carry private-route cells: `lib/private/udx-cell-endpoint.js:1398`
+binds its own UDX socket with no injection point, and `lib/private/guard-link.js`
+dials the endpoint bound into a signed relay capability, checked at line 627. A
+distributed route run therefore needs each role's reachable endpoint discovered
+first and minted into its capability, which is the next piece of work.
+
 Observed locally, for comparison:
 
 - Three peers on a local testnet: connect 18..19ms, round trip p50 0.4..0.5ms,
