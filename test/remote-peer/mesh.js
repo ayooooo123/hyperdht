@@ -17,6 +17,7 @@ const DHT = require('../..')
 const UDX = require('udx-native')
 const { peerKeyPair, proberKeyPair } = require('./identity')
 const { OP, writeFrame, FrameReader } = require('./frames')
+const { discoverMapping, resolveServers } = require('./stun')
 
 const DIAL_TIMEOUT_MS = 25_000
 const DIAL_RETRIES = 3
@@ -144,6 +145,24 @@ async function main() {
   const bindResult = cellSocket.bind(0)
   if (bindResult && typeof bindResult.then === 'function') await bindResult
   const cellPort = cellSocket.address().port
+
+  // The mapped address of this exact socket, from two different reflectors. A
+  // capability for a cross-runner route would have to carry the mapped value, and
+  // if the two reflectors disagree the mapping is per destination and no single
+  // value could ever be published.
+  const cellMappings = []
+  for (const server of await resolveServers()) {
+    const mapped = await discoverMapping(cellSocket, server)
+    cellMappings.push({ server: server.host, mapped })
+  }
+  const usable = cellMappings.filter((entry) => entry.mapped !== null)
+  const mappingIndependent =
+    usable.length > 1 &&
+    usable.every(
+      (entry) =>
+        entry.mapped.host === usable[0].mapped.host && entry.mapped.port === usable[0].mapped.port
+    )
+  const cellMapped = usable.length > 0 ? usable[0].mapped : null
   let cellPlan = null
 
   // Repeats on purpose: a first packet out of a NAT usually only creates the
@@ -200,7 +219,10 @@ async function main() {
                   relaying: node.stats.relaying,
                   inboundFrom: inbound.map((entry) => entry.from),
                   dialed: Object.fromEntries(dialed),
-                  cellPort
+                  cellPort,
+                  cellMapped,
+                  cellMappings,
+                  mappingIndependent
                 })
               )
             )
@@ -220,6 +242,8 @@ async function main() {
                 JSON.stringify({
                   index: options.index,
                   cellPort,
+                  cellMapped,
+                  mappingIndependent,
                   punchedAt: cellPunchedAt,
                   planSize: cellPlan === null ? 0 : Object.keys(cellPlan).length,
                   observed: cellObserved
