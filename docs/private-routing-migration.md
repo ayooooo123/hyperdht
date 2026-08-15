@@ -115,17 +115,45 @@ always measured concurrently, which is what exposes shared-socket and holepunch
 contention that one peer at a time hides. Every read phase is bounded, so a peer
 that accepts and then stalls fails in seconds naming the phase.
 
-Observed locally:
+Observed against GitHub `ubuntu-latest` runners, run 31909702808, two peers for
+300s, prober on a workstation behind a home NAT:
+
+- Peer 1: connect 761ms on the 4th attempt, round trip min 31.7ms p50 36.1ms
+  p95 115.7ms, echo 28.0 Mbit/s, remote 52.186.175.102:11265.
+- Peer 2: connect 966ms on the 5th attempt, round trip min 31.9ms p50 36.0ms
+  p95 111.8ms, echo 25.2 Mbit/s, remote 40.76.238.180:2049.
+- Both runners reported `firewalled true`, `accepted 1`, and
+  `echoed 1049088` bytes, which is exactly 64 pings of 8 bytes plus 1 MiB.
+- Peer 1 also reported `rejected 1`: the stranger-key test was refused by a real
+  remote peer, not only locally.
+- Neither side counted a relay or a punch (`relaying.attempts 0`, `punches` all
+  zero), and the prober's stream reported the runner's public address with a port
+  that differs from the runner's local port. Which mechanism carried the
+  connection is not established by these counters alone.
+
+A second dispatch, run 31910008193, held five peers for 300s and all five
+answered: connect 525..1,695ms, round trip p50 39.5..92.1ms, echo 3.1..21.6
+Mbit/s, across five distinct runner addresses, 12/12 assertions. The spread is
+the point of measuring peers concurrently: a single peer would have reported one
+region's latency as though it were the number.
+
+Observed locally, for comparison:
 
 - Three peers on a local testnet: connect 18..19ms, round trip p50 0.4..0.5ms,
   echo 78..127 Mbit/s, 8/8 assertions.
-- One peer on the public DHT across this LAN: connect 1,328ms in one attempt,
-  round trip p50 0.4ms, echo 173 Mbit/s.
-- A peer that accepts and never echoes: failed in 15s with
+- One peer over the public DHT on the same LAN as the prober: connect 1,328ms,
+  round trip p50 0.4ms, echo 173 Mbit/s. This measures the LAN shortcut, not a
+  cross-network path, so it is not evidence of remote reachability.
+- A peer that accepts and never echoes failed in 15s with
   `ping 0 timed out after 15000ms` rather than hanging.
-- A peer inside the Colima VM was unreachable by holepunch or relay, which is
-  that VM's UDP NAT, not a property of the harness. Runner reachability is
-  therefore still unproven: it needs one dispatch.
+
+A peer inside the Colima VM is not reachable from the host prober. What the
+diagnostics show: every prober attempt fails with `PEER_NOT_FOUND`, the peer
+reports `firewalled true` and never accepts, and the only punch either side
+counts is one random punch. So the peer is not discoverable through the DHT from
+the host, and the cause has not been isolated further than that. Either way, a
+remote peer belongs on a runner; the container stays for the kernel-dependent
+gates above.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
