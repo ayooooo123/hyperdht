@@ -174,14 +174,27 @@ test('mesh members reach each other and report the pairwise matrix', async (t) =
 
   // Second phase: can the sockets that carry route cells reach each other? The
   // DHT links above cannot answer that, because the DHT punches its own socket.
-  // Push every member the addresses the collector observed plus each member's own
-  // cell port, let all of them punch at once, then read what arrived.
+  // The plan carries each member's mapped address, learned by the member itself
+  // from public reflectors: a local port is only correct when the NAT preserves
+  // ports, which the first ten-runner attempt showed it does not.
   const plan = {}
+  let independentMappings = 0
   for (const report of reports.values()) {
-    if (report.observedHost && Number.isInteger(report.cellPort)) {
+    if (report.mappingIndependent) independentMappings++
+    if (report.cellMapped && Number.isInteger(report.cellMapped.port)) {
+      plan[report.index] = { host: report.cellMapped.host, cellPort: report.cellMapped.port }
+    } else if (report.observedHost && Number.isInteger(report.cellPort)) {
       plan[report.index] = { host: report.observedHost, cellPort: report.cellPort }
     }
   }
+  for (const report of [...reports.values()].sort((a, b) => a.index - b.index)) {
+    t.comment(
+      `member ${report.index} cell socket: local ${report.cellPort}, mapped ` +
+        `${report.cellMapped ? `${report.cellMapped.host}:${report.cellMapped.port}` : 'unknown'}` +
+        `, mapping independent of destination: ${report.mappingIndependent}`
+    )
+  }
+  t.comment(`${independentMappings}/${reports.size} members have a destination-independent mapping`)
   const planBytes = b4a.from(JSON.stringify(plan))
   const planned = await Promise.allSettled(
     [...reports.keys()].map((index) =>
