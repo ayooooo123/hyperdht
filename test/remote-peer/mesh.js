@@ -161,8 +161,9 @@ async function main() {
   // Two nodes are asked because equal answers mean the mapping does not depend on
   // the destination, so one value is publishable to any peer, which is what a
   // signed capability needs.
+  const reflectors = (await resolveReflectors()).slice(0, 2)
   const cellMappings = []
-  for (const reflector of (await resolveReflectors()).slice(0, 2)) {
+  for (const reflector of reflectors) {
     const observed = await reflect(cellSocket, reflector)
     cellMappings.push({ reflector: reflector.name, observed })
   }
@@ -176,6 +177,44 @@ async function main() {
     )
   const cellMapped = usable.length > 0 ? usable[0].observed : null
   let cellPlan = null
+  let rebind = null
+
+  // The production cell endpoint binds its own socket (udx-cell-endpoint.js:1401),
+  // so a discovered mapping is only usable if it survives closing a socket and
+  // rebinding the same local port: discover, mint the capability, then let the
+  // endpoint bind. Measured on a throwaway socket so the mesh socket above is
+  // untouched.
+  async function rebindProbe(reflectors) {
+    const first = cellUdx.createSocket()
+    const firstBind = first.bind(0)
+    if (firstBind && typeof firstBind.then === 'function') await firstBind
+    const localPort = first.address().port
+    const before = reflectors.length > 0 ? await reflect(first, reflectors[0]) : null
+    await first.close()
+
+    const second = cellUdx.createSocket()
+    let rebound = true
+    try {
+      const secondBind = second.bind(localPort)
+      if (secondBind && typeof secondBind.then === 'function') await secondBind
+    } catch {
+      rebound = false
+    }
+    const after = rebound && reflectors.length > 0 ? await reflect(second, reflectors[0]) : null
+    await second.close()
+
+    return {
+      localPort,
+      rebound,
+      before,
+      after,
+      stable:
+        before !== null &&
+        after !== null &&
+        before.host === after.host &&
+        before.port === after.port
+    }
+  }
 
   // Repeats on purpose: a first packet out of a NAT usually only creates the
   // mapping, and the peer's first packet is often already in flight against a
@@ -234,7 +273,8 @@ async function main() {
                   cellPort,
                   cellMapped,
                   cellMappings,
-                  mappingIndependent
+                  mappingIndependent,
+                  rebind
                 })
               )
             )
@@ -269,13 +309,18 @@ async function main() {
   )
 
   await server.listen(keyPair)
+  rebind = await rebindProbe(reflectors)
   emit({
     event: 'ready',
     index: options.index,
     count: options.count,
     runId,
     address: node.address(),
-    firewalled: node.firewalled
+    firewalled: node.firewalled,
+    cellPort,
+    cellMapped,
+    mappingIndependent,
+    rebind
   })
 
   // Everyone binds before anyone dials, otherwise early dials fail on peers that

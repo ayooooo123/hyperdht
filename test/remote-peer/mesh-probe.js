@@ -195,6 +195,22 @@ test('mesh members reach each other and report the pairwise matrix', async (t) =
     )
   }
   t.comment(`${independentMappings}/${reports.size} members have a destination-independent mapping`)
+
+  // Whether a discovered mapping survives closing a socket and rebinding the same
+  // local port. If it does, a role can discover its endpoint, have it minted into
+  // a signed capability, and only then let the production cell endpoint bind.
+  let stableRebinds = 0
+  for (const report of [...reports.values()].sort((a, b) => a.index - b.index)) {
+    const rebind = report.rebind
+    if (!rebind) continue
+    if (rebind.stable) stableRebinds++
+    t.comment(
+      `member ${report.index} rebind of local ${rebind.localPort}: rebound ${rebind.rebound}, ` +
+        `${rebind.before ? `${rebind.before.host}:${rebind.before.port}` : 'unknown'} then ` +
+        `${rebind.after ? `${rebind.after.host}:${rebind.after.port}` : 'unknown'}, stable ${rebind.stable}`
+    )
+  }
+  t.comment(`${stableRebinds}/${reports.size} members kept their mapping across a rebind`)
   const planBytes = b4a.from(JSON.stringify(plan))
   const planned = await Promise.allSettled(
     [...reports.keys()].map((index) =>
