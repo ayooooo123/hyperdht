@@ -154,6 +154,38 @@ assertions. Connect p50 759ms, round trip p50 31.7ms, reconnect p50 276ms with a
 worst case of 1,406ms. Reconnect is measured per pair because route rotation
 depends on a link returning after a drop.
 
+Cell-socket reachability was measured next, because a DHT link is not what
+carries route cells. Each member binds a second UDX socket of the kind
+`lib/private/udx-cell-endpoint.js:1401` binds, learns what address the world sees
+for that socket, and punches every peer at once from the collector's plan.
+
+Learning that address does not need an external STUN service. Every dht-rpc reply
+carries a `to` field with the responder's view of the sender, which is how
+dht-rpc fills its own `NatSampler` (`node_modules/dht-rpc/index.js:885`) and how
+`dht.host`, `dht.port` and `remoteAddress()` are populated. That covers the socket
+the DHT owns, and a NAT mapping belongs to a socket, so the cell socket is
+reflected off two DHT bootstrap nodes with a PING built by this repository's own
+client codec in `lib/private/dht-exit-wire.js`.
+
+Run 31913403231 and run 31914488659, ten `ubuntu-latest` members each:
+
+- 10/10 members reported the same mapped address from two different bootstrap
+  nodes, so the mapping does not depend on the destination and one value per role
+  is publishable to every peer.
+- Mapped ports differ from local ports on every runner, for example local 40881
+  mapped to 20.189.188.0:43970, so a local port would have been the wrong value to
+  publish. An earlier attempt that published local ports recorded 0/90 arrivals.
+- 90/90 directed cell-socket pairs arrived once the mapped address was used, with
+  the source port intact on all 90.
+- 10/10 members kept their mapping after closing a socket and binding a new one on
+  the same local port, which is the order a distributed run needs: discover the
+  endpoint, mint it into the signed capability, then let the endpoint bind.
+
+Note for the private stack itself: `decodeDhtExitReply`
+(`lib/private/dht-exit-wire.js:164`) rejects a reply whose `to` differs from the
+local tuple, so the audited codec cannot be used unchanged for discovery behind a
+NAT.
+
 Two facts follow. Peer-to-peer links between NAT'd runners are reliable enough to
 carry a distributed route topology, and a runner mesh can supply the two endpoint
 peers plus eight or more route candidates that route choice needs. What it does
