@@ -14,6 +14,7 @@
 
 const b4a = require('b4a')
 const DHT = require('../..')
+const UDX = require('udx-native')
 const { peerKeyPair, proberKeyPair } = require('./identity')
 const { OP, writeFrame, FrameReader } = require('./frames')
 
@@ -124,6 +125,51 @@ async function main() {
   })
   const inbound = []
   const dialed = new Map()
+  // A second socket, of the kind lib/private/udx-cell-endpoint.js binds for route
+  // cells. The DHT stream above cannot answer whether cells could travel directly
+  // between two runners, because the DHT punches its own socket. This one is
+  // punched by hand from the collector's plan, which is what a signed capability
+  // would have to describe.
+  const cellUdx = new UDX()
+  const cellSocket = cellUdx.createSocket()
+  const cellObserved = []
+  cellSocket.on('message', (message, from) => {
+    cellObserved.push({
+      claimedIndex: message.byteLength > 0 ? message[0] : null,
+      host: from.host,
+      port: from.port,
+      at: Date.now()
+    })
+  })
+  const bindResult = cellSocket.bind(0)
+  if (bindResult && typeof bindResult.then === 'function') await bindResult
+  const cellPort = cellSocket.address().port
+  let cellPlan = null
+
+  // Repeats on purpose: a first packet out of a NAT usually only creates the
+  // mapping, and the peer's first packet is often already in flight against a
+  // mapping that does not exist yet. Six spread over three seconds separates
+  // "never arrives" from "arrives once both mappings exist".
+  function punchAll(plan) {
+    const payload = b4a.alloc(1, options.index & 0xff)
+    let round = 0
+    const timer = setInterval(() => {
+      round++
+      for (const [index, target] of Object.entries(plan)) {
+        if (Number(index) === options.index) continue
+        if (!target || typeof target.host !== 'string' || !Number.isInteger(target.cellPort)) {
+          continue
+        }
+        try {
+          cellSocket.send(payload, target.cellPort, target.host)
+        } catch {
+          // A refused send is data too: the report will show nothing arrived.
+        }
+      }
+      if (round >= 6) clearInterval(timer)
+    }, 500)
+  }
+  let cellPunchedAt = null
 
   const server = node.createServer(
     {
@@ -153,7 +199,30 @@ async function main() {
                   punches: node.stats.punches,
                   relaying: node.stats.relaying,
                   inboundFrom: inbound.map((entry) => entry.from),
-                  dialed: Object.fromEntries(dialed)
+                  dialed: Object.fromEntries(dialed),
+                  cellPort
+                })
+              )
+            )
+          )
+        } else if (frame.op === OP.PLAN) {
+          // Every member punches the moment the plan lands, so the sends cross in
+          // flight. That is the only way two NAT'd hosts open a path neither can
+          // open alone.
+          cellPlan = JSON.parse(b4a.toString(frame.payload, 'utf8'))
+          cellPunchedAt = Date.now()
+          punchAll(cellPlan)
+        } else if (frame.op === OP.CELL_REPORT) {
+          socket.write(
+            writeFrame(
+              OP.CELL_REPORT,
+              b4a.from(
+                JSON.stringify({
+                  index: options.index,
+                  cellPort,
+                  punchedAt: cellPunchedAt,
+                  planSize: cellPlan === null ? 0 : Object.keys(cellPlan).length,
+                  observed: cellObserved
                 })
               )
             )
@@ -211,12 +280,15 @@ async function main() {
     index: options.index,
     inboundFrom: inbound.map((entry) => entry.from),
     dialed: Object.fromEntries(dialed),
+    cellPort,
+    cellObserved,
     punches: node.stats.punches,
     relaying: node.stats.relaying
   })
 
   await server.close()
   await node.destroy()
+  await cellSocket.close()
 }
 
 main().catch((err) => {

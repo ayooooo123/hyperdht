@@ -8,7 +8,11 @@
 const EventEmitter = require('events')
 const b4a = require('b4a')
 
-const OP = Object.freeze({ ECHO: 1, REPORT: 2 })
+// ECHO and REPORT carry the mesh matrix. PLAN pushes the collector's view of who
+// is where, and CELL_REPORT returns what a member's own UDX socket observed: that
+// pair measures whether private-route cell traffic could travel directly between
+// two runners, which signed capabilities would have to bind.
+const OP = Object.freeze({ ECHO: 1, REPORT: 2, PLAN: 3, CELL_REPORT: 4 })
 const HEADER_BYTES = 5
 const MAX_FRAME_BYTES = 4 * 1024 * 1024
 

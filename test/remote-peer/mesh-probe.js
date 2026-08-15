@@ -78,6 +78,9 @@ async function collect(node, keyPair, publicKey, index, count, deadline) {
       const frame = await reader.next(REPORT_TIMEOUT_MS)
       if (frame.op !== OP.REPORT) throw new Error('unexpected frame')
       lastReport = JSON.parse(b4a.toString(frame.payload, 'utf8'))
+      // The member cannot see its own public address; this stream can. It is what
+      // a signed capability would have to carry for a cross-runner route.
+      lastReport.observedHost = socket.rawStream ? socket.rawStream.remoteHost : null
       socket.destroy()
       if (Object.keys(lastReport.dialed || {}).length >= expectedDials) return lastReport
     } catch (err) {
@@ -88,6 +91,32 @@ async function collect(node, keyPair, publicKey, index, count, deadline) {
   }
   if (lastReport !== null) return lastReport
   throw new Error(`no report: ${lastError && (lastError.code || lastError.message)}`)
+}
+
+// Fire one frame and leave. Used for the plan: every member must punch at roughly
+// the same moment, so the collector must not wait for a reply in between.
+async function push(node, keyPair, publicKey, op, payload) {
+  const socket = await connectOnce(node, keyPair, publicKey)
+  socket.on('error', () => {})
+  socket.write(writeFrame(op, payload))
+  await new Promise((resolve) => setTimeout(resolve, 250))
+  socket.destroy()
+  return true
+}
+
+// Ask for one frame and return its parsed body.
+async function request(node, keyPair, publicKey, op) {
+  const socket = await connectOnce(node, keyPair, publicKey)
+  socket.on('error', () => {})
+  try {
+    const reader = new FrameReader(socket)
+    socket.write(writeFrame(op, null))
+    const frame = await reader.next(REPORT_TIMEOUT_MS)
+    if (frame.op !== op) throw new Error('unexpected frame')
+    return JSON.parse(b4a.toString(frame.payload, 'utf8'))
+  } finally {
+    socket.destroy()
+  }
 }
 
 function median(values) {
@@ -142,6 +171,78 @@ test('mesh members reach each other and report the pairwise matrix', async (t) =
         `open ${report.punches.open} consistent ${report.punches.consistent} random ${report.punches.random}`
     )
   }
+
+  // Second phase: can the sockets that carry route cells reach each other? The
+  // DHT links above cannot answer that, because the DHT punches its own socket.
+  // Push every member the addresses the collector observed plus each member's own
+  // cell port, let all of them punch at once, then read what arrived.
+  const plan = {}
+  for (const report of reports.values()) {
+    if (report.observedHost && Number.isInteger(report.cellPort)) {
+      plan[report.index] = { host: report.observedHost, cellPort: report.cellPort }
+    }
+  }
+  const planBytes = b4a.from(JSON.stringify(plan))
+  const planned = await Promise.allSettled(
+    [...reports.keys()].map((index) =>
+      push(
+        node,
+        keyPair,
+        peerKeyPair(options.secret, options.runId, index).publicKey,
+        OP.PLAN,
+        planBytes
+      )
+    )
+  )
+  t.comment(
+    `cell plan pushed to ${planned.filter((entry) => entry.status === 'fulfilled').length}/` +
+      `${reports.size} members, plan covers ${Object.keys(plan).length}`
+  )
+
+  // Punches repeat over three seconds, so give them time before asking.
+  await new Promise((resolve) => setTimeout(resolve, 8000))
+
+  const cellSettled = await Promise.allSettled(
+    [...reports.keys()].map((index) =>
+      request(
+        node,
+        keyPair,
+        peerKeyPair(options.secret, options.runId, index).publicKey,
+        OP.CELL_REPORT
+      )
+    )
+  )
+
+  const cellReports = new Map()
+  for (const outcome of cellSettled) {
+    if (outcome.status === 'fulfilled') cellReports.set(outcome.value.index, outcome.value)
+  }
+
+  let cellArrivals = 0
+  let portPreserved = 0
+  let portTranslated = 0
+  for (const report of [...cellReports.values()].sort((a, b) => a.index - b.index)) {
+    const from = new Map()
+    for (const packet of report.observed || []) {
+      if (!from.has(packet.claimedIndex)) from.set(packet.claimedIndex, packet)
+    }
+    cellArrivals += from.size
+    for (const [claimed, packet] of from) {
+      const expected = plan[claimed]
+      if (expected && expected.cellPort === packet.port) portPreserved++
+      else portTranslated++
+    }
+    t.comment(
+      `member ${report.index} cell socket ${report.cellPort}: heard from ` +
+        `[${[...from.keys()].join(',')}] of ${report.planSize - 1} peers`
+    )
+  }
+
+  const cellPairsPossible = reports.size * (reports.size - 1)
+  t.comment(
+    `cell arrivals ${cellArrivals}/${cellPairsPossible} directed pairs; source port ` +
+      `preserved ${portPreserved}, translated ${portTranslated}`
+  )
 
   // One row per dialling member: each pair is dialled once, by the lower index.
   const pairs = []
