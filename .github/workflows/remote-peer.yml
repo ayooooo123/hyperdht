@@ -1,0 +1,86 @@
+name: Remote Peer
+
+# Holds up to five real DHT peers open on runners for a fixed span, so a
+# workstation can time itself against genuinely remote hosts. Each job derives
+# its keypair from the REMOTE_PEER_SECRET repository secret and the run id, so
+# the peer keys are never inputs and never appear in the log; the prober derives
+# the same keys and finds the peers over the DHT.
+#
+# Dispatch with scripts/remote-peer.sh, which also does the timing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      peers:
+        description: How many peer jobs to hold open (1 to 5)
+        required: true
+        default: '2'
+      seconds:
+        description: How long each peer stays open
+        required: true
+        default: '300'
+      os:
+        description: Runner image
+        required: true
+        default: ubuntu-latest
+        type: choice
+        options:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+jobs:
+  peer:
+    # A matrix of five with an index gate keeps one job per peer without needing
+    # a generated matrix.
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4, 5]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Check inputs and skip unused peer slots
+        id: slot
+        shell: bash
+        env:
+          PEERS: ${{ inputs.peers }}
+          SECONDS_INPUT: ${{ inputs.seconds }}
+          INDEX: ${{ matrix.index }}
+        run: |
+          # Read through env, never by pasting inputs into the script body, and
+          # bound both values: the job timeout is 30 minutes.
+          case "$PEERS" in
+            1 | 2 | 3 | 4 | 5) ;;
+            *) echo "peers must be 1 to 5, got: $PEERS" >&2; exit 1 ;;
+          esac
+          case "$SECONDS_INPUT" in
+            '' | *[!0-9]*) echo "seconds must be a whole number" >&2; exit 1 ;;
+          esac
+          if [ "$SECONDS_INPUT" -lt 30 ] || [ "$SECONDS_INPUT" -gt 1500 ]; then
+            echo "seconds must be 30 to 1500, got: $SECONDS_INPUT" >&2
+            exit 1
+          fi
+          if [ "$INDEX" -le "$PEERS" ]; then
+            echo "wanted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "wanted=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        if: steps.slot.outputs.wanted == 'true'
+      - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
+        if: steps.slot.outputs.wanted == 'true'
+        with:
+          node-version: lts/*
+      - run: npm install
+        if: steps.slot.outputs.wanted == 'true'
+      - name: Hold peer open
+        if: steps.slot.outputs.wanted == 'true'
+        shell: bash
+        env:
+          REMOTE_PEER_SECRET: ${{ secrets.REMOTE_PEER_SECRET }}
+          REMOTE_PEER_RUN_ID: ${{ github.run_id }}
+          PEER_INDEX: ${{ matrix.index }}
+          PEER_SECONDS: ${{ inputs.seconds }}
+        run: node test/remote-peer/serve.js --index "$PEER_INDEX" --seconds "$PEER_SECONDS"

@@ -67,6 +67,66 @@ create network namespaces, veth pairs and iptables rules, and capture with
 `tcpdump`. They require Linux with non-interactive root and skip elsewhere with
 a stated reason. They are not part of the portable aggregate suite.
 
+Both limits are limits of the host kernel, not of the gates, so a Linux
+container satisfies them. `npm run test:private:linux-gates -- <gate ...>`
+builds `docker/linux-gates.Dockerfile` and runs any of `aggregate:node`,
+`aggregate:bare`, `process:node`, `process:bare`, `namespace`,
+`namespace:live`, or `all` in a privileged container with the working tree
+bind-mounted. Dependencies live at `/node_modules` inside the image and a tmpfs
+shadows `/app/node_modules`, so a host `node_modules` built for another platform
+is never loaded. This gives a macOS or Windows workstation the same six gates
+the Linux CI job runs, before pushing. It does not replace that job: the
+container shares the host kernel and its clock, so it is local evidence only,
+and KI-4 timing behaviour still has to be judged on the runner.
+
+Observed locally on macOS 25.5.0 arm64 with Docker 29.5.2 over Colima
+(`linux/aarch64`), Node v22.23.2 in the image:
+
+- `aggregate:node`: 876/876 tests, 18,106/18,106 assertions.
+- `aggregate:bare`: 855/855 tests, 18,047/18,047 assertions.
+- `process:node`: 1/1 test, 125/125 assertions.
+- `process:bare`: 1/1 test, 125/125 assertions.
+- `namespace`: 1/1 test, 27/27 assertions.
+- `namespace:live`: 1/1 test, 135/135 assertions, marker datagrams 0,
+  undecodable frames 0.
+
+### Remote peer timing harness
+
+Every gate above runs on one machine, so nothing measures this fork against a
+host on another network. `.github/workflows/remote-peer.yml` holds up to five
+peers open on runners for a chosen span, and `scripts/remote-peer.sh` times a
+workstation against them:
+
+- `scripts/remote-peer.sh secret --push` mints a 32-byte secret, keeps it in
+  `$XDG_CONFIG_HOME/hyperdht-remote-peer/secret`, and sets the
+  `REMOTE_PEER_SECRET` repository secret. Without `--push` nothing leaves the
+  machine.
+- `scripts/remote-peer.sh up -p 3 -s 300` dispatches three peers for five
+  minutes, then measures all three at once.
+- `scripts/remote-peer.sh local -p 3` runs the same harness against a local
+  testnet, with no CI and no public network.
+
+Peer and prober keys are derived from that secret plus the run id, so the DHT is
+the only rendezvous: no key is a workflow input, none has to be scraped from a
+runner log, and none is usable without the secret. Each peer pins its firewall to
+the derived prober key. Per peer the probe reports connect time and attempts,
+round-trip min/p50/p95 over 64 samples, and 1 MiB echo throughput; peers are
+always measured concurrently, which is what exposes shared-socket and holepunch
+contention that one peer at a time hides. Every read phase is bounded, so a peer
+that accepts and then stalls fails in seconds naming the phase.
+
+Observed locally:
+
+- Three peers on a local testnet: connect 18..19ms, round trip p50 0.4..0.5ms,
+  echo 78..127 Mbit/s, 8/8 assertions.
+- One peer on the public DHT across this LAN: connect 1,328ms in one attempt,
+  round trip p50 0.4ms, echo 173 Mbit/s.
+- A peer that accepts and never echoes: failed in 15s with
+  `ping 0 timed out after 15000ms` rather than hanging.
+- A peer inside the Colima VM was unreachable by holepunch or relay, which is
+  that VM's UDP NAT, not a property of the harness. Runner reachability is
+  therefore still unproven: it needs one dispatch.
+
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
 **Status: one cause fixed, one open. Never reproduced locally.**

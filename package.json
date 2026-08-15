@@ -70,6 +70,9 @@
     "test:private:process:bare": "brittle-node test/private/live-process-bare.js",
     "test:private:namespace": "brittle-node test/private/namespace-projection.js",
     "test:private:namespace:live": "brittle-node test/private/live-namespace-node.js",
+    "test:private:linux-gates": "bash scripts/linux-gates.sh",
+    "test:remote:peer": "bash scripts/remote-peer.sh",
+    "test:remote:peer:local": "bash scripts/remote-peer.sh local",
     "end-to-end": "brittle test/end-to-end/*.js"
   },
   "author": "Mathias Buus (@mafintosh)",
