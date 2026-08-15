@@ -61,8 +61,14 @@ function connectOnce(node, keyPair, publicKey) {
   })
 }
 
-async function collect(node, keyPair, publicKey, deadline) {
+// Members become ready minutes apart on CI and each waits out its own settle
+// window before dialling, so a single early report says nothing. Keep asking
+// until the member has a result for every higher index, or the deadline hits,
+// and return the last report either way so a partial matrix is still reported.
+async function collect(node, keyPair, publicKey, index, count, deadline) {
+  const expectedDials = count - index
   let lastError = null
+  let lastReport = null
   while (Date.now() < deadline) {
     let socket = null
     try {
@@ -71,15 +77,16 @@ async function collect(node, keyPair, publicKey, deadline) {
       socket.write(writeFrame(OP.REPORT, null))
       const frame = await reader.next(REPORT_TIMEOUT_MS)
       if (frame.op !== OP.REPORT) throw new Error('unexpected frame')
-      const report = JSON.parse(b4a.toString(frame.payload, 'utf8'))
+      lastReport = JSON.parse(b4a.toString(frame.payload, 'utf8'))
       socket.destroy()
-      return report
+      if (Object.keys(lastReport.dialed || {}).length >= expectedDials) return lastReport
     } catch (err) {
       if (socket) socket.destroy()
       lastError = err
-      await new Promise((resolve) => setTimeout(resolve, 3000))
     }
+    await new Promise((resolve) => setTimeout(resolve, 5000))
   }
+  if (lastReport !== null) return lastReport
   throw new Error(`no report: ${lastError && (lastError.code || lastError.message)}`)
 }
 
@@ -113,6 +120,8 @@ test('mesh members reach each other and report the pairwise matrix', async (t) =
         node,
         keyPair,
         peerKeyPair(options.secret, options.runId, offset + 1).publicKey,
+        offset + 1,
+        options.count,
         deadline
       )
     )
