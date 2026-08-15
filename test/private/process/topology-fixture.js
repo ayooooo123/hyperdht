@@ -78,7 +78,14 @@ const ALLOW_EDGES = Object.freeze([
 
 const PORTABLE_LOOPBACK = Object.freeze({ name: 'portable-loopback' })
 const LINUX_NAMESPACE = Object.freeze({ name: 'linux-namespace' })
+// Roles on separate hosts cannot be given addresses in advance: each one learns
+// the address the world sees for its own socket and the topology is minted from
+// those. Signed relay capabilities bind these tuples, and guard-link.js:627
+// requires a dialled endpoint to equal the signed one, so the discovered value is
+// the only value that can work.
+const DHT_MESH = Object.freeze({ name: 'dht-mesh' })
 const PROCESS_PLANS = Object.freeze({
+  DHT_MESH,
   LINUX_NAMESPACE,
   PORTABLE_LOOPBACK
 })
@@ -248,9 +255,45 @@ function planTuple(plan, roleIndex) {
   invalid()
 }
 
-function issueAuthority(plan) {
+// One place decides a role's addresses, so a derived plan and a discovered one
+// cannot drift apart. Two tuples per role, because they are not the same address:
+// a role binds a socket it owns locally, and publishes the address peers must dial.
+// On a runner those differ, and only the published one may go into a signed
+// capability.
+function meshTuples(endpoints) {
+  const values = exactArrayValues(endpoints, ROLES.length)
+  const seen = new Set()
+  const bind = []
+  const reachable = []
+  for (const value of values) {
+    exactObject(value, ['bind', 'reachable'])
+    numericTuple(value.bind)
+    numericTuple(value.reachable)
+    // Reachable addresses must be distinct: they are what peers dial and what the
+    // firewall map is keyed by. Bind addresses may repeat, because two roles on
+    // two machines can each bind the same local port.
+    const key = `${value.reachable.host}:${value.reachable.port}`
+    if (seen.has(key)) invalid()
+    seen.add(key)
+    bind.push(Object.freeze({ host: value.bind.host, port: value.bind.port }))
+    reachable.push(Object.freeze({ host: value.reachable.host, port: value.reachable.port }))
+  }
+  return Object.freeze({ bind: Object.freeze(bind), reachable: Object.freeze(reachable) })
+}
+
+function resolveTuples(plan, endpoints = null) {
+  if (plan === DHT_MESH) {
+    if (endpoints === null) invalid()
+    return meshTuples(endpoints)
+  }
+  if (endpoints !== null) invalid()
   if (plan !== PORTABLE_LOOPBACK && plan !== LINUX_NAMESPACE) invalid()
-  return networkAuthority(ROLES.map((role, index) => planTuple(plan, index + 1)))
+  const derived = Object.freeze(ROLES.map((role, index) => planTuple(plan, index + 1)))
+  return Object.freeze({ bind: derived, reachable: derived })
+}
+
+function issueAuthority(plan, endpoints = null) {
+  return networkAuthority(resolveTuples(plan, endpoints).reachable)
 }
 
 function issueProcessPhaseGate(run, generation) {
@@ -681,6 +724,8 @@ function validateNamespaceProjection(value) {
   }
 }
 
+// tuple is the node's own bind address; nodes and bootstrap are addresses of other
+// roles, so they carry reachable values.
 function dhtOptions(tuple, nodes, bootstrap = []) {
   return Object.freeze({
     anyPort: false,
@@ -696,15 +741,27 @@ function dhtOptions(tuple, nodes, bootstrap = []) {
 }
 
 function createLiveProcessTopology(options) {
-  exactObject(options, ['clocks', 'entropy', 'plan'])
+  if (options === null || typeof options !== 'object') invalid()
+  // endpoints belongs to the discovered plan only, so its presence is part of the
+  // exact shape rather than an extra that any plan may carry.
+  const supplied = Object.prototype.hasOwnProperty.call(options, 'endpoints')
+  exactObject(
+    options,
+    supplied ? ['clocks', 'endpoints', 'entropy', 'plan'] : ['clocks', 'entropy', 'plan']
+  )
   const clocks = CLOCK_CAPABILITIES.get(options.clocks)
   const entropy = ENTROPY_CAPABILITIES.get(options.entropy)
   if (
     !clocks ||
     !entropy ||
-    (options.plan !== PORTABLE_LOOPBACK && options.plan !== LINUX_NAMESPACE)
+    (options.plan !== PORTABLE_LOOPBACK &&
+      options.plan !== LINUX_NAMESPACE &&
+      options.plan !== DHT_MESH)
   )
     invalid()
+  // Validated before the entropy capability is spent, so a bad endpoint list does
+  // not consume it.
+  const resolved = resolveTuples(options.plan, supplied ? options.endpoints : null)
   ENTROPY_CAPABILITIES.delete(options.entropy)
   const plan = options.plan
   const now = clocks.wallNow()
@@ -726,7 +783,11 @@ function createLiveProcessTopology(options) {
     return value
   }
   try {
-    const tuples = ROLES.map((role, index) => planTuple(plan, index + 1))
+    // Reachable addresses drive every published value: advertisements, adjacency
+    // contacts, link specs, DHT peers and the firewall map. Only the bind tuple is
+    // local to the host that owns the socket.
+    const tuples = resolved.reachable
+    const bindTuples = resolved.bind
     const identities = []
     identities.push(identity(entropy))
     identities.push(identity(entropy, ROLE.SAFETY))
@@ -816,7 +877,7 @@ function createLiveProcessTopology(options) {
     const dhtIds = identities.slice(8).map((pair) => copy(pair.publicKey, 32))
 
     const common = (index) => ({
-      bind: tuples[index],
+      bind: bindTuples[index],
       controlAuditMacKey: roleMacKeys[index],
       generation: GENERATIONS[index],
       plan: plan.name,
@@ -983,21 +1044,21 @@ function createLiveProcessTopology(options) {
       deepFreeze({
         ...common(8),
         dhtId: dhtIds[0],
-        dhtOptions: dhtOptions(tuples[8], [tuples[9]])
+        dhtOptions: dhtOptions(bindTuples[8], [tuples[9]])
       })
     )
     projections.push(
       deepFreeze({
         ...common(9),
         dhtId: dhtIds[1],
-        dhtOptions: dhtOptions(tuples[9], [tuples[10]])
+        dhtOptions: dhtOptions(bindTuples[9], [tuples[10]])
       })
     )
     projections.push(
       deepFreeze({
         ...common(10),
         dhtId: dhtIds[2],
-        dhtOptions: dhtOptions(tuples[10], [], [tuples[10]])
+        dhtOptions: dhtOptions(bindTuples[10], [], [tuples[10]])
       })
     )
 

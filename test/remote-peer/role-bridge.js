@@ -1,0 +1,186 @@
+'use strict'
+
+// Runs one topology role on this host and hands its control channel to a remote
+// coordinator over the DHT.
+//
+// The role process is unchanged: test/private/process/role-runner.js already
+// speaks the binary control protocol on stdin and stdout, so this bridge only
+// moves those bytes. The coordinator dials in with a derived key, the bridge
+// spawns the role, and the two streams are joined. Keeping role-runner untouched
+// matters: it is what the local gates exercise, and a distributed run must not be
+// a different program.
+//
+//   REMOTE_PEER_SECRET=<hex> REMOTE_PEER_RUN_ID=<id> \
+//     node test/remote-peer/role-bridge.js --index 3 --runtime node --seconds 900
+
+const path = require('path')
+const { spawn } = require('child_process')
+const b4a = require('b4a')
+const DHT = require('../..')
+const { peerKeyPair, proberKeyPair } = require('./identity')
+const { reflect, resolveReflectors } = require('./dht-reflect')
+
+const ROLE_RUNNER = path.join(__dirname, '..', 'private', 'process', 'role-runner.js')
+const REPO_ROOT = path.join(__dirname, '..', '..')
+
+function parse(argv) {
+  const options = { index: 1, runtime: 'node', seconds: 900, cellPort: 0, bootstrap: [] }
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i]
+    const value = argv[i + 1]
+    if (flag === '--index') options.index = Number(value)
+    else if (flag === '--runtime') options.runtime = String(value)
+    else if (flag === '--seconds') options.seconds = Number(value)
+    else if (flag === '--cell-port') options.cellPort = Number(value)
+    else if (flag === '--bootstrap') {
+      const [host, port] = String(value).split(':')
+      options.bootstrap.push({ host, port: Number(port) })
+    } else continue
+    i++
+  }
+  if (!Number.isInteger(options.index) || options.index < 1) throw new Error('bad --index')
+  if (options.runtime !== 'node' && options.runtime !== 'bare') throw new Error('bad --runtime')
+  if (!Number.isFinite(options.seconds) || options.seconds <= 0) throw new Error('bad --seconds')
+  if (!Number.isInteger(options.cellPort) || options.cellPort < 0)
+    throw new Error('bad --cell-port')
+  return options
+}
+
+function emit(event) {
+  console.log(JSON.stringify({ roleBridge: event.event, ...event }))
+}
+
+function roleCommand(runtime) {
+  if (runtime === 'bare') return { command: require('bare-runtime')('bare'), args: [ROLE_RUNNER] }
+  return { command: process.execPath, args: [ROLE_RUNNER] }
+}
+
+// The role's own environment stays empty, exactly as the local coordinator runs
+// it, except for the opt-in fatal trace path.
+function roleEnvironment() {
+  const env = Object.create(null)
+  const fatalLog = process.env.PR_ROLE_FATAL_LOG
+  if (typeof fatalLog === 'string' && fatalLog.length > 0) env.PR_ROLE_FATAL_LOG = fatalLog
+  return env
+}
+
+async function main() {
+  const options = parse(process.argv.slice(2))
+  const secret = process.env.REMOTE_PEER_SECRET
+  const runId = process.env.REMOTE_PEER_RUN_ID || process.env.GITHUB_RUN_ID
+  if (!secret) throw new Error('REMOTE_PEER_SECRET is required')
+  if (!runId) throw new Error('REMOTE_PEER_RUN_ID or GITHUB_RUN_ID is required')
+
+  const keyPair = peerKeyPair(secret, runId, options.index)
+  const coordinator = proberKeyPair(secret, runId).publicKey
+  const node = new DHT({
+    bootstrap: options.bootstrap.length > 0 ? options.bootstrap : undefined
+  })
+
+  // The address this role will publish for route cells. The port is claimed here,
+  // reflected, then released, so the role's own cell endpoint can bind the same
+  // local port and be reachable at the address the coordinator mints into its
+  // capability. Ten-runner measurements showed the mapping survives that rebind.
+  const cellUdx = new (require('udx-native'))()
+  const probe = cellUdx.createSocket()
+  const probeBind = probe.bind(options.cellPort)
+  if (probeBind && typeof probeBind.then === 'function') await probeBind
+  const cellPort = probe.address().port
+  const reflectors = (await resolveReflectors()).slice(0, 2)
+  const observations = []
+  for (const reflector of reflectors) {
+    observations.push(await reflect(probe, reflector))
+  }
+  await probe.close()
+
+  const usable = observations.filter((entry) => entry !== null)
+  const endpoint = usable.length > 0 ? usable[0] : null
+  const endpointStable =
+    usable.length > 1 &&
+    usable.every((entry) => entry.host === usable[0].host && entry.port === usable[0].port)
+
+  let role = null
+  let attached = false
+
+  const server = node.createServer(
+    {
+      // Only the coordinator may drive a role.
+      firewall(remotePublicKey) {
+        const allowed = b4a.equals(remotePublicKey, coordinator)
+        if (!allowed) {
+          emit({
+            event: 'denied',
+            index: options.index,
+            saw: b4a.toString(remotePublicKey.subarray(0, 6), 'hex'),
+            expected: b4a.toString(coordinator.subarray(0, 6), 'hex')
+          })
+        }
+        return !allowed
+      }
+    },
+    (socket) => {
+      if (attached) {
+        socket.destroy()
+        return
+      }
+      attached = true
+      emit({ event: 'attached', index: options.index })
+      socket.on('error', () => {})
+
+      const launch = roleCommand(options.runtime)
+      role = spawn(launch.command, launch.args, {
+        cwd: REPO_ROOT,
+        env: roleEnvironment(),
+        stdio: ['pipe', 'pipe', 'pipe']
+      })
+
+      // Control frames both ways, untouched.
+      socket.on('data', (chunk) => {
+        if (role && role.stdin && !role.stdin.destroyed) role.stdin.write(chunk)
+      })
+      role.stdout.on('data', (chunk) => socket.write(chunk))
+
+      // A role must be silent on stderr; forwarding it as data would corrupt the
+      // control stream, so it is reported here and the run fails on the missing
+      // reply rather than on garbage.
+      role.stderr.on('data', (chunk) => {
+        emit({
+          event: 'role-stderr',
+          index: options.index,
+          text: b4a.toString(chunk, 'utf8').slice(0, 400)
+        })
+      })
+
+      role.once('exit', (code, signal) => {
+        emit({ event: 'role-exit', index: options.index, code, signal })
+        socket.destroy()
+      })
+      socket.once('close', () => {
+        if (role && !role.killed) role.kill('SIGTERM')
+      })
+    }
+  )
+
+  await server.listen(keyPair)
+  emit({
+    event: 'ready',
+    index: options.index,
+    runtime: options.runtime,
+    runId,
+    cellPort,
+    endpoint,
+    endpointStable,
+    observations
+  })
+
+  await new Promise((resolve) => setTimeout(resolve, options.seconds * 1000))
+  emit({ event: 'done', index: options.index, attached })
+  if (role && !role.killed) role.kill('SIGKILL')
+  await server.close()
+  await node.destroy()
+}
+
+main().catch((err) => {
+  emit({ event: 'error', message: err.message })
+  process.exit(1)
+})
