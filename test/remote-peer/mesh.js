@@ -17,7 +17,7 @@ const DHT = require('../..')
 const UDX = require('udx-native')
 const { peerKeyPair, proberKeyPair } = require('./identity')
 const { OP, writeFrame, FrameReader } = require('./frames')
-const { discoverMapping, resolveServers } = require('./stun')
+const { reflect, resolveReflectors } = require('./dht-reflect')
 
 const DIAL_TIMEOUT_MS = 25_000
 const DIAL_RETRIES = 3
@@ -152,23 +152,29 @@ async function main() {
   if (bindResult && typeof bindResult.then === 'function') await bindResult
   const cellPort = cellSocket.address().port
 
-  // The mapped address of this exact socket, from two different reflectors. A
-  // capability for a cross-runner route would have to carry the mapped value, and
-  // if the two reflectors disagree the mapping is per destination and no single
-  // value could ever be published.
+  // What address the world sees for this exact socket. hyperdht already learns
+  // this for the socket it owns, from the `to` field every dht-rpc reply carries,
+  // but a NAT mapping belongs to a socket: the cell socket needs its own answer.
+  // Reflecting off DHT bootstrap nodes rather than a public STUN service keeps the
+  // question inside the stack that will have to publish the answer.
+  //
+  // Two nodes are asked because equal answers mean the mapping does not depend on
+  // the destination, so one value is publishable to any peer, which is what a
+  // signed capability needs.
   const cellMappings = []
-  for (const server of await resolveServers()) {
-    const mapped = await discoverMapping(cellSocket, server)
-    cellMappings.push({ server: server.host, mapped })
+  for (const reflector of (await resolveReflectors()).slice(0, 2)) {
+    const observed = await reflect(cellSocket, reflector)
+    cellMappings.push({ reflector: reflector.name, observed })
   }
-  const usable = cellMappings.filter((entry) => entry.mapped !== null)
+  const usable = cellMappings.filter((entry) => entry.observed !== null)
   const mappingIndependent =
     usable.length > 1 &&
     usable.every(
       (entry) =>
-        entry.mapped.host === usable[0].mapped.host && entry.mapped.port === usable[0].mapped.port
+        entry.observed.host === usable[0].observed.host &&
+        entry.observed.port === usable[0].observed.port
     )
-  const cellMapped = usable.length > 0 ? usable[0].mapped : null
+  const cellMapped = usable.length > 0 ? usable[0].observed : null
   let cellPlan = null
 
   // Repeats on purpose: a first packet out of a NAT usually only creates the
