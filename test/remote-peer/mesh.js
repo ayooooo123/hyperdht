@@ -134,9 +134,15 @@ async function main() {
   const cellUdx = new UDX()
   const cellSocket = cellUdx.createSocket()
   const cellObserved = []
+  // Punches carry a tag. Without one, a STUN success response counts as a packet
+  // from member 1, because its first byte is 0x01: the reflector's own replies
+  // arrive on this socket too.
+  const PUNCH_TAG = b4a.from('pr-mesh-punch/1\n')
   cellSocket.on('message', (message, from) => {
+    if (message.byteLength !== PUNCH_TAG.byteLength + 1) return
+    if (!b4a.equals(message.subarray(0, PUNCH_TAG.byteLength), PUNCH_TAG)) return
     cellObserved.push({
-      claimedIndex: message.byteLength > 0 ? message[0] : null,
+      claimedIndex: message[PUNCH_TAG.byteLength],
       host: from.host,
       port: from.port,
       at: Date.now()
@@ -170,7 +176,7 @@ async function main() {
   // mapping that does not exist yet. Six spread over three seconds separates
   // "never arrives" from "arrives once both mappings exist".
   function punchAll(plan) {
-    const payload = b4a.alloc(1, options.index & 0xff)
+    const payload = b4a.concat([PUNCH_TAG, b4a.from([options.index & 0xff])])
     let round = 0
     const timer = setInterval(() => {
       round++
