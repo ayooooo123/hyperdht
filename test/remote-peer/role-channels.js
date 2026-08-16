@@ -41,6 +41,14 @@ class RemoteChild extends EventEmitter {
         callback()
       },
       final(callback) {
+        // The coordinator stops a role by ending its stdin (coordinator.js:549) and a
+        // spawned child sees EOF. Half-closing this stream is how the far side learns
+        // to do the same, so a role that waits for EOF is not left running.
+        try {
+          socket.end()
+        } catch {
+          // A stream already gone needs no half-close.
+        }
         callback()
       }
     })
@@ -69,9 +77,15 @@ class RemoteChild extends EventEmitter {
     this.emit('exit', code, signal)
   }
 
-  kill() {
+  kill(signal = 'SIGTERM') {
+    // A killed child reports no exit code and the signal that killed it. Reporting a
+    // zero exit here would make a role that was cut down indistinguishable from one
+    // that finished its work, which is exactly the confusion a green run must not
+    // hide.
     this.killed = true
-    this._socket.destroy()
+    const settled = this.exited
+    this._settle(null, typeof signal === 'string' ? signal : 'SIGTERM', null)
+    if (!settled) this._socket.destroy()
     return true
   }
 }
