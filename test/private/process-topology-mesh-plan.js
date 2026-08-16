@@ -24,11 +24,21 @@ function capabilities(seed) {
 
 // Two tuples per role: what the role binds locally, and what peers must dial. On
 // separate hosts these differ, which is the whole reason the plan exists.
+const EXIT_INDEXES = [4, 6, 8]
+
 function endpoints(overrides = {}) {
-  const list = ROLES.map((role, index) => ({
-    bind: { host: '0.0.0.0', port: 42_000 + index + 1 },
-    reachable: { host: `203.0.113.${index + 1}`, port: 52_000 + index + 1 }
-  }))
+  const list = ROLES.map((role, index) => {
+    const entry = {
+      bind: { host: '0.0.0.0', port: 42_000 + index + 1 },
+      reachable: { host: `203.0.113.${index + 1}`, port: 52_000 + index + 1 }
+    }
+    // Only an exit owns a second socket for reaching DHT nodes, and behind a NAT it
+    // has its own mapping, so only an exit publishes one.
+    if (EXIT_INDEXES.includes(index + 1)) {
+      entry.dhtExit = { host: `203.0.113.${index + 1}`, port: 62_000 + index + 1 }
+    }
+    return entry
+  })
   for (const [index, value] of Object.entries(overrides)) list[Number(index)] = value
   return list
 }
@@ -56,6 +66,19 @@ test('a discovered-endpoint topology binds exactly the endpoints it was given', 
     topology.oracle.tuples.map((tuple) => ({ host: tuple.host, port: tuple.port })),
     supplied.map((entry) => entry.reachable),
     'the published tuples are the reachable addresses, not the bind addresses'
+  )
+  const exitDht = supplied
+    .filter((entry, index) => EXIT_INDEXES.includes(index + 1))
+    .map((entry) => entry.dhtExit)
+  t.alike(
+    topology.projections[0].meshPeers.exitDht,
+    exitDht,
+    'every projection carries the exits DHT-exit addresses, which no role can derive'
+  )
+  t.alike(
+    topology.projections[0].meshPeers.tuples,
+    supplied.map((entry) => entry.reachable),
+    'and the reachable address of every role'
   )
   t.is(
     topology.oracle.endpointAddress,
@@ -170,7 +193,26 @@ test('endpoint lists are validated before anything is minted', (t) => {
         }
       ]
     ],
-    ['not an array', { 0: endpoints()[0] }]
+    ['not an array', { 0: endpoints()[0] }],
+    [
+      'an exit without its DHT-exit address',
+      endpoints({
+        3: {
+          bind: { host: '0.0.0.0', port: 42_004 },
+          reachable: { host: '203.0.113.4', port: 52_004 }
+        }
+      })
+    ],
+    [
+      'a non-exit carrying a DHT-exit address',
+      endpoints({
+        0: {
+          bind: { host: '0.0.0.0', port: 42_001 },
+          reachable: { host: '203.0.113.1', port: 52_001 },
+          dhtExit: { host: '203.0.113.1', port: 62_001 }
+        }
+      })
+    ]
   ]
 
   let seed = 0x50

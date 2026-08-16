@@ -178,7 +178,9 @@ function setupRequest(state, socketState, packet, decoded, host, port, ttl) {
 
   const recordSequence = ++state.recordSequence
   const nonce = fixed(state.randomBytes(16), 16)
-  const source = tupleBytes(state.source)
+  // The record describes what the peer sees, because that is what the reply's `to`
+  // field is compared against. Only the bind check above uses the local address.
+  const source = tupleBytes(state.observedSource)
   const destination = tupleBytes(state.destination)
   let open
   try {
@@ -275,14 +277,16 @@ function inbound(state, socketState, packet, source) {
   if (!state.permittedTuples.has(sourceKey)) invalid('PROCESS_DHT_SETUP_SOURCE')
   const decoded = decodePacket(packet)
   if (decoded.type === 0x13) {
-    if (tupleKey(decoded.to) !== state.sourceKey) invalid('PROCESS_DHT_SETUP_FORGED_RESPONSE')
+    if (tupleKey(decoded.to) !== state.observedSourceKey) {
+      invalid('PROCESS_DHT_SETUP_FORGED_RESPONSE')
+    }
     const setupKey = correlationKey('setup', source.host, source.port, decoded.transactionId)
     const internalKey = correlationKey('internal', source.host, source.port, decoded.transactionId)
     if (state.correlations.has(setupKey)) closeSetup(state, setupKey, packet)
     else if (state.correlations.has(internalKey)) state.correlations.delete(internalKey)
     else invalid('PROCESS_DHT_SETUP_FORGED_RESPONSE')
   } else {
-    if (tupleKey(decoded.to) !== state.sourceKey) invalid('PROCESS_DHT_SETUP_SOURCE')
+    if (tupleKey(decoded.to) !== state.observedSourceKey) invalid('PROCESS_DHT_SETUP_SOURCE')
     addCorrelation(
       state,
       correlationKey('server', source.host, source.port, decoded.transactionId),
@@ -390,6 +394,11 @@ function createDhtSetupAuditController(options) {
   if (!options || typeof options !== 'object') invalid()
   const source = exactTuple(options.source)
   const destination = exactTuple(options.destination)
+  // What this socket is bound to and what a peer reports back for it are the same
+  // address only when nothing translates in between. Behind a NAT they differ, so a
+  // caller may state the observed one; without it they are equal, as before.
+  const observedSource =
+    options.observedSource === undefined ? source : exactTuple(options.observedSource)
   if (
     typeof options.emit !== 'function' ||
     typeof options.onFailure !== 'function' ||
@@ -446,6 +455,8 @@ function createDhtSetupAuditController(options) {
     randomBytes: options.randomBytes,
     recordSequence: 0n,
     sockets: new Set(),
+    observedSource,
+    observedSourceKey: tupleKey(observedSource),
     source,
     sourceKey: tupleKey(source),
     udx: options.udx,

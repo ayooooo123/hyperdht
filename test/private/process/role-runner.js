@@ -132,6 +132,27 @@ function randomBytes(size) {
   return cryptoSuite.randomBytes(size)
 }
 
+// Exit roles own a second socket for reaching DHT nodes.
+const EXIT_ROLE_INDEXES = Object.freeze([4, 6, 8])
+const DHT_ROLE_INDEXES_FOR_AUDIT = Object.freeze([9, 10, 11])
+
+function invalidProjection() {
+  throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
+}
+
+function meshTuple(list, offset) {
+  const tuple = Array.isArray(list) ? list[offset] : null
+  if (
+    !tuple ||
+    typeof tuple !== 'object' ||
+    typeof tuple.host !== 'string' ||
+    !Number.isInteger(tuple.port)
+  ) {
+    invalidProjection()
+  }
+  return Object.freeze({ host: tuple.host, port: tuple.port })
+}
+
 function tupleForRole(roleIndex) {
   if (projection.plan === PROCESS_PLANS.PORTABLE_LOOPBACK.name) {
     return Object.freeze({ host: `127.64.${roleIndex}.1`, port: 42_000 + roleIndex })
@@ -139,12 +160,41 @@ function tupleForRole(roleIndex) {
   if (projection.plan === PROCESS_PLANS.LINUX_NAMESPACE.name) {
     return Object.freeze({ host: `10.203.${roleIndex}.2`, port: 42_000 + roleIndex })
   }
-  throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
+  // Roles on separate hosts cannot compute each other's addresses: behind a NAT a
+  // peer's address is whatever its own reflection reported, so it travels with the
+  // projection instead.
+  if (projection.plan === PROCESS_PLANS.DHT_MESH.name) {
+    if (!projection.meshPeers) invalidProjection()
+    return meshTuple(projection.meshPeers.tuples, roleIndex - 1)
+  }
+  invalidProjection()
 }
+
 // An exit reaches DHT nodes from its dedicated DHT-exit socket, so that is the
 // tuple a DHT node observes as the source, not the exit's cell endpoint.
 function exitDhtTupleForRole(roleIndex) {
+  if (projection.plan === PROCESS_PLANS.DHT_MESH.name) {
+    if (!projection.meshPeers) invalidProjection()
+    const offset = EXIT_ROLE_INDEXES.indexOf(roleIndex)
+    if (offset === -1) invalidProjection()
+    return meshTuple(projection.meshPeers.exitDht, offset)
+  }
   return Object.freeze({ host: tupleForRole(roleIndex).host, port: 43_000 + roleIndex })
+}
+
+// An audit record binds the two addresses it describes. Derived plans compute them
+// from role indexes; a discovered topology has to state them.
+function auditContextFields(roleIndex, destinationRoleIndex) {
+  if (projection.plan !== PROCESS_PLANS.DHT_MESH.name) return {}
+  const source =
+    EXIT_ROLE_INDEXES.includes(roleIndex) &&
+    DHT_ROLE_INDEXES_FOR_AUDIT.includes(destinationRoleIndex)
+      ? exitDhtTupleForRole(roleIndex)
+      : tupleForRole(roleIndex)
+  return {
+    destinationTuple: tupleForRole(destinationRoleIndex),
+    sourceTuple: source
+  }
 }
 
 function planCapability() {
@@ -152,7 +202,8 @@ function planCapability() {
     return PROCESS_PLANS.PORTABLE_LOOPBACK
   }
   if (projection.plan === PROCESS_PLANS.LINUX_NAMESPACE.name) return PROCESS_PLANS.LINUX_NAMESPACE
-  throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
+  if (projection.plan === PROCESS_PLANS.DHT_MESH.name) return PROCESS_PLANS.DHT_MESH
+  invalidProjection()
 }
 
 function verifyBound(owner) {
@@ -483,11 +534,16 @@ async function createDhtOwner() {
     setupAudit = createDhtSetupAuditController({
       auditContext: TEST_ONLY_AUDIT_CONTEXT_ISSUER.context({
         destinationRoleIndex: 11,
+        ...auditContextFields(10, 11),
         phase: AUDIT_PHASES.DHT_SETUP,
         plan: planCapability(),
         roleIndex: 10
       }),
       destination: tupleForRole(11),
+      // Bound locally, observed by the DHT node as the published address.
+      ...(projection.plan === PROCESS_PLANS.DHT_MESH.name
+        ? { observedSource: tupleForRole(10) }
+        : {}),
       emit: setupAuditEmitter,
       onFailure(err) {
         void fatal(err)

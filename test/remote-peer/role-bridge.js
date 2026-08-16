@@ -24,6 +24,11 @@ const { OP, writeFrame } = require('./frames')
 // A role binds a socket it owns; peers dial the address the world sees for it.
 const BIND_HOST = '0.0.0.0'
 const MODE = Object.freeze({ REPORT: 1, ATTACH: 2 })
+// An exit binds a second socket for reaching DHT nodes, at 43000 + roleIndex; see
+// role-runner.js:360. Behind a NAT it carries its own mapping, so it has to be
+// discovered separately.
+const EXIT_ROLE_INDEXES = Object.freeze([4, 6, 8])
+const EXIT_DHT_PORT_BASE = 43_000
 
 const ROLE_RUNNER = path.join(__dirname, '..', 'private', 'process', 'role-runner.js')
 const REPO_ROOT = path.join(__dirname, '..', '..')
@@ -106,6 +111,29 @@ async function main() {
   }
   await probe.close()
 
+  // The same claim-reflect-release for the exit's DHT socket. Its local port is
+  // fixed by the role, so the probe binds exactly that port and the mapping it
+  // learns is the one the role will own once it binds.
+  let dhtExit = null
+  if (EXIT_ROLE_INDEXES.includes(options.index)) {
+    const exitProbe = cellUdx.createSocket()
+    const exitPort = EXIT_DHT_PORT_BASE + options.index
+    const exitBind = exitProbe.bind(exitPort)
+    if (exitBind && typeof exitBind.then === 'function') await exitBind
+    if (options.reachableHost !== null) {
+      dhtExit = { host: options.reachableHost, port: exitPort }
+    } else {
+      for (const reflector of reflectors) {
+        const observed = await reflect(exitProbe, reflector)
+        if (observed !== null) {
+          dhtExit = observed
+          break
+        }
+      }
+    }
+    await exitProbe.close()
+  }
+
   const usable = observations.filter((entry) => entry !== null)
   // A rehearsal on one host has no translation to discover, so the reachable host
   // can be stated. On a runner it is always the reflected value.
@@ -160,6 +188,7 @@ async function main() {
                   runtime: options.runtime,
                   bind: { host: BIND_HOST, port: cellPort },
                   reachable: endpoint,
+                  dhtExit,
                   endpointStable
                 })
               )
@@ -223,6 +252,7 @@ async function main() {
     runId,
     cellPort,
     endpoint,
+    dhtExit,
     endpointStable,
     observations
   })
