@@ -40,7 +40,8 @@ function parse(argv) {
     seconds: 900,
     cellPort: 0,
     bootstrap: [],
-    reachableHost: null
+    reachableHost: null,
+    bindHost: null
   }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
@@ -50,6 +51,7 @@ function parse(argv) {
     else if (flag === '--seconds') options.seconds = Number(value)
     else if (flag === '--cell-port') options.cellPort = Number(value)
     else if (flag === '--reachable-host') options.reachableHost = String(value)
+    else if (flag === '--bind-host') options.bindHost = String(value)
     else if (flag === '--bootstrap') {
       const [host, port] = String(value).split(':')
       options.bootstrap.push({ host, port: Number(port) })
@@ -186,7 +188,7 @@ async function main() {
                 JSON.stringify({
                   index: options.index,
                   runtime: options.runtime,
-                  bind: { host: BIND_HOST, port: cellPort },
+                  bind: { host: options.bindHost || BIND_HOST, port: cellPort },
                   reachable: endpoint,
                   dhtExit,
                   endpointStable
@@ -234,7 +236,11 @@ async function main() {
 
         role.once('exit', (code, signal) => {
           emit({ event: 'role-exit', index: options.index, code, signal })
-          socket.destroy()
+          // A role that finished its work exits zero, and the coordinator must see
+          // that as a closed channel rather than a reset: ending the stream says the
+          // far side is done, destroying it says something broke.
+          if (code === 0) socket.end()
+          else socket.destroy()
         })
         socket.once('close', () => {
           if (role && !role.killed) role.kill('SIGTERM')

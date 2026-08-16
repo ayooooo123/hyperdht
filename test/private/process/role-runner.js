@@ -434,6 +434,14 @@ function startIncomingExtension() {
 async function createCellOwner() {
   cellEndpoint = new UdxCellEndpoint({
     host: projection.bind.host,
+    // On separate hosts the socket is bound locally and reached at a translated
+    // address, which is the one the role's capability names.
+    ...(projection.plan === PROCESS_PLANS.DHT_MESH.name
+      ? {
+          advertisedHost: tupleForRole(projection.roleIndex).host,
+          advertisedPort: tupleForRole(projection.roleIndex).port
+        }
+      : {}),
     onBootstrap: receiveRoleBootstrap,
     onCell: receiveRoleCell,
     onLinkFailure: receiveRoleLinkFailure,
