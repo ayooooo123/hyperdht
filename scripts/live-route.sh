@@ -226,6 +226,15 @@ start_local_bridges() {
   echo "hosting roles$local_list here, logs in $bridge_logs"
 }
 
+# The version every role must match. role-runner.js compares its own runtime version
+# against the coordinator's and refuses to configure if they differ, which is a
+# deliberate fail-closed check that all twelve processes are the same build - so the
+# runners have to install this exact patch version rather than whatever lts/* means
+# today.
+coordinator_node_version() {
+  "$node_bin" -p 'process.version.slice(1)'
+}
+
 # Reads back the pin the run was dispatched with. The workflow puts it in the run
 # name, which is public material by construction, so a run driven by the wrong
 # coordinator secret is named in seconds rather than appearing as eleven roles that
@@ -275,7 +284,8 @@ case "${1:-}" in
     # Roles pin this key and refuse everyone else, so a dispatch without it would
     # hold bridges open that no coordinator can drive.
     gh workflow run "$workflow" -f "seconds=$seconds" -f "wait=$wait_seconds" \
-      -f "remote_roles=$remote_list" -f "coordinator_key=$coordinator_key"
+      -f "remote_roles=$remote_list" -f "coordinator_key=$coordinator_key" \
+      -f "node_version=$(coordinator_node_version)"
     run_id="$(newest_run_id "$before")" || {
       echo "dispatched, but the run id never appeared; find it with: gh run list" >&2
       exit 75

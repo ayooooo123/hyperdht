@@ -101,6 +101,13 @@ on:
       coordinator_key:
         description: Hex public key of the coordinator the roles pin (scripts/remote-peer.sh secret prints it)
         required: true
+      node_version:
+        description: >-
+          Exact Node version the coordinator runs, without the leading v. Every role
+          compares its own runtime version against the coordinator's and refuses to
+          configure if they differ (PROCESS_RUNTIME_MISMATCH), so this cannot be
+          lts/* - it has to be the coordinator's exact patch version.
+        required: true
 
 jobs:
   role:
@@ -145,6 +152,7 @@ jobs:
           WAIT_INPUT: ${{ inputs.wait }}
           REMOTE_ROLES: ${{ inputs.remote_roles }}
           COORDINATOR_KEY: ${{ inputs.coordinator_key }}
+          NODE_VERSION: ${{ inputs.node_version }}
           INDEX: ${{ matrix.index }}
         run: |
           # Read through env, never by pasting inputs into the script body. Both
@@ -184,6 +192,16 @@ jobs:
             echo "coordinator_key must be 64 hex characters, got ${#COORDINATOR_KEY}" >&2
             exit 1
           fi
+          # Refused here rather than by setup-node, because role-runner.js compares its
+          # runtime version against the coordinator's and a mismatch surfaces as
+          # PROCESS_RUNTIME_MISMATCH on one role after every address has been
+          # discovered, which reads as a role fault rather than a dispatch typo.
+          case "$NODE_VERSION" in
+            '' | *[!0-9.]* | *..* | .* | *.)
+              echo "node_version must be an exact version without the leading v, got: $NODE_VERSION" >&2
+              exit 1
+              ;;
+          esac
           case "$REMOTE_ROLES" in
             '' | *[!0-9,]*)
               echo "remote_roles must be comma-separated whole numbers, got: $REMOTE_ROLES" >&2
@@ -208,7 +226,9 @@ jobs:
       - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
         if: steps.slot.outputs.wanted == 'true'
         with:
-          node-version: lts/*
+          # Not lts/*: role-runner.js refuses to configure unless its runtime version
+          # equals the coordinator's exactly, so the dispatch carries that version.
+          node-version: ${{ inputs.node_version }}
       - run: npm install
         if: steps.slot.outputs.wanted == 'true'
       - name: Host role ${{ matrix.index }} (${{ matrix.role }})
