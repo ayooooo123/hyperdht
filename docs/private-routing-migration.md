@@ -251,6 +251,29 @@ stays open, so no exit was ever reported and the coordinator burned its thirty
 second scenario deadline. A remote `end` is now the role finishing: it settles an
 exit with code zero and ends this side too.
 
+Two further places where a stream-backed role differed from a spawned one were
+measured and closed, both of which could have let a green run hide a fault.
+`kill()` reported a zero exit, making a role that was cut down indistinguishable
+from one that finished; it now reports no code and the signal, as a killed child
+does. And the coordinator stops a role by ending its stdin
+(`coordinator.js:549`), which a spawned role sees as EOF; the channel now
+half-closes the stream and the bridge passes the EOF on, so a role waiting for it
+is not left running.
+
+`test/remote-peer/role-channel-lifecycle.js` holds those semantics with eleven
+assertions over a real stream and no role process: byte fidelity in both directions
+across many packets, a silent stderr, a graceful end producing exactly one exit with
+code zero before the stream closes, a destroyed stream producing one failure exit
+with and without an error listener, kill closing the stream, and a write after the
+far side is gone reporting to its caller. The graceful-end assertion was checked
+against the pre-fix channel and fails there, so it guards the bug rather than
+describing it.
+
+Setting `PR_BRIDGE_TRACE` to a path makes both halves of the transport write one
+JSON object per line for every control frame, stream event and role exit, which is
+how the teardown sequence above was read back. It is off unless the variable is
+set.
+
 A rehearsal needs one address per role, because the diversity rule rejects a set of
 relays sharing a /24 (KI-5). Linux serves every 127/8 address, so the rehearsal runs
 in the container from `docker/linux-gates.Dockerfile` with
