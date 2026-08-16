@@ -990,7 +990,9 @@ function validateCommand(message, context) {
       if (
         !EXIT_ROLES.has(common.role) ||
         (context.coordinator !== true && context.receiver !== true) ||
-        (context.projection !== 'portable-loopback' && context.projection !== 'linux-namespace') ||
+        (context.projection !== 'portable-loopback' &&
+          context.projection !== 'linux-namespace' &&
+          context.projection !== 'dht-mesh') ||
         !fixed(message.grant, 137) ||
         !uint64(message.requestSequence, true) ||
         !fixed(message.tupleDigest, 32)

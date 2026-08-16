@@ -55,13 +55,24 @@ if [ -z "$bootstrap" ]; then
 fi
 echo "testnet at $bootstrap, run $run_id"
 
+# One address per role when the host allows it, because the diversity rule rejects a
+# set of relays that share a /24 (KI-5). Linux serves every 127/8 address, macOS does
+# not, so a rehearsal there shares 127.0.0.1 and stops at that rule.
 for index in $(seq 1 11); do
+  if [ -n "${REHEARSAL_HOST_PREFIX:-}" ]; then
+    host_flags=(
+      --reachable-host "$REHEARSAL_HOST_PREFIX.$index.1"
+      --bind-host "$REHEARSAL_HOST_PREFIX.$index.1"
+    )
+  else
+    host_flags=(--reachable-host 127.0.0.1)
+  fi
   REMOTE_PEER_SECRET="$secret" REMOTE_PEER_RUN_ID="$run_id" \
     node test/remote-peer/role-bridge.js \
     --index "$index" \
     --seconds "$seconds" \
     --cell-port "$((42000 + index))" \
-    --reachable-host 127.0.0.1 \
+    "${host_flags[@]}" \
     --bootstrap "$bootstrap" \
     >"/tmp/rehearsal-bridge-$index.log" 2>&1 &
   bridge_pids+=($!)
@@ -74,4 +85,4 @@ REMOTE_PEER_SECRET="$secret" \
   REMOTE_PEER_RUN_ID="$run_id" \
   REMOTE_PEER_WAIT_SECONDS=120 \
   REMOTE_PEER_BOOTSTRAP="$bootstrap" \
-  "$repo/node_modules/.bin/brittle-node" test/remote-peer/live-route.js
+  "${BRITTLE_NODE:-$repo/node_modules/.bin/brittle-node}" test/remote-peer/live-route.js
