@@ -128,7 +128,8 @@ if (options === null) {
         coordinatorSecret: options.coordinatorSecret,
         runId: options.runId,
         count: ROLES.length,
-        deadline
+        deadline,
+        comment: (message) => t.comment(message)
       })
 
       for (let index = 0; index < endpoints.length; index++) {
@@ -142,6 +143,10 @@ if (options === null) {
       for (const collision of sharedSubnets(endpoints)) {
         t.comment(`path diversity refuses roles sharing a subnet (KI-5): ${collision}`)
       }
+
+      // An exit's DHT socket is dialled directly by other roles, so an address only
+      // one reflector agreed on is named here rather than surfacing later as a
+      // dht-rpc REQUEST_TIMEOUT with nothing pointing at the address.
 
       return {
         endpoints,

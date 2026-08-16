@@ -927,6 +927,39 @@ local role while every reflector still agrees on the address. That is exactly wh
 was observed, and it is why an endpoint can be local but a DHT role cannot: the
 endpoint initiates.
 
+FOURTH, AND OPEN: the setup store does not complete over a real network. With the
+command deadline raised and EVERY role on a runner, so nothing depends on the
+laptop's NAT, the run reaches 10 of 11 assertions and then dies with
+`PROCESS_ROLE_FAILURE (dht-referral/CONTROL)`. The role's own stack, recovered from
+the runner, is `DHTError: REQUEST_TIMEOUT` raised inside `dht-rpc/lib/io.js:601` -
+dht-rpc's own request timeout, not a harness deadline and not a check failing. Some
+DHT request the referral role makes is never answered. Cause not established, and I
+am not going to guess it: it reproduces with all eleven roles remote, so the laptop
+is excluded, and it survives a ninefold increase in the coordinator's command
+budget, so it is not the harness being impatient.
+
+One asymmetry found while looking, worth recording because it is cheap to fix and
+could contribute. The cell socket's address is reflected off TWO reflectors and the
+bridge reports `endpointStable` only when both agree, which is what establishes that
+the NAT's mapping is endpoint-independent. The exits' second socket, the DHT socket
+at `43000 + index`, is reflected off reflectors in a loop that BREAKS on the first
+success, so its mapping is confirmed once and never cross-checked. If a NAT were
+endpoint-dependent for that socket, the published address would be the mapping for
+that one reflector rather than the one other roles will see, and requests to it
+would time out exactly as observed. That is a hypothesis, not the finding: on the
+run inspected, the exit's cell mapping was 104.209.7.229:29697 with both reflectors
+agreeing and its DHT mapping was :29698, which is consistent with a sequential
+allocator and endpoint-independent behaviour. Giving the DHT socket the same
+two-reflector agreement check as the cell socket would settle it.
+
+The order these were found matters for anyone repeating the exercise, because each
+one hid the next: the runtime attestation could never pass, so nothing beyond
+assertion 1 was reachable; then two roles could not be scheduled; then a laptop role
+could not be dialled; then a retransmission was called a replay; then the command
+budget was too small for real RTT; and only then did the setup store's own timeout
+become visible at assertion 11. Six distinct causes, each of which had to be removed
+before the next could be seen, and not one of them observable on loopback.
+
 So mixed placement works for roles that initiate and fails for roles that must be
 dialled, on this network. Whether that generalises depends entirely on the NAT in
 front of whoever runs it. The honest limit: nothing here distinguishes

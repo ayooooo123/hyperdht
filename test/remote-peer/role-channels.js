@@ -253,7 +253,7 @@ function connect(node, keyPair, publicKey, timeoutMs = CONNECT_TIMEOUT_MS) {
 // Each role's own addresses, asked for before the topology that will contain them
 // is minted. Retried until the deadline because roles come up minutes apart on CI.
 async function requestRoleEndpoints(options) {
-  const { node, secret, coordinatorSecret, runId, count, deadline } = options
+  const { node, secret, coordinatorSecret, runId, count, deadline, comment } = options
   if (!coordinatorSecret) {
     throw new Error('coordinatorSecret is required: roles pin only its public key')
   }
@@ -289,6 +289,16 @@ async function requestRoleEndpoints(options) {
     // Only an exit reports one, and the topology requires it from exactly those
     // roles.
     if (report.dhtExit) entry.dhtExit = report.dhtExit
+    // Reported through the caller's comment hook rather than attached anywhere: the
+    // topology fixture validates each record with exactObject AND the array itself
+    // with exactArrayValues, which rejects any own key beyond the indices and length.
+    // So neither the entry nor the array can carry a diagnostic.
+    if (report.dhtExit && report.dhtExitStable === false && typeof comment === 'function') {
+      comment(
+        `role ${index}: reflectors disagreed on its DHT socket ` +
+          `${report.dhtExit.host}:${report.dhtExit.port}, so peers may not reach it`
+      )
+    }
     endpoints.push(entry)
   }
   return endpoints
