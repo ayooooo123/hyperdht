@@ -1,86 +1,87 @@
 name: Live Route
+run-name: 'Live Route: roles ${{ inputs.remote_roles }}, coordinator ${{ inputs.coordinator_key }}'
 
-# Runs the eleven-role private-routing scenario with every role on its own runner,
-# which is the distributed path scripts/live-route-rehearsal.sh rehearses on one
-# machine. The rehearsal and this workflow drive the same file,
-# test/remote-peer/live-route.js, so there is one implementation of the scenario and
-# CI cannot drift from what a workstation can reproduce.
+# Hosts role bridges for the eleven-role private-routing scenario on runners, so a
+# coordinator elsewhere can drive the whole route across real hosts. This workflow
+# hosts roles and nothing else: the coordinator runs on the workstation, in
+# scripts/live-route.sh, exactly as remote-peer.yml and remote-mesh.yml are driven
+# by their own scripts.
 #
-# The sequence, which is the rehearsal's sequence with the loopback removed:
+# THE COORDINATOR IS NOT A JOB, AND THAT IS THE POINT. Only the coordinator holds
+# the secret its key comes from. A coordinator job would need that secret inside
+# Actions, which would mean uploading by hand the one credential the split exists
+# to keep on one machine. So this file references exactly one secret,
+# REMOTE_PEER_SECRET, which remote-peer.sh already pushes, and needs no manual
+# setup of any kind.
 #
-#   1. Eleven `role` jobs each run test/remote-peer/role-bridge.js for one index.
-#      A bridge derives its server key from the REMOTE_PEER_SECRET repository
-#      secret plus the run id, claims a UDP port, learns what the world sees for
-#      that port from two reflectors, releases it, and listens on the DHT with a
-#      firewall pinned to the coordinator's public key. The role process itself is
-#      test/private/process/role-runner.js, unmodified.
-#   2. The `coordinator` job asks each bridge for its addresses: one connection,
-#      mode byte 1, answered with a REPORT frame carrying the bound tuple, the
-#      reachable tuple and, for the three exits, the second socket they bind for
-#      reaching DHT nodes. It asks before it mints anything, because a runner
-#      behind a NAT is the only party that can discover its own mapping.
+# A ROLE DOES NOT KNOW WHERE IT IS. role-bridge.js binds 0.0.0.0 and learns the
+# address peers must dial from two reflectors, so a role on a runner, a laptop or
+# anything else behind a NAT is the same program with the same arguments. Placement
+# is therefore a property of the dispatch, not of the code: `remote_roles` names
+# the indices hosted here, and scripts/live-route.sh starts the rest locally. The
+# coordinator discovers all eleven over the DHT and cannot tell them apart.
+#
+# The sequence a run takes, with steps 2 to 5 driven from the workstation:
+#
+#   1. Each role job runs test/remote-peer/role-bridge.js for one index. The bridge
+#      derives its server key from REMOTE_PEER_SECRET plus the run id, claims a UDP
+#      port, learns what the world sees for it from two reflectors, releases it so
+#      the role can rebind the same local port, and listens on the DHT with a
+#      firewall pinned to the coordinator's public key.
+#   2. The coordinator asks each bridge for its addresses: one connection, mode
+#      byte 1, answered with a REPORT frame carrying the bound tuple, the reachable
+#      tuple and, for the three exits, the second socket they bind to reach DHT
+#      nodes. It asks before minting anything, because a host behind a NAT is the
+#      only party that can discover its own mapping.
 #   3. PROCESS_PLANS.DHT_MESH is minted from those eleven answers rather than
 #      derived from a prefix, so reachable addresses drive everything published and
 #      bind addresses only bind.
 #   4. The coordinator opens eleven control channels: one connection each, mode
-#      byte 2, which spawns the role and joins the two streams. test/private/
-#      process/coordinator.js drives them as if they were child processes.
+#      byte 2, which spawns test/private/process/role-runner.js unmodified and
+#      joins the two streams. test/private/process/coordinator.js drives them as if
+#      they were child processes.
 #   5. When a channel ends, the coordinator fetches that role's terminal status on
 #      a fresh connection, mode byte 3, because no stream event carries an exit
 #      code, a signal or what the role wrote to stderr. A role that cannot be asked
 #      fails its channel rather than arriving as a clean finish.
 #
-# Two pieces of key material, kept apart on purpose. Every role host holds the
-# shared REMOTE_PEER_SECRET, so anything derived from it is derivable by every role
-# host: a coordinator key derived that way could be minted by any role, which would
-# let one role pass another's firewall and take its single allowed attach. So the
-# coordinator's key comes from a separate secret, and the roles are handed only the
-# matching public key, as the `coordinator_key` dispatch input. A public key is safe
-# to carry as an input; the shared secret is not, and neither is the coordinator's
-# secret. Neither secret's value appears anywhere in this file.
-#
-# scripts/remote-peer.sh secret --push deliberately pushes only the shared secret,
-# because for the remote-peer and remote-mesh workflows the coordinator is a
-# workstation. Here the coordinator is a job, so its secret has to exist in the
-# repository as REMOTE_PEER_COORDINATOR_SECRET, set by hand and never equal to the
-# shared secret. The coordinator job checks that the pin passed as `coordinator_key`
-# is the public key of the secret it holds, before eleven runners spend twenty
-# minutes refusing it.
+# Every role host holds the shared REMOTE_PEER_SECRET, so anything derived from it
+# is mintable by any role: a coordinator key derived that way could be minted by
+# any role, letting one role pass another's firewall and take its single allowed
+# attach. The coordinator's key therefore comes from a separate secret that never
+# leaves the workstation, and roles receive only the matching public key, as the
+# `coordinator_key` input. A public key is safe to carry as an input; neither
+# secret is, and neither appears in this file.
 #
 # Linux only. The eleven-role scenario has never been exercised on a macOS or
-# Windows runner, and test-private-routing.yml keeps the live job Linux-only for the
-# same reason.
+# Windows runner, and test-private-routing.yml keeps its live job Linux-only for
+# the same reason.
 #
-# Dispatch:
+# Dispatch and drive in one command, which handles the keys itself:
 #
-#   gh workflow run live-route.yml \
-#     -f coordinator_key="$(REMOTE_PEER_COORDINATOR_SECRET=$(cat \
-#       ~/.config/hyperdht-remote-peer/coordinator-secret) \
-#       node test/remote-peer/identity.js)"
+#   scripts/live-route.sh up                    # all eleven roles on runners
+#   scripts/live-route.sh up -l 1,9,10,11       # those four here, seven on runners
 #
-# Addressing is not configurable here and needs no flag: on eleven separate runners
-# the divergence is physical. A bridge binds 0.0.0.0 (role-bridge.js:26) and
-# publishes what two reflectors observed, and this workflow deliberately passes
-# neither --reachable-host nor --bind-host, which are the only way to make the two
-# equal. So a dispatch is in the same bind-versus-published class the rehearsal's
-# divergent and unmapped modes simulate, with a real NAT instead of iptables and with
-# far more latency than loopback. Nothing here needs --privileged.
+# Addressing needs no flag. Roles bind 0.0.0.0 and publish a reflected address, so
+# bound and published differ by construction, which is the class the rehearsal's
+# divergent and unmapped modes simulate with iptables. Here the translation is a
+# real NAT, and nothing needs --privileged.
 #
-# That latency is why a dispatch is the strongest instrument we have rather than the
-# most fragile. KI-8 was a route frame queued with no reader wedging the endpoint's
-# transport, so an in-band branch loss was never consumed and the guard rebuild never
-# started; the deciding variable was a cancel-to-reply window of about 3.4ms, which a
-# sub-millisecond loopback usually wins and a translated address usually loses. It is
-# fixed in lib/private/m3-adjacency-runtime.js, green in five unmapped and five
+# That real latency is why a dispatch is the strongest instrument we have. KI-8 was
+# a route frame queued with no reader wedging the endpoint's transport, so an
+# in-band branch loss was never consumed and the guard rebuild never started; the
+# deciding variable was a cancel-to-reply window of about 3.4ms, which a
+# sub-millisecond loopback usually wins and a translated address usually loses. It
+# is fixed in lib/private/m3-adjacency-runtime.js, green in five unmapped and five
 # divergent rehearsals, so a first dispatch is expected to complete all 125
 # assertions. A real network loses that race more often than any rehearsal mode, so
-# this is the place a regression of that class would resurface first.
+# this is where a regression of that class would resurface first.
 #
-# If it does stop, expect to run it again, and re-run the whole workflow rather than
-# the coordinator job alone. Every key in a run is scoped to github.run_id, which a
-# re-run keeps, but a role job that already succeeded is not restarted: its bridge's
-# window is over, and a lone coordinator re-run would dial eleven servers that no
-# longer listen.
+# If a run does stop, re-run the whole workflow rather than one job, and re-drive
+# from the workstation. Every key in a run is scoped to github.run_id, which a
+# re-run keeps, but a role job that already succeeded is not restarted: its
+# bridge's window is over, and a coordinator would dial servers that no longer
+# listen.
 
 on:
   workflow_dispatch:
@@ -90,17 +91,22 @@ on:
         required: true
         default: '900'
       wait:
-        description: Seconds the coordinator waits for all eleven roles to answer
+        description: Seconds the coordinator may spend waiting for all eleven roles to answer
         required: true
         default: '600'
+      remote_roles:
+        description: Comma-separated role indices to host here, 1 to 11 (the rest run wherever the coordinator does)
+        required: true
+        default: '1,2,3,4,5,6,7,8,9,10,11'
       coordinator_key:
         description: Hex public key of the coordinator the roles pin (scripts/remote-peer.sh secret prints it)
         required: true
 
 jobs:
   role:
-    # One job per role. The index picks the key the coordinator dials; the role name
-    # is carried only so a job reads as the role it hosts in the failure list.
+    # One job per role index, with the role name carried alongside so a job reads as
+    # the role it hosts. Indices left out of remote_roles skip every step, which is
+    # how a mixed dispatch asks for nine runners instead of eleven.
     strategy:
       fail-fast: false
       matrix:
@@ -131,12 +137,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Check inputs
+      - name: Check inputs and skip roles hosted elsewhere
+        id: slot
         shell: bash
         env:
           SECONDS_INPUT: ${{ inputs.seconds }}
           WAIT_INPUT: ${{ inputs.wait }}
+          REMOTE_ROLES: ${{ inputs.remote_roles }}
           COORDINATOR_KEY: ${{ inputs.coordinator_key }}
+          INDEX: ${{ matrix.index }}
         run: |
           # Read through env, never by pasting inputs into the script body. Both
           # windows are bounded because the job timeout is 30 minutes.
@@ -154,8 +163,8 @@ jobs:
             exit 1
           fi
           # A bridge that goes away while the coordinator is still driving it takes
-          # the run with it, so the roles have to outlive the discovery window plus
-          # the scenario itself.
+          # the run with it, so a role has to outlive the discovery window plus the
+          # scenario itself.
           if [ "$SECONDS_INPUT" -le "$((WAIT_INPUT + 120))" ]; then
             echo "seconds must exceed wait by at least 120, got: $SECONDS_INPUT and $WAIT_INPUT" >&2
             exit 1
@@ -175,27 +184,51 @@ jobs:
             echo "coordinator_key must be 64 hex characters, got ${#COORDINATOR_KEY}" >&2
             exit 1
           fi
+          case "$REMOTE_ROLES" in
+            '' | *[!0-9,]*)
+              echo "remote_roles must be comma-separated whole numbers, got: $REMOTE_ROLES" >&2
+              exit 1
+              ;;
+          esac
+          # Every entry is validated even once this index has matched, so a typo in a
+          # later entry fails the run rather than silently hosting the wrong set.
+          wanted=false
+          for value in ${REMOTE_ROLES//,/ }; do
+            if [ "$value" -lt 1 ] || [ "$value" -gt 11 ]; then
+              echo "remote_roles entries must be 1 to 11, got: $value" >&2
+              exit 1
+            fi
+            if [ "$value" = "$INDEX" ]; then
+              wanted=true
+            fi
+          done
+          echo "wanted=$wanted" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        if: steps.slot.outputs.wanted == 'true'
       - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
+        if: steps.slot.outputs.wanted == 'true'
         with:
           node-version: lts/*
       - run: npm install
+        if: steps.slot.outputs.wanted == 'true'
       - name: Host role ${{ matrix.index }} (${{ matrix.role }})
+        if: steps.slot.outputs.wanted == 'true'
         shell: bash
         env:
           REMOTE_PEER_SECRET: ${{ secrets.REMOTE_PEER_SECRET }}
           REMOTE_PEER_COORDINATOR_KEY: ${{ inputs.coordinator_key }}
           REMOTE_PEER_RUN_ID: ${{ github.run_id }}
           # The bridge's half of the control-frame timeline, and the role's fatal
-          # stacks. Both are diagnostics for a KI-8 stall, which shows up as silence
+          # stacks. Both are diagnostics for a stall, which shows up as silence
           # rather than as an error, so the ordered frames are the only evidence.
           PR_BRIDGE_TRACE: ${{ runner.temp }}/bridge-trace.jsonl
           PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
           ROLE_INDEX: ${{ matrix.index }}
           ROLE_SECONDS: ${{ inputs.seconds }}
-        # No --bind-host or --reachable-host: on a runner the reachable address is
-        # always the reflected one, and a stated one would be the rehearsal lying to
-        # itself about what NAT does. No --cell-port either, so the port is
+        # The same command line a local role gets from scripts/live-route.sh, minus
+        # the local testnet's --bootstrap. No --bind-host or --reachable-host: the
+        # reachable address is always the reflected one, and stating one would be
+        # this host lying about what NAT does. No --cell-port either, so the port is
         # ephemeral and cannot collide with whatever else the image runs.
         run: |
           node test/remote-peer/role-bridge.js \
@@ -204,103 +237,10 @@ jobs:
       - name: Control-frame timeline and role stacks
         # Unconditional, because a bridge cannot see the coordinator's verdict: it
         # serves its window and exits zero whether the scenario passed or stalled, so
-        # a failure() guard here would withhold the evidence exactly when a run needs
-        # it. Bounded so eleven jobs do not bury the coordinator's log.
-        if: always()
+        # a failure() guard would withhold the evidence exactly when a run needs it.
+        # Bounded so eleven jobs do not bury the coordinator's own log.
+        if: steps.slot.outputs.wanted == 'true' && always()
         shell: bash
         run: |
           tail -n 80 "${{ runner.temp }}/bridge-trace.jsonl" || echo "no control frames recorded"
           cat "${{ runner.temp }}/role-fatal.log" || echo "no role stacks recorded"
-
-  coordinator:
-    # Deliberately not `needs: role`. The roles hold their bridges open for the whole
-    # window and only exit when it ends, so waiting for them would wait for the run
-    # to be over. Discovery retries instead, which is also what absorbs eleven jobs
-    # starting minutes apart.
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Check inputs
-        shell: bash
-        env:
-          SECONDS_INPUT: ${{ inputs.seconds }}
-          WAIT_INPUT: ${{ inputs.wait }}
-          COORDINATOR_KEY: ${{ inputs.coordinator_key }}
-        # The same gate the roles apply, on the same inputs, so one bad number fails
-        # every job of the run at once instead of leaving the coordinator to spend the
-        # whole discovery window waiting for roles that already refused to start.
-        run: |
-          for value in "$SECONDS_INPUT" "$WAIT_INPUT"; do
-            case "$value" in
-              '' | *[!0-9]*) echo "seconds and wait must be whole numbers" >&2; exit 1 ;;
-            esac
-          done
-          if [ "$SECONDS_INPUT" -lt 300 ] || [ "$SECONDS_INPUT" -gt 1500 ]; then
-            echo "seconds must be 300 to 1500, got: $SECONDS_INPUT" >&2
-            exit 1
-          fi
-          if [ "$WAIT_INPUT" -lt 60 ] || [ "$WAIT_INPUT" -gt 1200 ]; then
-            echo "wait must be 60 to 1200, got: $WAIT_INPUT" >&2
-            exit 1
-          fi
-          if [ "$SECONDS_INPUT" -le "$((WAIT_INPUT + 120))" ]; then
-            echo "seconds must exceed wait by at least 120, got: $SECONDS_INPUT and $WAIT_INPUT" >&2
-            exit 1
-          fi
-          COORDINATOR_KEY="$(printf '%s' "$COORDINATOR_KEY" | tr -d '[:space:]')"
-          case "$COORDINATOR_KEY" in
-            '' | *[!0-9a-fA-F]*)
-              echo "coordinator_key must be hex" >&2
-              exit 1
-              ;;
-          esac
-          if [ "${#COORDINATOR_KEY}" -ne 64 ]; then
-            echo "coordinator_key must be 64 hex characters, got ${#COORDINATOR_KEY}" >&2
-            exit 1
-          fi
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-      - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
-        with:
-          node-version: lts/*
-      - run: npm install
-      - name: Check the pin matches the coordinator key
-        shell: bash
-        env:
-          REMOTE_PEER_COORDINATOR_SECRET: ${{ secrets.REMOTE_PEER_COORDINATOR_SECRET }}
-          COORDINATOR_KEY: ${{ inputs.coordinator_key }}
-        run: |
-          if [ -z "$REMOTE_PEER_COORDINATOR_SECRET" ]; then
-            echo "the REMOTE_PEER_COORDINATOR_SECRET repository secret is not set" >&2
-            echo "set it from the workstation's coordinator secret, which" >&2
-            echo "scripts/remote-peer.sh secret writes but never pushes:" >&2
-            echo "  gh secret set REMOTE_PEER_COORDINATOR_SECRET \\" >&2
-            echo "    < ~/.config/hyperdht-remote-peer/coordinator-secret" >&2
-            echo "it must be its own value, never the shared REMOTE_PEER_SECRET" >&2
-            exit 1
-          fi
-          # Derived here, from the secret this job holds, and compared with the pin
-          # the eleven roles were given. A mismatch means every role will refuse
-          # every connection, which reads as eleven roles that never answered; this
-          # names it in seconds instead. Both sides of the comparison are public
-          # keys, so nothing secret is printed.
-          derived="$(node test/remote-peer/identity.js)"
-          expected="$(printf '%s' "$COORDINATOR_KEY" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
-          if [ "$derived" != "$expected" ]; then
-            echo "coordinator_key does not match REMOTE_PEER_COORDINATOR_SECRET" >&2
-            echo "  roles were pinned to: $expected" >&2
-            echo "  this job's key is:    $derived" >&2
-            exit 1
-          fi
-          echo "roles are pinned to this coordinator: $derived"
-      - name: Drive the eleven roles through the live route
-        shell: bash
-        env:
-          REMOTE_PEER_SECRET: ${{ secrets.REMOTE_PEER_SECRET }}
-          # The one place this secret is referenced. No role job asks for it, so a
-          # role host still cannot mint the key its own firewall pins.
-          REMOTE_PEER_COORDINATOR_SECRET: ${{ secrets.REMOTE_PEER_COORDINATOR_SECRET }}
-          REMOTE_PEER_RUN_ID: ${{ github.run_id }}
-          REMOTE_PEER_WAIT_SECONDS: ${{ inputs.wait }}
-          # No REMOTE_PEER_BOOTSTRAP: a real dispatch is the public DHT. The
-          # rehearsal is the only caller that sets it, to its throwaway testnet.
-        run: npx brittle-node test/remote-peer/live-route.js

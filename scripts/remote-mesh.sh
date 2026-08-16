@@ -20,45 +20,17 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
-secret_dir="${XDG_CONFIG_HOME:-$HOME/.config}/hyperdht-remote-peer"
-secret_file="$secret_dir/secret"
-coordinator_secret_file="$secret_dir/coordinator-secret"
 workflow=remote-mesh.yml
 node_bin="${NODE:-node}"
+# Both secrets, their paths, and the pin derivation. Shared with remote-peer.sh and
+# live-route.sh so one file decides how credentials are read.
+# shellcheck source=scripts/remote-peer-credentials.sh
+. "$(dirname "${BASH_SOURCE[0]}")/remote-peer-credentials.sh"
 
 members=10
 seconds=420
 settle=45
 os=ubuntu-latest
-
-read_secret() {
-  if [ ! -s "$secret_file" ]; then
-    echo "no local secret; run: scripts/remote-peer.sh secret --push" >&2
-    exit 69
-  fi
-  tr -d '[:space:]' <"$secret_file"
-}
-
-read_coordinator_secret() {
-  # The environment wins so a container or a one-off shell can supply it without a
-  # file. There is deliberately no fall back to the shared secret: every member
-  # holds that, and a collector key derivable from it would protect nothing.
-  if [ -n "${REMOTE_PEER_COORDINATOR_SECRET:-}" ]; then
-    printf '%s' "$REMOTE_PEER_COORDINATOR_SECRET" | tr -d '[:space:]'
-    return 0
-  fi
-  if [ ! -s "$coordinator_secret_file" ]; then
-    echo "no coordinator secret; run: scripts/remote-peer.sh secret --push" >&2
-    exit 69
-  fi
-  tr -d '[:space:]' <"$coordinator_secret_file"
-}
-
-# The pin every member is given. Deriving it here keeps key handling in
-# test/remote-peer/identity.js, which is the only file that should have any.
-derive_coordinator_key() {
-  REMOTE_PEER_COORDINATOR_SECRET="$1" "$node_bin" test/remote-peer/identity.js
-}
 
 # The docker credential and endpoint dance is only needed by the container gates,
 # not here: this script talks to gh and to the DHT, nothing else.

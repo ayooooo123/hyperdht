@@ -2,12 +2,14 @@
 
 // The eleven-role scenario with every role on a different host.
 //
-// This is the driver for both distributed paths, and there is deliberately no
+// This is the driver for every distributed path and there is deliberately no
 // second one. scripts/live-route-rehearsal.sh points it at a throwaway testnet
-// with eleven local bridges; the coordinator job in
-// .github/workflows/live-route.yml points this same file at the public DHT with
-// eleven bridges on eleven runners. All that differs is the bootstrap and how far
-// apart the roles come up, and both of those are environment.
+// with eleven local bridges; scripts/live-route.sh points this same file at the
+// public DHT with the roles wherever that dispatch put them, on runners, on this
+// machine, or split between the two. It cannot tell which, and nothing here asks:
+// a role is discovered by key and answers with the address the world sees for it.
+// All that differs between the paths is the bootstrap and how far apart the roles
+// come up, and both of those are environment.
 //
 // Nothing about the scenario changes. This supplies only the two things a
 // distributed run needs and a local one does not. First the addresses, asked of
@@ -20,8 +22,7 @@
 //     REMOTE_PEER_COORDINATOR_SECRET=<hex> \
 //     brittle-node test/remote-peer/live-route.js
 //
-// Skips with a stated reason when no run is configured, except inside GitHub
-// Actions, where an unconfigured coordinator is a fault rather than a skip.
+// Skips with a stated reason when no run is configured.
 
 const test = require('brittle')
 const DHT = require('../..')
@@ -37,7 +38,8 @@ function config() {
   const secret = process.env.REMOTE_PEER_SECRET
   // GITHUB_RUN_ID as a fallback exactly as role-bridge.js takes it: the roles and
   // the coordinator must derive the same keys, so they must not be able to end up
-  // scoped to different run ids.
+  // scoped to different run ids. It is the only thing in this file that names a CI
+  // variable, and it names it as a run label rather than as a place.
   const runId = process.env.REMOTE_PEER_RUN_ID || process.env.GITHUB_RUN_ID
   // The coordinator's own secret, which no role host has. The roles pin only its
   // public key, so this is the one piece of material that makes the bridges'
@@ -52,20 +54,10 @@ function config() {
       const [host, port] = entry.split(':')
       return { host, port: Number(port) }
     })
-  if (!secret || !runId) {
-    // A skip is honest on a workstation with nothing dispatched, which is how
-    // `brittle-node test/remote-peer/live-route.js` is reached by hand. It is
-    // never honest inside Actions: the coordinator job exists only to drive a
-    // run, so a missing secret there is an unset repository secret, and a pass
-    // reported for it would make the whole eleven-runner dispatch mean nothing.
-    if (process.env.GITHUB_ACTIONS === 'true') {
-      throw new Error(
-        'REMOTE_PEER_SECRET and a run id are required in GitHub Actions: set the ' +
-          'REMOTE_PEER_SECRET repository secret with scripts/remote-peer.sh secret --push'
-      )
-    }
-    return null
-  }
+  // Nothing is dispatched, which is what `brittle-node test/remote-peer/live-route.js`
+  // by hand looks like. Every caller that means to drive a run supplies both, and a
+  // half-configured one is caught below.
+  if (!secret || !runId) return null
   // A run is configured, so a missing coordinator secret is a fault rather than
   // an unconfigured harness: skipping here would report a pass for a run that
   // never happened.
