@@ -237,11 +237,16 @@ through a `prepare` hook.
 throwaway DHT: eleven bridges answer with their addresses, the topology is minted
 from those answers, eleven control channels open, and the scenario runs.
 
-**Status: incomplete.** The rehearsal reaches 21 of 22 assertions and then fails,
-so a distributed route is not yet proven. Ordered DHT setup, the immutable store
-with its three audited opens and closes, and every snapshot pass; route
-establishment then fails, where `announce-exit` rejects its incoming extension with
-an error carrying no code, from `role-runner.js:430`.
+**Status: incomplete, close.** The rehearsal reaches 70 of 71 assertions. Every
+role activates, the route builds across the eleven hosts, and traffic flows; the
+remaining failure is in teardown, where a role that has finished its work exits
+cleanly and the coordinator then waits out its scenario deadline for that role.
+
+A rehearsal needs one address per role, because the diversity rule rejects a set of
+relays sharing a /24 (KI-5). Linux serves every 127/8 address, so the rehearsal runs
+in the container from `docker/linux-gates.Dockerfile` with
+`REHEARSAL_HOST_PREFIX=127.64`; on macOS the roles share 127.0.0.1 and the run stops
+at that rule.
 
 Getting that far drove out three layers that each treated a role's local address
 and its published address as one value. They are equal only when nothing translates
@@ -263,7 +268,7 @@ reach each other between runners.
 
 ### KI-7: a cell endpoint must be bound to the address it advertises
 
-**Status: open. Found by running the topology across hosts, not by review.**
+**Status: fixed. Found by running the topology across hosts, not by review.**
 
 `lib/private/udx-cell-endpoint.js:1561` rejects a link whose handle carries a local
 address different from the address the endpoint bound:
@@ -286,13 +291,20 @@ rejects its incoming extension with `UNAUTHORIZED` from `openLink`. It is not a
 harness problem. Any deployment where a relay or exit sits behind a NAT hits it,
 which is most of them.
 
-The remedy is the split the rest of the stack already needed, applied one level
-down: an endpoint knows the address it bound and, separately, the address it
-advertises, and the ownership check compares against the advertised pair while the
-bind stays local. hyperdht itself keeps exactly that distinction for its own socket
-through dht-rpc's NatSampler. Making that change touches production code in a
-security-sensitive path, so it belongs in a reviewed sub-gate rather than in test
-infrastructure.
+`UdxCellEndpoint` now takes an optional `advertisedHost` and `advertisedPort`.
+Absent, they are the bound address, so every existing caller is unchanged. Stated,
+they must be stated as a pair and are validated like any other address, and the
+ownership check at `openLink` compares against them. The test is unchanged in
+substance: the advertised pair is fixed when the endpoint is constructed and is
+never taken from the handle. `test/private/udx-cell-endpoint-advertised.js` covers
+the pair rule and each rejection. hyperdht keeps the same distinction for its own
+socket through dht-rpc's NatSampler.
+
+Three further plan-name whitelists surfaced behind it, each rejecting an unknown
+plan: `role-runner.js` derived peer addresses from the plan, `audit-event.js:373`
+derived an audit record's addresses, and `control-channel.js:993` accepted only the
+two derived plans on the isolated-grant command. All three now handle the discovered
+plan.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
