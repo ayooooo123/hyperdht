@@ -20,18 +20,37 @@ const b4a = require('b4a')
 const DHT = require('../..')
 const { peerKeyPair, coordinatorPublicKey } = require('./identity')
 const { reflect, resolveReflectors } = require('./dht-reflect')
-const { OP, writeFrame } = require('./frames')
+const { OP, HEADER_BYTES, MAX_FRAME_BYTES, writeFrame } = require('./frames')
 
 // A role binds a socket it owns; peers dial the address the world sees for it.
 const BIND_HOST = '0.0.0.0'
-// One byte on a fresh connection says what it is for: addresses, a role's control
-// stream, or the role's terminal status.
-const MODE = Object.freeze({ REPORT: 1, ATTACH: 2, STATUS: 3 })
+// One byte on a fresh connection says what it is for: addresses, a punch round, a
+// role's control stream, or the role's terminal status.
+const MODE = Object.freeze({ REPORT: 1, ATTACH: 2, STATUS: 3, PUNCH: 4 })
 // An exit binds a second socket for reaching DHT nodes, at 43000 + roleIndex; see
 // role-runner.js:360. Behind a NAT it carries its own mapping, so it has to be
 // discovered separately.
 const EXIT_ROLE_INDEXES = Object.freeze([4, 6, 8])
 const EXIT_DHT_PORT_BASE = 43_000
+
+// A punch datagram. The tag exists so a reply that is not a punch cannot be counted
+// as one: a reflector's own STUN-shaped response arrives on these same sockets, and
+// without a tag its first byte would read as a peer index. The two trailing bytes
+// are the sending role's index and which of its sockets sent it.
+const PUNCH_TAG = b4a.from('pr-role-punch/1\n')
+const PUNCH_KIND = Object.freeze({ CELL: 1, EXIT_DHT: 2 })
+const PUNCH_KIND_NAME = Object.freeze({ 1: 'cell', 2: 'exit-dht' })
+const PUNCH_BYTES = PUNCH_TAG.byteLength + 2
+// Repeats on purpose: a first packet out of a NAT often only creates the mapping,
+// and the peer's first packet is already in flight against a mapping that does not
+// exist yet. Six over three seconds separates "never arrives" from "arrives once
+// both mappings exist". Same shape as test/remote-peer/mesh.js.
+const PUNCH_ROUNDS = 6
+const PUNCH_INTERVAL_MS = 500
+// After the last round, keep listening: a peer that got its plan a moment later is
+// still punching, and closing here would report its packets as never sent.
+const PUNCH_DRAIN_MS = 2_000
+const PUNCH_PLAN_TIMEOUT_MS = 20_000
 
 // A role must be silent on stderr. What one writes anyway is evidence the
 // coordinator has to see, so the count is exact and a bounded prefix is kept to
@@ -153,6 +172,221 @@ function roleEnvironment() {
   return env
 }
 
+// One complete length-prefixed frame, given whatever already arrived alongside the
+// mode byte. FrameReader cannot be used here: it only sees data that arrives after
+// it subscribes, and the punch plan can share a chunk with the mode byte that
+// selected it, so those leading bytes have to be fed in by hand.
+function readFrame(socket, initial, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let buffered = initial
+    let settled = false
+    const finish = (err, frame) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.off('data', onData)
+      socket.off('error', onError)
+      socket.off('close', onClose)
+      if (err) reject(err)
+      else resolve(frame)
+    }
+    const drain = () => {
+      if (buffered.byteLength < HEADER_BYTES) return
+      const length = buffered.readUInt32BE(1)
+      if (length > MAX_FRAME_BYTES) return finish(new Error('frame too large'))
+      if (buffered.byteLength < HEADER_BYTES + length) return
+      finish(null, {
+        op: buffered[0],
+        payload: b4a.from(buffered.subarray(HEADER_BYTES, HEADER_BYTES + length))
+      })
+    }
+    const onData = (data) => {
+      buffered = buffered.byteLength === 0 ? data : b4a.concat([buffered, data])
+      drain()
+    }
+    const onError = (err) => finish(err)
+    const onClose = () => finish(new Error('stream closed before the frame arrived'))
+    const timer = setTimeout(
+      () => finish(new Error(`frame timed out after ${timeoutMs}ms`)),
+      timeoutMs
+    )
+    socket.on('data', onData)
+    socket.on('error', onError)
+    socket.once('close', onClose)
+    drain()
+  })
+}
+
+// WHAT A PUNCH DOES, AND WHAT IT DOES NOT DO.
+//
+// Each role sends a datagram from the socket it will later use to every address it
+// may later have to reach. The content is irrelevant; the send is the whole point. It
+// makes THIS host's NAT create an outbound mapping for that destination, so the
+// peer's datagram - crossing in flight, which is why the coordinator makes every role
+// punch at the same moment - arrives at a mapping that already exists instead of
+// being dropped by a NAT that has never seen the destination. Neither side can open
+// that path alone, which is the entire reason this round exists.
+//
+// It does NOT make an unreachable peer reachable in general:
+//
+//   - PORT-SENSITIVE FILTERING. A NAT that filters on source port as well as source
+//     address only admits the peer if the punch went to the exact port the peer sends
+//     from, from the exact port the peer sends to. That is why every punch leaves the
+//     same local port the role will own - claim-reflect-release releases it above and
+//     the probes here re-bind it - and is addressed to the peer's reflected port. A
+//     mapping opened by any other socket is a mapping for another port and buys
+//     nothing. Under a symmetric NAT, which picks a fresh external port per
+//     destination, the reflected address is not the address a peer will see at all
+//     and no punch from here can repair that.
+//
+//   - NOTHING KEEPS THESE MAPPINGS ALIVE. Said plainly because it is not assumed:
+//     there is no keepalive anywhere in this harness. The punch is six datagrams over
+//     three seconds, sent before any role is attached, and the remaining ~900 seconds
+//     of a run are carried entirely by scenario traffic. A pair the scenario keeps
+//     busy refreshes its own mapping as a side effect. A pair that goes idle for
+//     longer than its NAT's UDP idle timeout - commonly 30 to 120 seconds - loses the
+//     mapping, and nothing here reopens it. That is the first thing to suspect if a
+//     long run fails late having passed its early phases.
+//
+// A stray punch that lands after the probes are gone is inert, so a slow peer cannot
+// corrupt a role: the cell endpoint drops any datagram whose length is not
+// BOOTSTRAP_SIZE (udx-cell-endpoint.js:1207, 1200 bytes against these 18), and
+// dht-rpc drops any whose first byte is neither its request nor its response id
+// (dht-rpc/lib/io.js:91-106; this tag begins 'p').
+async function runPunchPhase(options) {
+  const { plan, index, cellPort, exitPort, udx } = options
+  const observed = []
+  const probes = []
+  const bindErrors = []
+
+  // Punched FROM the role's own ports, one probe per socket the role will own. A
+  // mapping belongs to a port, so a probe on any other port would open a mapping the
+  // role never uses.
+  const openProbe = async (port, kind) => {
+    const socket = udx.createSocket()
+    socket.on('message', (message, from) => {
+      if (message.byteLength !== PUNCH_BYTES) return
+      if (!b4a.equals(message.subarray(0, PUNCH_TAG.byteLength), PUNCH_TAG)) return
+      observed.push({
+        from: message[PUNCH_TAG.byteLength],
+        fromKind: message[PUNCH_TAG.byteLength + 1],
+        arrivedOn: kind,
+        host: from.host,
+        port: from.port,
+        at: Date.now()
+      })
+    })
+    try {
+      const bound = socket.bind(port)
+      if (bound && typeof bound.then === 'function') await bound
+    } catch (err) {
+      // A port that cannot be re-bound means no punch can be sent from the address
+      // peers were told to use. Reported rather than silently punched from a random
+      // port, which would look like a punch and open the wrong mapping.
+      bindErrors.push({ port, kind: PUNCH_KIND_NAME[kind], message: err && err.message })
+      try {
+        await socket.close()
+      } catch {}
+      return
+    }
+    probes.push({
+      socket,
+      kind,
+      port,
+      payload: b4a.concat([PUNCH_TAG, b4a.from([index & 0xff, kind])])
+    })
+  }
+
+  await openProbe(cellPort, PUNCH_KIND.CELL)
+  if (exitPort !== null) await openProbe(exitPort, PUNCH_KIND.EXIT_DHT)
+
+  // Every socket in the plan except this role's own. Deliberately the full cross
+  // product rather than the scenario's actual edge set: which role talks to which is
+  // topology-fixture.js's business, and a second copy of that knowledge here would be
+  // a copy that drifts. Punching everything cannot under-cover, and 13 destinations
+  // times 6 rounds is nothing.
+  const targets = []
+  for (const [key, entry] of Object.entries(plan)) {
+    if (!entry || Number(key) === index) continue
+    if (typeof entry.host === 'string' && Number.isInteger(entry.cellPort)) {
+      targets.push({
+        index: Number(key),
+        kind: PUNCH_KIND.CELL,
+        host: entry.host,
+        port: entry.cellPort
+      })
+    }
+    // An exit's DHT socket is dialled directly by other roles, so it needs its own
+    // mapping. A punch that opened cell sockets alone would move the failure here.
+    if (typeof entry.dhtHost === 'string' && Number.isInteger(entry.dhtPort)) {
+      targets.push({
+        index: Number(key),
+        kind: PUNCH_KIND.EXIT_DHT,
+        host: entry.dhtHost,
+        port: entry.dhtPort
+      })
+    }
+  }
+
+  let sent = 0
+  let refused = 0
+  const startedAt = Date.now()
+  for (let round = 1; round <= PUNCH_ROUNDS; round++) {
+    for (const probe of probes) {
+      for (const target of targets) {
+        try {
+          probe.socket.send(probe.payload, target.port, target.host)
+          sent++
+        } catch {
+          // A refused send is data too: the report will show nothing arrived.
+          refused++
+        }
+      }
+    }
+    if (round < PUNCH_ROUNDS) {
+      await new Promise((resolve) => setTimeout(resolve, PUNCH_INTERVAL_MS))
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, PUNCH_DRAIN_MS))
+
+  // The probes must be gone before the role is attached: the role binds these exact
+  // ports, and a probe still holding one would fail its bind.
+  for (const probe of probes) {
+    try {
+      await probe.socket.close()
+    } catch {}
+  }
+
+  // Which peers were heard from, and which were not. A punch is mutual, so hearing
+  // peer P's punch on kind K is the evidence that P's packets reach this host from
+  // that socket. Silence names a directed pair, which is what a later
+  // REQUEST_TIMEOUT never does.
+  const heard = new Set(observed.map((entry) => `${entry.from}:${entry.fromKind}`))
+  const heardFrom = []
+  const silent = []
+  for (const target of targets) {
+    const label = `${target.index}/${PUNCH_KIND_NAME[target.kind]}`
+    if (heard.has(`${target.index}:${target.kind}`)) heardFrom.push(label)
+    else silent.push(label)
+  }
+
+  return {
+    index,
+    cellPort,
+    exitPort,
+    from: probes.map((probe) => `${PUNCH_KIND_NAME[probe.kind]}:${probe.port}`),
+    rounds: PUNCH_ROUNDS,
+    targets: targets.length,
+    sent,
+    refused,
+    bindErrors,
+    elapsedMs: Date.now() - startedAt,
+    heardFrom,
+    silent,
+    observed
+  }
+}
+
 async function main() {
   const options = parse(process.argv.slice(2))
   const secret = process.env.REMOTE_PEER_SECRET
@@ -205,9 +439,14 @@ async function main() {
   // cell socket needs.
   let dhtExit = null
   let dhtExitStable = false
-  if (EXIT_ROLE_INDEXES.includes(options.index)) {
+  // The local port, hoisted: the punch round has to re-bind this exact port, because
+  // a mapping opened from any other port is a mapping for another socket.
+  const exitLocalPort = EXIT_ROLE_INDEXES.includes(options.index)
+    ? EXIT_DHT_PORT_BASE + options.index
+    : null
+  if (exitLocalPort !== null) {
     const exitProbe = cellUdx.createSocket()
-    const exitPort = EXIT_DHT_PORT_BASE + options.index
+    const exitPort = exitLocalPort
     const exitBind = exitProbe.bind(exitPort)
     if (exitBind && typeof exitBind.then === 'function') await exitBind
     if (options.reachableHost !== null) {
@@ -244,6 +483,7 @@ async function main() {
 
   let role = null
   let attached = false
+  let punching = false
 
   // What no stream event can carry: whether the role exited, with what code or
   // signal, and what it said on stderr. A failed role's control stream is destroyed,
@@ -288,7 +528,8 @@ async function main() {
 
       // One byte decides what this connection is for. The coordinator has to learn
       // a role's addresses before it can mint the topology those addresses appear
-      // in, so it asks first and attaches later, on a second connection.
+      // in, so it asks first, punches on a third connection once it knows all eleven
+      // addresses, and attaches last.
       let mode = null
       const onFirstByte = (chunk) => {
         if (mode !== null) return
@@ -326,6 +567,79 @@ async function main() {
           socket.write(writeFrame(OP.REPORT, b4a.from(JSON.stringify(record))))
           // The answer is the whole purpose of this connection.
           setTimeout(() => socket.destroy(), 250)
+          return
+        }
+
+        // The punch round. A role cannot punch until it knows the other ten
+        // addresses and the coordinator is the only party that knows them, so it
+        // pushes the whole list here and every role punches at once. Necessarily
+        // before the attach: the probes re-bind the ports the role itself will bind.
+        if (mode === MODE.PUNCH) {
+          if (attached || punching) {
+            socket.destroy()
+            return
+          }
+          punching = true
+          void (async () => {
+            try {
+              const frame = await readFrame(socket, rest, PUNCH_PLAN_TIMEOUT_MS)
+              if (frame.op !== OP.PLAN) throw new Error(`unexpected punch frame ${frame.op}`)
+              const plan = JSON.parse(b4a.toString(frame.payload, 'utf8'))
+              emit({
+                event: 'punch-start',
+                index: options.index,
+                peers: Object.keys(plan).length,
+                cellPort,
+                exitPort: exitLocalPort
+              })
+              const report = await runPunchPhase({
+                plan,
+                index: options.index,
+                cellPort,
+                exitPort: exitLocalPort,
+                udx: cellUdx
+              })
+              emit({
+                event: 'punch',
+                index: options.index,
+                from: report.from,
+                rounds: report.rounds,
+                targets: report.targets,
+                sent: report.sent,
+                refused: report.refused,
+                heardFrom: report.heardFrom,
+                elapsedMs: report.elapsedMs
+              })
+              // Named on its own line so an unanswered pair is greppable. Every entry
+              // here is a directed pair with no mapping, which is the failure that
+              // would otherwise surface as a dht-rpc REQUEST_TIMEOUT much later with
+              // nothing pointing at an address.
+              if (report.silent.length > 0) {
+                emit({
+                  event: 'punch-unanswered',
+                  index: options.index,
+                  silent: report.silent,
+                  of: report.targets
+                })
+              }
+              if (report.bindErrors.length > 0) {
+                emit({
+                  event: 'punch-unbound',
+                  index: options.index,
+                  bindErrors: report.bindErrors
+                })
+              }
+              trace({ event: 'punched', index: options.index, silent: report.silent.length })
+              socket.write(writeFrame(OP.CELL_REPORT, b4a.from(JSON.stringify(report))))
+              // The answer is the whole purpose of this connection.
+              setTimeout(() => socket.destroy(), 250)
+            } catch (err) {
+              emit({ event: 'punch-failed', index: options.index, message: err && err.message })
+              socket.destroy()
+            } finally {
+              punching = false
+            }
+          })()
           return
         }
 
@@ -485,7 +799,16 @@ async function main() {
   await node.destroy()
 }
 
-main().catch((err) => {
-  emit({ event: 'error', message: err.message })
-  process.exit(1)
-})
+// Always true when a bridge is launched, which is the only way this file is used in a
+// run: `node test/remote-peer/role-bridge.js --index N`. The guard exists so the punch
+// round can be driven directly by a provocation harness, which is the only
+// pre-dispatch coverage the punch reporting has - a rehearsal on loopback answers
+// every punch, so the unanswered path never runs there.
+if (require.main === module) {
+  main().catch((err) => {
+    emit({ event: 'error', message: err.message })
+    process.exit(1)
+  })
+}
+
+module.exports = { MODE, PUNCH_KIND, PUNCH_TAG, PUNCH_BYTES, runPunchPhase }

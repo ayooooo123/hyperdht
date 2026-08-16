@@ -262,5 +262,15 @@ jobs:
         if: steps.slot.outputs.wanted == 'true' && always()
         shell: bash
         run: |
+          # Counted BEFORE the tail, because the store happens in the first seconds of a
+          # 900-second run and its frames are buried thousands of lines up. Each of the
+          # three store requests arms its own audit class immediately before it fires, and
+          # the role emits an audit-open per armed request. The TOKEN request is a round
+          # trip whose reply carries the token the PUT then uses, so a SECOND audit-open
+          # proves the pair was open in both directions at store time - which excludes a
+          # lapsed NAT mapping and indicts packet loss instead. Exactly one audit-open is
+          # the ambiguous case. This counts what the role armed, not what left the host.
+          grep -c '"type":"audit-open"' "${{ runner.temp }}/bridge-trace.jsonl" \
+            || echo "no audit-open frames recorded"
           tail -n 80 "${{ runner.temp }}/bridge-trace.jsonl" || echo "no control frames recorded"
           cat "${{ runner.temp }}/role-fatal.log" || echo "no role stacks recorded"

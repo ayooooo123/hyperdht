@@ -1133,8 +1133,9 @@ test('public start hosts both native branches, reaches READY, and returns exact 
     const initialGeneration = routing.snapshot()
     const lookupMiddle = hostedResources[1]
     // Close the link belonging to the exit actually on this branch. Indexing
-    // exitPairs by the middle's index only worked while selection paired middle
-    // i with exit i, which it no longer does.
+    // exitPairs by the middle's index happens to work today, because first-match
+    // selection pairs middle i with exit i, but that is a coincidence of record
+    // order rather than a guarantee; see KI-6. Look the exit up by identity.
     const lookupExit = hostedResources[2]
     const lookupExitIndex = exitIdentities.findIndex((identity) =>
       b4a.equals(identity.publicKey, lookupExit.identity.publicKey)

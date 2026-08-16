@@ -11,11 +11,14 @@
 // All that differs between the paths is the bootstrap and how far apart the roles
 // come up, and both of those are environment.
 //
-// Nothing about the scenario changes. This supplies only the two things a
+// Nothing about the scenario changes. This supplies only the three things a
 // distributed run needs and a local one does not. First the addresses, asked of
 // each role over the DHT, because a role behind a NAT is the only party that can
-// discover what the world sees for its own socket. Then the control channels,
-// which are DHT streams dressed as child processes so
+// discover what the world sees for its own socket. Then a punch round, because the
+// roles dial each other's sockets directly and two NAT'd hosts cannot open a path
+// either one can open alone: this process is the only party holding all eleven
+// addresses, so it distributes them and every role punches at once. Then the control
+// channels, which are DHT streams dressed as child processes so
 // test/private/process/coordinator.js drives them unchanged.
 //
 //   REMOTE_PEER_SECRET=<hex> REMOTE_PEER_RUN_ID=<id> \
@@ -31,6 +34,7 @@ const { PROCESS_PLANS, ROLES } = require('../private/process/topology-fixture')
 const {
   closeRemoteRoleChannels,
   openRemoteRoleChannels,
+  punchRoleEndpoints,
   requestRoleEndpoints
 } = require('./role-channels')
 
@@ -144,10 +148,60 @@ if (options === null) {
         t.comment(`path diversity refuses roles sharing a subnet (KI-5): ${collision}`)
       }
 
-      // An exit's DHT socket is dialled directly by other roles, so an address only
-      // one reflector agreed on is named here rather than surfacing later as a
-      // dht-rpc REQUEST_TIMEOUT with nothing pointing at the address.
+      // The punch round, before a single role is attached. Every role's cell socket
+      // and every exit's DHT socket at 43000+index gets a datagram from every other
+      // role, so each side's NAT holds a mapping for the other before any role
+      // process exists. Without it the plan's DHT edges are one-way - seed to
+      // referral to value, topology-fixture.js:1073-1087, with nothing pointing back
+      // - and the referral's setup store to role 11 dies as a dht-rpc
+      // REQUEST_TIMEOUT with nothing naming the address that was unreachable.
+      //
+      // An unanswered pair does NOT fail the run here. It is named instead, on its
+      // own comment line, so the scenario's own verdict stands and the cause is in
+      // the output above it rather than eight assertions downstream.
+      const punches = await punchRoleEndpoints({
+        node,
+        secret: options.secret,
+        coordinatorSecret: options.coordinatorSecret,
+        runId: options.runId,
+        endpoints,
+        deadline,
+        comment: (message) => t.comment(message)
+      })
 
+      let arrived = 0
+      let possible = 0
+      let silentPairs = 0
+      for (const report of punches.sort((a, b) => a.index - b.index)) {
+        arrived += report.heardFrom.length
+        possible += report.targets
+        silentPairs += report.silent.length
+        t.comment(
+          `${ROLES[report.index - 1]} punched from [${report.from.join(', ')}] to ` +
+            `${report.targets} sockets in ${report.rounds} rounds ` +
+            `(${report.sent} sent, ${report.refused} refused, ${report.elapsedMs}ms): ` +
+            `heard back from ${report.heardFrom.length}/${report.targets}`
+        )
+        if (report.silent.length > 0) {
+          t.comment(
+            `${ROLES[report.index - 1]} heard NOTHING from ${report.silent.join(', ')} ` +
+              `- those directed pairs have no mapping and a request across one will time out`
+          )
+        }
+        for (const failure of report.bindErrors) {
+          t.comment(
+            `${ROLES[report.index - 1]} could not re-bind ${failure.kind} port ${failure.port} ` +
+              `to punch (${failure.message}), so it punched from no such socket`
+          )
+        }
+      }
+      t.comment(
+        `punch matrix ${arrived}/${possible} directed pairs arrived across ` +
+          `${punches.length} roles, ${silentPairs} silent`
+      )
+      // Nothing refreshes these mappings for the rest of the run: see the limits
+      // documented at runPunchPhase in role-bridge.js. A pair the scenario leaves
+      // idle past its NAT's UDP timeout loses its mapping with nothing reopening it.
       return {
         endpoints,
         async openChannels(projections) {

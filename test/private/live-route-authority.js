@@ -25,7 +25,12 @@ const {
   createRouteExtensionFactory,
   createRouteManager
 } = require('../../lib/private/route-manager')
-const { candidate, liveTopologyFixture, NOW } = require('./live-topology-fixture')
+const {
+  candidate,
+  liveTopologyFixture,
+  NOW,
+  routeClock: topologyRouteClock
+} = require('./live-topology-fixture')
 const finalExitActivation = require('../../lib/private/final-exit-activation')
 const {
   DatagramReplayWindow,
@@ -218,8 +223,7 @@ function channelPair(edges) {
   return channels
 }
 
-function routeTransportPair(edges = [], binding = {}) {
-  const clock = routeClock()
+function routeTransportPair(edges = [], binding = {}, clock = routeClock()) {
   const channels = channelPair(edges)
   const digest = b4a.alloc(32, 0x71)
   const ids = deriveM3CellIds(digest, { crypto: cryptoSuite })
@@ -315,12 +319,13 @@ function endpointCodecFor(material) {
   })
 }
 
-async function productionAuthorityFixture(t, port = 47601) {
+async function productionAuthorityFixture(t, port = 47601, options = {}) {
   const topology = await liveTopologyFixture(
     port,
     port + 1,
     { left: '127.0.0.1', right: '127.0.0.2' },
     {
+      clock: options.clock,
       records: [
         candidate(ROLE.SAFETY, 1, 2),
         candidate(ROLE.SAFETY, 2, 3),
@@ -369,7 +374,7 @@ async function productionAuthorityFixture(t, port = 47601) {
   for (const [branchClass, name, value] of branches) {
     const branch = draft[name]
     const created = openMaterialFor(branch, value)
-    const pair = routeTransportPair([], branch)
+    const pair = routeTransportPair([], branch, options.transportClock)
     created.material.endpointOpenAuthority = finalExitActivation[
       TEST_ONLY_ENDPOINT_DHT_EXIT_OPEN_ISSUER
     ].create({
@@ -852,4 +857,110 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
   followupRequest.fill(0)
   requestReassembler.destroy()
   exitCodec.destroy()
+})
+
+// The endpoint arms its own `absoluteDeadlineMs` on the route transport's injected
+// scheduler, so these fire that timer directly instead of waiting out any real interval.
+// Clock values mirror `routeClock` above; only `schedule` differs, by being observable.
+function instrumentedTransportClock() {
+  const armed = []
+  // Only the four capabilities the authority accepts may go on `clock`; it is exact-checked.
+  const clock = {
+    wallNow: () => 1_000n,
+    monotonicNow: () => 10_000n,
+    schedule(callback, delay) {
+      const handle = Object.freeze({})
+      armed.push({ handle, delay, callback })
+      return handle
+    },
+    cancelScheduled(handle) {
+      const index = armed.findIndex((entry) => entry.handle === handle)
+      if (index !== -1) armed.splice(index, 1)
+    }
+  }
+  return {
+    clock,
+    armedDelays() {
+      return armed.map((entry) => entry.delay)
+    },
+    fireArmed(delay) {
+      const index = armed.findIndex((entry) => entry.delay === delay)
+      if (index === -1) return false
+      const [entry] = armed.splice(index, 1)
+      entry.callback()
+      return true
+    }
+  }
+}
+
+// Monotonic start is 10_000n, so this deadline leaves 3_137ms of budget: an unusual figure,
+// so the timer fired below cannot be confused with an adjacency lifetime timer.
+const DEADLINE_MS = 13_137n
+const DEADLINE_DELAY = 3_137
+
+function deadlineRequest(authority, value = 0xc1) {
+  const id = b4a.alloc(32, value)
+  const destinationRef = encodeDestinationRef({ id, handle: b4a.alloc(130, value + 1) })
+  issueLiveRouteDestination(authority, { branch: BRANCH_CLASS.LOOKUP, id, destinationRef })
+  const encodedRequest = encodeRoutedRequest({
+    requestId: b4a.alloc(16, value + 2),
+    operationClass: BRANCH_CLASS.LOOKUP,
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    absoluteDeadlineMs: DEADLINE_MS,
+    destination: destinationRef,
+    encodedBody: b4a.alloc(32, value + 3)
+  })
+  return authority.request({
+    branch: BRANCH_CLASS.LOOKUP,
+    destinationRef,
+    encodedRequest,
+    attempt: 1
+  })
+}
+
+test('production request enforces its own deadline and reports the branch lost', async (t) => {
+  const timers = instrumentedTransportClock()
+  const { authority, manager } = await productionAuthorityFixture(t, 47651, {
+    transportClock: timers.clock
+  })
+  const operation = deadlineRequest(authority)
+  t.ok(
+    timers.armedDelays().includes(DEADLINE_DELAY),
+    'the endpoint arms a timer for exactly the remaining budget on its own deadline'
+  )
+  let error = null
+  const settled = operation.promise.catch((err) => {
+    error = err
+  })
+  t.ok(timers.fireArmed(DEADLINE_DELAY), 'the deadline timer fires')
+  await settled
+  t.is(error && error.code, 'ERR_PRIVACY_UNAVAILABLE')
+  // Same observable the transport-rejection tests above use: a reported loss puts the branch
+  // into rotation, which distinguishes reporting the loss from merely cancelling the operation.
+  expectCode(t, () => manager.branchCapability(BRANCH_CLASS.LOOKUP), 'ERR_PRIVATE_BRANCH_ROTATING')
+  t.ok(manager.branchCapability(BRANCH_CLASS.ANNOUNCE), 'the sibling branch is untouched')
+})
+
+test('a cancelled production request disarms its deadline and reports no loss', async (t) => {
+  const timers = instrumentedTransportClock()
+  const { authority, manager } = await productionAuthorityFixture(t, 47653, {
+    transportClock: timers.clock
+  })
+  const operation = deadlineRequest(authority)
+  t.ok(timers.armedDelays().includes(DEADLINE_DELAY))
+  let error = null
+  const settled = operation.promise.catch((err) => {
+    error = err
+  })
+  t.ok(operation.cancel(new Error('caller went away')))
+  await settled
+  t.is(error && error.message, 'caller went away')
+  t.absent(
+    timers.armedDelays().includes(DEADLINE_DELAY),
+    'cancelling an operation disarms its deadline instead of leaking a timer'
+  )
+  t.ok(
+    manager.branchCapability(BRANCH_CLASS.LOOKUP),
+    'a caller cancellation must not mark the branch lost'
+  )
 })
