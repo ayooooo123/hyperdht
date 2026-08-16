@@ -24,7 +24,7 @@ With all traffic internal to the peer network, the abuse surface reduces to **on
   and per-cell crypto forwarding for strangers. Already bounded in
   `lib/private/relay-service.js`: `MAX_RELAY_CIRCUITS` (128 global), per-neighbor cap
   (`maxCircuitsPerNeighbor` 32), and per-circuit/global queue-byte caps. Sybil identity
-  churn lets an attacker *cycle* slots faster but **cannot exceed** the ceiling — the relay
+  churn lets an attacker _cycle_ slots faster but **cannot exceed** the ceiling — the relay
   refuses circuit 129. An admission token would add a per-circuit cost without lowering
   that ceiling. Marginal value, real complexity → not worth it.
 
@@ -51,14 +51,14 @@ handling is typed and bounded: `DHT_EXIT_ORIGIN_SERVICE_POLICY` is the first fou
 of `EXIT_ORIGIN_SERVICE_POLICY` (`lib/private/exit-policy.js`) — **immutable/mutable
 get/put only** (`M3_MESSAGE_ID.IMMUTABLE_GET_V1 0x0120 … MUTABLE_PUT_V1 0x0123`).
 `announce` is a separate `PRIVATE_ANNOUNCE`/private-records capability, not part of that
-policy. (A private endpoint using the DHT via a route is using the DHT *itself*, staying
+policy. (A private endpoint using the DHT via a route is using the DHT _itself_, staying
 inside the network — not exiting it.)
 
 ## If a separate VPN/exit service is ever built
 
 That would be a **different protocol**, not an extension of this one. It would introduce
 external attribution (the exit's address answering for others' traffic) and anonymous
-proxying to third parties — and *there* anonymous admission earns its keep, via VOPRF
+proxying to third parties — and _there_ anonymous admission earns its keep, via VOPRF
 tokens on the exit reservation path (issuer-key + relay-local nullifiers), never on plain
 circuit relay, and never RLN/Autobase-membership. Out of scope here; recorded so the
 analysis is not lost.

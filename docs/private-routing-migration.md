@@ -881,6 +881,58 @@ Deterministic follow-ups, each replacing an argument with a measurement:
    -1.3% and +26.3%, while a third swung -39.9% with identical counts, so the present sample
    cannot show a timing effect either way.
 
+### KI-12: what the first real eleven-runner dispatches found
+
+**Status: three findings, two closed and one open. All of them are conditions no
+local rehearsal can produce, which is the argument for dispatching at all.**
+
+The rehearsal simulates distance with loopback and iptables. A dispatch has eleven
+roles on separate Azure hosts with real public addresses, real NAT in front of each,
+and tens of milliseconds of RTT, driven by a coordinator on a laptop behind a
+domestic NAT. Three things failed in that environment that are structurally
+unreachable in any local mode.
+
+FIRST, the runtime attestation could never have passed. `role-runner.js:876-884`
+refuses to configure unless a role's own runtime version equals the version the
+coordinator attests. That is a deliberate fail-closed check that every process in a
+run is the same build, and on one machine it is trivially true because both sides
+read the same `process.version`. The workflow installed `node-version: lts/*`, which
+resolves to whatever the current LTS patch happens to be, so the check could only
+have passed by coincidence. FIXED by making the coordinator's exact version a
+dispatch input, like the coordinator pin before it. The check itself was not
+touched; relaxing it to a major version would have hidden the class of thing it
+exists to catch.
+
+SECOND, eleven concurrent role jobs exceed what the account will schedule.
+Observed: nine jobs started within 25 seconds and two stayed queued past a
+ten-minute discovery window, so the run failed as `role 9 never reported:
+PEER_NOT_FOUND` with nothing wrong in any role. Not a code fault and not fixable in
+code. Either wait longer than the queue, or host some roles where the coordinator
+runs - which is supported, and is the reason placement is a dispatch input.
+
+THIRD, AND OPEN: a role hosted behind this domestic NAT is not reachable from a
+runner, even though its address is correct and stable. With the endpoint and the
+three DHT roles local, every role reported an address, all eleven attested and all
+eleven bound, and then the ordered DHT setup timed out at the first role. With only
+the endpoint local, the same run passed DHT setup and got four assertions further.
+
+The distinction that explains it is worth stating precisely, because the local
+evidence looks reassuring and is not sufficient. Each local bridge reported
+`endpointStable: true` with two independent reflectors observing the same host and
+port, which establishes that the NAT's MAPPING is endpoint-independent. It says
+nothing about FILTERING. These roles dial each other directly at published
+addresses with no hole punching, so a NAT that only admits inbound datagrams from
+addresses the host has already written to will drop a runner's first packet to a
+local role while every reflector still agrees on the address. That is exactly what
+was observed, and it is why an endpoint can be local but a DHT role cannot: the
+endpoint initiates.
+
+So mixed placement works for roles that initiate and fails for roles that must be
+dialled, on this network. Whether that generalises depends entirely on the NAT in
+front of whoever runs it. The honest limit: nothing here distinguishes
+endpoint-independent filtering from endpoint-dependent filtering in advance, and
+the reflectors cannot, so a mixed dispatch is the test.
+
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
 **Status: one cause fixed, one open. Never reproduced locally.**
