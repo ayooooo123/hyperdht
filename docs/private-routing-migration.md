@@ -296,8 +296,13 @@ Absent, they are the bound address, so every existing caller is unchanged. State
 they must be stated as a pair and are validated like any other address, and the
 ownership check at `openLink` compares against them. The test is unchanged in
 substance: the advertised pair is fixed when the endpoint is constructed and is
-never taken from the handle. `test/private/udx-cell-endpoint-advertised.js` covers
-the pair rule and each rejection. hyperdht keeps the same distinction for its own
+never taken from the handle. `endpoint-bootstrap-authority.js` passes the pair
+through when given it, so the endpoint role's bootstrap path publishes the same
+address as everything else; stating one field without the other is refused there
+too. `test/private/udx-cell-endpoint-advertised.js` covers the pair rule, each
+rejection, and the behaviour itself: a handle naming the advertised address passes
+the ownership check while a handle naming the bound address is refused
+`UNAUTHORIZED`. hyperdht keeps the same distinction for its own
 socket through dht-rpc's NatSampler.
 
 Three further plan-name whitelists surfaced behind it, each rejecting an unknown
