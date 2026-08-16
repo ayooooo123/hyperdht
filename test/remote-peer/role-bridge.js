@@ -19,12 +19,24 @@ const b4a = require('b4a')
 const DHT = require('../..')
 const { peerKeyPair, proberKeyPair } = require('./identity')
 const { reflect, resolveReflectors } = require('./dht-reflect')
+const { OP, writeFrame } = require('./frames')
+
+// A role binds a socket it owns; peers dial the address the world sees for it.
+const BIND_HOST = '0.0.0.0'
+const MODE = Object.freeze({ REPORT: 1, ATTACH: 2 })
 
 const ROLE_RUNNER = path.join(__dirname, '..', 'private', 'process', 'role-runner.js')
 const REPO_ROOT = path.join(__dirname, '..', '..')
 
 function parse(argv) {
-  const options = { index: 1, runtime: 'node', seconds: 900, cellPort: 0, bootstrap: [] }
+  const options = {
+    index: 1,
+    runtime: 'node',
+    seconds: 900,
+    cellPort: 0,
+    bootstrap: [],
+    reachableHost: null
+  }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
     const value = argv[i + 1]
@@ -32,6 +44,7 @@ function parse(argv) {
     else if (flag === '--runtime') options.runtime = String(value)
     else if (flag === '--seconds') options.seconds = Number(value)
     else if (flag === '--cell-port') options.cellPort = Number(value)
+    else if (flag === '--reachable-host') options.reachableHost = String(value)
     else if (flag === '--bootstrap') {
       const [host, port] = String(value).split(':')
       options.bootstrap.push({ host, port: Number(port) })
@@ -94,7 +107,14 @@ async function main() {
   await probe.close()
 
   const usable = observations.filter((entry) => entry !== null)
-  const endpoint = usable.length > 0 ? usable[0] : null
+  // A rehearsal on one host has no translation to discover, so the reachable host
+  // can be stated. On a runner it is always the reflected value.
+  const endpoint =
+    options.reachableHost !== null
+      ? { host: options.reachableHost, port: cellPort }
+      : usable.length > 0
+        ? usable[0]
+        : null
   const endpointStable =
     usable.length > 1 &&
     usable.every((entry) => entry.host === usable[0].host && entry.port === usable[0].port)
@@ -119,45 +139,79 @@ async function main() {
       }
     },
     (socket) => {
-      if (attached) {
-        socket.destroy()
-        return
-      }
-      attached = true
-      emit({ event: 'attached', index: options.index })
       socket.on('error', () => {})
 
-      const launch = roleCommand(options.runtime)
-      role = spawn(launch.command, launch.args, {
-        cwd: REPO_ROOT,
-        env: roleEnvironment(),
-        stdio: ['pipe', 'pipe', 'pipe']
-      })
+      // One byte decides what this connection is for. The coordinator has to learn
+      // a role's addresses before it can mint the topology those addresses appear
+      // in, so it asks first and attaches later, on a second connection.
+      let mode = null
+      const onFirstByte = (chunk) => {
+        if (mode !== null) return
+        mode = chunk[0]
+        const rest = chunk.subarray(1)
 
-      // Control frames both ways, untouched.
-      socket.on('data', (chunk) => {
-        if (role && role.stdin && !role.stdin.destroyed) role.stdin.write(chunk)
-      })
-      role.stdout.on('data', (chunk) => socket.write(chunk))
+        if (mode === MODE.REPORT) {
+          socket.write(
+            writeFrame(
+              OP.REPORT,
+              b4a.from(
+                JSON.stringify({
+                  index: options.index,
+                  runtime: options.runtime,
+                  bind: { host: BIND_HOST, port: cellPort },
+                  reachable: endpoint,
+                  endpointStable
+                })
+              )
+            )
+          )
+          // The answer is the whole purpose of this connection.
+          setTimeout(() => socket.destroy(), 250)
+          return
+        }
 
-      // A role must be silent on stderr; forwarding it as data would corrupt the
-      // control stream, so it is reported here and the run fails on the missing
-      // reply rather than on garbage.
-      role.stderr.on('data', (chunk) => {
-        emit({
-          event: 'role-stderr',
-          index: options.index,
-          text: b4a.toString(chunk, 'utf8').slice(0, 400)
+        if (mode !== MODE.ATTACH || attached) {
+          socket.destroy()
+          return
+        }
+        attached = true
+        emit({ event: 'attached', index: options.index })
+
+        const launch = roleCommand(options.runtime)
+        role = spawn(launch.command, launch.args, {
+          cwd: REPO_ROOT,
+          env: roleEnvironment(),
+          stdio: ['pipe', 'pipe', 'pipe']
         })
-      })
 
-      role.once('exit', (code, signal) => {
-        emit({ event: 'role-exit', index: options.index, code, signal })
-        socket.destroy()
-      })
-      socket.once('close', () => {
-        if (role && !role.killed) role.kill('SIGTERM')
-      })
+        // Control frames both ways, untouched. Anything that arrived alongside the
+        // mode byte belongs to the role.
+        if (rest.byteLength > 0) role.stdin.write(rest)
+        socket.on('data', (data) => {
+          if (role && role.stdin && !role.stdin.destroyed) role.stdin.write(data)
+        })
+        role.stdout.on('data', (data) => socket.write(data))
+
+        // A role must be silent on stderr; forwarding it as data would corrupt the
+        // control stream, so it is reported here and the run fails on the missing
+        // reply rather than on garbage.
+        role.stderr.on('data', (data) => {
+          emit({
+            event: 'role-stderr',
+            index: options.index,
+            text: b4a.toString(data, 'utf8').slice(0, 400)
+          })
+        })
+
+        role.once('exit', (code, signal) => {
+          emit({ event: 'role-exit', index: options.index, code, signal })
+          socket.destroy()
+        })
+        socket.once('close', () => {
+          if (role && !role.killed) role.kill('SIGTERM')
+        })
+      }
+      socket.once('data', onFirstByte)
     }
   )
 
