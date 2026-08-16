@@ -15,6 +15,25 @@ const {
 
 const COMMAND_TIMEOUT_MS = 5_000
 const SCENARIO_TIMEOUT_MS = 30_000
+
+// Diagnostics only, and deliberately NOT reachable from a caller. A stalled step cannot
+// be watched past the deadline that kills it, so an operator debugging one may raise a
+// deadline from outside; but the shipped literals above never move, so the guard in
+// createProcessControl still rejects any caller that supplies its own deadlines, which
+// is the invariant it was written for. The override is loud on purpose: container gates
+// inherit the environment through `docker -e`, and a run at non-shipped deadlines must
+// never be mistakable for a canonical one whose assertion counts mean something. The
+// coordinator is not a role, so its stderr is free; a role's is not.
+function overriddenDeadline(name, shipped) {
+  const raw = process.env[name]
+  if (typeof raw !== 'string' || !/^[1-9][0-9]{0,6}$/.test(raw)) return shipped
+  const value = Number(raw)
+  if (value === shipped) return shipped
+  process.stderr.write(
+    `coordinator: ${name} overrides the shipped ${shipped}ms with ${value}ms; this is not a canonical run\n`
+  )
+  return value
+}
 const STDERR_LIMIT_BYTES = 4_096
 const TERMINATION_GRACE_MS = 2_000
 const HARD_KILL = process.platform === 'win32' ? 'SIGKILL' : 'SIGKILL'
@@ -127,6 +146,10 @@ function createProcessControl(options) {
   ) {
     throw new ProcessControlError('PROCESS_CONTROL_INVALID')
   }
+  // Resolved only after the guard above has had its say, and only from the environment,
+  // so the caller-facing invariant is untouched by the diagnostic path.
+  const effectiveCommandTimeoutMs = overriddenDeadline('PR_COMMAND_TIMEOUT_MS', commandTimeoutMs)
+  const effectiveScenarioTimeoutMs = overriddenDeadline('PR_SCENARIO_TIMEOUT_MS', scenarioTimeoutMs)
 
   const records = new Map()
   const waiters = new Map()
@@ -145,7 +168,7 @@ function createProcessControl(options) {
 
   const scenarioTimer = setTimeout(() => {
     fail('coordinator', 'SCENARIO', 'PROCESS_SCENARIO_DEADLINE')
-  }, scenarioTimeoutMs)
+  }, effectiveScenarioTimeoutMs)
 
   function scheduleStdinFailure(record) {
     if (
@@ -380,7 +403,7 @@ function createProcessControl(options) {
       waiters.delete(waiterKey)
       pending.reject(new ProcessControlError('PROCESS_COMMAND_DEADLINE'))
       fail(role, 'COMMAND', 'PROCESS_COMMAND_DEADLINE')
-    }, commandTimeoutMs)
+    }, effectiveCommandTimeoutMs)
     waiters.set(waiterKey, {
       ...pending,
       many,

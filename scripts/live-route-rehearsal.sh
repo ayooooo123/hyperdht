@@ -5,6 +5,7 @@
 #
 #   scripts/live-route-rehearsal.sh [seconds]
 #   REHEARSAL_ADDRESSES=divergent scripts/live-route-rehearsal.sh [seconds]
+#   REHEARSAL_ADDRESSES=unmapped scripts/live-route-rehearsal.sh [seconds]
 #
 # Every part of the distributed path is exercised except distance. Addresses are
 # asked for over the DHT, the topology is minted from the answers, and the roles
@@ -12,30 +13,61 @@
 #
 # REHEARSAL_ADDRESSES selects what a role's bound address has to do with the
 # address its peers dial. This is the flag that decides what the rehearsal is
-# able to catch, so read both modes before trusting a green run.
+# able to catch, so read all three modes before trusting a green run.
 #
-#   identical   (default) Bind and reachable are the same address. Needs no
-#               iptables, so this is the mode for macOS and for any host without
-#               the nat table. It CANNOT catch anything that confuses a bound
+#               NOTE none of the three modes runs on a macOS host: all eleven roles
+#               there report 127.0.0.1 and the path-diversity rule rejects them
+#               (KI-5). Every mode needs the Linux container; the modes differ only
+#               in what they need INSIDE it.
+#   identical   (default, for portability only - NOT the mode to trust) Bind and
+#               reachable are the same address. The only mode needing neither the
+#               nat table nor --privileged, which is the whole reason it is the
+#               default. It CANNOT catch anything that confuses a bound
 #               address with an advertised one, because the two are the same
 #               string: a green run here is not evidence about that class. Three
 #               separate faults of exactly that class passed this mode at
 #               125/125 before the divergent mode existed to expose them —
 #               role-runner's endpoint bootstrap authority, the exits' DHT-exit
 #               reservation, and the learned-closer digest in
-#               live-process-suite.js. See KI-8 in docs/private-routing-migration.md.
+#               live-process-suite.js. It is also the FASTEST mode, which is a
+#               second blind spot: KI-8 is a race that identical wins purely by
+#               being loopback-fast. See KI-8 and KI-10 in
+#               docs/private-routing-migration.md.
 #   divergent   Role `i` binds REHEARSAL_BIND_PREFIX.i.1 and is reached at
 #               REHEARSAL_ADVERTISED_PREFIX.i.1, with iptables translating both
 #               directions, which is what a runner behind a NAT has. This is the
-#               only mode that exercises the bind-versus-advertised class. Needs
-#               Linux, --privileged, and every 127/8 address. It is not the
-#               default because it currently stops at one assertion in the guard
-#               rebuild, 6 runs in 33 getting past it (KI-8). That is an open
-#               fault it found, not a reason to distrust the mode: rerunning
-#               until green is exactly how such a fault disappears from view.
+#               mode that exercises the bind-versus-advertised class the way a
+#               runner does. Needs Linux, --privileged, and every 127/8 address,
+#               which is the only reason it is not the default: `identical` is
+#               what runs on a host without the nat table. THIS IS THE MODE CI
+#               SHOULD RUN. It found the three bind-versus-advertised faults
+#               above, and separately exposed KI-8 - which is NOT an addressing
+#               fault at all, but a timing-sensitive race that only appears once
+#               the rehearsal stops being unrealistically fast. That is the mode's
+#               second and less obvious value: every mode here is sub-millisecond
+#               loopback, so a real deployment loses that race more often than our
+#               worst mode does. Before KI-8 was fixed no divergent run reached the
+#               teardown at all; after it, divergent reaches 125/125. Deliberately
+#               no pass RATE is quoted here: the pre-fix counts were taken with
+#               instrumentation whose synchronous writes biased them, so they and
+#               the post-fix counts come from different trees and are not a
+#               before/after pair. See KI-8.
+#   unmapped    Role `i` binds the WILDCARD and is reached at
+#               REHEARSAL_ADVERTISED_PREFIX.i.1, with NO packet translation
+#               anywhere: the published address is a real address on `lo`, so
+#               delivery is ordinary local delivery, and each role's egress
+#               source address is chosen by a routing rule keyed on its own
+#               source port. Bound and published differ - 0.0.0.0 against
+#               127.65.i.1 - so this mode exercises the bind-versus-advertised
+#               class exactly as divergent does, but a stall under it cannot be
+#               blamed on the harness's NAT because there is no NAT. That is what
+#               it is for: it is the control that says whether a divergent
+#               failure is the protocol's or the rehearsal's. Needs Linux,
+#               --privileged, and an iproute2 that can select a routing rule on
+#               sport.
 #
-# A divergent run that cannot install its rules stops with EX_UNAVAILABLE rather
-# than silently rehearsing the weaker mode.
+# A divergent or unmapped run that cannot install its plumbing stops with
+# EX_UNAVAILABLE rather than silently rehearsing the weaker mode.
 
 set -euo pipefail
 
@@ -59,9 +91,16 @@ case "$addresses" in
     [ -n "$bind_prefix" ] || bind_prefix=127.64
     bash scripts/live-route-nat.sh check
     ;;
+  unmapped)
+    # Nothing is bound per-role here: every role binds the wildcard, so a bind
+    # prefix is not merely unnecessary, it would contradict the mode.
+    bind_prefix=''
+    bash scripts/live-route-nat.sh alias-check
+    ;;
   identical) ;;
   *)
-    echo "REHEARSAL_ADDRESSES must be divergent or identical, got $addresses" >&2
+    echo "REHEARSAL_ADDRESSES must be identical, divergent or unmapped," >&2
+    echo "got $addresses" >&2
     exit 64
     ;;
 esac
@@ -89,12 +128,19 @@ coordinator_key="$(REMOTE_PEER_COORDINATOR_SECRET="$coordinator_secret" \
   node test/remote-peer/identity.js)"
 run_id="rehearsal-$(date +%s)"
 
-if [ "$addresses" = divergent ]; then
-  echo "addresses: roles bind $bind_prefix.<index>.1, reached at $advertised_prefix.<index>.1"
-  bash scripts/live-route-nat.sh up "$bind_prefix" "$advertised_prefix" "$roles"
-else
-  echo "addresses: identical, bind-versus-advertised divergence is not exercised"
-fi
+case "$addresses" in
+  divergent)
+    echo "addresses: roles bind $bind_prefix.<index>.1, reached at $advertised_prefix.<index>.1"
+    bash scripts/live-route-nat.sh up "$bind_prefix" "$advertised_prefix" "$roles"
+    ;;
+  unmapped)
+    echo "addresses: roles bind 0.0.0.0, reached at $advertised_prefix.<index>.1, untranslated"
+    bash scripts/live-route-nat.sh alias-up "$advertised_prefix" "$roles"
+    ;;
+  *)
+    echo "addresses: identical, bind-versus-advertised divergence is not exercised"
+    ;;
+esac
 
 testnet_log="$(mktemp)"
 node test/remote-peer/local-testnet.js --size 8 >"$testnet_log" 2>&1 &
@@ -104,9 +150,11 @@ cleanup() {
   for pid in ${bridge_pids+"${bridge_pids[@]}"}; do kill "$pid" 2>/dev/null || true; done
   kill "$testnet_pid" 2>/dev/null || true
   rm -f "$testnet_log"
-  # Unconditional: the rules outlive this shell otherwise, and `down` is a no-op
-  # when nothing was installed.
-  if [ "$addresses" = divergent ]; then bash scripts/live-route-nat.sh down || true; fi
+  # Unconditional for any mode that installed plumbing: it outlives this shell
+  # otherwise, and `down` is a no-op when nothing was installed.
+  case "$addresses" in
+    divergent | unmapped) bash scripts/live-route-nat.sh down || true ;;
+  esac
 }
 trap cleanup EXIT
 
@@ -138,6 +186,14 @@ for index in $(seq 1 "$roles"); do
   if [ "$addresses" = divergent ]; then
     host_flags=(
       --bind-host "$bind_prefix.$index.1"
+      --reachable-host "$advertised_prefix.$index.1"
+    )
+  elif [ "$addresses" = unmapped ]; then
+    # The wildcard is the point: the socket accepts the published address without
+    # anything rewriting the destination, and 0.0.0.0 is the most obviously wrong
+    # answer any code could give if it reached for the bound address by mistake.
+    host_flags=(
+      --bind-host 0.0.0.0
       --reachable-host "$advertised_prefix.$index.1"
     )
   elif [ -n "$bind_prefix" ]; then
