@@ -740,14 +740,19 @@ function openMaterialFor(branch, value) {
 
 let externalHarnesses = 0
 
-async function liveAuthorityHarness(configurePublications = null, existing = null) {
+async function liveAuthorityHarness(configurePublications = null, existing = null, overrides = {}) {
   const externalPublications = configurePublications !== null
   const externalIndex = existing === null && externalPublications ? externalHarnesses++ : 0
   const topology =
     existing === null
       ? await liveTopologyFixture(
           externalPublications ? 47641 + externalIndex * 20 : 47631,
-          externalPublications ? 47642 + externalIndex * 20 : 47632
+          externalPublications ? 47642 + externalIndex * 20 : 47632,
+          undefined,
+          // Default records leave no spare middle/exit pair once both branches are
+          // committed, so `rotate` fails closed before any build starts. A caller
+          // that drives a rotation passes a pool with a spare.
+          { records: overrides.records }
         )
       : existing.topology
   const randomBytes = sequenceBytes(externalPublications ? 0xe1 + externalIndex * 8 : 0xb1)
@@ -1131,8 +1136,11 @@ test('Gate 3A exposes immutable get query contexts only', (t) => {
 
 module.exports = {
   closeLiveAuthorityHarness,
+  createBranchNetwork,
   dhtResponseFor,
   liveAuthorityHarness,
+  openMaterialFor,
+  routeTransportPair,
   waitFor
 }
 

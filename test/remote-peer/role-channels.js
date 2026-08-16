@@ -13,11 +13,18 @@ const { PassThrough, Writable } = require('stream')
 const EventEmitter = require('events')
 const b4a = require('b4a')
 const { peerKeyPair, coordinatorKeyPair } = require('./identity')
-const { OP, FrameReader } = require('./frames')
+const { OP, FrameReader, writeFrame } = require('./frames')
 
 // Mirrors role-bridge.js: one byte says whether a connection asks for addresses,
-// carries a role's control stream, or asks for a role's terminal status.
-const MODE = Object.freeze({ REPORT: 1, ATTACH: 2, STATUS: 3 })
+// carries a punch plan, carries a role's control stream, or asks for a role's
+// terminal status.
+const MODE = Object.freeze({ REPORT: 1, ATTACH: 2, STATUS: 3, PUNCH: 4 })
+
+// A punch round is six datagrams over three seconds plus a drain, so a role answers
+// in about five seconds; the rest of this is DHT latency between eleven hosts.
+const PUNCH_REPORT_TIMEOUT_MS = 60_000
+const PUNCH_CONNECT_TIMEOUT_MS = 30_000
+const PUNCH_RETRY_MS = 5_000
 
 const CONNECT_TIMEOUT_MS = 30_000
 // A stream event says a role is gone; it never says how it went. The bridge's
@@ -304,6 +311,125 @@ async function requestRoleEndpoints(options) {
   return endpoints
 }
 
+// The punch round, between learning the addresses and attaching the roles.
+//
+// A role cannot punch until it knows the other ten addresses, and this coordinator is
+// the only party that knows them, so the list has to be distributed before any role
+// can open anything. Simultaneity is the whole mechanism: each side's OUTBOUND packet
+// is what opens its own NAT for the other, so the sends have to cross in flight, and
+// a role that punches ten seconds after its peer punches into a mapping that does not
+// exist yet.
+//
+// So the connections are opened FIRST, all eleven of them, and only then is the plan
+// written to every one of them in a single synchronous pass. Doing it role by role
+// would spread the punches across eleven DHT connects, which on the public DHT is
+// seconds apart - the staggering this round exists to avoid. This is the closest to
+// simultaneous the harness can get without a clock the roles share.
+//
+// Returns one report per role that answered. Deliberately does NOT throw on an
+// unanswered pair: a partial matrix may still carry the scenario, and failing here
+// would replace the run's own verdict with a new failure mode. The reports name every
+// missing directed pair instead, which is what the caller comments.
+async function punchRoleEndpoints(options) {
+  const { node, secret, coordinatorSecret, runId, endpoints, deadline, comment } = options
+  if (!coordinatorSecret) {
+    throw new Error('coordinatorSecret is required: roles pin only its public key')
+  }
+  if (!Array.isArray(endpoints) || endpoints.length === 0) {
+    throw new Error('endpoints are required')
+  }
+  const keyPair = coordinatorKeyPair(coordinatorSecret)
+  const say = typeof comment === 'function' ? comment : () => {}
+
+  // Every socket a role owns, keyed by role index. The exits' DHT socket is carried
+  // separately because it is a second socket with its own mapping, dialled directly
+  // by other roles: a plan naming only cell ports would open half the paths and move
+  // the failure rather than fix it.
+  const plan = {}
+  for (let offset = 0; offset < endpoints.length; offset++) {
+    const entry = endpoints[offset]
+    plan[offset + 1] = {
+      host: entry.reachable.host,
+      cellPort: entry.reachable.port,
+      ...(entry.dhtExit ? { dhtHost: entry.dhtExit.host, dhtPort: entry.dhtExit.port } : {})
+    }
+  }
+  const planBytes = writeFrame(OP.PLAN, b4a.from(JSON.stringify(plan)))
+  const entries = Object.values(plan)
+  const exitSockets = entries.filter((entry) => Number.isInteger(entry.dhtPort)).length
+  say(
+    `punch plan covers ${entries.length} roles over ${entries.length + exitSockets} sockets ` +
+      `(${entries.length} cell, ${exitSockets} exit-DHT)`
+  )
+
+  // Phase one: every connection open before any punch is asked for.
+  const opened = await Promise.all(
+    Object.keys(plan).map(async (key) => {
+      const index = Number(key)
+      const target = peerKeyPair(secret, runId, index).publicKey
+      let lastError = null
+      while (Date.now() < deadline) {
+        try {
+          const socket = await connect(node, keyPair, target, PUNCH_CONNECT_TIMEOUT_MS)
+          socket.on('error', () => {})
+          return { index, socket, reader: new FrameReader(socket) }
+        } catch (err) {
+          lastError = err
+          await new Promise((resolve) => setTimeout(resolve, PUNCH_RETRY_MS))
+        }
+      }
+      return { index, socket: null, reader: null, error: lastError }
+    })
+  )
+
+  const live = opened.filter((entry) => entry.socket !== null)
+  for (const entry of opened) {
+    if (entry.socket === null) {
+      say(
+        `role ${entry.index} could not be reached to punch: ` +
+          `${entry.error && entry.error.message}; it has no NAT mapping for any peer`
+      )
+    }
+  }
+
+  // Phase two: one synchronous pass, so eleven punch rounds start together.
+  for (const entry of live) {
+    try {
+      entry.socket.write(b4a.concat([b4a.from([MODE.PUNCH]), planBytes]))
+    } catch (err) {
+      say(`role ${entry.index} punch plan could not be written: ${err && err.message}`)
+    }
+  }
+
+  // Phase three: collect. Each role answers once its own rounds are finished and its
+  // probes are closed, which is also the signal that its ports are free for the role
+  // process to bind.
+  const settled = await Promise.allSettled(
+    live.map(async (entry) => {
+      try {
+        const frame = await entry.reader.next(PUNCH_REPORT_TIMEOUT_MS)
+        if (frame.op !== OP.CELL_REPORT) throw new Error(`unexpected punch frame ${frame.op}`)
+        return JSON.parse(b4a.toString(frame.payload, 'utf8'))
+      } finally {
+        entry.socket.destroy()
+      }
+    })
+  )
+
+  const reports = []
+  for (let offset = 0; offset < settled.length; offset++) {
+    const outcome = settled[offset]
+    if (outcome.status === 'fulfilled') reports.push(outcome.value)
+    else {
+      say(
+        `role ${live[offset].index} never reported its punch: ` +
+          `${outcome.reason && outcome.reason.message}`
+      )
+    }
+  }
+  return reports
+}
+
 // projections must be in ROLES order, exactly as spawnRoleProcesses returns them,
 // so the coordinator's records line up with the roles the topology describes.
 async function openRemoteRoleChannels(options) {
@@ -364,6 +490,7 @@ module.exports = {
   MODE,
   openRemoteRoleChannels,
   closeRemoteRoleChannels,
+  punchRoleEndpoints,
   requestRoleEndpoints,
   RemoteChild
 }
