@@ -1175,6 +1175,51 @@ front of whoever runs it. The honest limit: nothing here distinguishes
 endpoint-independent filtering from endpoint-dependent filtering in advance, and
 the reflectors cannot, so a mixed dispatch is the test.
 
+### KI-15: the route operation deadline is too short for a real multi-hop route
+
+**Status: open, and it is now the failure that stops a real dispatch. The constant is
+pre-existing; only its enforcement is new, which is why nothing noticed until now.**
+
+`routed-dht-io.js:36` sets `TIMEOUT_MS = 3000n`, minted into every routed request as
+`absoluteDeadlineMs` and sent to the exit, which has always enforced it. The endpoint did
+not hold itself to it until KI-10's L0 landed. With the deadline now enforced at both
+ends, a real dispatch fails on the FIRST routed immutable get, and the endpoint's own
+control-frame timeline gives the number:
+
+| event                    | elapsed |
+| ------------------------ | ------- |
+| `activate` received      | 0.000s  |
+| `ready` emitted          | 0.836s  |
+| `immutable-get` received | 0.920s  |
+| `error` emitted          | 3.968s  |
+
+3.048 seconds against a 3000ms budget. The route is endpoint to guard to middle to exit
+to a DHT node and back, so the budget has to cover four hops each way across the public
+internet plus per-hop crypto, against a constant chosen where every hop is loopback. The
+run reached 32 of 33 assertions: the setup store completed, all eleven roles activated,
+the endpoint's semantic edge was guard-only and it retained no bootstrap socket. Only the
+first application request failed.
+
+The failure presents as `ERR_PRIVACY_UNAVAILABLE` from `immutableGet` at
+`private-routing-controller.js:1139`, which is misleading if read alone: the deadline
+fired, reported the route failure, and took the controller to UNAVAILABLE, and the error
+surfaced from the operation's own path finding it already there. Only one `immutable-get`
+frame ever reached the endpoint and no `rotate` frame at all, which is what rules out a
+rotation or a second operation as the cause.
+
+THE FIX IS NOT TO LOOSEN THE ENFORCEMENT. The arm is correct: a component that computes a
+bound, sends it to its peer, and then does not apply it to itself is broken regardless of
+what the bound is. What is wrong is the bound. A deadline for a multi-hop overlay route
+cannot be a single constant chosen on loopback; it has to be derived from something that
+scales with the path - a per-hop allowance, a measured round trip, or a budget carried
+with the route - and whatever replaces it must remain something the exit can enforce
+identically, since that is the property `absoluteDeadlineMs` exists to provide.
+
+Note what this says about the local suites: every mode of the rehearsal and every gate
+completes the same operation well inside 3000ms, so no amount of local testing could have
+surfaced this. It took eleven separately-hosted roles, and it only became visible at all
+because the endpoint started enforcing a promise it had always been making.
+
 ### KI-13: the punch that makes a dispatch work is in the harness, not in production
 
 **Status: open, and it is the largest single item between this fork and production
