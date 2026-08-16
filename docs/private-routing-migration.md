@@ -946,11 +946,13 @@ at `43000 + index`, is reflected off reflectors in a loop that BREAKS on the fir
 success, so its mapping is confirmed once and never cross-checked. If a NAT were
 endpoint-dependent for that socket, the published address would be the mapping for
 that one reflector rather than the one other roles will see, and requests to it
-would time out exactly as observed. That is a hypothesis, not the finding: on the
-run inspected, the exit's cell mapping was 104.209.7.229:29697 with both reflectors
-agreeing and its DHT mapping was :29698, which is consistent with a sequential
-allocator and endpoint-independent behaviour. Giving the DHT socket the same
-two-reflector agreement check as the cell socket would settle it.
+would time out exactly as observed. That hypothesis is now ELIMINATED rather than open. The DHT
+socket was given the same two-reflector agreement check as the cell socket, and the
+coordinator names any disagreement before minting: on a further all-remote dispatch
+no exit reported a disagreement and assertion 11 failed identically. So the exits'
+DHT mappings are stable, cross-checked, and not the cause. The check stays because
+it turns an address nobody verified into one that is verified, but it bought a
+negative result rather than a fix.
 
 The order these were found matters for anyone repeating the exercise, because each
 one hid the next: the runtime attestation could never pass, so nothing beyond
@@ -958,7 +960,9 @@ assertion 1 was reachable; then two roles could not be scheduled; then a laptop 
 could not be dialled; then a retransmission was called a replay; then the command
 budget was too small for real RTT; and only then did the setup store's own timeout
 become visible at assertion 11. Six distinct causes, each of which had to be removed
-before the next could be seen, and not one of them observable on loopback.
+before the next could be seen, and not one of them observable on loopback. Five are
+fixed and landed; the sixth is where a real dispatch now stops, at 10 of 11
+assertions with every role on a runner.
 
 So mixed placement works for roles that initiate and fails for roles that must be
 dialled, on this network. Whether that generalises depends entirely on the NAT in
