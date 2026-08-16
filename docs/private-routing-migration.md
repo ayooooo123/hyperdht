@@ -343,9 +343,64 @@ derived an audit record's addresses, and `control-channel.js:993` accepted only 
 two derived plans on the isolated-grant command. All three now handle the discovered
 plan.
 
-### KI-8: the guard rebuild fails when bound and advertised addresses differ
+### KI-8: a branch loss is never delivered when a stale frame is queued unread
 
-**Status: open. Only observable in the rehearsal's divergent addressing mode.**
+**Status: FIXED. The fault was in the routing code, not in the rehearsal. Diagnosis and
+evidence are kept below because the mechanism is worth understanding and because three
+earlier hypotheses were wrong.**
+
+This entry was originally titled as an addressing fault and it is not one. Nothing in it
+confuses a bound address with an advertised one. The rehearsal's divergent mode exposed it
+by adding LATENCY, not by diverging addresses: the deciding variable is a 3.4ms window
+between a cancel and a reply, which is why the untranslated mode reproduces it with no
+translation anywhere and why identical addressing wins the race purely by being
+loopback-fast. That matters for what the mode is worth. Its obvious value is catching
+bind-versus-advertised confusion, and it caught three such faults; its second and less
+obvious value is being the only mode with remotely realistic timing. Every mode here is
+sub-millisecond loopback, so a real deployment loses this race MORE often than our worst
+mode does.
+
+The fix is recorded under KI-10, whose first half is the same fault: a live route
+transport now drains its physical channel for as long as it is live, so an in-band
+`BRANCH_DESTROY` is consumed on arrival whether or not the application is reading.
+
+Proof, on a tree carrying the fix, read by rotation trigger rather than by assertion
+number because both candidate faults failed the same assertion:
+
+| mode      | runs | after the fix | rotation trigger     |
+| --------- | ---- | ------------- | -------------------- |
+| unmapped  | 5    | 5 of 5        | loss, +4.4 to +9.5ms |
+| divergent | 5    | 5 of 5        | loss, +4.4 to +9.5ms |
+
+The pre-fix counts are deliberately NOT tabulated beside those, because they come from a
+different tree and are contaminated in the direction that would flatter the fix. The
+pre-fix rates of 0 in 11 unmapped and 0 in 12 divergent were measured with instrumentation
+active, and that instrumentation wrote with `appendFileSync` - synchronously, on the
+calling thread - with one probe firing inside the very window that decides the race. Extra
+latency there makes failure MORE likely, so those counts are a lower bound on the true
+pre-fix pass rate rather than an estimate of it. No pre-fix rate on a clean tree exists and
+none can be taken now without un-applying the fix.
+
+So the claim here is deliberately not "it went from zero to green". It is that the
+mechanism is fixed, proven by a probe-free before-and-after against committed exports
+extracted from the pre-fix commit - a destroy behind one unread frame is not consumed at
+queue depth 1 before, and is consumed at depth 0 after - and that the fixed tree is green
+on the tree that ships. Attribution is unaffected by probe cost, since the comparison that
+established it varied only translation while holding instrumentation constant across all
+three modes, and its packet-level half rested on netfilter counters and a capture, which no
+JavaScript timing can influence.
+
+`lookupBranchExpiry`, which was the only trigger that ever fired before, is never the
+trigger in any of the ten runs. The rebuild now starts on the loss it is supposed to start
+on, claims at +15 to +23ms and emits `rotated` at +122 to +215ms.
+
+FAULT B WAS NOT INDEPENDENT. The replacement middle extension - which took 4965ms and died
+on its deadline in the one disturbed run where it was ever reached, and was null in all 21
+pre-fix failures - completes in 98 to 175ms in all five divergent runs once Fault A is
+fixed. It needed no fix. It was a single observation of Fault A's downstream consequence: a
+rotation starting 9.7s late against a topology that had been idle for ten seconds. The
+caution three reviewers insisted on, against writing it up as a second independent fault,
+was correct.
 
 `scripts/live-route-rehearsal.sh` gained a second addressing mode because a
 rehearsal where every role binds the address it publishes cannot catch anything that
@@ -367,14 +422,208 @@ scenario at 125/125:
   wrong address throws nothing and logs nothing, the responder simply never matches,
   so no stack exists anywhere for it.
 
-What remains open is the fourth observation, and it is not a wrong address that
-anything reports. `test/private/live-process-suite.js:346`,
-`t.is(rotated.previousGeneration, endpointGeneration)`: after `lookup-middle-a` is
-commanded to `rotate`, the endpoint does not emit its `rotated` event and the
-scenario stops with `PROCESS_COMMAND_DEADLINE` at 40 of 41 assertions. Everything
-before it passes, including the first routed immutable get through the whole
-guard-middle-exit path, so a route across translated addresses works; it is the
-rebuild after a physical link fault that does not settle.
+What remains open is a fourth observation, and instrumented traces have now disproved
+this entry's original description of it. It is not that the rebuild fails. The rebuild
+never starts, and a second unrelated fault then breaks the rotation that eventually does
+start. Two runs, one per mode, instrumented identically, with times relative to the
+injected fault:
+
+| step                                       | identical | divergent |
+| ------------------------------------------ | --------- | --------- |
+| `fault-outgoing-physical-link` on middle-a | +0.0ms    | +0.0ms    |
+| endpoint consumes `BRANCH_DESTROY`         | +2.8ms    | never     |
+| `branch-physical-loss` at the endpoint     | +4.7ms    | never     |
+| signal that starts the rotation            | +5.8ms    | +9656.0ms |
+| kind of that signal                        | loss      | expiry    |
+| replacement middle extension completes     | +65.7ms   | never     |
+| `emit-rotated`                             | +142.0ms  | never     |
+
+So there are two faults, and both are a packet that does not arrive. They are not yet
+known to be independent: Fault A is measured in both modes and is solid, while Fault B
+has been observed exactly once, in a run whose rotation had already been started 9.7s
+late by Fault A, so its 5s build deadline was competing with a topology that had been
+idle for ten seconds. Until Fault B is reproduced in a rotation that started on time, it
+may be a consequence of A rather than a second fault.
+
+Fault A. The `BRANCH_DESTROY` that middle-a emits toward the guard is never consumed by
+the endpoint's route transport: `consumeM3RouteBranchDestroy`,
+`lib/private/m3-adjacency-runtime.js:842`, never runs, so
+`takeM3RuntimePhysicalLossState` at `:847` never runs and the loss sink registered by
+`commitBranchConnection`, `private-routing-controller.js:519`, never fires. There is no
+pending promise anywhere: the rebuild is not stalled mid-flight, it is never entered,
+which is why raising the coordinator's command timeout twelvefold changes nothing. What
+does eventually rotate the branch is `BRANCH_ROTATION_LEAD_MS`, `route-manager.js:36`,
+a scheduled timer that fires 5s before the branch material expires and would have fired
+at the same moment if nothing had been faulted at all. Because the shipped command
+timeout is 5s and the earliest possible rotation is 9.7s away, Fault A alone is fatal:
+a divergent run that passes is one where the `BRANCH_DESTROY` did arrive, so delivery of
+that one control message is at least the dominant variable. Whether anything else also
+varies is open until Fault B's status is settled.
+
+Fault B, provisional on the caveat above. Once a rotation does start, the replacement
+middle extension to lookup-middle-b
+gets no response and dies exactly on `REPLACEMENT_BRANCH_DEADLINE_MS`,
+`route-manager.js:38`, measured at 4965.6ms against a 5000ms budget. Identical mode
+completes the same extension in 39.5ms. This is the first packet ever sent on the
+guard-to-middle-b path, so nothing about it is a stale-state problem. The deadline fires
+correctly and the failure is clean: `enterUnavailable` runs, the controller reaches
+UNAVAILABLE, and the role emits `unavailable`. That is why a run with a raised command
+timeout fails as `PROCESS_PHASE_MISMATCH` rather than a deadline.
+
+Attribution: the rehearsal's NAT is exonerated, and Fault A is in the routing code. A
+third addressing mode, `REHEARSAL_ADDRESSES=unmapped`, makes bound and published
+addresses differ with no packet translation at all - roles bind `0.0.0.0` and are reached
+at `127.65.<index>.1` via `ip addr add` plus a per-role route carrying
+`src 127.65.<index>.1`, selected by an `ip rule` on source port, with all four netfilter
+tables verified bare. Fault A reproduces there, and in both runs the trace shows the
+`BRANCH_DESTROY` handed to the wire 2.3ms BEFORE the harness's link rearm dropped any
+link, and never consumed:
+
+| event                        | run 1     | run 2     |
+| ---------------------------- | --------- | --------- |
+| destroy emit begins          | fault+2.6 | fault+2.4 |
+| destroy handed to the wire   | fault+3.4 | fault+3.2 |
+| harness rearm drops links    | fault+5.7 | fault+5.5 |
+| destroy consumed by endpoint | never     | never     |
+
+So the message is sent, untranslated, and not consumed. That falsifies two earlier
+hypotheses outright: translation loss, and a race in which the harness's rearm tears down
+the link before the destroy is emitted.
+
+The mechanism is KI-10's head-of-line blocking, recorded below, and the full chain is now
+measured at a real fault rather than assembled from parts. Two unmapped runs, times
+relative to the injected fault, agreeing to within a millisecond:
+
+| event                                          | run 1  | run 2  |
+| ---------------------------------------------- | ------ | ------ |
+| the scenario cancels operation 2               | -5.1ms | -4.9ms |
+| the in-flight reply arrives with no reader     | -1.7ms | -1.4ms |
+| the pump declines to read and does not restart | -1.3ms | -0.9ms |
+| the link is faulted                            | 0.0ms  | 0.0ms  |
+| middle-a hands `BRANCH_DESTROY` to the wire    | +3.2ms | +3.3ms |
+| the harness's link rearm drops links           | +5.1ms | +5.2ms |
+| the endpoint consumes the destroy              | never  | never  |
+
+So: the cancel removes the reader; the reply to the cancelled operation lands about 3.4ms
+later with no waiter and is queued; the pump refuses to read while a frame is queued and
+does not restart; the link is faulted 1.4ms after that; middle-a emits the
+`BRANCH_DESTROY` and it reaches the wire; nobody ever reads it; the branch loss is never
+delivered; the rotation never starts; assertion 41 fails. The window that decides a run
+is the interval between the cancel and the reply's arrival, 3.4ms and 3.5ms in these two
+runs. Identical addressing wins that race and the translated and untranslated divergent
+modes lose it, which is why the same code passes 28 of 28 one way and fails the other.
+
+The comparison is symmetric and the separation is total. Twenty-seven instrumented runs
+across all three addressing modes, classified by one binary feature with no exceptions.
+Every run of every mode queues exactly two route frames with no reader; the modes differ
+only in when the second one lands:
+
+| mode      | runs | outcome | second queue event | destroy consumed | rotation      |
+| --------- | ---- | ------- | ------------------ | ---------------- | ------------- |
+| identical | 6    | pass    | +542 to +618ms     | +3.85 to +4.37ms | loss-driven   |
+| divergent | 12   | fail    | -1.3 to -3.1ms     | never            | never started |
+| unmapped  | 9    | fail    | -0.5 to -2.4ms     | never            | never started |
+
+The first queue event is common to all twenty-seven runs, at -160 to -262ms, and is always
+drained by a later reader. The second decides the run: in all twenty-one failures it lands
+inside the last 3.1ms before the fault, so the pump is already wedged when the destroy
+reaches the wire 3-6ms later; in all six passes it lands more than half a second after the
+fault, long after the destroy was consumed and the branch rotated. The clusters are
+separated by more than 540ms with no overlap.
+
+That yields the sharpest statement of the fault, and it is not the obvious one: a queued
+frame is not the fault. Frames queue with no reader twice per run, in healthy runs, in
+every mode, and are drained harmlessly. The fault is a frame queued in the roughly three
+milliseconds before a branch dies. Any fix or test that keys on "a frame was queued" will
+look correct and prove nothing.
+
+The trace-based finding is corroborated at packet level by an independent instrument. A
+divergent run that reached `not ok 41` was observed with pure-counter netfilter chains and
+`tcpdump` on `lo`, 272 packets captured across 17 samples:
+
+- The DNAT and SNAT rules for roles 5 and 6 - `lookup-middle-b` and `lookup-exit-b`, the
+  replacement pair - counted ZERO for the entire run, and no packet to either appears
+  anywhere in the capture. The guard never dialled either one. Fault A stops the rebuild
+  before a single replacement packet reaches the wire.
+- No rule stopped matching: counters are monotonic across all 17 samples. No UDP mapping
+  can expire, since the scenario is 6.8s end to end against a 30s unreplied timeout, and
+  `conntrack_count` rose monotonically to 436 against a maximum of 262144.
+- The uncovered-port catch-all counted zero packets, and every one of the 272 captured
+  destinations falls inside the covered set. The earlier hypothesis that a rebuild might
+  use a port the rules did not cover is dead by measurement rather than by reading.
+- Zero packets escaped SNAT: 250 translated, 0 untranslated, measured in `filter INPUT`
+  after both nat hooks. So nothing was silently discarded by a peer's source check.
+
+Two tooling limits are worth stating rather than leaving implicit: `conntrack(8)` is absent
+from the image and `/proc/net/nf_conntrack` does not exist, so per-flow listing was
+impossible and only aggregate counters were available.
+
+A limit on every load figure in this document, and on every timing number that depends on
+one. The container VM has four vCPUs, not the host's ten, and three unrelated long-lived
+containers share it - a relay and two Postgres instances, up four and seven days. They were
+idle when measured, but idle-when-measured is not idle-at-the-time, and no run here was
+taken with them stopped. So every recorded load average has an unmeasured floor under it.
+This does not undermine the findings, because the load-bearing evidence is mechanism-level
+and comparative rather than rate-level - a before-and-after on committed exports, and
+comparisons that hold instrumentation and machine constant while varying one thing - but any
+absolute rate in this document should be read as an observation under uncontrolled load
+rather than as a measurement of the code alone.
+
+Worse, every load figure recorded here is the macOS HOST one-minute average sampled before
+the run, and no harness ever sampled inside the guest. That number is nearly blind to what
+the container's four vCPUs were actually doing: the whole VM is one host process, so even a
+fully saturated guest contributes only about four to six to the host figure. A host average
+materially above that implies work outside the VM entirely - which, during this batch, means
+the agents' own tooling, since a lease that disciplined containers never covered anyone's
+`node`, `git` and `python` on the host. Two instruments that look like the answer are not. Guest `/proc/loadavg` reads 0.14-0.47
+while the host is at 12-14, because host oversubscription DESCHEDULES the guest's vCPU
+threads rather than lengthening the guest's runqueue - the guest runs slower in wall-clock
+without its runqueue growing, so guest loadavg would read the same whether the hypervisor
+gets full time or a third of it. Steal time, the normal metric for exactly that, is flat
+zero in `/proc/stat` because colima on Virtualization.framework does not report it to the
+guest. So neither reveals host starvation from inside a container on this setup.
+
+What does work is timing a fixed amount of work inside the guest, and the harness already
+records one: the scenario's own duration. Runs cluster tightly at 2775-3157ms across two
+harnesses and three modes, so a run well outside that band had its vCPUs descheduled
+whatever loadavg said. That is a zero-cost instrument, already present in every log.
+
+One indirect guest-side measure does exist, and it is the only one in this document. The
+trace intervals above are measured between lines inside a single container, so unlike a host
+average they stretch under guest contention. Across the twenty-seven classified runs the
+destroy was consumed at +2.8 to +4.4ms in six identical runs - a 0.5ms spread - with
+emit-sent at +3.0 to +6.0ms and the deciding queue event at -0.5 to -3.1ms across
+twenty-one failures in two modes. A guest under real contention does not hold a 0.5ms spread
+on a millisecond-scale interval six times running, so the corpus behind this diagnosis was
+taken on a guest that was not meaningfully contended - inferred from the intervals
+themselves rather than from a figure nobody sampled. Note also what this does NOT cover: the
+separation between clusters is 540ms, three orders of magnitude beyond any scheduling jitter
+that could survive in intervals this tight, so contention cannot flip a classification
+either way.
+
+That inference is scoped to that corpus and must not be read as a claim about the session.
+At a coarser grain the same guest was NOT stable: gate scenario wall times moved -1.3%,
++6.3%, +26.3% and -39.9% between two runs of the same four gates, with identical assertion
+counts in every pair. Millisecond intervals inside one container over twelve minutes were
+tight; multi-second scenario times across forty minutes swung by up to 40%. Both are true and
+they measure different windows at different resolutions. Whether that swing is guest
+contention, Bare runtime startup variance, or a real timing cost of the pump reading more is
+unresolved - what it is not is a change in work, since every assertion count in those pairs
+is identical.
+
+Fault B is unreachable before Fault A is fixed, and that is measured rather than assumed:
+`middleExtensionOpen` is null in all twelve divergent and all nine unmapped runs, so the
+rebuild is stopped before the replacement middle extension is ever attempted, twenty-one
+times out of twenty-one. No pre-fix capture in any mode can settle whether Fault B is
+independent. Only post-fix runs can, read by rotation trigger rather than by assertion
+number, since both faults fail the same assertion.
+
+One measurement note that supersedes the rate table below for divergent. A later batch ran
+twelve divergent rehearsals with the tree state and host load recorded for the first time
+and found zero passes. Under the earlier 22% estimate twelve consecutive failures has
+probability 5.4%, so this does not falsify the older figure, but the older figure was
+measured under unknown load against an unrecorded tree and this one was not. Do not quote
+22% as a post-fix baseline without that caveat.
 
 Measured across two independent batches on the same image, counting runs that
 reached 125/125. The second batch was run by a different party against the same tree
@@ -415,6 +664,222 @@ docker run --rm --privileged --mount type=bind,source=$PWD,target=/app \
   bash -c 'mkdir -p /root/.config/hyperdht-remote-peer && printf "%s" "<64 hex>" \
     > /root/.config/hyperdht-remote-peer/secret && bash scripts/live-route-rehearsal.sh 240'
 ```
+
+### KI-9: an expiry signal arriving during a rotation is lost permanently
+
+**Status: open. A production fault, not a harness artifact. Found by instrumenting a
+rehearsal, not by review.**
+
+A branch expiry signal that arrives while the controller is `ROTATING` is dropped, and
+the state needed to reissue it is destroyed at the same moment, so that branch never
+rotates again for the life of the controller. `private-routing-controller.js:272`
+refuses any signal delivered in a state other than `READY`, which alone would only
+delay it. What makes the loss permanent:
+
+- `route-manager.js:274-281`, `issueBranchSink` nulls `state.lifecycleSinks[key]`
+  before issuing, and the signal is one-shot: it is consumed and added to
+  `SPENT_SIGNALS` at `private-routing-controller.js:321-325`.
+- `route-manager.js:314` deletes the handle from `state.branchExpiryTimers` before
+  issuing, and `armBranchExpiry` is re-entered at `:322-324` only when the expiry has
+  moved further out, which on this path it has not.
+- `registerReplacementLifecycle`, `private-routing-controller.js:461-472`, recreates
+  expiry sinks only for the branch class being rotated, never the other one.
+
+So after the drop there is no sink and no timer for that branch class. The two branches
+expire on independent clocks and a rotation takes seconds, so a lookup rotation that
+overlaps the announce branch's expiry silently retires the announce branch's only
+rotation trigger.
+
+Observed in an instrumented divergent rehearsal: an `announceBranchExpiry` signal
+arrived 11072.4ms into the run with the controller in `ROTATING`, 130ms after a lookup
+rotation began, and was discarded with nothing rearming it.
+
+This is independent of KI-8. KI-8 is about which signal starts a rebuild, and whether
+the message that should start it arrives at all. This is about a signal that does
+arrive, at a moment the controller cannot accept it, and is then unrecoverable. The fix
+belongs in the controller: either expiry signals survive a rotation and are redelivered
+after it, or the timer and sink survive a refused delivery so the signal can be
+reissued. Nothing in the harness can compensate for it.
+
+### KI-10: an in-band branch loss is undeliverable to an idle endpoint, and only a lease bounds discovery
+
+**Status: open. Two compounding production faults. The first is reproduced
+deterministically in isolation; the second is a design property read from the code and
+confirmed by measurement.**
+
+FIRST: head-of-line blocking in the route transport. `pumpM3RouteTransport`,
+`lib/private/m3-adjacency-runtime.js:866-916`, is the only caller of
+`consumeM3RouteBranchDestroy` at `:842`, and it stops reading the physical channel
+whenever a frame is already sitting unread in `record.received`: the guard at `:872`
+returns when `record.received.length !== 0`, with the same condition again at the
+recursion gate `:893` and the re-pump gate `:903-909`. So a single unread route frame
+halts the transport, and a `BRANCH_DESTROY` queued behind it is never consumed. Not
+delayed: never. Nothing rearms it and no timer covers it.
+
+Measured on the endpoint's own receive context, two cases differing only in whether one
+unread frame precedes the destroy:
+
+| case                                   | destroy consumed | channel depth |
+| -------------------------------------- | ---------------- | ------------- |
+| branch destroy alone                   | true             | 0             |
+| branch destroy behind one unread frame | false            | 1             |
+
+In the second case the destroy is still in the channel and the transport is still live.
+
+An endpoint acquires an unread frame in ordinary operation.
+`lib/private/live-route-authority.js:715` reads the route transport in a
+`while (operationState.live)` loop, one loop per operation; on cancel, `:798-803` clears
+`live` and calls `cancelM3RouteFrameReservation`, removing the waiter. From then until a
+new operation starts, nothing reads that transport. A reply to a cancelled operation
+therefore arrives with no reader, queues, and halts the pump. An endpoint between
+operations is the normal idle state, so the window is not exotic.
+
+The fault was never endpoint-specific, and neither is the fix. Every route transport in the
+codebase is minted in one place, `m3-adjacency-runtime.js:785` via `takeM3RouteTransport`,
+called only from `tail-control.js:2079`: one object shape, one `record.received`, one pump,
+one wedge. It has three consumers, and all three have the same reader gap:
+
+- the endpoint's `binding.transport`, `live-route-authority.js:715`, which reserves per
+  operation;
+- an exit's `service.transport`, `dht-exit-io.js:765-823`, whose loop registers a waiter,
+  then runs `codec.open`, the class checks and `pushAuthenticated` with NO waiter registered
+  before reserving again - and whose four `continue` paths all return to the top the same
+  way, so every iteration has such a window;
+- `state.activationTransport`, `final-exit-activation.js:2220-2286`.
+
+So the precondition is structurally available on an exit and on the activation path, not only
+on the endpoint, and because the pump is shared the fix covers all three at once.
+
+SECOND: nothing detects branch liveness. If the in-band notification is lost, for this
+reason or any other, the only remaining path to discovery is
+`BRANCH_ROTATION_LEAD_MS`, `route-manager.js:36`, a timer scheduled 5s before the branch
+material expires. That is a lease running down, not liveness detection. There is no
+keepalive and no adjacency timeout. Measured in an instrumented rehearsal where the
+in-band notification never arrived, the endpoint learned nothing for 9656ms and then
+rotated on that timer, which would have fired at the same moment had nothing been
+faulted at all.
+
+Stated as one property: in-band branch-loss notification is best-effort and silently
+lossy while an endpoint is idle, and it is unreliable by the design of the reader rather
+than by anything the network does. The only reliable discovery mechanism is the branch
+lease running down.
+
+Together these mean a middle relay that dies without warning - power cut, host gone,
+process killed - leaves an endpoint routing into a black hole until branch material
+expires, and an endpoint holding one unread datagram discards the in-band notification
+even when the dying peer does send it. The two faults are separable and should be fixed
+separately: the pump must not let one unread frame block control frames, and branch
+liveness needs a bound that does not depend on either an in-band message or the
+expiry lease.
+
+Relationship to KI-8: this mechanism produces KI-8's Fault A exactly, but attribution is
+not established. It requires the stale frame to reach the endpoint before the destroy,
+and in identical mode the destroy is consumed 2.8ms after the fault while a routed get
+takes about 70ms end to end, so the destroy would normally win - which is consistent
+with identical addressing passing 28 of 28. Whether a failing divergent run actually has
+a queued unread frame at the moment of the fault is a single line of a single capture and
+is not yet answered.
+
+### KI-11: one unexplained teardown phase mismatch
+
+**Status: open, unattributed, observed exactly once in 64 recorded runs. Recorded rather
+than resolved, because the conditions that produced it are unmeasurable after the fact.**
+
+One divergent rehearsal on the fixed tree failed at
+`not ok 71 - PROCESS_PHASE_MISMATCH (lookup-exit-a/CONTROL)`, 70 of 71 assertions, where
+assertion 71 is the first of the teardown loop, `t.is(snapshot.state, 'CLOSED')` at
+`live-process-suite.js:437-443`. The run passed the rotate at 41, suspend and resume at
+55-66 and network-change at 69-70, so it is a different phase and a different failure mode
+from KI-8, which always failed at 41 with `PROCESS_COMMAND_DEADLINE`. A phase mismatch fires
+when a role's phase sequence has advanced past what the suite believes, so a `stop` carrying
+a computed phase is refused - it needs ONE unexpected event from one role, not a slow run.
+
+An interleaved A/B in identical mode - the only mode reaching teardown on both trees, since
+every pre-fix divergent run stops at 41 - found nothing: eight runs with the fix reverted and
+eight with it present, alternating on one machine, differing by exactly the two files of the
+fix, zero occurrences of assertion 71 in either arm. At a 1-in-31 rate that is an
+underpowered null and not evidence of absence. It was run with the guest effectively idle
+(VM load 0.39 while the host read 11-13), so it is not an under-load result. Its one useful
+incidental: the two arms' scenario bands overlap and the fixed arm's is slightly tighter,
+which is mild matched evidence that the fix costs no measurable wall time.
+
+A second-order effect of the KI-10 fix was the leading suspicion and is now DISFAVOURED BY
+SOURCE, on two counts. First, a retired exit's route transport is DESTROYED rather than
+wedged: retirement awaits `finalExitService.destroy()`, which reaches
+`destroyDhtExitRouteTransportForIO` via `closeState`, `dht-exit-io.js:887-892`. A destroyed
+transport cannot be wedged or drained, and teardown is 2.8s later. Second, and decisively,
+the premise was wrong: LOOKUP-EXIT-A IS NOT RETIRED AT TEARDOWN. `retainForSuspend()` clears
+`state.committed`, and `resume()` at `relay-candidate-directory.js:892` then calls
+`choosePairs(state, now)` with NO exclusions, which returns the first diverse quad in record
+order - and that order is the guard's fixed projection array, so resume re-selects
+`lookup-middle-a` with `lookup-exit-a`. The suspend and resume at assertions 55-66 put exit-a
+back in the live path before teardown. "The failing role is the retired exit", the detail
+that made the fix look implicated, is simply false.
+
+The leading explanation is now a pre-existing race in the harness's own control protocol,
+independent of route transports and therefore of the fix. [INFERENCE] - derived from source,
+not measured. The teardown loop advances each role's expected phase at
+`live-process-suite.js:429-435` and then sends `stop`, while the learned-grant responders stay
+armed until the `finally` at `:456`, i.e. throughout that loop. So an active exit can still
+emit an `isolated-grant-request` during teardown; any role-initiated event still in flight
+when its phase is advanced arrives carrying the old phase, fails `validateControlMessage`, and
+is reported as `PROCESS_PHASE_MISMATCH (role/CONTROL)` at `coordinator.js:343-348`, which is
+also the catch-all for any event validation failure. That accounts for the role identity, the
+phase, and why the failure has never appeared at any other assertion. It is cheap to falsify
+and cheap to close: stop the responders BEFORE the teardown loop rather than in the `finally`,
+or advance phases only after draining.
+
+The load explanation is neither confirmed nor excluded, and cannot be settled from the data
+held. The failing run recorded a host load of 15.31 against 2.39-3.73 for the five runs
+before it, with a decaying tail across four subsequent runs that all passed. Four instruments
+were considered and each is blind to what matters here:
+
+| instrument               | why it cannot answer                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------- |
+| host load average        | the whole VM is one host process, so it is nearly blind to guest saturation           |
+| guest `/proc/loadavg`    | host oversubscription deschedules vCPU threads without lengthening the guest runqueue |
+| steal time, `/proc/stat` | flat zero; colima on Virtualization.framework does not report it                      |
+| scenario wall time       | a 3s aggregate; a 20ms stall moves it 0.7% and vanishes in the 2775-3157ms band       |
+
+A fifth instrument does work, and it is the one this batch used elsewhere: timestamped trace
+intervals inside the run, which sample at millisecond scale and show a transient stall
+directly, because a descheduling in the wrong place stretches one interval while leaving the
+total untouched. This run carried none, correctly, since it was measuring the shipping tree.
+So the honest limit is not that the platform cannot be measured but that this run cannot be
+measured after the fact. Any future hunt for a millisecond-scale race here must instrument
+the run itself; nothing outside it can see in.
+
+One process note for whoever picks this up, and it is NOT "read the code first", because that
+rule would have failed this investigation. Ask whether the question is STRUCTURAL or EMPIRICAL
+before choosing the instrument. Structural questions ask whether something can happen, whether
+a path exists, whether a state is reachable; read the source, and it is usually minutes.
+Empirical questions ask whether it does happen, how often, under what conditions; run it, and
+reading substitutes for nothing.
+
+Nothing that actually cracked KI-8 was answerable from source: which mode reproduces it,
+whether the destroy was sent or only never received, whether a frame was queued before the
+fault, whether Fault B was independent. The pump gate was read early and correctly reported as
+permitting a wedge, which could not establish that a wedge was happening, in which role, or in
+which mode. Every expensive detour, by contrast, was a structural question attacked
+empirically: the rearm race, the uncovered-port lead, and the retired-exit coincidence, each of
+which had a twenty-line answer in the source the whole time. The one cheap decisive move early
+on - a 0.21s rig proving a destroy can be blocked behind an unread frame - worked because it
+turned a structural question into a two-line answer instead of a rate.
+
+Deterministic follow-ups, each replacing an argument with a measurement:
+
+1. Close the responder window, which is the fix if the explanation above is right: stop the
+   learned-grant responders before the teardown loop rather than in its `finally`, or advance
+   each role's phase only after draining its in-flight events. Falsifiable either way by
+   whether assertion 71 can be provoked deliberately - hold a grant request until after the
+   phase advance and the mismatch should reproduce on demand, on either tree.
+2. Whether guest starvation occurred - fixed-work timing inside the guest, since the four
+   instruments above cannot see it.
+3. Whether the fix costs wall time - interleaved medians of `process:node` and
+   `namespace:live` on both trees. Assertion counts are already known equal, so it is purely
+   a timing question. The two eleven-role gates moved in OPPOSITE directions between trees,
+   -1.3% and +26.3%, while a third swung -39.9% with identical counts, so the present sample
+   cannot show a timing effect either way.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
