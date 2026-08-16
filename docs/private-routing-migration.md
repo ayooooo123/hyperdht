@@ -237,10 +237,19 @@ through a `prepare` hook.
 throwaway DHT: eleven bridges answer with their addresses, the topology is minted
 from those answers, eleven control channels open, and the scenario runs.
 
-**Status: incomplete, close.** The rehearsal reaches 70 of 71 assertions. Every
-role activates, the route builds across the eleven hosts, and traffic flows; the
-remaining failure is in teardown, where a role that has finished its work exits
-cleanly and the coordinator then waits out its scenario deadline for that role.
+**Status: passing.** The rehearsal completes the whole scenario across eleven
+separately hosted roles: 1/1 test, 125/125 assertions, twice in a row. Roles
+activate, the route builds, traffic flows, every role stops on command and exits
+zero.
+
+The last failure was in the transport, not the protocol. `live-process-suite.js:415`
+ends the scenario by calling `expectExit` for every role, sending `stop`, and
+asserting each exit code is zero, so a role exiting cleanly is the expected outcome.
+`RemoteChild` listened only for the stream's `close` event, and a hyperdht stream
+that the far side half-closes with `end()` need never reach `close` while this side
+stays open, so no exit was ever reported and the coordinator burned its thirty
+second scenario deadline. A remote `end` is now the role finishing: it settles an
+exit with code zero and ends this side too.
 
 A rehearsal needs one address per role, because the diversity rule rejects a set of
 relays sharing a /24 (KI-5). Linux serves every 127/8 address, so the rehearsal runs

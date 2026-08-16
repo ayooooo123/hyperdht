@@ -49,6 +49,14 @@ class RemoteChild extends EventEmitter {
     // arrives.
     socket.write(b4a.from([MODE.ATTACH]))
     socket.on('data', (chunk) => this.stdout.write(chunk))
+    // A role that finished its work exits zero and its bridge ends the stream. That
+    // half-close is the exit: waiting for 'close' instead can wait forever, because
+    // a stream only closes once both sides have ended. The suite requires an exit
+    // with code zero here, so the mapping has to be end means finished.
+    socket.on('end', () => {
+      if (typeof socket.end === 'function') socket.end()
+      this._settle(0, null, null)
+    })
     socket.on('error', (err) => this._settle(1, null, err))
     socket.once('close', () => this._settle(0, null, null))
   }
