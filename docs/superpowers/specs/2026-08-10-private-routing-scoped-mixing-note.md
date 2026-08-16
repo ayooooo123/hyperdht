@@ -21,7 +21,7 @@ to latency-sensitive bulk flows (the CDN corollary: mix the signaling, not the p
 ## Grounding
 
 - Cell classes already separate concerns: `CELL_CLASS = { CONTROL: 0, STREAM: 1,
-  DATAGRAM: 2 }` (`lib/private/protocol.js:133`). This split is the lever.
+DATAGRAM: 2 }` (`lib/private/protocol.js:133`). This split is the lever.
 - The relay forwarding scheduler is `RelayService` (`lib/private/relay-service.js`):
   `trySend` queues per circuit, `state.fair` is a FIFO fair-queue across circuits. Any
   mix delay/reorder would attach here, at the relay's dequeue step — not in the crypto or

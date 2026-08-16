@@ -123,15 +123,54 @@ function purgeExpired(state) {
   }
 }
 
-function addCorrelation(state, key, value) {
+// A collision on a correlation key is a replay only when the bytes differ.
+// dht-rpc retransmits an outstanding request by re-sending the same encoded
+// buffer, with the same transaction id, to the same host and port
+// (dht-rpc/lib/io.js Request._sendNow), and only when a reply is slower than its
+// retry timer. On loopback the reply always wins that race, so no retry is ever
+// emitted and this audit never saw one; across a real network retries are
+// routine. Accepting identical bytes does not blunt the replay check:
+//   - A captured request re-injected AFTER its reply arrived finds no
+//     correlation, because the reply path deleted it, so it is judged by the
+//     source, arm and forged-response checks rather than by this one.
+//   - A different request reusing an outstanding transaction id differs in bytes
+//     and still raises.
+//   - Identical bytes to or from the same tuple while the original is still
+//     outstanding are not merely indistinguishable from a retry: at this layer
+//     they are the same event. One audit record covers it, and the reply is
+//     correlated to the same record and carried to the same tuple either way.
+// The event is counted so it stays observable through drainDhtSetupAuditEvents.
+function retransmitted(state, correlation, kind, packet) {
+  if (correlation === undefined) return false
+  if (correlation.type !== kind || !b4a.equals(correlation.payload, packet)) {
+    invalid('PROCESS_DHT_SETUP_REPLAY')
+  }
+  // Keep the original correlation and its expiry: a retransmission puts another
+  // copy in flight, it does not open a second exchange, so the only thing that
+  // grows is the number of replies the exchange may draw.
+  correlation.pending++
+  state.retransmissions++
+  return true
+}
+
+// A reply answers one copy of the request, so N accepted copies may draw N
+// replies and the correlation clears once the last copy has been answered.
+function consumeReply(state, key, correlation) {
+  if (--correlation.pending > 0) return
+  state.correlations.delete(key)
+}
+
+function addCorrelation(state, key, value, packet) {
   purgeExpired(state)
+  if (retransmitted(state, state.correlations.get(key), value.type, packet)) return
   if (state.correlations.size >= state.maximumCorrelations) {
     invalid('PROCESS_DHT_SETUP_CORRELATION_OVERFLOW')
   }
-  if (state.correlations.has(key)) invalid('PROCESS_DHT_SETUP_REPLAY')
   state.correlations.set(key, {
     ...value,
-    expiresAt: now(state) + DEFAULT_CORRELATION_TTL_MS
+    expiresAt: now(state) + DEFAULT_CORRELATION_TTL_MS,
+    payload: b4a.from(packet),
+    pending: 1
   })
 }
 
@@ -159,6 +198,15 @@ function setupRequest(state, socketState, packet, decoded, host, port, ttl) {
   }
   if (tupleKey(socketState.boundAddress) !== state.sourceKey) {
     invalid('PROCESS_DHT_SETUP_SOURCE')
+  }
+  // A retransmission arrives while the first copy is still outstanding, so the
+  // arm below is already open and the audit record already exists. Re-send the
+  // same bytes against that record instead of tripping the arm check or opening a
+  // second record: identical bytes cleared those checks when the first copy did.
+  const key = correlationKey('setup', host, port, decoded.transactionId)
+  purgeExpired(state)
+  if (retransmitted(state, state.correlations.get(key), 'setup', packet)) {
+    return socketState.socket.trySend(packet, port, host, ttl)
   }
   const arm = state.arms[0]
   if (!arm || arm.open) invalid('PROCESS_DHT_SETUP_UNARMED')
@@ -203,13 +251,17 @@ function setupRequest(state, socketState, packet, decoded, host, port, ttl) {
   arm.open = true
   arm.recordNonce = nonce
   arm.recordSequence = recordSequence
-  const key = correlationKey('setup', host, port, decoded.transactionId)
-  addCorrelation(state, key, {
-    arm,
-    destination: state.destinationKey,
-    transactionId: decoded.transactionId,
-    type: 'setup'
-  })
+  addCorrelation(
+    state,
+    key,
+    {
+      arm,
+      destination: state.destinationKey,
+      transactionId: decoded.transactionId,
+      type: 'setup'
+    },
+    packet
+  )
   emitAudit(state, 'audit-open', open)
   try {
     return socketState.socket.trySend(packet, port, host, ttl)
@@ -222,6 +274,8 @@ function setupRequest(state, socketState, packet, decoded, host, port, ttl) {
 function closeSetup(state, key, packet, outcome = AUDIT_OUTCOMES.SUCCESS) {
   const correlation = state.correlations.get(key)
   if (!correlation || correlation.type !== 'setup') invalid('PROCESS_DHT_SETUP_FORGED_RESPONSE')
+  // The record closes once however many copies of the request went out; a later
+  // duplicate reply finds no correlation and is judged a forged response.
   state.correlations.delete(key)
   const arm = correlation.arm
   const close = state.audit.close({
@@ -255,10 +309,15 @@ function outgoing(state, socketState, packet, port, host, ttl) {
     if (!state.permittedTuples.has(destinationKey) || tupleKey(decoded.to) !== destinationKey) {
       invalid('PROCESS_DHT_SETUP_DESTINATION')
     }
-    addCorrelation(state, correlationKey('internal', host, port, decoded.transactionId), {
-      transactionId: decoded.transactionId,
-      type: 'internal'
-    })
+    addCorrelation(
+      state,
+      correlationKey('internal', host, port, decoded.transactionId),
+      {
+        transactionId: decoded.transactionId,
+        type: 'internal'
+      },
+      packet
+    )
     return socketState.socket.trySend(packet, port, host, ttl)
   }
 
@@ -267,7 +326,7 @@ function outgoing(state, socketState, packet, port, host, ttl) {
   if (!correlation || correlation.type !== 'server') {
     invalid('PROCESS_DHT_SETUP_UNCLASSIFIED')
   }
-  state.correlations.delete(key)
+  consumeReply(state, key, correlation)
   return socketState.socket.trySend(packet, port, host, ttl)
 }
 
@@ -282,15 +341,17 @@ function inbound(state, socketState, packet, source) {
     }
     const setupKey = correlationKey('setup', source.host, source.port, decoded.transactionId)
     const internalKey = correlationKey('internal', source.host, source.port, decoded.transactionId)
+    const internal = state.correlations.get(internalKey)
     if (state.correlations.has(setupKey)) closeSetup(state, setupKey, packet)
-    else if (state.correlations.has(internalKey)) state.correlations.delete(internalKey)
+    else if (internal !== undefined) consumeReply(state, internalKey, internal)
     else invalid('PROCESS_DHT_SETUP_FORGED_RESPONSE')
   } else {
     if (tupleKey(decoded.to) !== state.observedSourceKey) invalid('PROCESS_DHT_SETUP_SOURCE')
     addCorrelation(
       state,
       correlationKey('server', source.host, source.port, decoded.transactionId),
-      { transactionId: decoded.transactionId, type: 'server' }
+      { transactionId: decoded.transactionId, type: 'server' },
+      packet
     )
   }
   for (const listener of socketState.messageListeners.slice()) listener(packet, source)
@@ -454,6 +515,7 @@ function createDhtSetupAuditController(options) {
     phaseSequence: options.phaseSequence,
     randomBytes: options.randomBytes,
     recordSequence: 0n,
+    retransmissions: 0,
     sockets: new Set(),
     observedSource,
     observedSourceKey: tupleKey(observedSource),
@@ -516,6 +578,10 @@ function drainDhtSetupAuditEvents(controller) {
   if (!state || state.destroyed) invalid('PROCESS_DHT_SETUP_DESTROYED')
   const events = state.eventQueue.slice()
   state.eventQueue.length = 0
+  // Retransmissions are not audit events - the control codec pins the field list
+  // of audit-open and audit-close - so the running total rides on the drained
+  // array, the only diagnostic surface this file exposes. Nothing is printed.
+  events.retransmissions = state.retransmissions
   return Object.freeze(events)
 }
 
