@@ -13,6 +13,11 @@ const { PassThrough, Writable } = require('stream')
 const EventEmitter = require('events')
 const b4a = require('b4a')
 const { peerKeyPair, proberKeyPair } = require('./identity')
+const { OP, FrameReader } = require('./frames')
+
+// Mirrors role-bridge.js: one byte says whether a connection asks for addresses or
+// carries a role's control stream.
+const MODE = Object.freeze({ REPORT: 1, ATTACH: 2 })
 
 const CONNECT_TIMEOUT_MS = 30_000
 
@@ -40,6 +45,9 @@ class RemoteChild extends EventEmitter {
       }
     })
 
+    // The bridge needs to know this stream carries a role before any control byte
+    // arrives.
+    socket.write(b4a.from([MODE.ATTACH]))
     socket.on('data', (chunk) => this.stdout.write(chunk))
     socket.on('error', (err) => this._settle(1, null, err))
     socket.once('close', () => this._settle(0, null, null))
@@ -76,6 +84,43 @@ function connect(node, keyPair, publicKey) {
       reject(err)
     })
   })
+}
+
+// Each role's own addresses, asked for before the topology that will contain them
+// is minted. Retried until the deadline because roles come up minutes apart on CI.
+async function requestRoleEndpoints(options) {
+  const { node, secret, runId, count, deadline } = options
+  const keyPair = proberKeyPair(secret, runId)
+  const endpoints = []
+  for (let index = 1; index <= count; index++) {
+    const target = peerKeyPair(secret, runId, index).publicKey
+    let report = null
+    let lastError = null
+    while (report === null && Date.now() < deadline) {
+      let socket = null
+      try {
+        socket = await connect(node, keyPair, target)
+        socket.on('error', () => {})
+        const reader = new FrameReader(socket)
+        socket.write(b4a.from([MODE.REPORT]))
+        const frame = await reader.next(20_000)
+        if (frame.op !== OP.REPORT) throw new Error('unexpected frame')
+        report = JSON.parse(b4a.toString(frame.payload, 'utf8'))
+        socket.destroy()
+      } catch (err) {
+        if (socket) socket.destroy()
+        lastError = err
+        await new Promise((resolve) => setTimeout(resolve, 5000))
+      }
+    }
+    if (report === null) {
+      throw new Error(`role ${index} never reported: ${lastError && lastError.message}`)
+    }
+    if (report.index !== index) throw new Error(`role ${index} reported as ${report.index}`)
+    if (!report.reachable) throw new Error(`role ${index} has no reachable address`)
+    endpoints.push({ bind: report.bind, reachable: report.reachable })
+  }
+  return endpoints
 }
 
 // projections must be in ROLES order, exactly as spawnRoleProcesses returns them,
@@ -131,4 +176,10 @@ function closeRemoteRoleChannels(entries) {
   return true
 }
 
-module.exports = { openRemoteRoleChannels, closeRemoteRoleChannels, RemoteChild, b4a }
+module.exports = {
+  MODE,
+  openRemoteRoleChannels,
+  closeRemoteRoleChannels,
+  requestRoleEndpoints,
+  RemoteChild
+}

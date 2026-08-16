@@ -51,17 +51,26 @@ function registerLiveProcessSuite(launch) {
   const label = launch.label ? ` on ${launch.label}` : ''
 
   test(`live private route lifecycle in eleven ${launch.runtime} role processes${label}`, async (t) => {
+    // `launch.prepare` lets the roles live somewhere this process cannot spawn
+    // them. It returns the addresses each role discovered for itself, which the
+    // topology is then minted from, and a way to open their control channels. The
+    // scenario below is identical either way: same protocol, same auditing.
+    const prepared = launch.prepare ? await launch.prepare(t) : null
     const topology = createLiveProcessTopology({
       plan,
+      ...(prepared && prepared.endpoints ? { endpoints: prepared.endpoints } : {}),
       ...capabilities(launch.runtime === 'node' ? 0x31 : 0x32)
     })
     const placement = launch.createPlacement ? launch.createPlacement(topology) : null
     const auditor = createProcessConfigAuditor(topology.oracle)
     auditor.auditAll(topology.projections)
-    const children = spawnRoleProcesses(launch.runtime, topology.projections, {
-      enter: placement ? placement.enter : undefined,
-      nodePath: launch.nodePath
-    })
+    const children =
+      prepared && prepared.openChannels
+        ? await prepared.openChannels(topology.projections)
+        : spawnRoleProcesses(launch.runtime, topology.projections, {
+            enter: placement ? placement.enter : undefined,
+            nodePath: launch.nodePath
+          })
     const control = createProcessControl({ auditor, children })
     const phases = new Map(ROLES.map((role) => [role, 1n]))
     const generations = new Map(

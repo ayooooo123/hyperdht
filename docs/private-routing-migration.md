@@ -213,6 +213,48 @@ the host, and the cause has not been isolated further than that. Either way, a
 remote peer belongs on a runner; the container stays for the kernel-dependent
 gates above.
 
+#### A route across separate hosts
+
+`PROCESS_PLANS.DHT_MESH` builds the eleven-role topology from addresses discovered
+at runtime instead of deriving `127.64.x.1`. Each role supplies two tuples,
+because they are not the same address: a role binds a socket it owns, and
+publishes the address peers must dial. Reachable values drive everything published
+(advertisements, adjacency contacts, link specs, DHT peer lists, the firewall map,
+the leak oracle's endpoint address); the bind tuple is used only where a socket is
+bound, including a DHT role's own host and port.
+
+`test/remote-peer/role-bridge.js` hosts one role on another machine. One byte
+decides what a coordinator connection is for: ask for the role's addresses, or
+attach and become the role's control stream. The role process itself is
+`test/private/process/role-runner.js`, unmodified, so a distributed run executes
+the same program the local gates do.
+`test/remote-peer/role-channels.js` presents those streams to
+`test/private/process/coordinator.js` as child processes, and
+`test/remote-peer/live-route.js` supplies both halves to the existing scenario
+through a `prepare` hook.
+
+`scripts/live-route-rehearsal.sh` runs the whole path on one machine against a
+throwaway DHT. Observed: eleven bridges answered with their addresses, the
+topology was minted from those answers, eleven control channels opened, and the
+roles were configured. The run then stops in `role-runner.js`, which derives peer
+addresses from the plan name and rejects an unknown one:
+
+- `role-runner.js:135` `tupleForRole()` and `role-runner.js:150`
+  `planCapability()` accept only the two derived plans and throw
+  `PROCESS_PROJECTION_INVALID` otherwise. That is where the rehearsal stops, at
+  `dht-referral`.
+- `role-runner.js:146` `exitDhtTupleForRole()` derives a peer exit's DHT-exit
+  address as `tupleForRole(i).host` with port `43_000 + i`. An exit binds that
+  second socket at `role-runner.js:360`, and behind a NAT it carries its own
+  separate mapping, so it cannot be derived from another role's address.
+
+Finishing the distributed run therefore needs three things, all bounded: each exit
+discovers a second mapping for its DHT-exit socket; the topology carries the
+reachable tuples the three DHT roles need, including those exit mappings; and
+`role-runner.js` reads them from the projection under `DHT_MESH` rather than
+deriving them. No transport question remains open, since 90/90 directed
+cell-socket pairs already reach each other between runners.
+
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
 **Status: one cause fixed, one open. Never reproduced locally.**
