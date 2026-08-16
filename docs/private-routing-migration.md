@@ -234,26 +234,32 @@ the same program the local gates do.
 through a `prepare` hook.
 
 `scripts/live-route-rehearsal.sh` runs the whole path on one machine against a
-throwaway DHT. Observed: eleven bridges answered with their addresses, the
-topology was minted from those answers, eleven control channels opened, and the
-roles were configured. The run then stops in `role-runner.js`, which derives peer
-addresses from the plan name and rejects an unknown one:
+throwaway DHT: eleven bridges answer with their addresses, the topology is minted
+from those answers, eleven control channels open, and the scenario runs.
 
-- `role-runner.js:135` `tupleForRole()` and `role-runner.js:150`
-  `planCapability()` accept only the two derived plans and throw
-  `PROCESS_PROJECTION_INVALID` otherwise. That is where the rehearsal stops, at
-  `dht-referral`.
-- `role-runner.js:146` `exitDhtTupleForRole()` derives a peer exit's DHT-exit
-  address as `tupleForRole(i).host` with port `43_000 + i`. An exit binds that
-  second socket at `role-runner.js:360`, and behind a NAT it carries its own
-  separate mapping, so it cannot be derived from another role's address.
+**Status: incomplete.** The rehearsal reaches 21 of 22 assertions and then fails,
+so a distributed route is not yet proven. Ordered DHT setup, the immutable store
+with its three audited opens and closes, and every snapshot pass; route
+establishment then fails, where `announce-exit` rejects its incoming extension with
+an error carrying no code, from `role-runner.js:430`.
 
-Finishing the distributed run therefore needs three things, all bounded: each exit
-discovers a second mapping for its DHT-exit socket; the topology carries the
-reachable tuples the three DHT roles need, including those exit mappings; and
-`role-runner.js` reads them from the projection under `DHT_MESH` rather than
-deriving them. No transport question remains open, since 90/90 directed
-cell-socket pairs already reach each other between runners.
+Getting that far drove out three layers that each treated a role's local address
+and its published address as one value. They are equal only when nothing translates
+in between, which is what a run across hosts breaks:
+
+- `topology-fixture.js` now carries a bind tuple and a reachable tuple per role,
+  and an exit also publishes the address of the second socket it binds at
+  `role-runner.js:360` for reaching DHT nodes. No role can derive a peer's address
+  under this plan, so they travel with the projection as `meshPeers`.
+- `audit-event.js:373` built a record's addresses from the plan name. Under the
+  discovered plan the two addresses a record binds are stated instead, encoded to
+  the same nineteen bytes the derived plans produce.
+- `dht-setup-audit-udx.js` compared one address against both the socket's own bind
+  and the address a peer reports back. Those are now separate: the bind check uses
+  the local address, the reply checks and the record use the observed one.
+
+No transport question remains open, since 90/90 directed cell-socket pairs already
+reach each other between runners.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 

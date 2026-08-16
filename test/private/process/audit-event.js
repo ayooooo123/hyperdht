@@ -347,6 +347,38 @@ function eventMac(fields, discriminator, key) {
   }
 }
 
+// A tuple in wire form from an address a role discovered. Same nineteen bytes the
+// derived plans produce, so a record's digest is built the one way.
+function statedTuple(value) {
+  const output = b4a.allocUnsafeSlow(19)
+  bufferFill.call(output, 0)
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    typeof value.host !== 'string' ||
+    !uint16(value.port)
+  ) {
+    clear(output)
+    invalid()
+  }
+  const parts = value.host.split('.')
+  if (parts.length !== 4) {
+    clear(output)
+    invalid()
+  }
+  output[0] = 4
+  for (let index = 0; index < 4; index++) {
+    const octet = Number(parts[index])
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) {
+      clear(output)
+      invalid()
+    }
+    output[13 + index] = octet
+  }
+  writeU16(output, value.port, 17)
+  return output
+}
+
 function projectedTuple(plan, roleIndex) {
   const output = b4a.allocUnsafeSlow(19)
   bufferFill.call(output, 0)
@@ -371,15 +403,29 @@ function projectedTuple(plan, roleIndex) {
 }
 
 function issueAuditContext(value) {
-  exactObject(value, ['destinationRoleIndex', 'phase', 'plan', 'roleIndex'])
+  // Under the discovered plan no address can be derived from a role index, so the
+  // two addresses this record binds are stated instead.
+  const mesh = value !== null && typeof value === 'object' && value.plan === PROCESS_PLANS.DHT_MESH
+  exactObject(
+    value,
+    mesh
+      ? ['destinationRoleIndex', 'destinationTuple', 'phase', 'plan', 'roleIndex', 'sourceTuple']
+      : ['destinationRoleIndex', 'phase', 'plan', 'roleIndex']
+  )
   if (
     (value.plan !== PROCESS_PLANS.PORTABLE_LOOPBACK &&
-      value.plan !== PROCESS_PLANS.LINUX_NAMESPACE) ||
+      value.plan !== PROCESS_PLANS.LINUX_NAMESPACE &&
+      !mesh) ||
     !uint8(value.roleIndex) ||
     !uint8(value.destinationRoleIndex) ||
     !AUDIT_PHASE_BYTES.has(value.phase)
   )
     invalid()
+  if (mesh) {
+    // Validated now so a bad address fails at issue rather than mid-record.
+    clear(statedTuple(value.sourceTuple))
+    clear(statedTuple(value.destinationTuple))
+  }
   const setup =
     value.roleIndex === 10 &&
     value.destinationRoleIndex === 11 &&
@@ -394,6 +440,18 @@ function issueAuditContext(value) {
     capability,
     Object.freeze({
       destinationRoleIndex: value.destinationRoleIndex,
+      ...(mesh
+        ? {
+            destinationTuple: Object.freeze({
+              host: value.destinationTuple.host,
+              port: value.destinationTuple.port
+            }),
+            sourceTuple: Object.freeze({
+              host: value.sourceTuple.host,
+              port: value.sourceTuple.port
+            })
+          }
+        : {}),
       phase: value.phase,
       plan: value.plan,
       roleIndex: value.roleIndex
@@ -418,11 +476,17 @@ function validateOptions(options) {
   const context = AUDIT_CONTEXTS.get(options.context)
   if (!context) invalid()
   return {
-    destination: projectedTuple(context.plan, context.destinationRoleIndex),
+    destination:
+      context.plan === PROCESS_PLANS.DHT_MESH
+        ? statedTuple(context.destinationTuple)
+        : projectedTuple(context.plan, context.destinationRoleIndex),
     destinationRoleIndex: context.destinationRoleIndex,
     phase: context.phase,
     roleIndex: context.roleIndex,
-    source: projectedTuple(context.plan, context.roleIndex)
+    source:
+      context.plan === PROCESS_PLANS.DHT_MESH
+        ? statedTuple(context.sourceTuple)
+        : projectedTuple(context.plan, context.roleIndex)
   }
 }
 

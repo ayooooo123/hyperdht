@@ -118,7 +118,11 @@ async function requestRoleEndpoints(options) {
     }
     if (report.index !== index) throw new Error(`role ${index} reported as ${report.index}`)
     if (!report.reachable) throw new Error(`role ${index} has no reachable address`)
-    endpoints.push({ bind: report.bind, reachable: report.reachable })
+    const entry = { bind: report.bind, reachable: report.reachable }
+    // Only an exit reports one, and the topology requires it from exactly those
+    // roles.
+    if (report.dhtExit) entry.dhtExit = report.dhtExit
+    endpoints.push(entry)
   }
   return endpoints
 }
