@@ -12,26 +12,58 @@
 const { PassThrough, Writable } = require('stream')
 const EventEmitter = require('events')
 const b4a = require('b4a')
-const { peerKeyPair, proberKeyPair } = require('./identity')
+const { peerKeyPair, coordinatorKeyPair } = require('./identity')
 const { OP, FrameReader } = require('./frames')
 
-// Mirrors role-bridge.js: one byte says whether a connection asks for addresses or
-// carries a role's control stream.
-const MODE = Object.freeze({ REPORT: 1, ATTACH: 2 })
+// Mirrors role-bridge.js: one byte says whether a connection asks for addresses,
+// carries a role's control stream, or asks for a role's terminal status.
+const MODE = Object.freeze({ REPORT: 1, ATTACH: 2, STATUS: 3 })
 
 const CONNECT_TIMEOUT_MS = 30_000
+// A stream event says a role is gone; it never says how it went. The bridge's
+// status record is the only place the exit code, the signal and anything the role
+// wrote to stderr exist, so it is fetched on its own connection once the control
+// stream is over. The fetch is bounded in attempts and in time, and a record that
+// cannot be reached fails the channel: a crashed or killed role must never arrive
+// as a clean finish.
+//
+// Each attempt is bounded separately so one hung connect cannot eat the whole
+// window and leave no retry. Latency matters beyond the bound: a role that dies
+// mid-command races the coordinator's own five-second command deadline
+// (coordinator.js:16), and the fetch has to win that race for the run to be told
+// "the role exited with code N" rather than "the role did not answer". Both fail,
+// so nothing is hidden either way, but only one of them names the cause.
+const STATUS_TIMEOUT_MS = 15_000
+const STATUS_CONNECT_TIMEOUT_MS = 5_000
+const STATUS_FRAME_TIMEOUT_MS = 5_000
+const STATUS_ATTEMPTS = 3
+const STATUS_RETRY_MS = 500
 
 class RemoteChild extends EventEmitter {
-  constructor(socket, index) {
+  // options carries what a status fetch needs: the coordinator's node and key pair,
+  // and this role's public key. openRemoteRoleChannels holds all three at the point
+  // it dials the control stream, so nothing else has to derive them.
+  constructor(socket, index, options = {}) {
     super()
     this.index = index
     this.killed = false
     this.exited = false
     this.stdout = new PassThrough()
-    // A remote role's stderr never carries bytes: the bridge reports role stderr
-    // out of band. The stream exists because the coordinator subscribes to it.
+    // Nothing arrives here while the channel is live: role stderr on the control
+    // stream would corrupt it, so the bridge counts the bytes and keeps a bounded
+    // sample, and _replayStderr writes that sample in before the exit. The
+    // coordinator's own stderr check (coordinator.js:279) then fires for a remote
+    // role exactly as it does for a spawned one.
     this.stderr = new PassThrough()
     this._socket = socket
+    this._statusEndpoint = {
+      node: options.node || null,
+      keyPair: options.keyPair || null,
+      publicKey: options.publicKey || null,
+      timeoutMs: options.statusTimeoutMs || STATUS_TIMEOUT_MS
+    }
+    this._transportError = null
+    this._finishing = false
 
     const self = this
     this.stdin = new Writable({
@@ -57,17 +89,120 @@ class RemoteChild extends EventEmitter {
     // arrives.
     socket.write(b4a.from([MODE.ATTACH]))
     socket.on('data', (chunk) => this.stdout.write(chunk))
-    // A role that finished its work exits zero and its bridge ends the stream. That
-    // half-close is the exit: waiting for 'close' instead can wait forever, because
-    // a stream only closes once both sides have ended. The suite requires an exit
-    // with code zero here, so the mapping has to be end means finished.
+    // A role that finished its work exits zero and its bridge ends the stream; a
+    // role that failed has its stream destroyed, and that can arrive as a close with
+    // no error at all. Neither event carries an outcome, so all three start the same
+    // bounded status fetch and the exit is settled from what it returns. Waiting for
+    // 'close' alone would also wait forever on a half-open stream, which is why the
+    // 'end' is acted on immediately.
     socket.on('end', () => {
       if (typeof socket.end === 'function') socket.end()
-      this._settle(0, null, null)
+      this._finish(null)
     })
-    socket.on('error', (err) => this._settle(1, null, err))
-    socket.once('close', () => this._settle(0, null, null))
+    socket.on('error', (err) => this._finish(err))
+    socket.once('close', () => this._finish(null))
   }
+
+  // The control stream is over. What the role did lives in the bridge's status
+  // record, so it is fetched here and the exit settled from it; an unreachable
+  // record settles a failure.
+  _finish(err) {
+    if (err && this._transportError === null) this._transportError = err
+    if (this.exited || this._finishing) return
+    this._finishing = true
+    this._fetchStatus().then(
+      (record) => this._settleFromStatus(record),
+      (failure) => this._settle(1, null, this._transportError || failure)
+    )
+  }
+
+  async _settleFromStatus(record) {
+    if (this.exited) return
+    if (this._replayStderr(record)) {
+      // The exit must not overtake the bytes. The coordinator fails a run on the
+      // stderr chunk itself, and one that saw the exit first would report the wrong
+      // reason for the same fault.
+      await new Promise((resolve) => setImmediate(resolve))
+      if (this.exited) return
+    }
+    const exited = record !== null && typeof record === 'object' && record.exited === true
+    const code = exited && Number.isInteger(record.code) ? record.code : null
+    const signal =
+      exited && typeof record.signal === 'string' && record.signal.length > 0 ? record.signal : null
+    if (code === null && signal === null) {
+      // Fail closed. The far side is gone and nothing establishes that the role
+      // finished, so the channel reports a failure rather than the zero a bare
+      // stream event used to produce.
+      this._settle(
+        1,
+        null,
+        this._transportError || new Error(`role ${this.index} reported no terminal status`)
+      )
+      return
+    }
+    // A transport error alongside a definite outcome is the protocol working: the
+    // bridge destroys a failed role's stream on purpose. A spawned child that exits
+    // non-zero emits 'exit' alone, and this must too, or the coordinator would see
+    // PROCESS_CHILD_ERROR where a local run sees PROCESS_EARLY_EXIT.
+    this._settle(code, signal, null)
+  }
+
+  // Whatever the role wrote to stderr, replayed into the stream the coordinator
+  // subscribed to. A count with no sample still has to arrive: what matters is that
+  // a role which wrote stderr fails the run, not that the text survived.
+  _replayStderr(record) {
+    if (record === null || typeof record !== 'object') return false
+    const bytes = Number.isInteger(record.stderrBytes) ? record.stderrBytes : 0
+    const sample = typeof record.stderrSample === 'string' ? record.stderrSample : ''
+    if (bytes === 0 && sample.length === 0) return false
+    const text = sample.length > 0 ? sample : `role ${this.index} wrote ${bytes} stderr bytes\n`
+    this.stderr.write(b4a.from(text, 'utf8'))
+    return true
+  }
+
+  async _fetchStatus() {
+    const { node, keyPair, publicKey, timeoutMs } = this._statusEndpoint
+    if (node === null || keyPair === null || publicKey === null) {
+      throw new Error(`role ${this.index} has no status endpoint`)
+    }
+    const deadline = Date.now() + timeoutMs
+    let lastError = null
+    for (let attempt = 1; attempt <= STATUS_ATTEMPTS; attempt++) {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      let socket = null
+      try {
+        socket = await connect(
+          node,
+          keyPair,
+          publicKey,
+          Math.min(STATUS_CONNECT_TIMEOUT_MS, remaining)
+        )
+        socket.on('error', () => {})
+        const reader = new FrameReader(socket)
+        // A stream that died between the open and here raises no further event, so
+        // the reader would sit out its timeout for nothing.
+        if (socket.destroyed) throw new Error('status stream closed before the request')
+        socket.write(b4a.from([MODE.STATUS]))
+        const frame = await reader.next(
+          Math.max(1000, Math.min(STATUS_FRAME_TIMEOUT_MS, deadline - Date.now()))
+        )
+        if (frame.op !== OP.REPORT) throw new Error(`unexpected status frame ${frame.op}`)
+        const record = JSON.parse(b4a.toString(frame.payload, 'utf8'))
+        socket.destroy()
+        return record
+      } catch (err) {
+        if (socket !== null) socket.destroy()
+        lastError = err
+        if (attempt === STATUS_ATTEMPTS || Date.now() + STATUS_RETRY_MS >= deadline) break
+        await new Promise((resolve) => setTimeout(resolve, STATUS_RETRY_MS))
+      }
+    }
+    throw new Error(
+      `role ${this.index} terminal status unavailable: ${lastError && lastError.message}`
+    )
+  }
+
   _settle(code, signal, err) {
     if (this.exited) return
     this.exited = true
@@ -81,7 +216,8 @@ class RemoteChild extends EventEmitter {
     // A killed child reports no exit code and the signal that killed it. Reporting a
     // zero exit here would make a role that was cut down indistinguishable from one
     // that finished its work, which is exactly the confusion a green run must not
-    // hide.
+    // hide. This is the one settle that needs no status record: the coordinator asked
+    // for the signal, so it already knows the outcome.
     this.killed = true
     const settled = this.exited
     this._settle(null, typeof signal === 'string' ? signal : 'SIGTERM', null)
@@ -90,13 +226,13 @@ class RemoteChild extends EventEmitter {
   }
 }
 
-function connect(node, keyPair, publicKey) {
+function connect(node, keyPair, publicKey, timeoutMs = CONNECT_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const socket = node.connect(publicKey, { keyPair })
     const timer = setTimeout(() => {
       socket.destroy()
       reject(new Error('role did not accept in time'))
-    }, CONNECT_TIMEOUT_MS)
+    }, timeoutMs)
     socket.once('open', () => {
       clearTimeout(timer)
       resolve(socket)
@@ -105,14 +241,23 @@ function connect(node, keyPair, publicKey) {
       clearTimeout(timer)
       reject(err)
     })
+    // A far side that closes without an error would otherwise hold this open for the
+    // whole timeout. After the open resolved this is a no-op.
+    socket.once('close', () => {
+      clearTimeout(timer)
+      reject(new Error('role closed the connection before it opened'))
+    })
   })
 }
 
 // Each role's own addresses, asked for before the topology that will contain them
 // is minted. Retried until the deadline because roles come up minutes apart on CI.
 async function requestRoleEndpoints(options) {
-  const { node, secret, runId, count, deadline } = options
-  const keyPair = proberKeyPair(secret, runId)
+  const { node, secret, coordinatorSecret, runId, count, deadline } = options
+  if (!coordinatorSecret) {
+    throw new Error('coordinatorSecret is required: roles pin only its public key')
+  }
+  const keyPair = coordinatorKeyPair(coordinatorSecret)
   const endpoints = []
   for (let index = 1; index <= count; index++) {
     const target = peerKeyPair(secret, runId, index).publicKey
@@ -152,11 +297,14 @@ async function requestRoleEndpoints(options) {
 // projections must be in ROLES order, exactly as spawnRoleProcesses returns them,
 // so the coordinator's records line up with the roles the topology describes.
 async function openRemoteRoleChannels(options) {
-  const { node, secret, runId, projections, deadline } = options
+  const { node, secret, coordinatorSecret, runId, projections, deadline } = options
   if (!Array.isArray(projections) || projections.length === 0) {
     throw new Error('projections are required')
   }
-  const keyPair = proberKeyPair(secret, runId)
+  if (!coordinatorSecret) {
+    throw new Error('coordinatorSecret is required: roles pin only its public key')
+  }
+  const keyPair = coordinatorKeyPair(coordinatorSecret)
   const entries = []
   for (let offset = 0; offset < projections.length; offset++) {
     const projection = projections[offset]
@@ -181,7 +329,7 @@ async function openRemoteRoleChannels(options) {
     }
     entries.push(
       Object.freeze({
-        child: new RemoteChild(socket, index),
+        child: new RemoteChild(socket, index, { node, keyPair, publicKey: target }),
         generation: projection.generation,
         phaseGate: projection.phaseGate || null,
         phaseSequence: 1n,

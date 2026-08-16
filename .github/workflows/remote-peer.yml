@@ -6,6 +6,13 @@ name: Remote Peer
 # the peer keys are never inputs and never appear in the log; the prober derives
 # the same keys and finds the peers over the DHT.
 #
+# The prober's own key is not in that set. Every peer here holds the shared
+# secret, so a prober key derived from it would be a key every peer could mint,
+# and the firewall pin below would stop nothing. The prober keeps its secret on
+# the workstation and passes only the matching public key, as the coordinator_key
+# input. That input is public material by construction, which is exactly why it
+# may travel where the shared secret may not.
+#
 # Dispatch with scripts/remote-peer.sh, which also does the timing.
 
 on:
@@ -28,6 +35,9 @@ on:
           - ubuntu-latest
           - macos-latest
           - windows-latest
+      coordinator_key:
+        description: Hex public key of the prober allowed to connect (scripts/remote-peer.sh secret prints it)
+        required: true
 
 jobs:
   peer:
@@ -47,6 +57,7 @@ jobs:
         env:
           PEERS: ${{ inputs.peers }}
           SECONDS_INPUT: ${{ inputs.seconds }}
+          COORDINATOR_KEY: ${{ inputs.coordinator_key }}
           INDEX: ${{ matrix.index }}
         run: |
           # Read through env, never by pasting inputs into the script body, and
@@ -60,6 +71,22 @@ jobs:
           esac
           if [ "$SECONDS_INPUT" -lt 30 ] || [ "$SECONDS_INPUT" -gt 1500 ]; then
             echo "seconds must be 30 to 1500, got: $SECONDS_INPUT" >&2
+            exit 1
+          fi
+          # A malformed pin is caught here rather than 20 minutes later: a peer
+          # whose firewall was pinned to nonsense refuses every connection, and
+          # the run would look like a reachability failure instead of a typo.
+          # Whitespace is stripped first so this gate accepts exactly what
+          # identity.js accepts, no more and no less.
+          COORDINATOR_KEY="$(printf '%s' "$COORDINATOR_KEY" | tr -d '[:space:]')"
+          case "$COORDINATOR_KEY" in
+            '' | *[!0-9a-fA-F]*)
+              echo "coordinator_key must be hex" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#COORDINATOR_KEY}" -ne 64 ]; then
+            echo "coordinator_key must be 64 hex characters, got ${#COORDINATOR_KEY}" >&2
             exit 1
           fi
           if [ "$INDEX" -le "$PEERS" ]; then
@@ -80,6 +107,7 @@ jobs:
         shell: bash
         env:
           REMOTE_PEER_SECRET: ${{ secrets.REMOTE_PEER_SECRET }}
+          REMOTE_PEER_COORDINATOR_KEY: ${{ inputs.coordinator_key }}
           REMOTE_PEER_RUN_ID: ${{ github.run_id }}
           PEER_INDEX: ${{ matrix.index }}
           PEER_SECONDS: ${{ inputs.seconds }}

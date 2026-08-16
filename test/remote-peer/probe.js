@@ -4,6 +4,7 @@
 // reason when no run is configured, so it is safe in any suite.
 //
 //   REMOTE_PEER_SECRET=<hex> REMOTE_PEER_RUN_ID=<id> REMOTE_PEER_COUNT=3 \
+//     REMOTE_PEER_COORDINATOR_SECRET=<hex> \
 //     brittle-node test/remote-peer/probe.js
 //
 // Every peer is measured at the same time, on purpose: concurrent connects are
@@ -14,7 +15,7 @@ const test = require('brittle')
 const b4a = require('b4a')
 const DHT = require('../..')
 const crypto = require('hypercore-crypto')
-const { peerKeyPair, proberKeyPair } = require('./identity')
+const { peerKeyPair, coordinatorKeyPair } = require('./identity')
 
 const PING_SAMPLES = 64
 const ECHO_BYTES = 1024 * 1024
@@ -25,6 +26,9 @@ const BULK_TIMEOUT_MS = 60_000
 function config() {
   const secret = process.env.REMOTE_PEER_SECRET
   const runId = process.env.REMOTE_PEER_RUN_ID
+  // The prober's own secret, which the peers never see: they are given only its
+  // public key to pin.
+  const coordinatorSecret = process.env.REMOTE_PEER_COORDINATOR_SECRET
   const count = Number(process.env.REMOTE_PEER_COUNT || 1)
   const waitMs = Number(process.env.REMOTE_PEER_WAIT_SECONDS || 300) * 1000
   const bootstrap = (process.env.REMOTE_PEER_BOOTSTRAP || '')
@@ -45,7 +49,17 @@ function config() {
   if (listed.length > 0) indexes.push(...listed)
   else for (let index = 1; index <= count; index++) indexes.push(index)
   if (!secret || !runId) return null
-  return { secret, runId, indexes, waitMs, bootstrap }
+  // A run is configured, so a missing prober secret is a fault, not an
+  // unconfigured harness: skipping here would report a pass for peers nobody
+  // could have reached.
+  if (!coordinatorSecret) {
+    throw new Error(
+      'REMOTE_PEER_COORDINATOR_SECRET is required alongside REMOTE_PEER_SECRET: ' +
+        'the workstation-only secret whose public key the peers pin, ' +
+        'from scripts/remote-peer.sh secret'
+    )
+  }
+  return { secret, coordinatorSecret, runId, indexes, waitMs, bootstrap }
 }
 
 class Framed {
@@ -191,7 +205,7 @@ test('remote peers answer and their timings are recorded', async (t) => {
   // booting on the runner when the probe starts.
   t.timeout(options.waitMs + 120_000)
 
-  const keyPair = proberKeyPair(options.secret, options.runId)
+  const keyPair = coordinatorKeyPair(options.coordinatorSecret)
   const node = new DHT({
     bootstrap: options.bootstrap.length > 0 ? options.bootstrap : undefined
   })
@@ -254,7 +268,7 @@ test('remote peers answer and their timings are recorded', async (t) => {
   }
 })
 
-test('a peer refuses anyone but the derived prober', async (t) => {
+test('a peer refuses anyone but the pinned prober', async (t) => {
   const options = config()
   if (options === null) {
     t.comment('skipped: set REMOTE_PEER_SECRET and REMOTE_PEER_RUN_ID to time a run')
@@ -269,8 +283,9 @@ test('a peer refuses anyone but the derived prober', async (t) => {
   })
   t.teardown(() => node.destroy(), { order: Infinity })
 
-  // A stranger who knows the peer key but not the secret has no matching prober
-  // key, so the peer firewall must never hand it a stream.
+  // A stranger who holds the whole shared run secret still has no matching prober
+  // key, because the prober's key comes from a secret that never left the
+  // workstation, so the peer firewall must never hand it a stream.
   const stranger = crypto.keyPair()
   const target = peerKeyPair(options.secret, options.runId, options.indexes[0]).publicKey
   const socket = node.connect(target, { keyPair: stranger })

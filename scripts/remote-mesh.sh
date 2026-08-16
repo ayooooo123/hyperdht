@@ -6,9 +6,15 @@
 #   scripts/remote-mesh.sh collect <run-id> [-n 10]
 #   scripts/remote-mesh.sh local [-n 4]
 #
-# Uses the same secret as scripts/remote-peer.sh; run that script's `secret`
+# Uses the same two secrets as scripts/remote-peer.sh; run that script's `secret`
 # subcommand first. Members dial each higher index once, so a mesh of n reports
 # n(n-1)/2 links.
+#
+# Members derive every member key from the shared run secret, so they need no
+# directory to find each other. The collector's key is not in that set: it comes
+# from a secret that stays on this machine, and members are given only its public
+# key, as the coordinator_key dispatch input, so no member can pose as the
+# collector and read the matrix.
 
 set -euo pipefail
 
@@ -16,6 +22,7 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
 secret_dir="${XDG_CONFIG_HOME:-$HOME/.config}/hyperdht-remote-peer"
 secret_file="$secret_dir/secret"
+coordinator_secret_file="$secret_dir/coordinator-secret"
 workflow=remote-mesh.yml
 node_bin="${NODE:-node}"
 
@@ -30,6 +37,27 @@ read_secret() {
     exit 69
   fi
   tr -d '[:space:]' <"$secret_file"
+}
+
+read_coordinator_secret() {
+  # The environment wins so a container or a one-off shell can supply it without a
+  # file. There is deliberately no fall back to the shared secret: every member
+  # holds that, and a collector key derivable from it would protect nothing.
+  if [ -n "${REMOTE_PEER_COORDINATOR_SECRET:-}" ]; then
+    printf '%s' "$REMOTE_PEER_COORDINATOR_SECRET" | tr -d '[:space:]'
+    return 0
+  fi
+  if [ ! -s "$coordinator_secret_file" ]; then
+    echo "no coordinator secret; run: scripts/remote-peer.sh secret --push" >&2
+    exit 69
+  fi
+  tr -d '[:space:]' <"$coordinator_secret_file"
+}
+
+# The pin every member is given. Deriving it here keeps key handling in
+# test/remote-peer/identity.js, which is the only file that should have any.
+derive_coordinator_key() {
+  REMOTE_PEER_COORDINATOR_SECRET="$1" "$node_bin" test/remote-peer/identity.js
 }
 
 # The docker credential and endpoint dance is only needed by the container gates,
@@ -106,9 +134,15 @@ newest_run_id() {
 
 collect() {
   local run_id="$1"
+  local secret coordinator_secret
+  # Read into locals first: a missing secret must stop the run here, with the
+  # message the reader prints, not inside brittle with an empty environment.
+  secret="$(read_secret)"
+  coordinator_secret="$(read_coordinator_secret)"
   # Members dial only after the settle window, so the collector must outlast
   # queueing plus install plus settle plus the dial sweep.
-  REMOTE_PEER_SECRET="$(read_secret)" \
+  REMOTE_PEER_SECRET="$secret" \
+    REMOTE_PEER_COORDINATOR_SECRET="$coordinator_secret" \
     REMOTE_PEER_RUN_ID="$run_id" \
     REMOTE_PEER_COUNT="$members" \
     REMOTE_PEER_WAIT_SECONDS="$((seconds + 300))" \
@@ -121,8 +155,11 @@ case "${1:-}" in
     parse_flags "$@"
     before="$(gh run list --workflow "$workflow" --limit 1 --json databaseId \
       --jq '.[0].databaseId' 2>/dev/null || true)"
+    # Members pin this key and refuse everyone else, so a dispatch without it
+    # would hold a mesh open that no collector can read.
     gh workflow run "$workflow" -f "members=$members" -f "seconds=$seconds" \
-      -f "settle=$settle" -f "os=$os"
+      -f "settle=$settle" -f "os=$os" \
+      -f "coordinator_key=$(derive_coordinator_key "$(read_coordinator_secret)")"
     run_id="$(newest_run_id "$before")" || {
       echo "dispatched, but the run id never appeared; find it with: gh run list" >&2
       exit 75
@@ -146,6 +183,10 @@ case "${1:-}" in
     seconds=180
     parse_flags "$@"
     secret="$(read_secret)"
+    # Both sides run here, so this shell holds both secrets; the members it starts
+    # still receive only the public key, exactly as a runner does.
+    coordinator_secret="$(read_coordinator_secret)"
+    coordinator_key="$(derive_coordinator_key "$coordinator_secret")"
     run_id="mesh-local-$(date +%s)"
     testnet_log="$(mktemp)"
     "$node_bin" test/remote-peer/local-testnet.js --size 8 >"$testnet_log" 2>&1 &
@@ -177,12 +218,14 @@ case "${1:-}" in
     fi
     for index in $(seq 1 "$members"); do
       REMOTE_PEER_SECRET="$secret" REMOTE_PEER_RUN_ID="$run_id" \
+        REMOTE_PEER_COORDINATOR_KEY="$coordinator_key" \
         "$node_bin" test/remote-peer/mesh.js --index "$index" --count "$members" \
         --seconds "$seconds" --settle "$settle" --bootstrap "$bootstrap" >/dev/null 2>&1 &
       member_pids+=($!)
     done
     sleep $((settle + 8))
     REMOTE_PEER_SECRET="$secret" \
+      REMOTE_PEER_COORDINATOR_SECRET="$coordinator_secret" \
       REMOTE_PEER_RUN_ID="$run_id" \
       REMOTE_PEER_COUNT="$members" \
       REMOTE_PEER_WAIT_SECONDS=120 \
@@ -190,7 +233,7 @@ case "${1:-}" in
       "$repo/node_modules/.bin/brittle-node" test/remote-peer/mesh-probe.js
     ;;
   *)
-    sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 64
     ;;
 esac

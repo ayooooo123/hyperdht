@@ -343,6 +343,79 @@ derived an audit record's addresses, and `control-channel.js:993` accepted only 
 two derived plans on the isolated-grant command. All three now handle the discovered
 plan.
 
+### KI-8: the guard rebuild fails when bound and advertised addresses differ
+
+**Status: open. Only observable in the rehearsal's divergent addressing mode.**
+
+`scripts/live-route-rehearsal.sh` gained a second addressing mode because a
+rehearsal where every role binds the address it publishes cannot catch anything that
+confuses the two. That mode found three faults which had all passed the same
+scenario at 125/125:
+
+- `role-runner.js` built the endpoint role's bootstrap authority without the
+  advertised pair, so it alone published its bound address. Fixed; note that the
+  KI-7 entry above already claimed this path published the same address as
+  everything else, which was true of `endpoint-bootstrap-authority.js` and not of
+  its caller.
+- `wire-services.js` used one tuple both to bind an exit's DHT-exit socket and as
+  the reservation's `local`, which is the address a peer's reply must echo
+  (`lib/private/dht-exit-reservation.js:403`, `lib/private/dht-exit-wire.js:164`).
+  Fixed by taking an optional advertised pair; the socket still binds the local one.
+- `live-process-suite.js` recomputed the learned-closer isolated-address digest from
+  a candidate's bound address, while `topology-fixture.js:1030` mints those grant
+  pools from the reachable one. Fixed. This one was silent: a digest keyed on the
+  wrong address throws nothing and logs nothing, the responder simply never matches,
+  so no stack exists anywhere for it.
+
+What remains open is the fourth observation, and it is not a wrong address that
+anything reports. `test/private/live-process-suite.js:346`,
+`t.is(rotated.previousGeneration, endpointGeneration)`: after `lookup-middle-a` is
+commanded to `rotate`, the endpoint does not emit its `rotated` event and the
+scenario stops with `PROCESS_COMMAND_DEADLINE` at 40 of 41 assertions. Everything
+before it passes, including the first routed immutable get through the whole
+guard-middle-exit path, so a route across translated addresses works; it is the
+rebuild after a physical link fault that does not settle.
+
+Measured across two independent batches on the same image, counting runs that
+reached 125/125. The second batch was run by a different party against the same tree
+precisely because the first batch's stronger claim, that the failure had become
+consistent, did not survive checking:
+
+| batch  | mode      | runs | reached 125/125 |
+| ------ | --------- | ---- | --------------- |
+| first  | divergent | 33   | 6               |
+| second | divergent | 12   | 4               |
+| first  | identical | 15   | 15              |
+| second | identical | 7    | 7               |
+
+So it is intermittent, roughly one run in four passing, and not a failure that has
+settled into always happening: an earlier draft of this entry claimed twenty-one
+consecutive divergent failures, and twelve consecutive runs then produced four
+passes. What is consistent is where it stops. Every one of the twenty divergent
+failures across both batches stopped at the same place, assertion 41,
+`PROCESS_COMMAND_DEADLINE`, with 40 of 41 assertions passing. Identical addressing
+has never failed in 22 runs.
+
+Because of this, divergent is not the default: a mode that passes 10 runs in 45 would
+either be muted or be rerun until green, and rerunning until green is how the fault
+it exposes disappears from view. Reproduce it with the documented container rehearsal
+plus `--privileged` and the mode flag:
+
+```
+DOCKER_CONFIG=/tmp/hyperdht-private-routing-linux-gates-docker \
+DOCKER_HOST=unix:///Users/jd/.colima/default/docker.sock \
+docker run --rm --privileged --mount type=bind,source=$PWD,target=/app \
+  --mount type=tmpfs,destination=/app/node_modules \
+  --mount type=tmpfs,destination=/root/.config \
+  -e REHEARSAL_ADDRESSES=divergent -e REHEARSAL_HOST_PREFIX=127.64 \
+  -e XDG_CONFIG_HOME=/root/.config \
+  -e BRITTLE_NODE=/node_modules/.bin/brittle-node \
+  -e REMOTE_PEER_COORDINATOR_SECRET=<64 hex> \
+  -w /app hyperdht-private-routing/linux-gates:ffd5f7f04db9 \
+  bash -c 'mkdir -p /root/.config/hyperdht-remote-peer && printf "%s" "<64 hex>" \
+    > /root/.config/hyperdht-remote-peer/secret && bash scripts/live-route-rehearsal.sh 240'
+```
+
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
 **Status: one cause fixed, one open. Never reproduced locally.**

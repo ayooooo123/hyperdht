@@ -121,6 +121,17 @@ function numberNow(fn) {
   return result
 }
 
+// The same shape lib/private/dht-exit-io.js:92 accepts for the address it binds, so a
+// tuple this file forwards cannot be looser than the one the consumer enforces.
+function numericTuple(value) {
+  if (!value || typeof value !== 'object') return false
+  const { host, port } = value
+  if (typeof host !== 'string') return false
+  if (!/^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$/.test(host)) return false
+  if (!host.split('.').every((part) => Number(part) <= 255)) return false
+  return Number.isSafeInteger(port) && port >= 0 && port <= 0xffff
+}
+
 function createProjectedLinkService(options) {
   if (!options || typeof options !== 'object') throw PrivateRouteError.INVALID_ROUTE()
   const {
@@ -1038,6 +1049,13 @@ async function activateFinalExitActor(options) {
     identitySecretKey,
     clocks,
     local,
+    // `local` binds the DHT-exit socket. On separate hosts a DHT node observes that
+    // socket at a translated address, and the reply it sends back echoes the address
+    // it saw, which the reservation compares against its own local tuple
+    // (lib/private/dht-exit-reservation.js:403, lib/private/dht-exit-wire.js:164).
+    // So the table has to hold the observed pair while the socket still binds the
+    // bound one. Omitted, they are the same address, as on one host they are.
+    advertised,
     dhtSeed,
     dhtSeedId,
     exitRole,
@@ -1052,10 +1070,14 @@ async function activateFinalExitActor(options) {
     !same(identitySecretKey.subarray(32), identityPublicKey) ||
     !Number.isSafeInteger(exitRole) ||
     typeof generation !== 'bigint' ||
-    typeof requestIsolatedGrant !== 'function'
+    typeof requestIsolatedGrant !== 'function' ||
+    !numericTuple(local) ||
+    (advertised !== undefined && !numericTuple(advertised))
   ) {
     throw PrivateRouteError.INVALID_ROUTE()
   }
+  // What the reservation calls its local address, which a peer's reply must echo.
+  const observedLocal = advertised === undefined ? local : advertised
   const tupleDigest = digestTestIsolatedAddressTuple({
     tuple: dhtSeed,
     id: dhtSeedId,
@@ -1127,7 +1149,7 @@ async function activateFinalExitActor(options) {
     table = createDhtExitDestinationTableForTest(
       channel.tableIssuer,
       {
-        local,
+        local: observedLocal,
         configuredBootstrap: [dhtSeed],
         monotonicNow: clocks.monotonicNow,
         randomBytes: cryptoSuite.randomBytes
