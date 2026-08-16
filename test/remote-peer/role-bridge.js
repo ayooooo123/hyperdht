@@ -195,7 +195,16 @@ async function main() {
   // The same claim-reflect-release for the exit's DHT socket. Its local port is
   // fixed by the role, so the probe binds exactly that port and the mapping it
   // learns is the one the role will own once it binds.
+  //
+  // Reflected off BOTH reflectors and required to agree, exactly as the cell socket
+  // is. Taking the first success would confirm the mapping once and never
+  // cross-check it, and under a NAT that maps per destination the published address
+  // would then be the mapping for that one reflector rather than the one other
+  // roles see - which is indistinguishable from a correct address until requests to
+  // it time out. Peers dial this socket directly, so it needs the same evidence the
+  // cell socket needs.
   let dhtExit = null
+  let dhtExitStable = false
   if (EXIT_ROLE_INDEXES.includes(options.index)) {
     const exitProbe = cellUdx.createSocket()
     const exitPort = EXIT_DHT_PORT_BASE + options.index
@@ -203,14 +212,19 @@ async function main() {
     if (exitBind && typeof exitBind.then === 'function') await exitBind
     if (options.reachableHost !== null) {
       dhtExit = { host: options.reachableHost, port: exitPort }
+      dhtExitStable = true
     } else {
+      const exitObservations = []
       for (const reflector of reflectors) {
-        const observed = await reflect(exitProbe, reflector)
-        if (observed !== null) {
-          dhtExit = observed
-          break
-        }
+        exitObservations.push(await reflect(exitProbe, reflector))
       }
+      const exitUsable = exitObservations.filter((entry) => entry !== null)
+      dhtExit = exitUsable.length > 0 ? exitUsable[0] : null
+      dhtExitStable =
+        exitUsable.length > 1 &&
+        exitUsable.every(
+          (entry) => entry.host === exitUsable[0].host && entry.port === exitUsable[0].port
+        )
     }
     await exitProbe.close()
   }
@@ -292,6 +306,7 @@ async function main() {
                   bind: { host: options.bindHost || BIND_HOST, port: cellPort },
                   reachable: endpoint,
                   dhtExit,
+                  dhtExitStable,
                   endpointStable
                 })
               )
@@ -458,6 +473,7 @@ async function main() {
     cellPort,
     endpoint,
     dhtExit,
+    dhtExitStable,
     endpointStable,
     observations
   })
