@@ -782,59 +782,200 @@ with identical addressing passing 28 of 28. Whether a failing divergent run actu
 a queued unread frame at the moment of the fault is a single line of a single capture and
 is not yet answered.
 
-### KI-11: one unexplained teardown phase mismatch
+### KI-11: a teardown phase mismatch, window found and closed
 
-**Status: open, unattributed, observed exactly once in 64 recorded runs. Recorded rather
-than resolved, because the conditions that produced it are unmeasurable after the fact.**
+**Status: the window is CLOSED in the harness and the closure is confirmed by a
+deliberate provocation that reproduces the exact failure on demand in 0.11s. What is
+still open is attribution: the provocation proves the mechanism exists and that the fix
+removes it, NOT that this mechanism is what produced the one field occurrence. That run
+remains unmeasurable after the fact.**
 
 One divergent rehearsal on the fixed tree failed at
 `not ok 71 - PROCESS_PHASE_MISMATCH (lookup-exit-a/CONTROL)`, 70 of 71 assertions, where
 assertion 71 is the first of the teardown loop, `t.is(snapshot.state, 'CLOSED')` at
-`live-process-suite.js:437-443`. The run passed the rotate at 41, suspend and resume at
-55-66 and network-change at 69-70, so it is a different phase and a different failure mode
-from KI-8, which always failed at 41 with `PROCESS_COMMAND_DEADLINE`. A phase mismatch fires
-when a role's phase sequence has advanced past what the suite believes, so a `stop` carrying
-a computed phase is refused - it needs ONE unexpected event from one role, not a slow run.
+`live-process-suite.js:499`. The run passed the rotate at 41, suspend and resume at 55-66
+and network-change at 69-70, so it is a different phase and a different failure mode from
+KI-8, which always failed at 41 with `PROCESS_COMMAND_DEADLINE`. A phase mismatch fires
+when a role's phase sequence has advanced past what the suite believes, so it needs ONE
+unexpected event from one role, not a slow run.
 
-An interleaved A/B in identical mode - the only mode reaching teardown on both trees, since
-every pre-fix divergent run stops at 41 - found nothing: eight runs with the fix reverted and
-eight with it present, alternating on one machine, differing by exactly the two files of the
-fix, zero occurrences of assertion 71 in either arm. At a 1-in-31 rate that is an
-underpowered null and not evidence of absence. It was run with the guest effectively idle
-(VM load 0.39 while the host read 11-13), so it is not an under-load result. Its one useful
-incidental: the two arms' scenario bands overlap and the fixed arm's is slightly tighter,
-which is mild matched evidence that the fix costs no measurable wall time.
+An interleaved A/B in identical mode - the only mode reaching teardown on both trees,
+since every pre-fix divergent run stops at 41 - found nothing: eight runs with the KI-10
+fix reverted and eight with it present, alternating on one machine, zero occurrences of
+assertion 71 in either arm. At a 1-in-31 rate that is an underpowered null and not
+evidence of absence. It was run with the guest effectively idle (VM load 0.39 while the
+host read 11-13), so it is not an under-load result. Its one useful incidental: the two
+arms' scenario bands overlap and the fixed arm's is slightly tighter, which is mild
+matched evidence that the KI-10 fix costs no measurable wall time.
 
-A second-order effect of the KI-10 fix was the leading suspicion and is now DISFAVOURED BY
-SOURCE, on two counts. First, a retired exit's route transport is DESTROYED rather than
+A second-order effect of the KI-10 fix was the original suspicion and remains DISFAVOURED
+BY SOURCE, on two counts. First, a retired exit's route transport is DESTROYED rather than
 wedged: retirement awaits `finalExitService.destroy()`, which reaches
 `destroyDhtExitRouteTransportForIO` via `closeState`, `dht-exit-io.js:887-892`. A destroyed
 transport cannot be wedged or drained, and teardown is 2.8s later. Second, and decisively,
-the premise was wrong: LOOKUP-EXIT-A IS NOT RETIRED AT TEARDOWN. `retainForSuspend()` clears
-`state.committed`, and `resume()` at `relay-candidate-directory.js:892` then calls
-`choosePairs(state, now)` with NO exclusions, which returns the first diverse quad in record
-order - and that order is the guard's fixed projection array, so resume re-selects
-`lookup-middle-a` with `lookup-exit-a`. The suspend and resume at assertions 55-66 put exit-a
-back in the live path before teardown. "The failing role is the retired exit", the detail
-that made the fix look implicated, is simply false.
+the premise was wrong: LOOKUP-EXIT-A IS NOT RETIRED AT TEARDOWN. `retainForSuspend()`
+clears `state.committed`, and `resume()` at `relay-candidate-directory.js:892` then calls
+`choosePairs(state, now)` with NO exclusions, which returns the first diverse quad in
+record order - and that order is the guard's fixed projection array, so resume re-selects
+`lookup-middle-a` with `lookup-exit-a`. The suspend and resume at assertions 55-66 put
+exit-a back in the live path before teardown. "The failing role is the retired exit", the
+detail that made the fix look implicated, is simply false.
 
-The leading explanation is now a pre-existing race in the harness's own control protocol,
-independent of route transports and therefore of the fix. [INFERENCE] - derived from source,
-not measured. The teardown loop advances each role's expected phase at
-`live-process-suite.js:429-435` and then sends `stop`, while the learned-grant responders stay
-armed until the `finally` at `:456`, i.e. throughout that loop. So an active exit can still
-emit an `isolated-grant-request` during teardown; any role-initiated event still in flight
-when its phase is advanced arrives carrying the old phase, fails `validateControlMessage`, and
-is reported as `PROCESS_PHASE_MISMATCH (role/CONTROL)` at `coordinator.js:343-348`, which is
-also the catch-all for any event validation failure. That accounts for the role identity, the
-phase, and why the failure has never appeared at any other assertion. It is cheap to falsify
-and cheap to close: stop the responders BEFORE the teardown loop rather than in the `finally`,
-or advance phases only after draining.
+#### The mechanism, now measured rather than inferred
 
-The load explanation is neither confirmed nor excluded, and cannot be settled from the data
-held. The failing run recorded a host load of 15.31 against 2.39-3.73 for the five runs
-before it, with a decaying tail across four subsequent runs that all passed. Four instruments
-were considered and each is blind to what matters here:
+The harness's own control protocol had a race, independent of route transports and
+therefore of the KI-10 fix. It is no longer an inference. Each of its three steps is in
+source and the whole is reproducible:
+
+1. Every event is validated against a single scalar, and by EXACT EQUALITY:
+   `baseMessage` rejects the message unless `context.phaseSequence === phaseSequence`,
+   `control-channel.js:964`. There is no tolerance for the immediately preceding phase.
+2. `dispatch` maps any validation throw to one code:
+   `PROCESS_PHASE_MISMATCH`, `coordinator.js:343-348`, which is also the catch-all for
+   every other event validation failure.
+3. The coordinator's expected phase for a role is advanced BEFORE the command that carries
+   the new phase is written, because `send` validates the outgoing command against
+   `record.phaseSequence`, `coordinator.js:481`. Advance-then-send is structural, not a
+   choice the suite makes.
+
+So for any role that speaks unprompted, every phase advance opens a window: an event
+already emitted and not yet read carries the OLD phase, and is refused. By teardown
+exactly one role class still speaks unprompted. Every `emit` site in `role-runner.js` is
+either a direct answer to a command or one of `isolated-grant-request` (the three exits,
+raised whenever the exit's own discovery finds an isolated candidate) and the endpoint's
+`rotated` and `unavailable`, which are gated on `state === 'READY'`,
+`role-runner.js:920-934`, and the terminal network-change immediately before teardown
+leaves the endpoint UNAVAILABLE. The window is therefore an `isolated-grant-request`
+overtaking the teardown loop, which accounts for the role identity, the phase, and why the
+failure has never appeared at any other assertion.
+
+#### The obvious fix is not the fix
+
+The earlier proposal, and the one this batch was briefed with, was to stop the
+learned-grant responders BEFORE the teardown loop instead of in its `finally`. That cannot
+close this window, and the reason is worth stating plainly because it is easy to
+re-derive wrongly: THE REQUEST IS EMITTED BY THE ROLE, NOT SOLICITED BY THE COORDINATOR.
+The responders are coordinator-side standing waiters. Stopping one cannot unsend a frame
+already in the pipe. The provocation confirms this directly rather than by argument: the
+`stale` arm below never answers a single grant - it is run with granting already stopped -
+and it still reproduces the mismatch.
+
+Stopping the responders early is kept anyway, as hygiene, for two reasons that are its own
+and not the window's:
+
+- A grant answered after the advance is refused by
+  `observed.phaseSequence !== record.phaseSequence`, `coordinator.js:516`, and
+  `respondIsolatedGrant` throws SYNCHRONOUSLY there. The suite's
+  `await control.respondIsolatedGrant(...).catch(noop)` cannot catch a synchronous throw,
+  and `.then(onFulfilled, noop)` handles the SOURCE promise's rejection rather than its own
+  handler's, so the throw escaped as an unhandled rejection - which takes the entire run
+  down, not one assertion. Reachable today: a request dispatched at the correct phase
+  resolves the waiter, the loop advances that role's phase at the next `await`, and the
+  queued handler then calls into `respondIsolatedGrant`. The handler is now wrapped, so a
+  future ordering cannot be fatal either.
+- An exit handed a grant mid-teardown admits the closer and restarts the very discovery
+  that emits the next request. Unanswered, it cannot: `requestIsolatedGrant` throws while
+  one request is pending, `role-runner.js:335-342`, so at most one request per exit exists
+  during teardown.
+
+Withholding the grant is safe on the role side, which was checked before relying on it:
+`stopOwners` rejects a pending isolated grant with `PROCESS_CANCELLED` before destroying
+the exit service, `role-runner.js:816-821`, so an unanswered request cannot wedge the
+`stop`. `stopGranting()` deliberately does NOT disarm the standing waiter - only `stop()`
+does, in the `finally` - because a request that still arrives must be tolerated rather than
+become `PROCESS_UNEXPECTED_EVENT`.
+
+#### The fix
+
+A round trip at the phase already in force, per role, immediately before that role's phase
+is advanced: `live-process-suite.js:486`, ahead of the advance at `:487-489`. A role's
+events reach the coordinator as one FIFO stream decoded in order, so once this snapshot has
+been dispatched, every frame that role emitted earlier has been dispatched too, under the
+phase it was emitted with. That is an ordering proof rather than a delay.
+
+Three properties made this cheap. Re-sending at the current phase is legal because the
+runner adopts whatever phase a command carries, `role-runner.js:968`, and it is already an
+established pattern in this suite - both `immutable-get`s in the resume path reuse
+`phases.get('endpoint')`. A `snapshot` command is pure, `role-runner.js:1050-1052`. And the
+extra snapshots are audit-neutral: `validatePostSetupState` returns early for snapshots,
+and for DHT roles every field `validateDhtSnapshot` constrains is structurally fixed,
+because `snapshotFields` derives them from controller, wire and exit snapshots that are all
+null for those roles, `role-runner.js:740-772`.
+
+Rejected shapes, with reasons, so they are not retried:
+
+- Sending `stop` at the current phase with no advance at all. This closes the window
+  completely and was rejected anyway: it would let a stale event from the network-change
+  step be accepted during teardown, which is a real loss of the phase separation the
+  equality check exists to provide. Not a check worth weakening for a 1-in-64 event.
+- Draining by yielding the event loop. Timing-shaped, no ordering guarantee, and it would
+  read as a fix while proving nothing.
+- Reordering the loop to stop the DHT roles first, starving the exits of referrals. Too
+  clever, and it perturbs the wire record the namespace oracles read.
+
+#### The provocation
+
+`test/private/process/teardown-phase-window-probe.js`, standalone and deliberately NOT
+registered in `test/private-routing.js` so its assertions cannot move the aggregate's
+counts. Run it with `node test/private/process/teardown-phase-window-probe.js`; set
+`PR_BRIDGE_TRACE` to also append the trace, in the same JSON-per-line shape the bridge's
+own sniffer uses, `frameSniffer` in `role-bridge.js`. It drives the REAL coordinator with a synthetic role
+that is a pair of streams, and models exactly one thing explicitly: `outbound`, the bytes
+that have left the role and that the coordinator has not read yet. A frame's phase is
+stamped when the role emits it, which is what makes a delayed frame stale; whether the byte
+landed a microsecond before or after the advance is invisible to the coordinator.
+
+Three arms, differing only in where the coordinator's read falls relative to the advance.
+0.11s for all three:
+
+| arm       | order                                                 | result                                           |
+| --------- | ----------------------------------------------------- | ------------------------------------------------ |
+| `control` | advance with NO frame in flight                       | no failure - the advance alone is harmless       |
+| `stale`   | advance, then read (shipped order, no grant answered) | `PROCESS_PHASE_MISMATCH (lookup-exit-a/CONTROL)` |
+| `drained` | read at the current phase, then advance (fixed order) | no failure; the request is accepted at phase 5   |
+
+The stale frame, named by the trace:
+
+```
+{"t":1786915234793.8203,"side":"probe","pid":69822,"event":"frame","direction":"role->coordinator","type":"isolated-grant-request","generation":"7","phaseSequence":"5","queued":true}
+```
+
+`phaseSequence: "5"` is the phase in force when the exit emitted it; the coordinator
+advanced to 6 before reading it. The `control` arm is what makes this attribution rather
+than coincidence: the same advance with no frame in flight is clean, so the frame is the
+cause and not the advance. The same run also confirms the second hazard directly - a grant
+answered after the advance returns `PROCESS_CONTROL_INVALID` from `coordinator.js:516`,
+observed in the `drained` arm.
+
+What this establishes and what it does not. It establishes that the window is real, that
+the shipped teardown order reproduces the exact recorded failure signature on demand, that
+stopping the responders alone does not prevent it, and that reading before advancing does.
+It does NOT establish that this is what happened in the one field occurrence. That would
+need the failing run instrumented, and it was not.
+
+#### What is left
+
+- A residual window remains, one round trip wide instead of the whole loop wide: an exit
+  can emit between answering the drain snapshot and receiving its `stop`. It cannot emit
+  twice, because granting has stopped. A COMPLETE closure is not reachable from the suite:
+  it needs either events validated against the phase in force at EMISSION rather than at
+  read, or the `phase-pending`/`phase-ack` pair - which is fully defined and validated in
+  `control-channel.js:1023-1026` and `:1130-1137`, exercised only by the codec tests, and
+  wired to nothing. That pair looks like exactly this drain barrier, designed and never
+  connected.
+- The same advance-while-armed shape still exists, narrower, at the exit snapshot step,
+  `live-process-suite.js:391-394`: it advances all three exits' phases while the responders
+  are necessarily still granting, because the resumes ahead of it need grants. Not closed by
+  this change and never observed; recorded so it is not rediscovered as new.
+- Whether guest starvation occurred in the field run - fixed-work timing inside the guest,
+  since the four instruments below cannot see it.
+
+#### Why the field run cannot be re-read
+
+The load explanation for that one run is neither confirmed nor excluded. It recorded a host
+load of 15.31 against 2.39-3.73 for the five runs before it, with a decaying tail across
+four subsequent runs that all passed. Four instruments were considered and each is blind to
+what matters:
 
 | instrument               | why it cannot answer                                                                  |
 | ------------------------ | ------------------------------------------------------------------------------------- |
@@ -843,45 +984,37 @@ were considered and each is blind to what matters here:
 | steal time, `/proc/stat` | flat zero; colima on Virtualization.framework does not report it                      |
 | scenario wall time       | a 3s aggregate; a 20ms stall moves it 0.7% and vanishes in the 2775-3157ms band       |
 
-A fifth instrument does work, and it is the one this batch used elsewhere: timestamped trace
-intervals inside the run, which sample at millisecond scale and show a transient stall
-directly, because a descheduling in the wrong place stretches one interval while leaving the
-total untouched. This run carried none, correctly, since it was measuring the shipping tree.
-So the honest limit is not that the platform cannot be measured but that this run cannot be
-measured after the fact. Any future hunt for a millisecond-scale race here must instrument
-the run itself; nothing outside it can see in.
+A fifth does work: timestamped trace intervals inside the run, which sample at millisecond
+scale and show a transient stall directly, because a descheduling in the wrong place
+stretches one interval while leaving the total untouched. That run carried none, correctly,
+since it was measuring the shipping tree. Any future hunt for a millisecond-scale race here
+must instrument the run itself; nothing outside it can see in.
 
-One process note for whoever picks this up, and it is NOT "read the code first", because that
-rule would have failed this investigation. Ask whether the question is STRUCTURAL or EMPIRICAL
-before choosing the instrument. Structural questions ask whether something can happen, whether
-a path exists, whether a state is reachable; read the source, and it is usually minutes.
-Empirical questions ask whether it does happen, how often, under what conditions; run it, and
-reading substitutes for nothing.
+One process note, and it is NOT "read the code first", because that rule would have failed
+the KI-8 investigation. Ask whether the question is STRUCTURAL or EMPIRICAL before choosing
+the instrument. Structural questions ask whether something can happen, whether a path
+exists, whether a state is reachable. Empirical questions ask whether it does happen, how
+often, under what conditions. Nothing that cracked KI-8 was answerable from source, and
+every expensive detour there was a structural question attacked empirically. This entry is
+the same lesson from the other side: "can a stale frame fail the phase gate" is structural,
+and a 0.11s rig answered it and the fix's adequacy together, where sixteen interleaved
+three-second runs had answered neither.
 
-Nothing that actually cracked KI-8 was answerable from source: which mode reproduces it,
-whether the destroy was sent or only never received, whether a frame was queued before the
-fault, whether Fault B was independent. The pump gate was read early and correctly reported as
-permitting a wedge, which could not establish that a wedge was happening, in which role, or in
-which mode. Every expensive detour, by contrast, was a structural question attacked
-empirically: the rearm race, the uncovered-port lead, and the retired-exit coincidence, each of
-which had a twenty-line answer in the source the whole time. The one cheap decisive move early
-on - a 0.21s rig proving a destroy can be blocked behind an unread frame - worked because it
-turned a structural question into a two-line answer instead of a rate.
+#### Verification of the fix
 
-Deterministic follow-ups, each replacing an argument with a measurement:
-
-1. Close the responder window, which is the fix if the explanation above is right: stop the
-   learned-grant responders before the teardown loop rather than in its `finally`, or advance
-   each role's phase only after draining its in-flight events. Falsifiable either way by
-   whether assertion 71 can be provoked deliberately - hold a grant request until after the
-   phase advance and the mismatch should reproduce on demand, on either tree.
-2. Whether guest starvation occurred - fixed-work timing inside the guest, since the four
-   instruments above cannot see it.
-3. Whether the fix costs wall time - interleaved medians of `process:node` and
-   `namespace:live` on both trees. Assertion counts are already known equal, so it is purely
-   a timing question. The two eleven-role gates moved in OPPOSITE directions between trees,
-   -1.3% and +26.3%, while a third swung -39.9% with identical counts, so the present sample
-   cannot show a timing effect either way.
+- `process:node` 125/125 three times, 3675ms cold then 2816ms and 2819ms, both inside the
+  documented 2775-3157ms band, so eleven extra round trips cost nothing measurable.
+- `process:bare` 125/125.
+- Host aggregate 882 tests and 18138 asserts, which was the baseline at the moment this was
+  measured and is not quoted here as the standing one - other slices in the same batch
+  registered tests after it. The durable claim is the delta: this change adds no test and no
+  assertion, so it moves the aggregate by zero whatever the baseline is. Note also that a
+  host aggregate is NOT evidence about the eleven-role scenario, which it does not contain,
+  by KI-2.
+- Assertion counts are unchanged everywhere because the drain adds round trips and no
+  assertions. The 44 successful drain round trips across those four runs are themselves the
+  evidence that a command re-sent at the phase already in force is accepted: each is awaited
+  under the 5s command deadline, so a refusal would have failed the run.
 
 ### KI-12: what the first real eleven-runner dispatches found
 
@@ -929,7 +1062,77 @@ local role while every reflector still agrees on the address. That is exactly wh
 was observed, and it is why an endpoint can be local but a DHT role cannot: the
 endpoint initiates.
 
-FOURTH, AND OPEN: the setup store does not complete over a real network. With the
+FOURTH, NOW EXPLAINED: nothing in the eleven-role plan punches, so no role-to-role
+datagram has ever been delivered in a dispatch. Established by source reading:
+
+- `role-runner.js:638-657` issues three raw `dht.request(..., tupleForRole(11),
+{ retry: false })` straight to a literal address, with no `connect()` and no punch.
+- `role-runner.js:166-169` resolves that to dht-value's REFLECTED public address.
+- `retry: false` sets `req.retries = 0`, so dht-rpc destroys the request at
+  `io.js:601` after ONE unanswered datagram - the exact frame in the stack recovered
+  from the runner.
+- `topology-fixture.js:1073`, `:1080`, `:1087` wire every DHT edge one way, seed to
+  referral to value, with nothing pointing back. dht-value therefore never sends to
+  dht-referral, its NAT holds no mapping for it, and dht-referral's first packet
+  inbound is dropped. No reply is possible, and raising any timeout cannot help
+  because the packet is never delivered at all.
+- `grep -c punch` is zero in role-bridge.js, role-runner.js, topology-fixture.js and
+  across all of lib/private.
+
+The source read also predicts the observed boundary, which is the strongest available
+consistency check: assertions 1 to 10 are all satisfiable on a completely deaf
+network, and the run dies at the 11th emission.
+
+One precision about that emission, because it is the kind of line a later reader
+re-derives wrongly. The eleventh assertion RESULT is the catch-block `t.fail` at
+`live-process-suite.js:509-510`, reporting the role's REQUEST_TIMEOUT thrown out of the
+`Promise.all` at `:168`. The eleventh assertion in SOURCE ORDER, the audit-open class
+check at `:169`, was never reached. Both statements are true of different things, and
+the distinction points at opposite halves of the system: had `:169` run and failed, the
+diagnosis would be that three audit opens arrived with the wrong classes, a codec or
+audit-arming fault, and a reader would search `AUDIT_CLASSES` and `armSetupDhtAudit` and
+find nothing wrong. The events never arrived at all. Note also that once the store
+completes, `:169` WILL execute, and "assertion 11" will then mean the audit-open check
+rather than a caught role failure.
+
+This repository already solved the same problem in a sibling harness.
+`test/remote-peer/mesh.js` punches at ten sites, and states the principle at
+`:294-297`: every member punches the moment the plan lands so the sends cross in
+flight, because that is the only way two NAT'd hosts open a path neither can open
+alone. The measured result is recorded earlier in this document: 90 of 90 directed
+cell-socket pairs arrived between ten runners once every member punched
+simultaneously, source port intact on all 90. So the mechanism is proven here; the
+eleven-role plan simply never adopted it.
+
+FIFTH, AND ITS OWN FAULT: the DHT-setup assertions cannot fail when the DHT is deaf,
+so they are not gates. `live-process-suite.js:142-145` asserts
+`t.is(ready.state, 'DHT_SETUP')` per DHT role and the suite reads it as evidence that
+setup worked. It is evidence that a local variable changed. `role-runner.js:600-606`
+awaits `dht.ready()` and then sets that state unconditionally, and a dht-rpc query
+treats a request timeout as an error it counts and continues past, with
+`_bootstrapping` additionally `.catch(noop)`. So `dht.ready()` resolves on a network
+where nothing was ever answered. Three green assertions covered exactly that
+condition, and the first assertion with teeth was eight later. This would be worth
+fixing even if reachability were perfect: an assertion that cannot fail when the
+subject is dead is not a gate. The fix is for it to require an ANSWERED request -
+a success count from the bootstrap query, or one round trip - rather than a state
+transition.
+
+That fix is cheap but NOT free, and the reason is worth recording because the obvious
+version does not work. Event shapes are strictly validated: `control-channel.js` builds
+`EVENT_FIELDS` and then calls `exactObject`, which enforces an EXACT field list rather
+than a minimum, so simply attaching an answered-request count to the `ready` event throws
+at validation. It takes three edits: read `dht.stats.requests.responses` after
+`await dht.ready()` in `role-runner.js` `activate()` and pass it to the `ready` emit; add
+the field name to `EVENT_FIELDS.ready`, which is the shared control codec at
+`control-channel.js:809`; and assert it is above zero for the two roles that must have
+been answered. Routing it through the `snapshot` event instead is strictly worse, since
+that path needs both a digest and the same field-list change. A corollary for anyone
+wanting one value out of a role quickly: anything structured must pass `exactObject`, so
+an unstructured diagnostic log is the only genuinely zero-cost probe in this harness.
+
+Kept for the record, since it was the observable symptom: the setup store does not
+complete over a real network. With the
 command deadline raised and EVERY role on a runner, so nothing depends on the
 laptop's NAT, the run reaches 10 of 11 assertions and then dies with
 `PROCESS_ROLE_FAILURE (dht-referral/CONTROL)`. The role's own stack, recovered from
@@ -971,6 +1174,119 @@ dialled, on this network. Whether that generalises depends entirely on the NAT i
 front of whoever runs it. The honest limit: nothing here distinguishes
 endpoint-independent filtering from endpoint-dependent filtering in advance, and
 the reflectors cannot, so a mixed dispatch is the test.
+
+### KI-13: the punch that makes a dispatch work is in the harness, not in production
+
+**Status: open, and it is the largest single item between this fork and production
+readiness. The harness change that unblocks a dispatch is landed; the production gap it
+exposes is not addressed.**
+
+The eleven-role dispatch now opens role-to-role NAT mappings before any role starts:
+the coordinator distributes all eleven addresses over a fourth bridge mode byte, and
+every role punches simultaneously from probes bound to the exact ports it will later
+own, following the mechanism `test/remote-peer/mesh.js` already proved here.
+
+Stated as plainly as it can be, because a green run will otherwise be read as more than
+it is:
+
+> The punch is in the harness, not in production. `lib/private` contains zero punching.
+> A green eleven-role dispatch proves the SCENARIO can run across NAT'd hosts because
+> `test/remote-peer/role-bridge.js` opens the mappings before any role is attached. It
+> does not prove two NAT'd relays can join a route in production. The rehearsal cannot
+> narrow this: identical mode passes `--reachable-host`, and the bridge's
+> `if (options.reachableHost !== null)` branches skip reflection entirely when that is
+> set - `role-bridge.js:452-454` for the exit's DHT socket and `:475` for the cell
+> endpoint - so no local mode reflects or translates
+> and 140/140 on loopback is the floor, not evidence. A rehearsal proves the frame path,
+> the one-tick plan distribution and that the probes release the role's ports. Only a
+> dispatch tests traversal.
+
+`udx-cell-endpoint.js:1427-1428` owns its socket with no injection point, so there is no
+seam where a production punch could currently be introduced.
+
+Three limits belong beside it, and together they mean a green store assertion says the
+pair was open at that moment rather than that the topology is durably connected:
+
+- Nothing refreshes a mapping for the length of a 900-second run.
+- The punch sits at the earliest point in the run, so the gap to the store is the
+  largest possible, and it grows with RTT while the NAT's idle timeout does not.
+- `retry: false` at `role-runner.js:641`, `:649` and `:656` means one lost datagram
+  still fails the store with a perfect mapping.
+- The three DHT roles hold the LONGEST unbound window of any role, and they are exactly
+  the ones the store depends on. `role-runner.js:532-537` has `prepare()` for a DHT role
+  set `PREPARED` and bind nothing; its socket is bound only later at activate, via
+  `createDhtOwner` and `dht.ready()` at `:595-597` and `:600-606`. Every other role binds
+  its cell endpoint during its own prepare at `:538-539`. So for dht-seed, dht-referral
+  and dht-value the port is unbound from probe-release until activate, spanning role spawn
+  plus eleven configures plus eleven prepares - and the mapping-survival measurement above
+  covers a QUICK rebind, not that.
+
+AND ONE HOP NOBODY HAS MEASURED, which is precisely the seam this design rests on. Two
+measurements exist and neither covers it: the record above shows a MAPPING survives
+close-and-rebind, and the 90-of-90 result never rebinds at all, because `mesh.js`
+punches and receives on one live socket. So nothing measures whether a NAT still ADMITS
+a previously punched peer after the local socket has been closed and rebound. If a
+dispatch reports a partial punch matrix, that is the first place to look.
+
+### KI-14: a rotation re-qualifies the hop it just rotated away from
+
+**Status: open. Distinct from KI-6, and NOT fixed by fixing KI-6.**
+
+There is no fault-based exclusion anywhere in the relay directory. Quarantine is
+populated ONLY at seal time and ONLY on equivocation: one identity advertising two
+different digests at the same epoch, in which case both copies are dropped and the
+identity is barred until the later expiry. Nothing in reserve, commit or rotate writes it,
+and there is no path by which a hop's behaviour on a live route can bar it. The sole
+`quarantine.set` is inside `ownRecords`, at `relay-candidate-directory.js:531` when this
+was written; the remaining writes are a clear and two expiry deletes. The sentence above
+is the durable form, since the numbers move. The exclusion set covers only the currently live pairs, so a relay rotated
+off one branch is immediately eligible for the sibling.
+
+Measured with three middles and three exits:
+
+| step             | selection                     |
+| ---------------- | ----------------------------- |
+| initial lookup   | middleA + exitA               |
+| initial announce | announceMiddle + announceExit |
+| rotate lookup    | middleB + exitB               |
+| rotate announce  | middleA + exitA               |
+
+The announce branch rotates onto the pair the lookup branch vacated one step earlier. In
+this shape it is not merely likely, it is FORCED: excluding the live lookup pair plus the
+current announce pair removes two of three middles and two of three exits, leaving
+exactly one qualifying pair, so any selection rule at all returns it. First-match plays
+no part.
+
+In a LARGER pool the reuse is not forced but it is still certain, and the mechanism is
+tighter than "first-match happens to pick it". Measured at four middles and four exits,
+with four combinations available at the announce rotation, across six different record
+orders including two interleaved: the vacated pair was reused 6 times out of 6, and it
+was the earliest available 6 times out of 6. The reason is structural. `choosePairs` is
+first-match and the LOOKUP branch is built first, so the lookup pair is by construction
+the earliest middle and earliest exit in record order. Rotation returns exactly those two
+records to the pool, still earliest, and first-match then hands them to the sibling
+branch. First-match creates the condition and then exploits it.
+
+Under a uniform draw at four-plus-four the same reuse falls to roughly one in four:
+reduced, not eliminated. So the relationship to KI-6 is precise rather than merely
+"different question":
+
+- In the minimal three-plus-three shape, the one actually run, reuse is FORCED and a KI-6
+  fix changes nothing at all.
+- In a larger pool, reuse is CERTAIN under first-match and merely likely under a uniform
+  draw, so a KI-6 fix would weaken this without closing it.
+- Either way a just-failed relay remains QUALIFYING. Only fault-based exclusion removes
+  it, and there is none.
+
+Whether it is a gap depends on why the rotation fired. On material expiry it is
+harmless. On failure or suspected misbehaviour the directory hands the suspect straight
+to the sibling branch - and for a privacy system that is the wrong direction, because a
+relay that wants to observe more of a route can get there by failing. Guaranteed in the
+minimal pool; a probability in a larger one.
+
+It bears on KI-9: a loss signal that cannot be distinguished from an expiry signal
+leaves the directory unable to quarantine selectively, so whatever KI-9's fix delivers
+must carry a reason rather than only a trigger, even if nothing consumes it yet.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
@@ -1153,33 +1469,59 @@ attack without bounding the attacker's share of the candidate set.
 
 ### KI-6: hop selection is first-match, not random
 
-**Status: open. A fix was implemented, verified and reverted; the design below is
-known to work.**
+**Status: open, and staying open. A fix was implemented, verified and reverted;
+the design below is known to work, and what blocks it is a measured structural
+fact about the eleven-role fixture rather than remaining effort.**
 
-`choosePairs` returns the first combination that passes the diversity rule,
-walking candidates in `state.records` insertion order, and `chooseReplacementPair`
-does the same. Selection is therefore deterministic: the same directory always
-yields the same hops, and whoever is discovered earliest is chosen every time
-they are eligible rather than occasionally. An adversary who can influence
-discovery order converts that into permanent placement on the path.
+`choosePairs` at `relay-candidate-directory.js:702` returns the first combination
+that passes the diversity rule, walking candidates in `state.records` order, and
+`chooseReplacementPair` at `:728` does the same for one pair. Selection is
+therefore deterministic. Measured against a sealed directory through its public
+API: rotating the record order rotates the selection with it, and five identical
+runs return one distinct result. Whoever is discovered earliest is chosen every
+time they are eligible rather than occasionally, and an adversary who can
+influence discovery order converts that into permanent placement on the path.
 
 The remedy is to draw uniformly over the combinations that pass diversity.
 Counting the qualifying combinations and then walking to a drawn index keeps
 allocation flat, an injected `randomBytes` capability keeps the source testable,
-and rejection sampling avoids favouring low indices through modulo bias. With
-that in place the host suites were green at 877/877 under Node and 856/856 under
-Bare, including a deterministic test that feeds draws zero through three, obtains
-four distinct combinations, and confirms draw four wraps onto draw zero, which
-pins the count at exactly four rather than at least four.
+and rejection sampling avoids favouring low indices through modulo bias. No new
+capability has to be invented for it. `createEndpointBootstrapAuthority` already
+receives an injected `randomBytes` and builds the directory sink two statements
+later with clocks alone, at `endpoint-bootstrap-authority.js:128` and `:149`, and
+the reconnect site at `udx-cell-endpoint.js:3075` has `cryptoSuite.randomBytes` in
+scope and already hands it to bootstrap IO at `:3109`. What widens is the sink's
+`CLOCK_FIELDS` contract, which `exactObject` enforces at every construction site.
+With that in place the host suites were green at 877/877 under Node and 856/856
+under Bare, including a deterministic test that feeds draws zero through three,
+obtains four distinct combinations, and confirms draw four wraps onto draw zero,
+which pins the count at exactly four rather than at least four.
 
 It was reverted because the eleven-role process fixture is wired to matched
-adjacencies. Landing the fix means generalising that fixture so any middle can
-serve any exit, which is the more faithful model anyway, and a second attempt
-mapped the work completely. Four layers are involved:
+adjacencies, and the size of that mismatch has now been measured. For a directory
+of three middles and three exits, which is the eleven-role shape, 36 ordered quads
+pass the diversity rule. That count is the module's own rule rather than a
+re-implementation of it: each quad was placed first in the record order and the
+directory returned it. Of the 36, six pair middle i with exit i, and only those
+six describe a topology the fixture holds grants for. A uniform draw would
+therefore build a servable topology one run in six. That is a design
+incompatibility, not a flake.
 
-1. **Grants.** `linkSpecs` mints one grant per matched adjacency. Widening it to
-   all nine middle-to-exit pairs, and `ALLOW_EDGES` with them, is mechanical; the
-   namespace routes and firewall rules derive from `ALLOW_EDGES` automatically.
+The replacement path is not exposed. Once both branches are committed the
+exclusion set leaves exactly one middle and one exit, so `chooseReplacementPair`
+has a single qualifying pair and a draw over it is forced; rotation onto the
+reserve stays deterministic whatever is done here. The whole exposure sits in
+`reserveInitialPair` and `resume`.
+
+Landing the fix means generalising the fixture so any middle can serve any exit,
+which is the more faithful model anyway, and a second attempt mapped the work
+completely. Four layers are involved, all four unchanged as of this entry:
+
+1. **Grants.** `linkSpecs` mints one grant per matched adjacency: of its seven
+   entries only `3-4`, `5-6` and `7-8` cross the middle-to-exit tier. Widening it
+   to all nine pairs, and `ALLOW_EDGES` with them, is mechanical; the namespace
+   routes and firewall rules derive from `ALLOW_EDGES` automatically, including
+   the expected rule count.
 2. **Middle downstreams.** A middle's projection carries `adjacencies[1]` and
    `grants[1]` for one exit, chosen before any route exists. It needs all three,
    selected by the identity the route names. `wire-services.js` already supports
@@ -1191,12 +1533,12 @@ mapped the work completely. Four layers are involved:
    route uses. `prearmAccept` opens an independent link per grant, so several
    arms coexist.
 4. **Predecessor binding.** This is what stopped the second attempt.
-   `observedPredecessorEndpoint` is passed to `acceptProjectedExtension` when the
-   actor is constructed, and it must be the endpoint of the middle that actually
-   connects. With several arms that identity is not known until one resolves, so
-   the exit branch has to be restructured to race the arms first and construct
-   the actor afterwards, carrying the winning arm's endpoint and keeping the two
-   existing zeroization paths correct.
+   `observedPredecessorEndpoint` is passed into the `acceptProjectedExtension`
+   call that constructs the actor, opened at `role-runner.js:386` with the field
+   at `:398`, and it must be the endpoint of the middle that actually connects. With several arms that identity is not
+   known until one resolves, so the exit branch has to be restructured to race
+   the arms first and construct the actor afterwards, carrying the winning arm's
+   endpoint and keeping both existing zeroization paths correct.
 
 Layer 4 is a lifecycle restructure inside the harness that produces the privacy
 evidence, and an earlier partial attempt turned the namespace live gate red.
@@ -1204,12 +1546,31 @@ Reddening the gates that carry that evidence is not an acceptable trade for a fi
 whose practical impact begins only when a real relay population exists, so the
 gap stays recorded and the work is scoped for a deliberate change.
 
+One shortcut is worth ruling out explicitly, because it looks cheap. Pinning the
+draw inside the harness so the first combination always wins would keep the gates
+green without generalising anything. It does not work. The harness passes the real
+`cryptoSuite.randomBytes` into `createEndpointBootstrapAuthority` at
+`role-runner.js:234`, and that same capability supplies bootstrap nonces, so it
+cannot be pinned in isolation. Pinning only the draw means a second,
+selection-only entropy capability whose only caller is the harness, and it would
+make middle i with exit i a permanent fixture assumption, which is the coincidence
+the `exitPairs` correction below removed. It buys green gates by having them prove
+something production would not do.
+
+A future attempt must not be judged on the host aggregate. The eleven-role
+scenarios are excluded from `test/private-routing.js`, which is why the earlier
+attempt could be host-green and still have to be reverted; they run only under the
+`process:node`, `process:bare` and `namespace:live` gates. A change that leaves
+the host aggregate green has demonstrated nothing about this issue either way,
+whatever count it lands on.
+
 Two smaller findings from the attempt are worth keeping. The reconnect request
 built by `consumeGuardReconnectRequest` carries clocks but no randomness, so a
-selection capability threaded through that path has to source it elsewhere. And
-`test/private/live-immutable-get.js` indexed `exitPairs` by a middle's index,
-which held only while selection paired middle i with exit i; that is corrected
-regardless, since it relied on a coincidence.
+selection capability threaded through that path has to source it from the crypto
+suite already in scope at that site. And `test/private/live-immutable-get.js`
+indexed `exitPairs` by a middle's index, which held only while selection paired
+middle i with exit i; that is corrected regardless, since it relied on a
+coincidence.
 
 ## Comparison with Veilid
 

@@ -43,11 +43,20 @@
 # naming the addresses.
 #
 # ONE THING THIS CANNOT CHECK: whether this machine's NAT lets a runner reach a
-# local role at all. Roles send to each other's reflected addresses directly, with
-# no punching, so a NAT that filters by source address will drop a runner's first
-# packet to a local role even though the mapping exists. That shows up as links
-# that never open, not as a diversity error. It is also precisely what a mixed
-# dispatch tests; if it fails that way, all eleven remote is the fallback.
+# local role at all. Roles send to each other's reflected addresses directly, so a
+# NAT that filters by source address drops a peer's first packet even though the
+# mapping exists. live-route.js now runs a punch round before it attaches any role -
+# the coordinator hands every role all eleven addresses and they all punch at once,
+# which is what opens each side's NAT for the other - and that closes the ordinary
+# case. It does not close every case: a NAT that filters on source port as well, or
+# a symmetric NAT whose reflected port is not the port a peer will see, is not
+# satisfied by a punch, and NOTHING refreshes a mapping once opened, so a pair the
+# scenario leaves idle past its NAT's UDP timeout goes quiet again. What the punch
+# round does buy is that this now NAMES ITSELF: every role reports the directed
+# pairs it heard nothing from, as `punch matrix N/M directed pairs arrived` and one
+# `heard NOTHING from` line per role, instead of surfacing as links that never open.
+# It is also precisely what a mixed dispatch tests; if it fails that way, all eleven
+# remote is the fallback.
 
 set -euo pipefail
 

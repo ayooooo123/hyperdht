@@ -234,7 +234,13 @@ function registerLiveProcessSuite(launch) {
           exitRole: exitProjection.roleIndex,
           generation: exitProjection.generation
         })
-        const state = { first: null, resolveFirst: null, stopped: false, waiter: null }
+        const state = {
+          first: null,
+          granting: true,
+          resolveFirst: null,
+          stopped: false,
+          waiter: null
+        }
         state.firstRequest = new Promise((resolve) => {
           state.resolveFirst = resolve
         })
@@ -276,17 +282,35 @@ function registerLiveProcessSuite(launch) {
               t.is(request.requestSequence, 1n, `${role} configured seed used no grant request`)
               state.resolveFirst(request)
             }
+            if (!state.granting) return
             if (granted === undefined || granted.used >= granted.grants.length) return
             const grant = granted.grants[granted.used++]
-            await control.respondIsolatedGrant(role, request, grant).catch(noop)
+            // `respondIsolatedGrant` throws SYNCHRONOUSLY when the role's expected phase
+            // has moved since the request was observed, coordinator.js:516. A `.catch` on
+            // its return value never sees that throw, and the throw then escapes this
+            // handler - `.then(onFulfilled, noop)` handles the SOURCE promise's rejection,
+            // not its own handler's - so it lands as an unhandled rejection and takes the
+            // whole run down. `stopGranting()` removes the reachable case; this keeps a
+            // future one from being fatal.
+            try {
+              await control.respondIsolatedGrant(role, request, grant)
+            } catch {}
           }, noop)
         }
         arm()
         return {
           role,
           firstRequest: state.firstRequest,
+          // Stops ANSWERING, and deliberately not listening. The standing waiter has to
+          // stay armed so a request that still arrives is tolerated rather than becoming
+          // PROCESS_UNEXPECTED_EVENT, and `state.stopped` is what disarms re-arming, so
+          // it stays with `stop()`.
+          stopGranting() {
+            state.granting = false
+          },
           stop() {
             state.stopped = true
+            state.granting = false
             for (const pools of learnedCandidates) {
               for (const candidate of Object.values(pools)) candidate.digest.fill(0)
             }
@@ -424,10 +448,42 @@ function registerLiveProcessSuite(launch) {
       t.is(networkChangedSnapshot.endpointSockets, 0, 'network change leaves no endpoint socket')
       t.is(networkChangedSnapshot.guardOnly, false, 'network change installs no fallback edge')
       // We cannot test guard-loss after network-change because network-change is terminal.
+      // KI-11. Advancing a role's expected phase while one of that role's own events is
+      // still unread makes the event stale: `baseMessage` compares the two phases for
+      // exact equality, control-channel.js:964, and `dispatch` reports any validation
+      // failure as PROCESS_PHASE_MISMATCH, coordinator.js:343-348. The exits are the only
+      // roles that still speak unprompted by the time we get here - every other event in
+      // the scenario answers a command, and the endpoint's autonomous `rotated` and
+      // `unavailable` both need state READY, which the terminal network-change above left
+      // as UNAVAILABLE - so the window is an `isolated-grant-request` overtaking the loop
+      // below. Provoked deliberately, and shown closed, by
+      // test/private/process/teardown-phase-window-probe.js.
+      //
+      // Stop ANSWERING first. This is hygiene, not the fix: the request is emitted by the
+      // exit on its own schedule, so nothing done on this side can unsend a frame already
+      // in the pipe. It earns its place for a different reason - a grant answered after
+      // the advance throws synchronously out of `respondIsolatedGrant`, see the responder
+      // above - and because an exit handed a grant mid-teardown restarts the very
+      // discovery that emits the next request. Nothing below needs a responder: both
+      // `isolatedGrantResponses` reads are awaited above, and the six grants per pool
+      // cover the initial build, the rotation and the two resumes, all of which are done.
+      // An unanswered request is expected on the role side too, `stopOwners` rejects a
+      // pending one with PROCESS_CANCELLED before destroying the exit service,
+      // role-runner.js:816-821, so it cannot wedge the stop below.
+      for (const responder of learnedGrantResponders) responder.stopGranting()
       const exits = []
       const snapshots = []
       const closed = []
       for (const role of ROLES) {
+        // The fix: a round trip at the phase already in force, which the runner accepts
+        // because it adopts whatever phase a command carries, role-runner.js:968 - the
+        // same reuse the two `immutable-get`s above rely on. A role's events reach us as
+        // one FIFO stream decoded in order, so once this snapshot has been dispatched
+        // every frame that role emitted earlier has been dispatched too, under the phase
+        // it was emitted with. Only then is the phase advanced. What remains is one round
+        // trip wide instead of the whole loop wide, and with granting stopped an exit that
+        // does emit inside it cannot be given a grant and so cannot emit a second.
+        await sendAndWait(role, 'snapshot', 'snapshot', {}, phases.get(role))
         const generation = generations.get(role)
         const stopPhase = nextPhase(role)
         control.setPhase(role, generation, stopPhase)
