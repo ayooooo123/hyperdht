@@ -10,12 +10,13 @@
 // long they take, and whether they come back after a drop.
 //
 //   REMOTE_PEER_SECRET=<hex> REMOTE_PEER_RUN_ID=<id> \
+//     REMOTE_PEER_COORDINATOR_KEY=<hex public key> \
 //     node test/remote-peer/mesh.js --index 3 --count 10 --seconds 420
 
 const b4a = require('b4a')
 const DHT = require('../..')
 const UDX = require('udx-native')
-const { peerKeyPair, proberKeyPair } = require('./identity')
+const { peerKeyPair, coordinatorPublicKey } = require('./identity')
 const { OP, writeFrame, FrameReader } = require('./frames')
 const { reflect, resolveReflectors } = require('./dht-reflect')
 
@@ -110,11 +111,20 @@ async function main() {
   const options = parse(process.argv.slice(2))
   const secret = process.env.REMOTE_PEER_SECRET
   const runId = process.env.REMOTE_PEER_RUN_ID || process.env.GITHUB_RUN_ID
+  // Members share the run secret, so a member cannot be allowed to derive the
+  // collector's key: its public key is handed in and only pinned here.
+  const coordinatorKey = process.env.REMOTE_PEER_COORDINATOR_KEY
   if (!secret) throw new Error('REMOTE_PEER_SECRET is required')
   if (!runId) throw new Error('REMOTE_PEER_RUN_ID or GITHUB_RUN_ID is required')
+  if (!coordinatorKey) {
+    throw new Error(
+      'REMOTE_PEER_COORDINATOR_KEY is required: the hex public key of the collector ' +
+        'that is allowed to connect, from scripts/remote-peer.sh secret'
+    )
+  }
 
   const keyPair = peerKeyPair(secret, runId, options.index)
-  const prober = proberKeyPair(secret, runId).publicKey
+  const prober = coordinatorPublicKey(coordinatorKey)
   const members = []
   for (let index = 1; index <= options.count; index++) {
     members.push({ index, publicKey: peerKeyPair(secret, runId, index).publicKey })
@@ -243,8 +253,9 @@ async function main() {
 
   const server = node.createServer(
     {
-      // Mesh members and the prober only: the derived key set is the whole
-      // access list, so a stranger cannot join the mesh.
+      // Mesh members and the pinned collector only: the derived member keys plus
+      // that one supplied key are the whole access list, so a stranger cannot
+      // join the mesh and a member cannot pose as the collector.
       firewall(remotePublicKey) {
         const hex = b4a.toString(remotePublicKey, 'hex')
         return !(allowed.has(hex) || b4a.equals(remotePublicKey, prober))

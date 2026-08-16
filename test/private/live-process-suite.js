@@ -35,6 +35,17 @@ function base(projection, type, phaseSequence, generation = projection.generatio
 
 function noop() {}
 
+// A role's reachable address: the one peers dial, and the one every isolated-address
+// digest is keyed on, because a closer is discovered over the wire and a peer appears
+// there at the address it published. topology-fixture.js:1030 mints the learned-grant
+// pools from exactly this tuple. A derived plan binds what it publishes, so the two are
+// the same address there; a discovered topology carries the published tuples in the
+// projection because no role can compute another's.
+function reachableTupleFor(projection) {
+  if (!projection.meshPeers) return projection.bind
+  return projection.meshPeers.tuples[projection.roleIndex - 1]
+}
+
 function registerLiveProcessSuite(launch) {
   if (
     !launch ||
@@ -197,10 +208,11 @@ function registerLiveProcessSuite(launch) {
           ['dht-seed', exitProjection.learnedSeedGrants]
         ].map(([candidateRole, pools]) => {
           const candidateProjection = projectionFor(candidateRole)
-          const id = deriveDhtExitPeerId(candidateProjection.bind)
+          const candidateTuple = reachableTupleFor(candidateProjection)
+          const id = deriveDhtExitPeerId(candidateTuple)
           const digestForGen = (gen) =>
             digestTestIsolatedAddressTuple({
-              tuple: candidateProjection.bind,
+              tuple: candidateTuple,
               id,
               exitRole: exitProjection.roleIndex,
               generation: BigInt(gen)

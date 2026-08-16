@@ -7,9 +7,14 @@
 // test that plays the part of role-bridge.js, so every event a RemoteChild can
 // raise is provoked on purpose rather than waited for. What is pinned is the
 // lifecycle the coordinator depends on and cannot see the transport behind:
-// bytes both ways, a silent stderr, one 'exit' per channel, the difference
-// between a graceful far-side close and a broken one, kill(), and what a write
+// bytes both ways, a silent stderr, one 'exit' per channel, the outcome a channel
+// settles for a clean end, a broken stream and a killed role, and what a write
 // after the far side is gone reports.
+//
+// The outcome is the part a stream cannot carry. An 'end' and a 'close' say only
+// that a role is gone, so the channel asks the far side for a terminal status
+// record and settles from that; the far side here serves one per channel, or
+// refuses to, which is how the fail-closed path is provoked.
 //
 // Everything runs on one testnet over real DHT streams: the encoding, framing and
 // half-close rules of the transport are exactly what a distributed run uses.
@@ -18,10 +23,14 @@ const test = require('brittle')
 const b4a = require('b4a')
 const DHT = require('../..')
 const createTestnet = require('../../testnet')
-const { peerKeyPair, proberKeyPair } = require('./identity')
+const { peerKeyPair, coordinatorKeyPair: deriveCoordinatorKeyPair } = require('./identity')
+const { OP, writeFrame } = require('./frames')
 const { MODE, RemoteChild } = require('./role-channels')
 
 const SECRET = 'c0ffee0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+// The coordinator's own secret. A role host never holds this, only the matching
+// public key, so this file holds both halves precisely because it plays both sides.
+const COORDINATOR_SECRET = 'facade00112233445566778899aabbccddeeff00112233445566778899aabbcc'
 // Far past a udx packet, so assertion 1 crosses many of them.
 const BIG_BYTES = 256 * 1024
 const SETTLE_MS = 500
@@ -56,11 +65,12 @@ async function waitFor(predicate, timeoutMs, what) {
 }
 
 // The far side of one channel, as role-bridge.js sees it: a mode byte, then the
-// role's bytes.
+// role's bytes. The mode byte is read by the server, which has to route a status
+// request away from the channel before either sees the other's bytes.
 class FarSide {
-  constructor(socket) {
+  constructor(socket, first) {
     this.socket = socket
-    this.mode = null
+    this.mode = first[0]
     this.received = []
     this.bytes = 0
     this.ended = false
@@ -73,16 +83,15 @@ class FarSide {
     socket.once('close', () => {
       this.closed = true
     })
-    const onData = (chunk) => {
-      if (this.mode === null) {
-        this.mode = chunk[0]
-        chunk = chunk.subarray(1)
-        if (chunk.byteLength === 0) return
-      }
+    socket.on('data', (chunk) => {
       this.received.push(chunk)
       this.bytes += chunk.byteLength
+    })
+    const rest = first.subarray(1)
+    if (rest.byteLength > 0) {
+      this.received.push(rest)
+      this.bytes += rest.byteLength
     }
-    socket.on('data', onData)
   }
 
   payload() {
@@ -90,33 +99,42 @@ class FarSide {
   }
 }
 
-// One server standing in for every role's bridge, plus the coordinator's node.
-// Each attach() is a fresh channel on the same pair of nodes, which is how a real
-// run reaches eleven roles: one prober key, many connections.
+// role-bridge.js's terminal status record, with the clean outcome as the default so
+// each case states only what it is about. A far side that serves no record at all is
+// a bridge that died with its role, which the coordinator must read as a failure.
+function statusFrame(index, status) {
+  return writeFrame(
+    OP.REPORT,
+    b4a.from(
+      JSON.stringify({
+        index,
+        attached: true,
+        exited: true,
+        code: null,
+        signal: null,
+        stderrBytes: 0,
+        stderrSample: '',
+        ...status
+      })
+    )
+  )
+}
+
+// The coordinator's node, plus one server per channel. A role's terminal status
+// lives behind that role's own key on a real bridge, so each attach() takes its own
+// role key pair and serves both the channel and the status behind it; the
+// coordinator's key is one for all of them, exactly as a run of eleven roles has it.
 async function harness(t) {
   const testnet = await createTestnet(6, t.teardown.bind(t))
   const runId = `lifecycle-${Date.now()}`
-  const hostKeyPair = peerKeyPair(SECRET, runId, 1)
-  const coordinatorKeyPair = proberKeyPair(SECRET, runId)
+  const coordinatorKeyPair = deriveCoordinatorKeyPair(COORDINATOR_SECRET)
 
   const host = new DHT({ bootstrap: testnet.bootstrap })
   const coordinator = new DHT({ bootstrap: testnet.bootstrap })
 
-  const pending = []
-  const waiting = []
-  const server = host.createServer(
-    { firewall: (remotePublicKey) => !b4a.equals(remotePublicKey, coordinatorKeyPair.publicKey) },
-    (socket) => {
-      const far = new FarSide(socket)
-      const waiter = waiting.shift()
-      if (waiter) waiter.resolve(far)
-      else pending.push(far)
-    }
-  )
-  await server.listen(hostKeyPair)
-
   const children = []
   const fars = []
+  const servers = []
 
   t.teardown(
     async () => {
@@ -124,7 +142,7 @@ async function harness(t) {
         if (!child.killed) child.kill()
       }
       for (const far of fars) far.socket.destroy()
-      await server.close()
+      for (const server of servers) await server.close()
       await coordinator.destroy()
       await host.destroy()
     },
@@ -133,10 +151,34 @@ async function harness(t) {
 
   let next = 1
   return {
-    async attach() {
-      const accepted = pending.length > 0 ? Promise.resolve(pending.shift()) : null
-      const gate = accepted === null ? deferred() : null
-      if (gate) waiting.push(gate)
+    // status is what a MODE.STATUS connection will be answered with, merged over a
+    // clean record. Passing none means this far side serves no status at all.
+    async attach({ status = null } = {}) {
+      const index = next++
+      const hostKeyPair = peerKeyPair(SECRET, runId, index)
+      const statusRequests = []
+      const gate = deferred()
+
+      const server = host.createServer(
+        {
+          firewall: (remotePublicKey) => !b4a.equals(remotePublicKey, coordinatorKeyPair.publicKey)
+        },
+        (socket) => {
+          socket.on('error', () => {})
+          socket.once('data', (chunk) => {
+            if (chunk[0] === MODE.STATUS) {
+              statusRequests.push(Date.now())
+              if (status === null) return socket.destroy()
+              socket.write(statusFrame(index, status))
+              setTimeout(() => socket.destroy(), 100)
+              return
+            }
+            gate.resolve(new FarSide(socket, chunk))
+          })
+        }
+      )
+      servers.push(server)
+      await server.listen(hostKeyPair)
 
       const socket = coordinator.connect(hostKeyPair.publicKey, { keyPair: coordinatorKeyPair })
       socket.on('error', () => {})
@@ -145,35 +187,52 @@ async function harness(t) {
         socket.once('error', reject)
       })
 
-      const child = new RemoteChild(socket, next++)
+      const child = new RemoteChild(socket, index, {
+        node: coordinator,
+        keyPair: coordinatorKeyPair,
+        publicKey: hostKeyPair.publicKey,
+        // Inside every wait below: a status that cannot be fetched has to fail the
+        // channel promptly, not stall the run that is waiting on the exit.
+        statusTimeoutMs: 8000
+      })
       // The coordinator attaches one on every record; a stdin write that fails has
       // to be reported through the callback, not thrown at the process.
       const stdinErrors = []
       child.stdin.on('error', (err) => stdinErrors.push(err))
       children.push(child)
 
+      // Role stderr exists only in the terminal status, and RemoteChild replays it
+      // here. Whether it landed before the exit is the whole point: the coordinator
+      // fails a run on the stderr chunk, so an exit that overtook it would report the
+      // wrong reason.
+      const stderrChunks = []
+      child.stderr.on('data', (chunk) => stderrChunks.push(chunk))
+      const stderrBytes = () => stderrChunks.reduce((total, chunk) => total + chunk.byteLength, 0)
+
       const exits = []
       const errors = []
       const firstExit = deferred()
       child.on('exit', (code, signal) => {
-        // Captured synchronously. Whether the stream had already closed when the
-        // exit fired is the whole difference between reading the far side's 'end'
-        // and waiting for a 'close' that a half-open stream never reaches.
-        const outcome = { code, signal, streamClosed: child._socket.destroyed }
+        // Captured synchronously, stderr included: what the coordinator had already
+        // seen when the exit fired is not recoverable afterwards.
+        const outcome = { code, signal, stderrBytes: stderrBytes() }
         exits.push(outcome)
         firstExit.resolve(outcome)
       })
 
-      const far = await (accepted || gate.promise)
+      const far = await gate.promise
       fars.push(far)
-      await waitFor(() => far.mode !== null, 20_000, 'the mode byte')
 
       return {
         child,
         far,
         exits,
         errors,
+        statusRequests,
         stdinErrors,
+        stderr() {
+          return b4a.toString(b4a.concat(stderrChunks), 'utf8')
+        },
         // Attaching 'error' is optional for the coordinator, so it is optional here:
         // assertion 5 needs both shapes.
         listenForErrors() {
@@ -210,11 +269,6 @@ test('a remote role channel behaves like a child process', async (t) => {
     'bytes written to stdin reach the far side unchanged, across many packets'
   )
 
-  let stderrBytes = 0
-  io.child.stderr.on('data', (chunk) => {
-    stderrBytes += chunk.byteLength
-  })
-
   const downstream = pattern(BIG_BYTES, 19)
   const collected = []
   let collectedBytes = 0
@@ -231,30 +285,39 @@ test('a remote role channel behaves like a child process', async (t) => {
   )
 
   await delay(SETTLE_MS)
-  t.is(stderrBytes, 0, 'stderr carries no bytes: the bridge reports role stderr out of band')
+  t.is(
+    io.stderr().length,
+    0,
+    'stderr carries nothing while the channel is live: role stderr never rides the control stream'
+  )
 
-  // 4: a graceful far-side close. role-bridge.js:242 ends the stream for a role
-  // that exited zero, so this is what the coordinator sees when a role finishes
-  // its work, and live-process-suite.js expects an exit with code 0 for it.
+  // 4: a graceful far-side close. role-bridge.js ends the stream for a role that
+  // exited zero, so this is what the coordinator sees when a role finishes its work,
+  // and live-process-suite.js expects an exit with code 0 for it.
   //
-  // The end has to be the exit by itself. This side stays open, so the stream
-  // never closes, and a channel that waits for 'close' burns the coordinator's
-  // thirty-second scenario deadline instead. Five seconds is far more than a
-  // half-close needs and far less than that deadline, so a pass here means the
-  // exit came from 'end'.
-  const graceful = await remote.attach()
+  // The end has to start the settle by itself, and the settle costs one status round
+  // trip. This side stays open until then, so a channel that instead waited for
+  // 'close' would burn the coordinator's thirty-second scenario deadline. Ten seconds
+  // is far more than an end plus a status fetch needs and far less than that deadline,
+  // so a pass here means the exit came from the 'end'. Exactly one status is asked
+  // for: the close that follows must not fetch a second one.
+  const graceful = await remote.attach({ status: { code: 0, signal: null } })
   graceful.listenForErrors()
   graceful.far.socket.end()
   let gracefulExit = null
   try {
-    gracefulExit = await graceful.exit(5000)
+    gracefulExit = await graceful.exit(10_000)
   } catch (err) {
     gracefulExit = { failure: err.message }
   }
   t.alike(
-    { exits: graceful.exits.length, outcome: gracefulExit },
-    { exits: 1, outcome: { code: 0, signal: null, streamClosed: false } },
-    'a graceful far-side end exits exactly once with code 0, without waiting for the stream to close'
+    {
+      exits: graceful.exits.length,
+      outcome: gracefulExit,
+      statuses: graceful.statusRequests.length
+    },
+    { exits: 1, outcome: { code: 0, signal: null, stderrBytes: 0 }, statuses: 1 },
+    'a graceful far-side end exits exactly once with code 0, taken from the status the far side served'
   )
   await delay(SETTLE_MS)
   t.is(
@@ -263,8 +326,11 @@ test('a remote role channel behaves like a child process', async (t) => {
     'the close that follows the graceful end does not exit a second time'
   )
 
-  // 5: a broken far side. role-bridge.js:243 destroys the stream for a role that
-  // exited non-zero, and the transport itself fails this way too.
+  // 5: a broken far side that can no longer be asked how it went. role-bridge.js
+  // destroys the stream for a role that exited non-zero, and the transport itself
+  // fails this way too; here the far side also refuses the status, which is a bridge
+  // that died with its role. Nothing establishes an outcome, so the channel must
+  // report a failure.
   const broken = await remote.attach()
   broken.listenForErrors()
   broken.far.socket.destroy()
@@ -274,10 +340,11 @@ test('a remote role channel behaves like a child process', async (t) => {
     {
       exits: broken.exits.length,
       failed: brokenExit.code !== 0 || brokenExit.signal !== null,
+      asked: broken.statusRequests.length > 0,
       errors: broken.errors.length > 0
     },
-    { exits: 1, failed: true, errors: true },
-    'a destroyed far side exits once as a failure and hands the error to a listener'
+    { exits: 1, failed: true, asked: true, errors: true },
+    'a destroyed far side with no status exits once as a failure and hands the error to a listener'
   )
 
   // The same break with nothing listening for 'error'. Reaching the assertion at
@@ -297,15 +364,31 @@ test('a remote role channel behaves like a child process', async (t) => {
     'a destroyed far side with no error listener exits once as a failure and does not crash the process'
   )
 
-  // 6: kill() is the coordinator's only lever on a remote role.
-  const killed = await remote.attach()
+  // 6: kill() is the coordinator's only lever on a remote role, and the one settle
+  // that consults no status: the coordinator chose the signal, so it already knows
+  // the outcome. A local child that is killed reports code null and the signal, and
+  // this has to match, or a role that had to be cut down would be indistinguishable
+  // from one that finished its work. The far side here would happily serve a clean
+  // zero, and must not be asked.
+  const killed = await remote.attach({ status: { code: 0, signal: null } })
   killed.listenForErrors()
   t.is(killed.child.kill(), true, 'kill reports that it acted')
   await waitFor(() => killed.far.closed, 20_000, 'the far side to see the close')
-  await killed.exit(20_000)
+  const killedExit = await killed.exit(20_000)
+  await delay(SETTLE_MS)
   t.ok(
     killed.child.killed && killed.far.closed && killed.child._socket.destroyed,
     'kill closes the stream and the far side observes it'
+  )
+  t.alike(
+    {
+      exits: killed.exits.length,
+      code: killedExit.code,
+      signal: killedExit.signal,
+      statuses: killed.statusRequests.length
+    },
+    { exits: 1, code: null, signal: 'SIGTERM', statuses: 0 },
+    'kill exits once with no code and the signal it was given, without asking for a status'
   )
 
   // 7: the coordinator writes control frames without knowing whether the role is
@@ -333,22 +416,98 @@ test('a remote role channel behaves like a child process', async (t) => {
     'a write after the far side is gone reports an error to the caller instead of throwing'
   )
 
-  // Two more lifecycle facts, reported rather than asserted: they are what
-  // RemoteChild does today, and pinning them here would fight whoever fixes them.
-  //
-  // A local child that is killed reports code null with a signal. kill() here
-  // destroys the stream, and the destroy arrives as the same exit a finished role
-  // gets, so a role the coordinator had to kill is indistinguishable from one that
-  // stopped on its own.
-  t.comment(`kill() surfaced exit ${JSON.stringify(killed.exits[0])}`)
+  // 8: a role that failed behind a stream that ended cleanly. This is the case no
+  // stream event can express: an 'end' used to mean zero, so a role that exited 7
+  // arrived at the coordinator as a clean finish. Only the status record carries the
+  // code, and no 'error' may accompany it -- a spawned child that exits non-zero
+  // emits 'exit' alone, and the coordinator would otherwise report
+  // PROCESS_CHILD_ERROR where a local run reports PROCESS_EARLY_EXIT.
+  const failedCode = await remote.attach({ status: { code: 7, signal: null } })
+  failedCode.listenForErrors()
+  failedCode.far.socket.end()
+  const failedCodeExit = await failedCode.exit(20_000)
+  await delay(SETTLE_MS)
+  t.alike(
+    {
+      exits: failedCode.exits.length,
+      code: failedCodeExit.code,
+      signal: failedCodeExit.signal,
+      errors: failedCode.errors.length
+    },
+    { exits: 1, code: 7, signal: null, errors: 0 },
+    'a far side reporting a non-zero code exits with that code rather than with zero'
+  )
 
-  // coordinator.js:549 ends a role's stdin to stop it. A local role reads that as
-  // EOF; here the Writable's final() only calls back, so the far side is told
-  // nothing and role-bridge.js never gives its role process an EOF either.
-  const eof = await remote.attach()
+  // 9: a role the far side had to kill, reached through a stream that was destroyed
+  // rather than ended. A spawned child reports code null with the signal, and the
+  // record is what makes that reachable at all.
+  const signalled = await remote.attach({ status: { code: null, signal: 'SIGKILL' } })
+  signalled.listenForErrors()
+  signalled.far.socket.destroy()
+  const signalledExit = await signalled.exit(20_000)
+  await delay(SETTLE_MS)
+  t.alike(
+    {
+      exits: signalled.exits.length,
+      code: signalledExit.code,
+      signal: signalledExit.signal,
+      errors: signalled.errors.length
+    },
+    { exits: 1, code: null, signal: 'SIGKILL', errors: 0 },
+    'a far side reporting a signal exits with that signal and no code'
+  )
+
+  // 10: fail closed. The stream ends exactly the way a finished role's does and the
+  // far side serves no status at all. Reporting zero here is the confusion this
+  // protocol exists to prevent, so the channel reports a failure instead, and inside
+  // its own bounded window rather than hanging on the coordinator's deadline.
+  const noStatus = await remote.attach()
+  noStatus.listenForErrors()
+  noStatus.far.socket.end()
+  const startedAt = Date.now()
+  const noStatusExit = await noStatus.exit(20_000)
+  const elapsed = Date.now() - startedAt
+  t.alike(
+    {
+      exits: noStatus.exits.length,
+      failed: noStatusExit.code !== 0 || noStatusExit.signal !== null,
+      asked: noStatus.statusRequests.length > 0,
+      errors: noStatus.errors.length > 0
+    },
+    { exits: 1, failed: true, asked: true, errors: true },
+    'a clean far-side end with no status available exits as a failure, never as a success'
+  )
+  t.ok(elapsed < 15_000, `the unavailable status failed inside its window, in ${elapsed}ms`)
+
+  // 11: role stderr. The bridge counts it and hands back a bounded sample, and the
+  // channel replays that into its own stderr before settling, so coordinator.js:279
+  // fails a remote run on stderr exactly as it fails a local one. The count captured
+  // when 'exit' fired is what proves the order: an exit that overtook the bytes would
+  // have the coordinator report the wrong reason for the same fault.
+  const noisy = await remote.attach({
+    status: { code: 0, signal: null, stderrBytes: 11, stderrSample: 'role noise\n' }
+  })
+  noisy.listenForErrors()
+  noisy.far.socket.end()
+  const noisyExit = await noisy.exit(20_000)
+  await delay(SETTLE_MS)
+  t.alike(
+    { text: noisy.stderr(), atExit: noisyExit.stderrBytes, code: noisyExit.code },
+    { text: 'role noise\n', atExit: 11, code: 0 },
+    'stderr reported in the status reaches child.stderr, and lands before the exit'
+  )
+
+  // coordinator.js:549 stops a role by ending its stdin, and a spawned role reads
+  // that as EOF. The channel half-closes its stream so the bridge can pass the same
+  // EOF to its role, and like a spawned child that has not chosen to exit yet, the
+  // channel does not exit on it.
+  const eof = await remote.attach({ status: { code: 0, signal: null } })
   eof.child.stdin.end()
-  await delay(1500)
-  t.comment(
-    `after stdin.end() the far side saw ended=${eof.far.ended} closed=${eof.far.closed}, and the channel exited=${eof.child.exited}`
+  await waitFor(() => eof.far.ended, 20_000, 'the far side to see the half-close')
+  await delay(SETTLE_MS)
+  t.alike(
+    { ended: eof.far.ended, exited: eof.child.exited },
+    { ended: true, exited: false },
+    'ending stdin half-closes the stream so the far side sees EOF, and does not exit the channel'
   )
 })

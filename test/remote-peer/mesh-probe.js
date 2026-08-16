@@ -6,12 +6,13 @@
 // NAT'd runners has to be measured before any route topology is built on it.
 //
 //   REMOTE_PEER_SECRET=<hex> REMOTE_PEER_RUN_ID=<id> REMOTE_PEER_COUNT=10 \
+//     REMOTE_PEER_COORDINATOR_SECRET=<hex> \
 //     brittle-node test/remote-peer/mesh-probe.js
 
 const test = require('brittle')
 const b4a = require('b4a')
 const DHT = require('../..')
-const { peerKeyPair, proberKeyPair } = require('./identity')
+const { peerKeyPair, coordinatorKeyPair } = require('./identity')
 const { OP, writeFrame, FrameReader } = require('./frames')
 
 const CONNECT_ATTEMPT_MS = 20_000
@@ -20,6 +21,9 @@ const REPORT_TIMEOUT_MS = 30_000
 function config() {
   const secret = process.env.REMOTE_PEER_SECRET
   const runId = process.env.REMOTE_PEER_RUN_ID
+  // The collector's own secret. Members hold the shared run secret and pin only
+  // this key's public half, so a member cannot pose as the collector.
+  const coordinatorSecret = process.env.REMOTE_PEER_COORDINATOR_SECRET
   const count = Number(process.env.REMOTE_PEER_COUNT || 0)
   const waitMs = Number(process.env.REMOTE_PEER_WAIT_SECONDS || 600) * 1000
   const bootstrap = (process.env.REMOTE_PEER_BOOTSTRAP || '')
@@ -40,7 +44,17 @@ function config() {
       : process.env.REMOTE_PEER_MIN_DEGREE
   )
   if (!secret || !runId || !Number.isInteger(count) || count < 2) return null
-  return { secret, runId, count, waitMs, bootstrap, minPairRatio, minDegree }
+  // A run is configured, so a missing collector secret is a fault rather than an
+  // unconfigured harness: skipping here would report a pass for a matrix nobody
+  // could have collected.
+  if (!coordinatorSecret) {
+    throw new Error(
+      'REMOTE_PEER_COORDINATOR_SECRET is required alongside REMOTE_PEER_SECRET: ' +
+        'the workstation-only secret whose public key the members pin, ' +
+        'from scripts/remote-peer.sh secret'
+    )
+  }
+  return { secret, coordinatorSecret, runId, count, waitMs, bootstrap, minPairRatio, minDegree }
 }
 
 function connectOnce(node, keyPair, publicKey) {
@@ -135,7 +149,7 @@ test('mesh members reach each other and report the pairwise matrix', async (t) =
 
   t.timeout(options.waitMs + 180_000)
 
-  const keyPair = proberKeyPair(options.secret, options.runId)
+  const keyPair = coordinatorKeyPair(options.coordinatorSecret)
   const node = new DHT({
     bootstrap: options.bootstrap.length > 0 ? options.bootstrap : undefined
   })

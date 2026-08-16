@@ -5,6 +5,7 @@
 // DHT for that span, then measure against it from a workstation.
 //
 //   REMOTE_PEER_SECRET=<hex> REMOTE_PEER_RUN_ID=<id> \
+//     REMOTE_PEER_COORDINATOR_KEY=<hex public key> \
 //     node test/remote-peer/serve.js --index 1 --seconds 300
 //
 // Options: --index (default 1), --seconds (default 300),
@@ -13,7 +14,7 @@
 
 const b4a = require('b4a')
 const DHT = require('../..')
-const { peerKeyPair, proberKeyPair } = require('./identity')
+const { peerKeyPair, coordinatorPublicKey } = require('./identity')
 
 function parse(argv) {
   const options = { index: 1, seconds: 300, bootstrap: [], host: null, port: 0 }
@@ -45,11 +46,21 @@ async function main() {
   const options = parse(process.argv.slice(2))
   const secret = process.env.REMOTE_PEER_SECRET
   const runId = process.env.REMOTE_PEER_RUN_ID || process.env.GITHUB_RUN_ID
+  // The prober's public key is supplied, not derived. This peer holds the shared
+  // run secret, so anything derivable from it is derivable here, and a firewall
+  // pinned to a key this host could mint is not a firewall at all.
+  const coordinatorKey = process.env.REMOTE_PEER_COORDINATOR_KEY
   if (!secret) throw new Error('REMOTE_PEER_SECRET is required')
   if (!runId) throw new Error('REMOTE_PEER_RUN_ID or GITHUB_RUN_ID is required')
+  if (!coordinatorKey) {
+    throw new Error(
+      'REMOTE_PEER_COORDINATOR_KEY is required: the hex public key of the prober ' +
+        'that is allowed to connect, from scripts/remote-peer.sh secret'
+    )
+  }
 
   const keyPair = peerKeyPair(secret, runId, options.index)
-  const prober = proberKeyPair(secret, runId).publicKey
+  const prober = coordinatorPublicKey(coordinatorKey)
   const node = new DHT({
     bootstrap: options.bootstrap.length > 0 ? options.bootstrap : undefined,
     host: options.host || undefined,
@@ -62,8 +73,8 @@ async function main() {
 
   const server = node.createServer(
     {
-      // Only the derived prober may connect. A leaked peer key is then useless
-      // on its own.
+      // Only the pinned prober may connect. A leaked peer key is then useless on
+      // its own, and so is this host's copy of the shared run secret.
       firewall(remotePublicKey) {
         const allowed = b4a.equals(remotePublicKey, prober)
         if (!allowed) rejected++

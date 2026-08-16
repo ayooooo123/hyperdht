@@ -9,6 +9,12 @@ name: Remote Mesh
 # workstation-to-peer links: a guard must reach a middle and a middle an exit.
 # Two runners are the endpoint pair; the rest are route candidates.
 #
+# The collector's key is not one of those derived keys. Every member holds the
+# shared secret, so a collector key derived from it would be a key every member
+# could mint, and no member could be told apart from the collector. The collector
+# keeps its secret on the workstation and passes only the matching public key, as
+# the coordinator_key input, which is public material by construction.
+#
 # Dispatch with scripts/remote-mesh.sh.
 
 on:
@@ -34,6 +40,9 @@ on:
         options:
           - ubuntu-latest
           - macos-latest
+      coordinator_key:
+        description: Hex public key of the collector allowed to connect (scripts/remote-peer.sh secret prints it)
+        required: true
 
 jobs:
   member:
@@ -51,6 +60,7 @@ jobs:
           MEMBERS: ${{ inputs.members }}
           SECONDS_INPUT: ${{ inputs.seconds }}
           SETTLE_INPUT: ${{ inputs.settle }}
+          COORDINATOR_KEY: ${{ inputs.coordinator_key }}
           INDEX: ${{ matrix.index }}
         run: |
           case "$MEMBERS" in
@@ -68,6 +78,21 @@ jobs:
           fi
           if [ "$SETTLE_INPUT" -lt 5 ] || [ "$SETTLE_INPUT" -ge "$SECONDS_INPUT" ]; then
             echo "settle must be 5 or more and below seconds" >&2
+            exit 1
+          fi
+          # A malformed pin is caught here rather than after the settle window: a
+          # member pinned to nonsense refuses the collector, and the run would look
+          # like a reachability failure instead of a typo. Whitespace is stripped
+          # first so this gate accepts exactly what identity.js accepts.
+          COORDINATOR_KEY="$(printf '%s' "$COORDINATOR_KEY" | tr -d '[:space:]')"
+          case "$COORDINATOR_KEY" in
+            '' | *[!0-9a-fA-F]*)
+              echo "coordinator_key must be hex" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#COORDINATOR_KEY}" -ne 64 ]; then
+            echo "coordinator_key must be 64 hex characters, got ${#COORDINATOR_KEY}" >&2
             exit 1
           fi
           if [ "$INDEX" -le "$MEMBERS" ]; then
@@ -88,6 +113,7 @@ jobs:
         shell: bash
         env:
           REMOTE_PEER_SECRET: ${{ secrets.REMOTE_PEER_SECRET }}
+          REMOTE_PEER_COORDINATOR_KEY: ${{ inputs.coordinator_key }}
           REMOTE_PEER_RUN_ID: ${{ github.run_id }}
           MEMBER_INDEX: ${{ matrix.index }}
           MEMBER_COUNT: ${{ inputs.members }}

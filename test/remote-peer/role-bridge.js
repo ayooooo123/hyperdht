@@ -5,30 +5,40 @@
 //
 // The role process is unchanged: test/private/process/role-runner.js already
 // speaks the binary control protocol on stdin and stdout, so this bridge only
-// moves those bytes. The coordinator dials in with a derived key, the bridge
+// moves those bytes. The coordinator dials in with a key this host cannot derive,
 // spawns the role, and the two streams are joined. Keeping role-runner untouched
 // matters: it is what the local gates exercise, and a distributed run must not be
 // a different program.
 //
 //   REMOTE_PEER_SECRET=<hex> REMOTE_PEER_RUN_ID=<id> \
+//     REMOTE_PEER_COORDINATOR_KEY=<hex public key> \
 //     node test/remote-peer/role-bridge.js --index 3 --runtime node --seconds 900
 
 const path = require('path')
 const { spawn } = require('child_process')
 const b4a = require('b4a')
 const DHT = require('../..')
-const { peerKeyPair, proberKeyPair } = require('./identity')
+const { peerKeyPair, coordinatorPublicKey } = require('./identity')
 const { reflect, resolveReflectors } = require('./dht-reflect')
 const { OP, writeFrame } = require('./frames')
 
 // A role binds a socket it owns; peers dial the address the world sees for it.
 const BIND_HOST = '0.0.0.0'
-const MODE = Object.freeze({ REPORT: 1, ATTACH: 2 })
+// One byte on a fresh connection says what it is for: addresses, a role's control
+// stream, or the role's terminal status.
+const MODE = Object.freeze({ REPORT: 1, ATTACH: 2, STATUS: 3 })
 // An exit binds a second socket for reaching DHT nodes, at 43000 + roleIndex; see
 // role-runner.js:360. Behind a NAT it carries its own mapping, so it has to be
 // discovered separately.
 const EXIT_ROLE_INDEXES = Object.freeze([4, 6, 8])
 const EXIT_DHT_PORT_BASE = 43_000
+
+// A role must be silent on stderr. What one writes anyway is evidence the
+// coordinator has to see, so the count is exact and a bounded prefix is kept to
+// hand back with the terminal status. Nothing beyond that prefix is ever buffered,
+// however loud a role gets.
+const STDERR_SAMPLE_CHARS = 400
+const STDERR_SAMPLE_BYTES = 4 * STDERR_SAMPLE_CHARS
 
 const ROLE_RUNNER = path.join(__dirname, '..', 'private', 'process', 'role-runner.js')
 const REPO_ROOT = path.join(__dirname, '..', '..')
@@ -146,11 +156,21 @@ async function main() {
   const options = parse(process.argv.slice(2))
   const secret = process.env.REMOTE_PEER_SECRET
   const runId = process.env.REMOTE_PEER_RUN_ID || process.env.GITHUB_RUN_ID
+  // Supplied, not derived. This host holds the shared run secret, so a pin on
+  // anything derived from it would be a pin on a key this host could mint, and any
+  // role could then pass any other role's firewall and take its one ATTACH.
+  const coordinatorKey = process.env.REMOTE_PEER_COORDINATOR_KEY
   if (!secret) throw new Error('REMOTE_PEER_SECRET is required')
   if (!runId) throw new Error('REMOTE_PEER_RUN_ID or GITHUB_RUN_ID is required')
+  if (!coordinatorKey) {
+    throw new Error(
+      'REMOTE_PEER_COORDINATOR_KEY is required: the hex public key of the coordinator ' +
+        'that is allowed to attach, from scripts/remote-peer.sh secret'
+    )
+  }
 
   const keyPair = peerKeyPair(secret, runId, options.index)
-  const coordinator = proberKeyPair(secret, runId).publicKey
+  const coordinator = coordinatorPublicKey(coordinatorKey)
   const node = new DHT({
     bootstrap: options.bootstrap.length > 0 ? options.bootstrap : undefined
   })
@@ -210,9 +230,31 @@ async function main() {
   let role = null
   let attached = false
 
+  // What no stream event can carry: whether the role exited, with what code or
+  // signal, and what it said on stderr. A failed role's control stream is destroyed,
+  // and a destroyed stream can reach the coordinator as a bare close, so the outcome
+  // has to be answerable on a second connection or a crash reads as a clean finish.
+  const status = {
+    exited: false,
+    code: null,
+    signal: null,
+    stderrBytes: 0,
+    stderrHead: b4a.alloc(0)
+  }
+  const statusRecord = () => ({
+    index: options.index,
+    attached,
+    exited: status.exited,
+    code: status.code,
+    signal: status.signal,
+    stderrBytes: status.stderrBytes,
+    stderrSample: b4a.toString(status.stderrHead, 'utf8').slice(0, STDERR_SAMPLE_CHARS)
+  })
+
   const server = node.createServer(
     {
-      // Only the coordinator may drive a role.
+      // Only the coordinator may drive a role, and this host cannot derive its key:
+      // it is handed the public half and nothing else.
       firewall(remotePublicKey) {
         const allowed = b4a.equals(remotePublicKey, coordinator)
         if (!allowed) {
@@ -254,6 +296,18 @@ async function main() {
               )
             )
           )
+          // The answer is the whole purpose of this connection.
+          setTimeout(() => socket.destroy(), 250)
+          return
+        }
+
+        // The terminal status, asked for on a fresh connection once the control
+        // stream is over. Answered whether or not a role was ever attached, and after
+        // the role has gone: the record outlives it.
+        if (mode === MODE.STATUS) {
+          const record = statusRecord()
+          trace({ event: 'status-served', ...record })
+          socket.write(writeFrame(OP.REPORT, b4a.from(JSON.stringify(record))))
           // The answer is the whole purpose of this connection.
           setTimeout(() => socket.destroy(), 250)
           return
@@ -324,18 +378,34 @@ async function main() {
         )
         socket.once('end', () => trace({ event: 'socket-end', index: options.index }))
 
-        // A role must be silent on stderr; forwarding it as data would corrupt the
-        // control stream, so it is reported here and the run fails on the missing
-        // reply rather than on garbage.
+        // A role must be silent on stderr, and forwarding its bytes as data would
+        // corrupt the control stream. So they are counted, a bounded prefix is kept,
+        // and both travel back with the terminal status: the coordinator replays the
+        // sample into the channel's stderr and its own check fires, exactly as it
+        // does for a spawned role. The log line keeps the evidence here as well.
         role.stderr.on('data', (data) => {
+          status.stderrBytes += data.byteLength
+          if (status.stderrHead.byteLength < STDERR_SAMPLE_BYTES) {
+            const room = STDERR_SAMPLE_BYTES - status.stderrHead.byteLength
+            const slice = data.byteLength > room ? data.subarray(0, room) : data
+            status.stderrHead =
+              status.stderrHead.byteLength === 0
+                ? b4a.from(slice)
+                : b4a.concat([status.stderrHead, slice])
+          }
           emit({
             event: 'role-stderr',
             index: options.index,
-            text: b4a.toString(data, 'utf8').slice(0, 400)
+            bytes: data.byteLength,
+            total: status.stderrBytes,
+            text: b4a.toString(data, 'utf8').slice(0, STDERR_SAMPLE_CHARS)
           })
         })
 
         role.once('exit', (code, signal) => {
+          status.exited = true
+          status.code = typeof code === 'number' ? code : null
+          status.signal = typeof signal === 'string' ? signal : null
           emit({ event: 'role-exit', index: options.index, code, signal })
           trace({
             event: 'role-exit',
