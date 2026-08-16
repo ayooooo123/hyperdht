@@ -33,6 +33,64 @@ const EXIT_DHT_PORT_BASE = 43_000
 const ROLE_RUNNER = path.join(__dirname, '..', 'private', 'process', 'role-runner.js')
 const REPO_ROOT = path.join(__dirname, '..', '..')
 
+// Diagnostics only, off unless PR_BRIDGE_TRACE names a file: one JSON object per
+// line recording every control frame, the stream lifecycle and the role's exit, so
+// a teardown that hangs can be read back as an ordered sequence. role-channels.js
+// writes the coordinator's half of the same file; `t` is epoch milliseconds taken
+// from the high-resolution clock, so lines from different processes on one host
+// sort into one timeline.
+const TRACE_PATH = process.env.PR_BRIDGE_TRACE || null
+const TRACING = TRACE_PATH !== null
+const { performance: clock } = require('perf_hooks')
+
+function trace(event) {
+  if (TRACE_PATH === null) return
+  try {
+    require('fs').appendFileSync(
+      TRACE_PATH,
+      `${JSON.stringify({
+        t: clock.timeOrigin + clock.now(),
+        side: 'bridge',
+        pid: process.pid,
+        ...event
+      })}\n`
+    )
+  } catch {}
+}
+
+// Names the frames in a control stream without touching the bytes passing through:
+// the sniffer is handed every chunk and reports the type of each complete frame. It
+// disables itself on the first decode error, so a diagnostic can never break a pipe.
+function frameSniffer(index, direction) {
+  if (TRACE_PATH === null) return () => {}
+  let decoder = null
+  try {
+    const { ControlFrameDecoder } = require('../private/process/control-channel')
+    decoder = new ControlFrameDecoder((message) => {
+      trace({
+        event: 'frame',
+        index,
+        direction,
+        type: typeof message.type === 'string' ? message.type : null,
+        generation: typeof message.generation === 'bigint' ? String(message.generation) : null,
+        phaseSequence:
+          typeof message.phaseSequence === 'bigint' ? String(message.phaseSequence) : null
+      })
+    })
+  } catch {
+    return () => {}
+  }
+  return (chunk) => {
+    if (decoder === null) return
+    try {
+      decoder.push(chunk)
+    } catch (err) {
+      decoder = null
+      trace({ event: 'frame-undecodable', index, direction, message: err && err.message })
+    }
+  }
+}
+
 function parse(argv) {
   const options = {
     index: 1,
@@ -207,6 +265,7 @@ async function main() {
         }
         attached = true
         emit({ event: 'attached', index: options.index })
+        trace({ event: 'attached', index: options.index, firstChunkBytes: chunk.byteLength })
 
         const launch = roleCommand(options.runtime)
         role = spawn(launch.command, launch.args, {
@@ -214,14 +273,56 @@ async function main() {
           env: roleEnvironment(),
           stdio: ['pipe', 'pipe', 'pipe']
         })
+        trace({ event: 'role-spawn', index: options.index, rolePid: role.pid })
+
+        const inbound = frameSniffer(options.index, 'coordinator->role')
+        const outbound = frameSniffer(options.index, 'role->coordinator')
 
         // Control frames both ways, untouched. Anything that arrived alongside the
         // mode byte belongs to the role.
-        if (rest.byteLength > 0) role.stdin.write(rest)
+        if (rest.byteLength > 0) {
+          if (TRACING) {
+            trace({
+              event: 'socket-data',
+              index: options.index,
+              bytes: rest.byteLength,
+              withMode: true
+            })
+          }
+          inbound(rest)
+          role.stdin.write(rest)
+        }
+        // The per-chunk sites are guarded rather than left to trace(): the argument
+        // object would otherwise be built for every chunk on a stream that is not
+        // being traced.
         socket.on('data', (data) => {
-          if (role && role.stdin && !role.stdin.destroyed) role.stdin.write(data)
+          const writable = !!(role && role.stdin && !role.stdin.destroyed)
+          if (TRACING) {
+            trace({
+              event: 'socket-data',
+              index: options.index,
+              bytes: data.byteLength,
+              stdinWritable: writable
+            })
+            inbound(data)
+          }
+          if (writable) role.stdin.write(data)
         })
-        role.stdout.on('data', (data) => socket.write(data))
+        role.stdout.on('data', (data) => {
+          if (TRACING) {
+            trace({ event: 'role-stdout', index: options.index, bytes: data.byteLength })
+            outbound(data)
+          }
+          socket.write(data)
+        })
+
+        // Which side closed the role's stdin, and whether the far side half-closed or
+        // reset, is what a hanging teardown turns on. Both are recorded.
+        role.stdin.once('close', () => trace({ event: 'role-stdin-close', index: options.index }))
+        role.stdin.on('error', (err) =>
+          trace({ event: 'role-stdin-error', index: options.index, message: err && err.message })
+        )
+        socket.once('end', () => trace({ event: 'socket-end', index: options.index }))
 
         // A role must be silent on stderr; forwarding it as data would corrupt the
         // control stream, so it is reported here and the run fails on the missing
@@ -236,13 +337,40 @@ async function main() {
 
         role.once('exit', (code, signal) => {
           emit({ event: 'role-exit', index: options.index, code, signal })
+          trace({
+            event: 'role-exit',
+            index: options.index,
+            code,
+            signal,
+            killedByBridge: role.killed,
+            stdinDestroyed: role.stdin.destroyed
+          })
           // A role that finished its work exits zero, and the coordinator must see
           // that as a closed channel rather than a reset: ending the stream says the
           // far side is done, destroying it says something broke.
-          if (code === 0) socket.end()
-          else socket.destroy()
+          if (code === 0) {
+            trace({ event: 'socket-end-called', index: options.index })
+            socket.end()
+          } else {
+            trace({ event: 'socket-destroy-called', index: options.index })
+            socket.destroy()
+          }
+        })
+        // The coordinator stops a role by ending its stdin, and a spawned role sees
+        // EOF. The coordinator's half-close arrives here, so pass the EOF on rather
+        // than leaving the role waiting for a signal.
+        socket.on('end', () => {
+          trace({ event: 'socket-end-received', index: options.index })
+          if (role && role.stdin && role.stdin.writable && !role.stdin.destroyed) {
+            role.stdin.end()
+          }
         })
         socket.once('close', () => {
+          trace({
+            event: 'socket-close',
+            index: options.index,
+            roleExitCode: role ? role.exitCode : null
+          })
           if (role && !role.killed) role.kill('SIGTERM')
         })
       }
