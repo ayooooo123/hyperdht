@@ -60,6 +60,7 @@ for index in $(seq 1 11); do
     node test/remote-peer/role-bridge.js \
     --index "$index" \
     --seconds "$seconds" \
+    --cell-port "$((42000 + index))" \
     --reachable-host 127.0.0.1 \
     --bootstrap "$bootstrap" \
     >"/tmp/rehearsal-bridge-$index.log" 2>&1 &

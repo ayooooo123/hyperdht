@@ -264,11 +264,18 @@ function meshTuples(endpoints) {
   const values = exactArrayValues(endpoints, ROLES.length)
   const seen = new Set()
   const bind = []
+  const exitDht = []
   const reachable = []
-  for (const value of values) {
-    exactObject(value, ['bind', 'reachable'])
+  for (let index = 0; index < values.length; index++) {
+    const value = values[index]
+    // An exit owns a second socket for reaching DHT nodes, and behind a NAT that
+    // socket carries its own mapping, so an exit must publish it too. No other role
+    // has one.
+    const needsDhtExit = EXIT_ROLE_INDICES.has(index + 1)
+    exactObject(value, needsDhtExit ? ['bind', 'dhtExit', 'reachable'] : ['bind', 'reachable'])
     numericTuple(value.bind)
     numericTuple(value.reachable)
+    if (needsDhtExit) numericTuple(value.dhtExit)
     // Reachable addresses must be distinct: they are what peers dial and what the
     // firewall map is keyed by. Bind addresses may repeat, because two roles on
     // two machines can each bind the same local port.
@@ -277,8 +284,15 @@ function meshTuples(endpoints) {
     seen.add(key)
     bind.push(Object.freeze({ host: value.bind.host, port: value.bind.port }))
     reachable.push(Object.freeze({ host: value.reachable.host, port: value.reachable.port }))
+    if (needsDhtExit) {
+      exitDht.push(Object.freeze({ host: value.dhtExit.host, port: value.dhtExit.port }))
+    }
   }
-  return Object.freeze({ bind: Object.freeze(bind), reachable: Object.freeze(reachable) })
+  return Object.freeze({
+    bind: Object.freeze(bind),
+    exitDht: Object.freeze(exitDht),
+    reachable: Object.freeze(reachable)
+  })
 }
 
 function resolveTuples(plan, endpoints = null) {
@@ -289,7 +303,9 @@ function resolveTuples(plan, endpoints = null) {
   if (endpoints !== null) invalid()
   if (plan !== PORTABLE_LOOPBACK && plan !== LINUX_NAMESPACE) invalid()
   const derived = Object.freeze(ROLES.map((role, index) => planTuple(plan, index + 1)))
-  return Object.freeze({ bind: derived, reachable: derived })
+  // Derived plans need no published exit-DHT tuples: a role computes a peer's from
+  // the plan, which is exactly what a discovered topology cannot do.
+  return Object.freeze({ bind: derived, exitDht: Object.freeze([]), reachable: derived })
 }
 
 function issueAuthority(plan, endpoints = null) {
@@ -876,8 +892,18 @@ function createLiveProcessTopology(options) {
     const policyDigest = digestExitOriginServicePolicy()
     const dhtIds = identities.slice(8).map((pair) => copy(pair.publicKey, 32))
 
+    // Under the discovered plan a role cannot compute any peer's address, so the
+    // addresses it is allowed to reach travel with its projection.
+    const meshPeers =
+      plan === DHT_MESH
+        ? deepFreeze({
+            exitDht: resolved.exitDht.map((tuple) => ({ ...tuple })),
+            tuples: tuples.map((tuple) => ({ ...tuple }))
+          })
+        : null
     const common = (index) => ({
       bind: bindTuples[index],
+      ...(meshPeers === null ? {} : { meshPeers }),
       controlAuditMacKey: roleMacKeys[index],
       generation: GENERATIONS[index],
       plan: plan.name,
