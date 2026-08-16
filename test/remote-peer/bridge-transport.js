@@ -15,11 +15,16 @@ const { spawn } = require('child_process')
 const b4a = require('b4a')
 const DHT = require('../..')
 const createTestnet = require('../../testnet')
-const { peerKeyPair, proberKeyPair } = require('./identity')
+const { peerKeyPair, coordinatorKeyPair } = require('./identity')
 const { openRemoteRoleChannels, closeRemoteRoleChannels } = require('./role-channels')
 
 const BRIDGE = path.join(__dirname, 'role-bridge.js')
 const SECRET = 'a1b2c3d4e5f60718293a4b5c6d7e8f901122334455667788990aabbccddeeff0'
+// The two halves a real run keeps apart. The bridge is spawned with the public
+// key only, exactly as a role host receives it; the coordinator secret stays on
+// this side, and only this file plays both parts.
+const COORDINATOR_SECRET = 'facade00112233445566778899aabbccddeeff00112233445566778899aabbcc'
+const COORDINATOR_KEY = b4a.toString(coordinatorKeyPair(COORDINATOR_SECRET).publicKey, 'hex')
 
 function readyLine(child, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -62,7 +67,12 @@ test('a role on the far side of a DHT stream speaks the control protocol', async
     [BRIDGE, '--index', '1', '--seconds', '90', '--bootstrap', bootstrap],
     {
       cwd: path.join(__dirname, '..', '..'),
-      env: { ...process.env, REMOTE_PEER_SECRET: SECRET, REMOTE_PEER_RUN_ID: runId },
+      env: {
+        ...process.env,
+        REMOTE_PEER_SECRET: SECRET,
+        REMOTE_PEER_RUN_ID: runId,
+        REMOTE_PEER_COORDINATOR_KEY: COORDINATOR_KEY
+      },
       stdio: ['ignore', 'pipe', 'pipe']
     }
   )
@@ -104,9 +114,34 @@ test('a role on the far side of a DHT stream speaks the control protocol', async
   const node = new DHT({ bootstrap: testnet.bootstrap })
   t.teardown(() => node.destroy(), { order: 2 })
 
+  // The bridge claims only the coordinator may drive a role. This is what that
+  // claim is worth: a role host holds the shared run secret and the pin, and every
+  // role key in the run is derivable from that secret, so the one thing standing
+  // between a compromised role and any other role's single ATTACH is that the
+  // coordinator's key is not derivable from anything a role has. Derive one from
+  // the shared secret, the way this bridge used to, and it must be refused.
+  const forged = node.connect(peerKeyPair(SECRET, runId, 1).publicKey, {
+    keyPair: coordinatorKeyPair(SECRET)
+  })
+  forged.on('error', () => {})
+  const forgedOpened = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), 10_000)
+    forged.once('open', () => {
+      clearTimeout(timer)
+      resolve(true)
+    })
+    forged.once('error', () => {
+      clearTimeout(timer)
+      resolve(false)
+    })
+  })
+  forged.destroy()
+  t.absent(forgedOpened, 'a coordinator key derived from the shared run secret is refused')
+
   const entries = await openRemoteRoleChannels({
     node,
     secret: SECRET,
+    coordinatorSecret: COORDINATOR_SECRET,
     runId,
     projections: [
       {

@@ -10,6 +10,7 @@
 // test/private/process/coordinator.js drives them unchanged.
 //
 //   REMOTE_PEER_SECRET=<hex> REMOTE_PEER_RUN_ID=<id> \
+//     REMOTE_PEER_COORDINATOR_SECRET=<hex> \
 //     brittle-node test/remote-peer/live-route.js
 //
 // Skips with a stated reason when no run is configured.
@@ -27,6 +28,10 @@ const {
 function config() {
   const secret = process.env.REMOTE_PEER_SECRET
   const runId = process.env.REMOTE_PEER_RUN_ID
+  // The coordinator's own secret, which no role host has. The roles pin only its
+  // public key, so this is the one piece of material that makes the bridges'
+  // firewalls mean anything.
+  const coordinatorSecret = process.env.REMOTE_PEER_COORDINATOR_SECRET
   const waitMs = Number(process.env.REMOTE_PEER_WAIT_SECONDS || 900) * 1000
   const bootstrap = (process.env.REMOTE_PEER_BOOTSTRAP || '')
     .split(',')
@@ -37,7 +42,17 @@ function config() {
       return { host, port: Number(port) }
     })
   if (!secret || !runId) return null
-  return { secret, runId, waitMs, bootstrap }
+  // A run is configured, so a missing coordinator secret is a fault rather than
+  // an unconfigured harness: skipping here would report a pass for a run that
+  // never happened.
+  if (!coordinatorSecret) {
+    throw new Error(
+      'REMOTE_PEER_COORDINATOR_SECRET is required alongside REMOTE_PEER_SECRET: ' +
+        'the workstation-only secret whose public key the role bridges pin, ' +
+        'from scripts/remote-peer.sh secret'
+    )
+  }
+  return { secret, coordinatorSecret, runId, waitMs, bootstrap }
 }
 
 const options = config()
@@ -68,6 +83,7 @@ if (options === null) {
       const endpoints = await requestRoleEndpoints({
         node,
         secret: options.secret,
+        coordinatorSecret: options.coordinatorSecret,
         runId: options.runId,
         count: ROLES.length,
         deadline
@@ -87,6 +103,7 @@ if (options === null) {
           const entries = await openRemoteRoleChannels({
             node,
             secret: options.secret,
+            coordinatorSecret: options.coordinatorSecret,
             runId: options.runId,
             projections,
             deadline

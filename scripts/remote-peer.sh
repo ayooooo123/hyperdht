@@ -3,15 +3,24 @@
 # Drives the Remote Peer workflow and times this machine against the peers it
 # holds open.
 #
-#   scripts/remote-peer.sh secret            # create the local secret, push it to the repo
+#   scripts/remote-peer.sh secret            # create both local secrets, push the shared one
 #   scripts/remote-peer.sh up [-p 3] [-s 300] [-o ubuntu-latest]
 #   scripts/remote-peer.sh probe <run-id> [-p 3]
 #   scripts/remote-peer.sh local [-p 2]      # same harness on a local testnet, no CI
 #
-# The secret lives in $XDG_CONFIG_HOME/hyperdht-remote-peer/secret and in the
-# REMOTE_PEER_SECRET repository secret. It is never a workflow input: dispatch
-# inputs are readable by anyone who can read the repository, and the secret is
-# what stops a stranger from connecting to a peer.
+# Two secrets, because they protect different things.
+#
+# The shared run secret lives in $XDG_CONFIG_HOME/hyperdht-remote-peer/secret and
+# in the REMOTE_PEER_SECRET repository secret. Every peer derives its own server
+# key from it, which is how the prober finds peers without a directory. It is
+# never a workflow input: dispatch inputs are readable by anyone who can read the
+# repository, and this secret is what stops a stranger from connecting to a peer.
+#
+# The coordinator secret lives in .../coordinator-secret and nowhere else. It is
+# not pushed and not derived from the shared secret, because every peer holds the
+# shared secret and could otherwise mint the prober's key and drive its siblings.
+# A run carries only the matching public key, as the coordinator_key dispatch
+# input, which is safe to publish precisely because it is public.
 
 set -euo pipefail
 
@@ -21,6 +30,7 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
 secret_dir="${XDG_CONFIG_HOME:-$HOME/.config}/hyperdht-remote-peer"
 secret_file="$secret_dir/secret"
+coordinator_secret_file="$secret_dir/coordinator-secret"
 workflow=remote-peer.yml
 node_bin="${NODE:-node}"
 
@@ -36,21 +46,55 @@ read_secret() {
   tr -d '[:space:]' <"$secret_file"
 }
 
+read_coordinator_secret() {
+  # The environment wins so a container or a one-off shell can supply it without a
+  # file. There is deliberately no fall back to the shared secret: that is the
+  # scheme this file exists to replace.
+  if [ -n "${REMOTE_PEER_COORDINATOR_SECRET:-}" ]; then
+    printf '%s' "$REMOTE_PEER_COORDINATOR_SECRET" | tr -d '[:space:]'
+    return 0
+  fi
+  if [ ! -s "$coordinator_secret_file" ]; then
+    echo "no coordinator secret; run: scripts/remote-peer.sh secret" >&2
+    exit 69
+  fi
+  tr -d '[:space:]' <"$coordinator_secret_file"
+}
+
+# The pin every role and peer is given. Deriving it here keeps key handling in
+# test/remote-peer/identity.js, which is the only file that should have any.
+derive_coordinator_key() {
+  REMOTE_PEER_COORDINATOR_SECRET="$1" "$node_bin" test/remote-peer/identity.js
+}
+
 ensure_secret() {
   mkdir -p "$secret_dir"
   if [ ! -s "$secret_file" ]; then
     "$node_bin" -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex"))' \
       >"$secret_file"
     chmod 600 "$secret_file"
-    echo "wrote a new secret to $secret_file"
+    echo "wrote a new shared run secret to $secret_file"
   else
-    echo "keeping the existing secret in $secret_file"
+    echo "keeping the existing shared run secret in $secret_file"
   fi
+  # The coordinator's own secret, generated in the same breath so no entry point
+  # can find one half without the other. It is never pushed: a peer that held it
+  # could mint the prober's key and drive its siblings.
+  if [ ! -s "$coordinator_secret_file" ]; then
+    "$node_bin" -e 'process.stdout.write(require("crypto").randomBytes(32).toString("hex"))' \
+      >"$coordinator_secret_file"
+    chmod 600 "$coordinator_secret_file"
+    echo "wrote a new coordinator secret to $coordinator_secret_file"
+  else
+    echo "keeping the existing coordinator secret in $coordinator_secret_file"
+  fi
+  echo "coordinator public key: $(derive_coordinator_key "$(read_coordinator_secret)")"
   # Writing a repository secret changes repository settings, so it only happens
-  # when asked for. The local file alone is enough for the `local` harness.
+  # when asked for. The local files alone are enough for the `local` harness.
   if [ "${1:-}" = "--push" ]; then
     gh secret set REMOTE_PEER_SECRET --body "$(read_secret)"
-    echo "pushed it to the REMOTE_PEER_SECRET repository secret"
+    echo "pushed the shared run secret to the REMOTE_PEER_SECRET repository secret"
+    echo "the coordinator secret stays here; a run carries only its public key"
   else
     echo "not pushed; run with --push to set the REMOTE_PEER_SECRET repository secret"
   fi
@@ -125,9 +169,15 @@ newest_run_id() {
 
 probe() {
   local run_id="$1"
+  local secret coordinator_secret
+  # Read into locals first: a missing secret must stop the run here, with the
+  # message read_secret prints, not inside brittle with an empty environment.
+  secret="$(read_secret)"
+  coordinator_secret="$(read_coordinator_secret)"
   # The wait window covers runner queueing plus npm install before a peer
   # listens, so it is deliberately larger than the peer lifetime.
-  REMOTE_PEER_SECRET="$(read_secret)" \
+  REMOTE_PEER_SECRET="$secret" \
+    REMOTE_PEER_COORDINATOR_SECRET="$coordinator_secret" \
     REMOTE_PEER_RUN_ID="$run_id" \
     REMOTE_PEER_COUNT="$peers" \
     REMOTE_PEER_WAIT_SECONDS="$((seconds + 240))" \
@@ -144,7 +194,10 @@ case "${1:-}" in
     parse_flags "$@"
     before="$(gh run list --workflow "$workflow" --limit 1 --json databaseId \
       --jq '.[0].databaseId' 2>/dev/null || true)"
-    gh workflow run "$workflow" -f "peers=$peers" -f "seconds=$seconds" -f "os=$os"
+    # The peers pin this key and refuse everyone else, so a dispatch without it
+    # would hold five peers open that nobody can reach.
+    gh workflow run "$workflow" -f "peers=$peers" -f "seconds=$seconds" -f "os=$os" \
+      -f "coordinator_key=$(derive_coordinator_key "$(read_coordinator_secret)")"
     run_id="$(newest_run_id "$before")" || {
       echo "dispatched, but the run id never appeared; find it with: gh run list" >&2
       exit 75
@@ -164,6 +217,10 @@ case "${1:-}" in
     shift
     parse_flags "$@"
     secret="$(read_secret)"
+    # The local harness plays both sides on one machine, so it holds both secrets;
+    # the peers it starts still receive only the public key, exactly as a runner does.
+    coordinator_secret="$(read_coordinator_secret)"
+    coordinator_key="$(derive_coordinator_key "$coordinator_secret")"
     run_id="local-$(date +%s)"
     testnet_log="$(mktemp)"
     "$node_bin" "$repo/test/remote-peer/local-testnet.js" --size 8 >"$testnet_log" 2>&1 &
@@ -195,12 +252,14 @@ case "${1:-}" in
     fi
     for index in $(seq 1 "$peers"); do
       REMOTE_PEER_SECRET="$secret" REMOTE_PEER_RUN_ID="$run_id" \
+        REMOTE_PEER_COORDINATOR_KEY="$coordinator_key" \
         "$node_bin" "$repo/test/remote-peer/serve.js" --index "$index" --seconds "$seconds" \
         --bootstrap "$bootstrap" --host 127.0.0.1 >/dev/null 2>&1 &
       peer_pids+=($!)
     done
     sleep 2
     REMOTE_PEER_SECRET="$secret" \
+      REMOTE_PEER_COORDINATOR_SECRET="$coordinator_secret" \
       REMOTE_PEER_RUN_ID="$run_id" \
       REMOTE_PEER_COUNT="$peers" \
       REMOTE_PEER_WAIT_SECONDS=60 \
@@ -208,7 +267,7 @@ case "${1:-}" in
       "$repo/node_modules/.bin/brittle-node" test/remote-peer/probe.js
     ;;
   *)
-    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 64
     ;;
 esac

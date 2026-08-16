@@ -214,7 +214,16 @@ function verifyBound(owner) {
 }
 
 async function createEndpointOwner() {
+  // The endpoint's bootstrap socket is a cell endpoint like any other, so on
+  // separate hosts it too is bound locally and reached at a translated address.
+  // Without the advertised pair its link handles would claim the bound address,
+  // which is not the address the guard's capability names.
+  const advertised =
+    projection.plan === PROCESS_PLANS.DHT_MESH.name ? tupleForRole(projection.roleIndex) : null
   const authority = createEndpointBootstrapAuthority({
+    ...(advertised === null
+      ? {}
+      : { advertisedHost: advertised.host, advertisedPort: advertised.port }),
     bootstrapEndpoints: [projection.guardBootstrap],
     cancelScheduled,
     host: projection.bind.host,
@@ -410,6 +419,12 @@ function startIncomingExtension() {
           host: projection.bind.host,
           port: 43_000 + projection.roleIndex
         },
+        // Same divergence as the cell endpoint: the socket is bound locally and a DHT
+        // node observes it at the published DHT-exit address, which is the address a
+        // reply echoes back.
+        ...(projection.plan === PROCESS_PLANS.DHT_MESH.name
+          ? { advertised: exitDhtTupleForRole(projection.roleIndex) }
+          : {}),
         dhtSeed: projection.dhtSeed,
         dhtSeedId: projection.dhtSeedId,
         exitRole: projection.roleIndex,
