@@ -703,11 +703,13 @@ reissued. Nothing in the harness can compensate for it.
 
 ### KI-10: an in-band branch loss is undeliverable to an idle endpoint, and only a lease bounds discovery
 
-**Status: open. Two compounding production faults. The first is reproduced
-deterministically in isolation; the second is a design property read from the code and
-confirmed by measurement.**
+**Status: FIRST HALF FIXED, SECOND HALF OPEN. Two compounding production faults. The
+first, head-of-line blocking, is the same fault as KI-8 and was closed by the same
+change; it is retained here because this is where the mechanism is documented. The
+second, that nothing but a lease bounds discovery of a dead branch, is untouched and
+needs a reviewed design rather than a patch.**
 
-FIRST: head-of-line blocking in the route transport. `pumpM3RouteTransport`,
+FIRST, NOW FIXED: head-of-line blocking in the route transport. `pumpM3RouteTransport`,
 `lib/private/m3-adjacency-runtime.js:866-916`, is the only caller of
 `consumeM3RouteBranchDestroy` at `:842`, and it stops reading the physical channel
 whenever a frame is already sitting unread in `record.received`: the guard at `:872`
@@ -750,7 +752,7 @@ one wedge. It has three consumers, and all three have the same reader gap:
 So the precondition is structurally available on an exit and on the activation path, not only
 on the endpoint, and because the pump is shared the fix covers all three at once.
 
-SECOND: nothing detects branch liveness. If the in-band notification is lost, for this
+SECOND, STILL OPEN: nothing detects branch liveness. If the in-band notification is lost, for this
 reason or any other, the only remaining path to discovery is
 `BRANCH_ROTATION_LEAD_MS`, `route-manager.js:36`, a timer scheduled 5s before the branch
 material expires. That is a lease running down, not liveness detection. There is no
