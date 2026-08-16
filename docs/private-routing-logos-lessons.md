@@ -105,7 +105,7 @@ teardown semantics.
 
 **Gap (forward-looking).** v1 admits "DHT storage nodes see stored record keys and
 bounded descriptor bytes." Route material rotates by `epoch` throughout the code, but a
-grep of `lib/private` for `blind` returns **zero hits** — there is no key-*blinding*
+grep of `lib/private` for `blind` returns **zero hits** — there is no key-_blinding_
 primitive, only rotation. Private presence records are also not implemented at the
 current gate (Gate 3B1 is route construction), so this is guidance for when the
 `lookup`/`announce` private-presence path lands, not a present defect.

@@ -14,7 +14,8 @@ const {
 const {
   armSetupDhtAudit,
   createDhtSetupAuditController,
-  destroyDhtSetupAuditController
+  destroyDhtSetupAuditController,
+  drainDhtSetupAuditEvents
 } = require('./process/dht-setup-audit-udx')
 
 const SOURCE = Object.freeze({ host: '127.64.10.1', port: 42_010 })
@@ -25,6 +26,7 @@ function encodePacket({
   internal = false,
   target = null,
   tid,
+  to = null,
   value = null,
   response = false
 }) {
@@ -37,7 +39,7 @@ function encodePacket({
   state.buffer[state.start++] = response ? 0x13 : 0x03
   state.buffer[state.start++] = flags
   c.uint16.encode(state, tid)
-  c.ipv4Address.encode(state, response ? SOURCE : DESTINATION)
+  c.ipv4Address.encode(state, to === null ? (response ? SOURCE : DESTINATION) : to)
   if (!response) c.uint.encode(state, command)
   if (target !== null) c.fixed32.encode(state, target)
   if (value !== null) c.buffer.encode(state, value)
@@ -147,6 +149,16 @@ function zeroDigest() {
   return b4a.alloc(32)
 }
 
+function throwsCode(t, fn, expected, message) {
+  let code = null
+  try {
+    fn()
+  } catch (err) {
+    code = err && err.code
+  }
+  t.is(code, expected, message)
+}
+
 test('direct dht request packet is observed only at native trySend with its assigned TID', (t) => {
   const f = fixture()
   const socket = f.socket()
@@ -203,7 +215,7 @@ test('setup observing UDX correlates swapped reply before forwarding unchanged',
   destroyDhtSetupAuditController(f.controller)
 })
 
-test('setup observing UDX rejects unarmed, mismatched, retry, forged and post-destroy traffic', (t) => {
+test('setup observing UDX rejects unarmed, mismatched, tid-reuse, forged and post-destroy traffic', (t) => {
   const f = fixture()
   const socket = f.socket()
   const target = b4a.alloc(32, 6)
@@ -218,7 +230,13 @@ test('setup observing UDX rejects unarmed, mismatched, retry, forged and post-de
   })
   t.exception(() => socket.trySend(packet, DESTINATION.port, '127.64.9.1', 0))
   socket.trySend(packet, DESTINATION.port, DESTINATION.host, 0)
-  t.exception(() => socket.trySend(packet, DESTINATION.port, DESTINATION.host, 0))
+  const colliding = encodePacket({ command: 9, target, tid: 10, value: b4a.from('extra') })
+  throwsCode(
+    t,
+    () => socket.trySend(colliding, DESTINATION.port, DESTINATION.host, 0),
+    'PROCESS_DHT_SETUP_REPLAY',
+    'different bytes reusing an outstanding tid are a replay'
+  )
   const forged = encodePacket({ command: 0, tid: 11, response: true })
   t.is(
     f.udx.sockets[0].emit('message', forged, {
@@ -247,5 +265,104 @@ test('setup observing UDX delegates network watches and passes internal request/
   const from = { host: DESTINATION.host, port: DESTINATION.port }
   f.udx.sockets[0].emit('message', reply, from)
   t.is(f.events.length, 0)
+  destroyDhtSetupAuditController(f.controller)
+})
+
+test('setup observing UDX forwards an identical setup retransmission against one record', (t) => {
+  const f = fixture()
+  const socket = f.socket()
+  const target = b4a.alloc(32, 4)
+  armSetupDhtAudit(f.controller, {
+    class: AUDIT_CLASSES.SETUP_STORE_TOKEN,
+    command: 9,
+    destination: DESTINATION,
+    target,
+    valueDigest: zeroDigest()
+  })
+  const request = encodePacket({ command: 9, target, tid: 77 })
+  socket.trySend(request, DESTINATION.port, DESTINATION.host, 0)
+  // dht-rpc resends the same buffer object; the copy proves the audit compares
+  // bytes rather than buffer identity.
+  socket.trySend(b4a.from(request), DESTINATION.port, DESTINATION.host, 0)
+  socket.trySend(request, DESTINATION.port, DESTINATION.host, 0)
+  t.is(f.udx.sockets[0].calls.length, 3, 'every copy reaches the wire')
+  t.is(f.events.length, 1, 'no second audit record is opened')
+  t.is(f.events[0].type, 'audit-open')
+  t.is(f.failures.length, 0)
+  const reply = encodePacket({ command: 0, tid: 77, response: true, value: b4a.from('value') })
+  f.udx.sockets[0].emit('message', reply, { host: DESTINATION.host, port: DESTINATION.port })
+  t.is(f.events.length, 2, 'the first reply closes the single record')
+  t.is(f.events[1].type, 'audit-close')
+  const drained = drainDhtSetupAuditEvents(f.controller)
+  t.is(drained.length, 2)
+  t.is(drained.retransmissions, 2, 'both retransmissions are counted')
+  // closeSetup deleted the correlation, so a request replayed afterwards is
+  // judged by the arm check exactly as it is today.
+  throwsCode(
+    t,
+    () => socket.trySend(request, DESTINATION.port, DESTINATION.host, 0),
+    'PROCESS_DHT_SETUP_UNARMED',
+    'a request replayed after closeSetup finds no correlation'
+  )
+  destroyDhtSetupAuditController(f.controller)
+})
+
+test('setup observing UDX accepts an internal retransmission and one reply per copy', (t) => {
+  const f = fixture()
+  const socket = f.socket()
+  const received = []
+  socket.on('message', (buffer) => received.push(buffer))
+  const request = encodePacket({ command: 0, internal: true, tid: 91 })
+  socket.trySend(request, DESTINATION.port, DESTINATION.host, 3)
+  socket.trySend(b4a.from(request), DESTINATION.port, DESTINATION.host, 3)
+  t.is(f.udx.sockets[0].calls.length, 2, 'both copies reach the wire')
+  t.is(f.failures.length, 0)
+  const colliding = encodePacket({ command: 1, internal: true, tid: 91 })
+  throwsCode(
+    t,
+    () => socket.trySend(colliding, DESTINATION.port, DESTINATION.host, 3),
+    'PROCESS_DHT_SETUP_REPLAY',
+    'a different internal request on the same tid is a replay'
+  )
+  const reply = encodePacket({ command: 0, tid: 91, response: true })
+  const from = { host: DESTINATION.host, port: DESTINATION.port }
+  f.udx.sockets[0].emit('message', reply, from)
+  f.udx.sockets[0].emit('message', reply, from)
+  t.is(received.length, 2, 'each copy may be answered')
+  t.is(f.failures.length, 0)
+  t.is(drainDhtSetupAuditEvents(f.controller).retransmissions, 1)
+  f.udx.sockets[0].emit('message', reply, from)
+  t.is(f.failures.length, 1, 'a reply beyond the copies sent is uncorrelated')
+  t.is(f.failures[0].code, 'PROCESS_DHT_SETUP_FORGED_RESPONSE')
+  destroyDhtSetupAuditController(f.controller)
+})
+
+test('setup observing UDX accepts an inbound request retransmission and one reply per copy', (t) => {
+  const f = fixture()
+  const socket = f.socket()
+  const received = []
+  socket.on('message', (buffer) => received.push(buffer))
+  const request = encodePacket({ command: 9, target: b4a.alloc(32, 3), tid: 55, to: SOURCE })
+  const from = { host: DESTINATION.host, port: DESTINATION.port }
+  f.udx.sockets[0].emit('message', request, from)
+  f.udx.sockets[0].emit('message', b4a.from(request), from)
+  t.is(received.length, 2, 'both copies reach the node')
+  t.is(f.failures.length, 0)
+  const reply = encodePacket({ command: 0, tid: 55, response: true, to: DESTINATION })
+  socket.trySend(reply, DESTINATION.port, DESTINATION.host, 0)
+  socket.trySend(reply, DESTINATION.port, DESTINATION.host, 0)
+  t.is(f.udx.sockets[0].calls.length, 2, 'each received copy may be answered')
+  throwsCode(
+    t,
+    () => socket.trySend(reply, DESTINATION.port, DESTINATION.host, 0),
+    'PROCESS_DHT_SETUP_UNCLASSIFIED',
+    'a third reply has no received request left to answer'
+  )
+  t.is(drainDhtSetupAuditEvents(f.controller).retransmissions, 1)
+  const colliding = encodePacket({ command: 9, target: b4a.alloc(32, 8), tid: 55, to: SOURCE })
+  f.udx.sockets[0].emit('message', request, from)
+  f.udx.sockets[0].emit('message', colliding, from)
+  t.is(f.failures.length, 1)
+  t.is(f.failures[0].code, 'PROCESS_DHT_SETUP_REPLAY')
   destroyDhtSetupAuditController(f.controller)
 })

@@ -21,7 +21,7 @@ Noise identities") and [`private-routing-logos-lessons.md`](../../private-routin
   (`destination-ref.js` `DESTINATION_REF_SIZE = 172`). This hides the destination from
   intermediaries **in-band**, per request. It is not a public key stored on DHT nodes.
 - A `grep` of `lib/private` for `blind` returns zero hits: route/descriptor material
-  **rotates by `epoch`** throughout, but there is no key-*blinding* primitive.
+  **rotates by `epoch`** throughout, but there is no key-_blinding_ primitive.
 - Private presence records themselves — the address-free records `announce`/`lookup`
   would store on DHT nodes in `required` mode — do not exist yet.
 
@@ -40,8 +40,8 @@ by DHT storage nodes** MUST use **blinded, epoch-rotating keys**, not mere rotat
 - The blinding scheme must let a legitimate looker-up who knows the destination's stable
   identity compute the current blinded key and locate/verify the record, while a storage
   node holding the record cannot.
-- **Separate concern — body confidentiality.** Blinding hides *identity and linkage* from
-  the storage node; it does **not** control who may *read* the descriptor. The public
+- **Separate concern — body confidentiality.** Blinding hides _identity and linkage_ from
+  the storage node; it does **not** control who may _read_ the descriptor. The public
   stable key `A` is not a confidentiality boundary (it may be widely known). Restricting
   readers requires a separate **reader credential** — a shared secret or the looker's own
   keypair (Tor v3 "client authorization" style) — used to derive the body-encryption key.
@@ -101,6 +101,7 @@ not decrypt it. A storage node holding `{k_e, A', body}` cannot recover `A`, can
 services it stores.
 
 Notes:
+
 - The ed25519 blinding must follow Tor's clamping-aware derivation (rend-spec-v3 §A.2);
   ristretto255 (which would be cleaner) is **unavailable** in the pinned sodium.
 - Rotation is automatic (new epoch ⇒ new key); early revocation uses an identity-signed
