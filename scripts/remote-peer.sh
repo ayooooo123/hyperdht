@@ -28,44 +28,16 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # brittle resolves test paths as globs relative to the working directory, so the
 # whole script runs from the repository root.
 cd "$repo"
-secret_dir="${XDG_CONFIG_HOME:-$HOME/.config}/hyperdht-remote-peer"
-secret_file="$secret_dir/secret"
-coordinator_secret_file="$secret_dir/coordinator-secret"
 workflow=remote-peer.yml
 node_bin="${NODE:-node}"
+# Both secrets, their paths, and the pin derivation. Shared with remote-mesh.sh and
+# live-route.sh so one file decides how credentials are read.
+# shellcheck source=scripts/remote-peer-credentials.sh
+. "$(dirname "${BASH_SOURCE[0]}")/remote-peer-credentials.sh"
 
 peers=2
 seconds=300
 os=ubuntu-latest
-
-read_secret() {
-  if [ ! -s "$secret_file" ]; then
-    echo "no local secret; run: scripts/remote-peer.sh secret" >&2
-    exit 69
-  fi
-  tr -d '[:space:]' <"$secret_file"
-}
-
-read_coordinator_secret() {
-  # The environment wins so a container or a one-off shell can supply it without a
-  # file. There is deliberately no fall back to the shared secret: that is the
-  # scheme this file exists to replace.
-  if [ -n "${REMOTE_PEER_COORDINATOR_SECRET:-}" ]; then
-    printf '%s' "$REMOTE_PEER_COORDINATOR_SECRET" | tr -d '[:space:]'
-    return 0
-  fi
-  if [ ! -s "$coordinator_secret_file" ]; then
-    echo "no coordinator secret; run: scripts/remote-peer.sh secret" >&2
-    exit 69
-  fi
-  tr -d '[:space:]' <"$coordinator_secret_file"
-}
-
-# The pin every role and peer is given. Deriving it here keeps key handling in
-# test/remote-peer/identity.js, which is the only file that should have any.
-derive_coordinator_key() {
-  REMOTE_PEER_COORDINATOR_SECRET="$1" "$node_bin" test/remote-peer/identity.js
-}
 
 ensure_secret() {
   mkdir -p "$secret_dir"

@@ -45,10 +45,11 @@ const REPO_ROOT = path.join(__dirname, '..', '..')
 
 // Diagnostics only, off unless PR_BRIDGE_TRACE names a file: one JSON object per
 // line recording every control frame, the stream lifecycle and the role's exit, so
-// a teardown that hangs can be read back as an ordered sequence. role-channels.js
-// writes the coordinator's half of the same file; `t` is epoch milliseconds taken
-// from the high-resolution clock, so lines from different processes on one host
-// sort into one timeline.
+// a teardown that hangs can be read back as an ordered sequence. This is the ROLE
+// side only: nothing writes a coordinator half, so a hang that is invisible from
+// here needs instrumenting on the coordinator separately. `t` is epoch milliseconds
+// taken from the high-resolution clock, so lines from several role processes on one
+// host sort into one timeline.
 const TRACE_PATH = process.env.PR_BRIDGE_TRACE || null
 const TRACING = TRACE_PATH !== null
 const { performance: clock } = require('perf_hooks')
