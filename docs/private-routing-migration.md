@@ -261,6 +261,39 @@ in between, which is what a run across hosts breaks:
 No transport question remains open, since 90/90 directed cell-socket pairs already
 reach each other between runners.
 
+### KI-7: a cell endpoint must be bound to the address it advertises
+
+**Status: open. Found by running the topology across hosts, not by review.**
+
+`lib/private/udx-cell-endpoint.js:1561` rejects a link whose handle carries a local
+address different from the address the endpoint bound:
+
+```
+if (link.localAddress.host !== state.host || link.localAddress.port !== state.port) {
+  throw PrivateRouteError.UNAUTHORIZED()
+}
+```
+
+The check is sound as an ownership test, and it holds trivially in both derived
+plans, where a role binds the same `127.64.x.1` or `10.203.x.2` address it
+advertises. It cannot hold behind a NAT. A role there binds a private address or
+`0.0.0.0` and is reachable at a translated one, so the address in its signed
+capability is never the address it bound, and every `openLink` fails
+`UNAUTHORIZED`.
+
+This is what stops the distributed rehearsal after the DHT phases: `announce-exit`
+rejects its incoming extension with `UNAUTHORIZED` from `openLink`. It is not a
+harness problem. Any deployment where a relay or exit sits behind a NAT hits it,
+which is most of them.
+
+The remedy is the split the rest of the stack already needed, applied one level
+down: an endpoint knows the address it bound and, separately, the address it
+advertises, and the ownership check compares against the advertised pair while the
+bind stays local. hyperdht itself keeps exactly that distinction for its own socket
+through dht-rpc's NatSampler. Making that change touches production code in a
+security-sensitive path, so it belongs in a reviewed sub-gate rather than in test
+infrastructure.
+
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
 **Status: one cause fixed, one open. Never reproduced locally.**
