@@ -32,6 +32,10 @@ const {
   publishM3TailForwarding,
   consumeTailResponderToken,
   deriveM3CellIds,
+  readM3RouteTransportDiagnostics,
+  receiveM3RouteFrame,
+  sendM3RouteFrame,
+  takeM3RouteTransport,
   revokeM3TailCapability,
   revokeM3TailForwardingLease,
   revokeTailResponderToken,
@@ -40,6 +44,7 @@ const {
   takeM3TailForwardingPublication,
   validateM3Install
 } = require('../../lib/private/m3-adjacency-runtime')
+const { MAX_FRAGMENTS } = require('../../lib/private/fragments')
 function fakeClock({ wall = 1_000n, monotonic = 10_000n } = {}) {
   let currentWall = wall
   let currentMonotonic = monotonic
@@ -139,6 +144,7 @@ function forwardingFacade(destroy = () => {}) {
 
 function relayChannel() {
   const packets = []
+  const inbound = []
   const waiters = []
   let receiveError = null
   let sendError = null
@@ -157,6 +163,7 @@ function relayChannel() {
         receiveError = null
         return Promise.reject(error)
       }
+      if (inbound.length > 0) return Promise.resolve(inbound.shift())
       return new Promise((resolve, reject) => waiters.push({ resolve, reject }))
     },
     destroy() {
@@ -169,6 +176,16 @@ function relayChannel() {
   return {
     value,
     packets,
+    // `deliver` requires a pending receive on purpose: three tests rely on that
+    // throw to prove the pump was reading when they delivered. A route transport
+    // that has stopped reading is exactly the state KI-10 is about, so it needs a
+    // delivery that does not assert a reader - the packet waits in the channel the
+    // way a datagram waits in a link buffer.
+    deliverUnread(packet) {
+      const waiter = waiters.shift()
+      if (waiter) waiter.resolve(b4a.from(packet))
+      else inbound.push(b4a.from(packet))
+    },
     deliver(packet) {
       const waiter = waiters.shift()
       if (waiter) waiter.resolve(b4a.from(packet))
@@ -289,6 +306,138 @@ function syntheticLink(overrides = {}) {
     state
   }
 }
+
+async function microtasks(turns = 40) {
+  for (let turn = 0; turn < turns; turn++) await Promise.resolve()
+}
+
+// A datagram cell sealed the way the peer would send it: the local side's own rx
+// context and cell id, with a caller-owned SenderCounter so several forged cells
+// arrive as distinct in-order counters rather than as a replay of one.
+function routeCell(state, counter, payload) {
+  const codec = new CellCodec({ crypto: cryptoSuite, cellSize: 1200 })
+  const context = state.contexts[CELL_CLASS.DATAGRAM].rx
+  return codec.seal({
+    key: context.key,
+    noncePrefix: context.noncePrefix,
+    senderCounter: counter,
+    class: CELL_CLASS.DATAGRAM,
+    direction: state.initiator ? DIRECTION.REVERSE : DIRECTION.FORWARD,
+    epoch: state.generation,
+    circuitId: state.localId,
+    payload
+  })
+}
+
+function branchDestroyBody(state) {
+  const body = b4a.alloc(42)
+  body[0] = state.branchClass
+  body.set(state.branchId, 1)
+  body.set(state.circuitId, 17)
+  writeU64(body, state.generation, 33)
+  body[41] = 1
+  return encodeM3Object({ messageId: M3_MESSAGE_ID.BRANCH_DESTROY_V1, body })
+}
+
+async function routeTransportRig() {
+  const clock = fakeClock()
+  const link = syntheticLink({ channel: relayChannel(), wireExpiresAt: 2_000n })
+  const adopted = authority(clock).adopt(link.handle)
+  const moved = takeM3TailCapability(adopted.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  const transport = takeM3RouteTransport(moved.transportOwner)
+  // The pump arms its first receive on a microtask, so the channel holds no pending
+  // reader until that has run.
+  await microtasks(5)
+  return { transport, link, counter: new SenderCounter() }
+}
+
+test('a route transport delivers every frame that arrived while no reader was pending', async (t) => {
+  const rig = await routeTransportRig()
+  const first = b4a.alloc(1100, 0x5a)
+  const second = b4a.alloc(1100, 0x5b)
+
+  // Two frames of one reply, both arriving while the reader is between reservations:
+  // live-route-authority's loop is inside codec.open and pushAuthenticated for the
+  // fragment it just took, so it legitimately holds no waiter. Neither may be lost.
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, first))
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, second))
+  await microtasks()
+
+  t.alike(await receiveM3RouteFrame(rig.transport), first, 'the queued frame is delivered')
+  t.alike(
+    await receiveM3RouteFrame(rig.transport),
+    second,
+    'a frame behind it is delivered too: a fragmented reply loses nothing to a reader gap'
+  )
+})
+
+test('a branch destroy behind an unread route frame is consumed', async (t) => {
+  const rig = await routeTransportRig()
+
+  // The measured sequence: an operation is cancelled, its in-flight reply lands with
+  // no reader, and the branch dies about two milliseconds later. Before the fix that
+  // one queued frame stopped the pump reading, so the destroy was never consumed and
+  // the endpoint kept routing into a dead branch until its material expired.
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, b4a.alloc(1100, 0x5a)))
+  await microtasks()
+  t.is(
+    readM3RouteTransportDiagnostics(rig.transport).received,
+    1,
+    'the orphaned frame is retained rather than dropped'
+  )
+
+  rig.link.channel.deliverUnread(
+    routeCell(rig.link.state, rig.counter, branchDestroyBody(rig.link.state))
+  )
+  await microtasks()
+
+  t.is(readM3RouteTransportDiagnostics(rig.transport), null, 'the transport is destroyed')
+  t.exception(
+    () => sendM3RouteFrame(rig.transport, b4a.alloc(1100, 0x01)),
+    'the branch destroy queued behind an unread frame was consumed'
+  )
+})
+
+test('a route transport caps residency and still consumes a destroy behind a full buffer', async (t) => {
+  const rig = await routeTransportRig()
+  for (let index = 0; index < MAX_FRAGMENTS; index++) {
+    rig.link.channel.deliverUnread(
+      routeCell(rig.link.state, rig.counter, b4a.alloc(1100, 0x60 + index))
+    )
+  }
+  await microtasks()
+  t.alike(
+    readM3RouteTransportDiagnostics(rig.transport),
+    {
+      active: true,
+      received: MAX_FRAGMENTS,
+      waiters: 0,
+      droppedFrames: 0,
+      branchDestroyConsumed: false
+    },
+    'residency is capped at the most route frames one reply can occupy'
+  )
+
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, b4a.alloc(1100, 0x71)))
+  await microtasks()
+  t.is(
+    readM3RouteTransportDiagnostics(rig.transport).droppedFrames,
+    1,
+    'a frame past the cap is discarded and counted rather than stopping the reader'
+  )
+
+  rig.link.channel.deliverUnread(
+    routeCell(rig.link.state, rig.counter, branchDestroyBody(rig.link.state))
+  )
+  await microtasks()
+  t.exception(
+    () => sendM3RouteFrame(rig.transport, b4a.alloc(1100, 0x01)),
+    'a destroy arriving behind a full buffer is still consumed'
+  )
+})
 
 test('M3 authority requires separate wall, monotonic, scheduler, and canceller capabilities', (t) => {
   const clock = fakeClock()
