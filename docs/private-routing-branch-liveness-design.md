@@ -54,6 +54,13 @@ Two consequences that shape everything below:
 
 **Status: ratified and landed in this pass, with tests.** The rest of this file is design.
 
+**Amendment, after KI-15.** The field this section calls `absoluteDeadlineMs` no longer
+exists. The wire now carries `operationBudgetMs`, a relative duration, and each host
+derives its own absolute deadline from its own clock; the endpoint's local deadline travels
+as the `operationDeadlineMs` request option and is never encoded. L0 as landed is unchanged
+in behaviour - the endpoint still arms and enforces its own deadline - but read every
+`absoluteDeadlineMs` below as the endpoint-local deadline derived from that budget.
+
 Every routed request already carries `absoluteDeadlineMs`. The **exit** enforces it
 (`dht-exit-io.js:519-521`). The endpoint only _validates_ it once at admission,
 `live-route-authority.js:668`, captures `started` at `:672`, and then waits forever: the

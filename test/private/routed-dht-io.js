@@ -7,14 +7,16 @@ const sodium = require('sodium-universal')
 const { COMMANDS } = require('../../lib/constants')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const { createQueryContexts } = require('../../lib/private/query-context')
-const { RoutedDHTIO } = require('../../lib/private/routed-dht-io')
+const { ROUTE_OPERATION_BUDGET, RoutedDHTIO } = require('../../lib/private/routed-dht-io')
 const { TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER } = require('../../lib/private/live-route-authority')
 const { decodeDestinationRef, encodeDestinationRef } = require('../../lib/private/destination-ref')
 const {
   clearRoutedRequest,
   decodeRoutedRequest,
-  encodeRoutedRequest
+  encodeRoutedRequest,
+  validateRoutedRequestForExit
 } = require('../../lib/private/routed-dht')
+const { EXIT_ORIGIN_SERVICE_POLICY } = require('../../lib/private/exit-policy')
 const { BRANCH_CLASS, M3_MESSAGE_ID } = require('../../lib/private/protocol')
 const { FakeRouteAuthority } = require('./fake-route-authority')
 
@@ -261,7 +263,7 @@ test('request emits exact immutable-get routed bytes and normalizes logical repl
   t.is(decoded.commandId, M3_MESSAGE_ID.IMMUTABLE_GET_V1)
   t.alike(decoded.encodedBody, bytes(0x31, 32))
   t.alike(decoded.requestId, bytes(0x44, 16))
-  t.is(decoded.absoluteDeadlineMs, 4_000n)
+  t.is(decoded.operationBudgetMs, 3_000n)
   t.alike(decoded.destinationEncoded, destinationRecord.destinationRef)
   clearRoutedRequest(decoded)
 
@@ -1217,14 +1219,14 @@ test('random callback cannot redirect captured mutable intrinsics', async (t) =>
     requestId: bytes(0x77, 16),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: 4_000n,
+    operationBudgetMs: 3_000n,
     destination: source.destinationRef,
     encodedBody: bytes(0x31, 32)
   })
   const authorityPromise = Promise.resolve(
     TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.authenticateResponse(
       authority,
-      { branch: BRANCH_CLASS.LOOKUP, encodedRequest },
+      { branch: BRANCH_CLASS.LOOKUP, encodedRequest, operationDeadlineMs: 4_000n },
       response
     )
   )
@@ -1629,4 +1631,148 @@ test('value is copied before later hostile closer-record reflection', async (t) 
   const reply = await current.io.request(message(to, current.contexts.immutableGet.lookup)).promise
   t.alike(reply.value, bytes(0x5a, 32))
   t.alike(Object.keys(reply), ['rtt', 'from', 'to', 'token', 'closerNodes', 'error', 'value'])
+})
+
+test('routed operation budget follows the path and is clamped to what the exit admits', (t) => {
+  const { hops, perHopOneWayMs, exitDhtReferralMs, forHops, admitted } = ROUTE_OPERATION_BUDGET
+
+  // Four links in one direction: guard, middle, exit, then the exit's own request to a DHT node.
+  t.is(hops, 4n)
+  t.is(forHops(hops), perHopOneWayMs * hops * 2n + exitDhtReferralMs)
+
+  // The budget scales with the path. One more hop is one more round trip of the per-hop
+  // allowance, which is exactly what a single constant could not express.
+  for (const count of [1n, 2n, 3n, 4n, 5n, 8n]) {
+    t.is(forHops(count + 1n) - forHops(count), perHopOneWayMs * 2n)
+  }
+  t.is(forHops(3n), 2_500n)
+  t.is(forHops(4n), 3_000n)
+  t.is(forHops(5n), 3_500n)
+
+  // A shorter path is a smaller budget, not the same one.
+  t.ok(forHops(3n) < forHops(4n))
+  t.ok(forHops(4n) < forHops(5n))
+
+  // The exit refuses a deadline past its own advertised ceiling, so the endpoint mints the
+  // smaller of the derived budget and that ceiling rather than a number of its own choosing.
+  let ceiling = null
+  for (const entry of EXIT_ORIGIN_SERVICE_POLICY) {
+    if (entry.commandId === M3_MESSAGE_ID.IMMUTABLE_GET_V1) ceiling = BigInt(entry.timeoutMs)
+  }
+  t.is(ceiling, 3_000n)
+  t.is(admitted(M3_MESSAGE_ID.IMMUTABLE_GET_V1), forHops(hops) < ceiling ? forHops(hops) : ceiling)
+})
+
+// The endpoint's own absolute deadline is handed to the authority as `operationDeadlineMs` and
+// is deliberately never encoded, so recording the option is the only way to observe it. Both
+// halves of the split KI-15 forced have to stay pinned: what goes on the wire, and what this
+// host derives from it.
+class DeadlineRecordingAuthority extends FakeRouteAuthority {
+  constructor() {
+    super()
+    this.operationDeadlines = []
+  }
+
+  request(options) {
+    this.operationDeadlines.push(options.operationDeadlineMs)
+    return super.request(options)
+  }
+}
+
+function budgetSlot(encoded) {
+  // Body offset 39 behind the 8-byte M3 header: the uint64 `operationBudgetMs` slot.
+  return b4a.from(encoded.subarray(47, 55))
+}
+
+function mintFor(start) {
+  const authority = new DeadlineRecordingAuthority()
+  // Registered with a monotonic clock matching the IO's, so the branch material's liveness
+  // window travels with the clock origin. Otherwise every `start` would be measured against one
+  // fixed epoch and only the values near it could be minted at all, which is the same
+  // single-host assumption KI-15 was.
+  TEST_ONLY_LIVE_ROUTE_AUTHORITY_ISSUER.register(authority, {
+    monotonicNow: () => BigInt(start)
+  })
+  const { io, contexts } = fixture({ authority, now: () => start })
+  const destinationRecord = record(10)
+  authority.lookup = [destinationRecord]
+  authority.response = {
+    rtt: 12,
+    from: destinationRecord,
+    to: null,
+    token: null,
+    closerNodes: [],
+    error: 0,
+    value: bytes(0x55, 32)
+  }
+  const [to] = io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: contexts.immutableGet.lookup
+  })
+  const operation = io.request(message(to, contexts.immutableGet.lookup))
+  return {
+    operation,
+    minted: b4a.from(authority.requests[0].encodedRequest),
+    deadline: authority.operationDeadlines[0]
+  }
+}
+
+test('minted wire value is the relative budget the exit admits, not an absolute instant', async (t) => {
+  const budget = ROUTE_OPERATION_BUDGET.admitted(M3_MESSAGE_ID.IMMUTABLE_GET_V1)
+
+  // Three unrelated clock readings. The wire value must not move with them, because it is a
+  // duration; the endpoint's own deadline must, because that one lives in this host's clock
+  // domain.
+  for (const start of [1_000, 4_000, 6_000]) {
+    const { operation, minted, deadline } = mintFor(start)
+    const decoded = decodeRoutedRequest(minted)
+    t.is(decoded.operationBudgetMs, budget)
+    t.is(deadline, BigInt(start) + budget)
+    clearRoutedRequest(decoded)
+
+    // Shown rather than asserted: the exit's own validator is handed the bytes the endpoint
+    // actually minted, so what the exit admits is observed rather than restated.
+    const admit = (exitNow) => {
+      const request = validateRoutedRequestForExit(b4a.from(minted), {
+        now: () => exitNow,
+        branchClass: BRANCH_CLASS.LOOKUP,
+        verifyDestination: () => true
+      })
+      clearRoutedRequest(request)
+    }
+
+    // KI-15: the exit's clock origin is no longer part of the decision. A reading at the origin,
+    // one matching the endpoint, and one absurdly far ahead all admit the same bytes. The middle
+    // two used to be the only ones that worked and the outer two used to refuse outright, which
+    // is exactly what happened once the two roles stopped sharing a host.
+    admit(0n)
+    admit(BigInt(start))
+    admit(BigInt(start) + budget)
+    admit(1_000_000_000_000n)
+
+    await operation.promise
+  }
+})
+
+test('minted budget bytes are identical across clocks with unrelated origins', async (t) => {
+  const budget = ROUTE_OPERATION_BUDGET.admitted(M3_MESSAGE_ID.IMMUTABLE_GET_V1)
+
+  // Two endpoints whose monotonic clocks were started by unrelated boots. Under the old absolute
+  // encoding these two mints differed in the uint64 at body offset 39 by the whole boot-time
+  // delta, and the exit rejected whichever one its own clock did not happen to bracket.
+  const low = mintFor(1_000)
+  const high = mintFor(5_000_000_000_000)
+
+  t.alike(budgetSlot(low.minted), budgetSlot(high.minted), 'the wire slot carries no clock origin')
+  t.alike(low.minted, high.minted, 'and nothing else in the request tracks the clock either')
+
+  // The local halves do differ, so the budget is being resolved per host rather than pinned to
+  // one reading: without this the assertion above would also hold for a frozen clock.
+  t.is(low.deadline, 1_000n + budget)
+  t.is(high.deadline, 5_000_000_000_000n + budget)
+  t.not(low.deadline, high.deadline)
+
+  await low.operation.promise
+  await high.operation.promise
 })

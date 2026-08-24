@@ -667,8 +667,9 @@ docker run --rm --privileged --mount type=bind,source=$PWD,target=/app \
 
 ### KI-9: an expiry signal arriving during a rotation is lost permanently
 
-**Status: open. A production fault, not a harness artifact. Found by instrumenting a
-rehearsal, not by review.**
+**Status: FIXED. A production fault, not a harness artifact. Found by instrumenting a
+rehearsal, not by review. The diagnosis below is kept because the mechanism is the
+reason the fix is level-triggered rather than a queue.**
 
 A branch expiry signal that arrives while the controller is `ROTATING` is dropped, and
 the state needed to reissue it is destroyed at the same moment, so that branch never
@@ -696,10 +697,20 @@ rotation began, and was discarded with nothing rearming it.
 
 This is independent of KI-8. KI-8 is about which signal starts a rebuild, and whether
 the message that should start it arrives at all. This is about a signal that does
-arrive, at a moment the controller cannot accept it, and is then unrecoverable. The fix
-belongs in the controller: either expiry signals survive a rotation and are redelivered
-after it, or the timer and sink survive a refused delivery so the signal can be
-reissued. Nothing in the harness can compensate for it.
+arrive, at a moment the controller cannot accept it, and is then unrecoverable.
+
+The fix keeps the condition standing rather than queueing the event. A refused
+`lookupBranchExpiry` or `announceBranchExpiry` delivery makes the controller mint a
+replacement sink for the emptied slot, `private-routing-controller.js:298-302`, and
+`renewRouteManagerBranchExpiry`, `route-manager.js:1235-1250`, re-arms the manager's
+own clock at `BRANCH_EXPIRY_RETRY_MS` of 250ms - well inside
+`BRANCH_ROTATION_LEAD_MS` - so redelivery does not depend on the controller reaching
+any particular state. Only an empty slot can be filled, so a live sink is never
+displaced. A branch LOSS is deliberately not renewed this way: it is a past event with
+no timer behind it, its expiry timer remains the backstop, and that residual gap is
+KI-10's second half rather than this path's. Regression coverage is
+`test/private/branch-expiry-rotation.js:271`, which refuses an announce expiry during a
+lookup rotation and asserts the redelivered signal rotates the announce branch.
 
 ### KI-10: an in-band branch loss is undeliverable to an idle endpoint, and only a lease bounds discovery
 
@@ -752,24 +763,44 @@ one wedge. It has three consumers, and all three have the same reader gap:
 So the precondition is structurally available on an exit and on the activation path, not only
 on the endpoint, and because the pump is shared the fix covers all three at once.
 
-SECOND, STILL OPEN: nothing detects branch liveness. If the in-band notification is lost, for this
-reason or any other, the only remaining path to discovery is
+SECOND, STILL OPEN: no guaranteed branch-liveness mechanism is specified. If the
+in-band notification is lost, the remaining specified path to discovery is
 `BRANCH_ROTATION_LEAD_MS`, `route-manager.js:36`, a timer scheduled 5s before the branch
 material expires. That is a lease running down, not liveness detection. There is no
-keepalive and no adjacency timeout. Measured in an instrumented rehearsal where the
-in-band notification never arrived, the endpoint learned nothing for 9656ms and then
-rotated on that timer, which would have fired at the same moment had nothing been
-faulted at all.
+keepalive or adjacency timeout in the private-routing design. In an instrumented
+rehearsal where the in-band notification never arrived and no lower-layer loss signal
+was observed, the endpoint learned nothing for 9656ms and then rotated on that timer,
+which would have fired at the same moment had nothing been faulted at all.
 
-Stated as one property: in-band branch-loss notification is best-effort and silently
-lossy while an endpoint is idle, and it is unreliable by the design of the reader rather
-than by anything the network does. The only reliable discovery mechanism is the branch
-lease running down.
+The lease-only premise was falsified by a separate blackhole probe on the same
+eleven-role topology. With `lookup-middle-a` route cells dropped in both
+directions, the endpoint reported a route change after about 1.48-1.52 seconds
+when idle, and about 1.30-1.34 seconds with an immutable get outstanding. The
+no-fault control remained silent for about 14.7 seconds before the lease. Reverting
+the L0 deadline arm made no material difference. This proves that the blackhole
+was detected before lease expiry; it does **not** identify the detector. The
+current evidence points at the physical-loss sink or UDX link progress, but that
+attribution remains unverified. The probe is deliberately not a gate because
+asserting the observed latency would pin an unexplained implementation detail.
+
+This changes the open question from "does anything detect a silent branch?" to
+"which native layer detects this failure, and is that mechanism guaranteed for
+healthy-but-silent links?" No liveness feature is claimed or shipped from this
+measurement.
+
+Stated precisely: in-band branch-loss notification is best-effort and silently
+lossy while an endpoint is idle, and it is unreliable by the design of the reader
+rather than by anything the network does. The only reliable **specified** discovery
+mechanism is the branch lease running down; the blackhole result proves an additional
+native mechanism exists in at least one failure mode, but its contract is unknown.
 
 Together these mean a middle relay that dies without warning - power cut, host gone,
-process killed - leaves an endpoint routing into a black hole until branch material
-expires, and an endpoint holding one unread datagram discards the in-band notification
-even when the dying peer does send it. The two faults are separable and should be fixed
+process killed - **may** leave an endpoint routing into a black hole until branch
+material expires when no lower-layer loss signal arrives. The blackhole measurement
+shows that a lower-layer signal can arrive in at least one such failure mode, but
+does not establish coverage or a bound for healthy-but-silent links. An endpoint
+holding one unread datagram can still discard the in-band notification even when
+the dying peer does send it. The two faults are separable and should be fixed
 separately: the pump must not let one unread frame block control frames, and branch
 liveness needs a bound that does not depend on either an in-band message or the
 expiry lease.
@@ -1175,50 +1206,114 @@ front of whoever runs it. The honest limit: nothing here distinguishes
 endpoint-independent filtering from endpoint-dependent filtering in advance, and
 the reflectors cannot, so a mixed dispatch is the test.
 
-### KI-15: the route operation deadline is too short for a real multi-hop route
+### KI-15: an absolute deadline is built on a host-local monotonic clock
 
-**Status: open, and it is now the failure that stops a real dispatch. The constant is
-pre-existing; only its enforcement is new, which is why nothing noticed until now.**
+**Status: FIXED, by changing what the field MEANS rather than what it is worth. The wire
+now carries a RELATIVE budget and each host derives its own absolute deadline from its own
+clock, so no clock value is ever compared across hosts. This entry originally recorded the
+wrong cause - that the 3000ms budget was too small - and that diagnosis is retracted below,
+because the way it was wrong is instructive. NOT yet confirmed by a real two-host dispatch:
+the fault this removes was structural and is proven removed by construction and by test,
+but the dispatch that exposed it has not been re-run.**
 
-`routed-dht-io.js:36` sets `TIMEOUT_MS = 3000n`, minted into every routed request as
-`absoluteDeadlineMs` and sent to the exit, which has always enforced it. The endpoint did
-not hold itself to it until KI-10's L0 landed. With the deadline now enforced at both
-ends, a real dispatch fails on the FIRST routed immutable get, and the endpoint's own
-control-frame timeline gives the number:
+#### The fix
 
-| event                    | elapsed |
-| ------------------------ | ------- |
-| `activate` received      | 0.000s  |
-| `ready` emitted          | 0.836s  |
-| `immutable-get` received | 0.920s  |
-| `error` emitted          | 3.968s  |
+`absoluteDeadlineMs` is gone. The uint64 at request body offset 39 is now
+`operationBudgetMs`, a DURATION in milliseconds. The layout is bit-identical - the fixed
+body is still 221 bytes and an encoded immutable-get is still 261 - so this is a semantic
+change to one field, not a wire-format change.
 
-3.048 seconds against a 3000ms budget. The route is endpoint to guard to middle to exit
-to a DHT node and back, so the budget has to cover four hops each way across the public
-internet plus per-hop crypto, against a constant chosen where every hop is loopback. The
-run reached 32 of 33 assertions: the setup store completed, all eleven roles activated,
-the endpoint's semantic edge was guard-only and it retained no bootstrap socket. Only the
-first application request failed.
+- The endpoint mints the budget it already derived (`routed-dht-io.js`, `ROUTE_HOPS` x
+  `PER_HOP_ONE_WAY_MS` x 2 + `EXIT_DHT_REFERRAL_MS`, clamped to the exit's advertised
+  ceiling) and puts THAT on the wire. Its own absolute deadline stays local and is passed
+  to `live-route-authority.js` as the `operationDeadlineMs` request option. It is never
+  encoded.
+- The exit admits on a duration-vs-duration comparison,
+  `operationBudgetMs === 0n || operationBudgetMs > policy.timeoutMs`, which needs no clock
+  agreement of any kind, then derives its OWN deadline as `exitNow + operationBudgetMs` for
+  the ordinary DHT reservation and the referral probe cap.
+- `dht-exit-destination-table.js` likewise derives before comparing, so the checks against
+  `state.absoluteDeadline` and `entry.expiresAt` are exit-domain on both sides.
+- `opaque-destination.js` is untouched. Its `deadline` is minted AND verified on the
+  endpoint - `createRoutedReplyReferralAuthority` and
+  `createAuthenticatedRoutedReplyAuthority` are both endpoint-side - so it was never a
+  cross-host comparison and stays a local monotonic absolute.
 
-The failure presents as `ERR_PRIVACY_UNAVAILABLE` from `immutableGet` at
-`private-routing-controller.js:1139`, which is misleading if read alone: the deadline
-fired, reported the route failure, and took the controller to UNAVAILABLE, and the error
-surfaced from the operation's own path finding it already there. Only one `immutable-get`
-frame ever reached the endpoint and no `rotate` frame at all, which is what rules out a
-rotation or a second operation as the cause.
+Why a relative budget and not the alternatives the earlier entry listed: a wall-clock
+domain would import skew and a time-sync dependency into an admission check; an exit-minted
+deadline echoed back would move who is trusted to bound the operation. The objection to a
+relative TTL was that decrementing per hop leaks or bounds path length - which does not
+apply here, because relays never read this field. The routed request is encrypted
+end-to-end between endpoint and exit, so there is nothing to decrement and no hop count to
+leak: exactly two parties read the number, and each reads it in its own domain.
 
-THE FIX IS NOT TO LOOSEN THE ENFORCEMENT. The arm is correct: a component that computes a
-bound, sends it to its peer, and then does not apply it to itself is broken regardless of
-what the bound is. What is wrong is the bound. A deadline for a multi-hop overlay route
-cannot be a single constant chosen on loopback; it has to be derived from something that
-scales with the path - a per-hop allowance, a measured round trip, or a budget carried
-with the route - and whatever replaces it must remain something the exit can enforce
-identically, since that is the property `absoluteDeadlineMs` exists to provide.
+The endpoint holds itself to the same bound it advertises. `requestProduction` samples its
+clock once and refuses a zero budget, a budget above the exit's ceiling, and a local
+deadline that either lies in the past or outlasts the advertised budget. The ceiling is
+read from `EXIT_ORIGIN_SERVICE_POLICY` - the same table the exit enforces - rather than
+restated as a constant, since two constants agreeing by coincidence is how this fault was
+built in the first place.
 
-Note what this says about the local suites: every mode of the rehearsal and every gate
-completes the same operation well inside 3000ms, so no amount of local testing could have
-surfaced this. It took eleven separately-hosted roles, and it only became visible at all
-because the endpoint started enforcing a promise it had always been making.
+What pins it: `test/private/routed-dht.js` admits ONE encoded request at exit clocks `0n`
+and `10_000_000n` and refuses `0n` and `3_001n` budgets at both, and reverting the
+admission check makes the far-clock arm throw `ERR_AUTHENTICATION` - the KI-15 failure
+reproduced on demand. `test/private/routed-dht-io.js` mints from clocks with unrelated
+origins and asserts the budget BYTES are identical while the local deadlines differ, so a
+frozen clock cannot satisfy it vacuously. `test/private/live-route-authority.js` proves the
+endpoint still arms a real timer off its own absolute deadline and still reports the branch
+lost when it fires; feeding the wire budget to that timer instead fails the test.
+
+Gates after the change, and after the three audit fixes it prompted: aggregate 902/902 tests
+and 18326/18326 asserts under Node, 881/881 and 18267/18267 under Bare, eleven-role live
+127/127 under both runtimes,
+namespace 27/27, namespace-live 137/137.
+
+#### The fault, as it stood before the fix
+
+`absoluteDeadlineMs` is minted from the endpoint's `monotonicNow` and compared against the
+EXIT's clock in production code: `dht-exit-io.js:519` evaluates
+`current + 1_000n < request.absoluteDeadlineMs`, where `current` is the exit's own sample.
+So two peers' monotonic clock values are compared directly.
+
+A monotonic clock is host-local by definition, and the harness supplies exactly that,
+correctly: `test/private/process/runtime-clock.js` builds it from `process.hrtime.bigint()`
+and its own comment says the clock must keep hrtime's machine-wide scale rather than
+restarting per process. That is right for a monotonic clock and it is not the bug. The bug
+is that the protocol compares two of them. On one host both sides share an origin, which is
+why every container rehearsal and every gate passes.
+
+Across two hosts the origins are unrelated, and admission requires
+`endpointNow - exitNow` to fall inside a bounded window, so the comparison is against an
+arbitrary boot-time delta. The exit therefore refuses the request outright and the
+endpoint waits out its full budget.
+
+That made this a design fault rather than a tuning error: an ABSOLUTE deadline expressed in
+a RELATIVE clock domain. The three candidate domains were a wall clock, a relative TTL, and
+an exit-minted deadline echoed back; the fix above takes the relative one and records why.
+
+RETRACTED DIAGNOSIS, kept because the error is worth more than the conclusion. This entry
+first read the observed 3.048 seconds as evidence that a four-hop route needs more than
+3000ms. It is not: it is the signature of the endpoint's own deadline firing after the
+exit rejected the request. Two checks would have caught it and neither was done before
+writing it down:
+
+- The endpoint's 3000ms is not an independent constant. It is exactly the exit's policy
+  ceiling for IMMUTABLE_GET_V1, and the admitted window measures as exactly
+  `[exitNow, exitNow+3000]`, with a 3001ms budget rejected as `ERR_AUTHENTICATION`. So
+  raising it - which the retracted entry implied - would have reddened `process:node` and
+  `process:bare` immediately while doing nothing for the dispatch.
+- The measurements already in this document refute the premise. Single-link p95 round trip
+  is 115.7ms, so eight transits plus the exit's 1000ms referral round is roughly two
+  seconds, comfortably inside 3000.
+
+The general lesson, since it has now cost an hour of wrong record: A TIMEOUT IS NOT
+EVIDENCE OF SLOWNESS. It is evidence that something did not arrive, and a rejected request
+looks exactly like a slow one from the waiting end.
+
+One change did land from this, and it is worth keeping on its own terms: the endpoint's
+budget is now derived and clamped to the exit's advertised ceiling rather than being a
+second constant that must agree with the first by coincidence. It evaluates to the same
+value today, so nothing on the wire or in the live path changes.
 
 ### KI-13: the punch that makes a dispatch work is in the harness, not in production
 
@@ -1275,63 +1370,240 @@ dispatch reports a partial punch matrix, that is the first place to look.
 
 ### KI-14: a rotation re-qualifies the hop it just rotated away from
 
-**Status: open. Distinct from KI-6, and NOT fixed by fixing KI-6.**
+**Status: FIXED on the ROTATION path for pools larger than three-plus-three. NO
+OBSERVABLE EFFECT in the three-plus-three shape the eleven-role scenario runs, and NOT
+applied to the two-pair build at all — so the attack remains fully open for that
+topology, and this entry must not be read as "the eleven-role scenario is now
+protected".** Distinct from KI-6, and was never going to be fixed by fixing KI-6 — but
+it turns out to be BLOCKED BY the same coupling KI-6 describes, which is recorded below
+and is the most consequential thing in this entry.
 
-There is no fault-based exclusion anywhere in the relay directory. Quarantine is
-populated ONLY at seal time and ONLY on equivocation: one identity advertising two
-different digests at the same epoch, in which case both copies are dropped and the
-identity is barred until the later expiry. Nothing in reserve, commit or rotate writes it,
-and there is no path by which a hop's behaviour on a live route can bar it. The sole
-`quarantine.set` is inside `ownRecords`, at `relay-candidate-directory.js:531` when this
-was written; the remaining writes are a clear and two expiry deletes. The sentence above
-is the durable form, since the numbers move. The exclusion set covers only the currently live pairs, so a relay rotated
-off one branch is immediately eligible for the sibling.
+The honest cost first, because it is the part a later reader most needs and least wants.
+At three middles and three exits, `reserveReplacement` already excludes the live opposite
+pair and the pair being replaced — two of three middles and two of three exits — so the
+only qualifying pair IS the one just vacated. The preferred tier therefore comes back
+empty, the fallback admits the vacated pair, and the selection is byte-for-byte what it
+was before this fix. That is not an oversight: it is the property that keeps a legitimate
+rotation from failing closed, and it is why the process gates cannot go red. The fix
+helps a deployment with a genuinely larger relay pool and does nothing for the minimal
+one. Both halves are pinned by tests, so neither can change unnoticed.
 
-Measured with three middles and three exits:
+#### The design question came first: was a reason available at all?
 
-| step             | selection                     |
-| ---------------- | ----------------------------- |
-| initial lookup   | middleA + exitA               |
-| initial announce | announceMiddle + announceExit |
-| rotate lookup    | middleB + exitB               |
-| rotate announce  | middleA + exitA               |
+A rotation fires for at least two unrelated reasons. Material expiry is routine and
+implies nothing about the hop. Failure or suspected misbehaviour does. The directory could
+not tell them apart, so the first question was whether the signal reaching it carried a
+reason, and if not, where one would have to come from.
 
-The announce branch rotates onto the pair the lookup branch vacated one step earlier. In
-this shape it is not merely likely, it is FORCED: excluding the live lookup pair plus the
-current announce pair removes two of three middles and two of three exits, leaving
-exactly one qualifying pair, so any selection rule at all returns it. First-match plays
-no part.
+It did carry one, and no protocol change or new signal was needed. Both triggers converge
+on `issueBranchSink(state, branchClass, suffix)` in `route-manager.js` with the suffix
+`'BranchLoss'` or `'BranchExpiry'`, so the four controller signal kinds —
+`lookupBranchLoss`, `announceBranchLoss`, `lookupBranchExpiry`, `announceBranchExpiry` —
+already encode expiry-versus-fault. The reason was discarded at exactly one place: the
+four-kind case arm in `private-routing-controller.js` reads `signal.kind` only to derive a
+`branchClass` and then calls `routeManager.rotate(branchClass)`. Nothing below that hop
+ever saw a reason: `rotate` to `createRotationDraft` to `createReplacementBranchDraft` to
+`reserveReplacement({ branchClass, generation })`.
 
-In a LARGER pool the reuse is not forced but it is still certain, and the mechanism is
-tighter than "first-match happens to pick it". Measured at four middles and four exits,
-with four combinations available at the announce rotation, across six different record
-orders including two interleaved: the vacated pair was reused 6 times out of 6, and it
-was the earliest available 6 times out of 6. The reason is structural. `choosePairs` is
-first-match and the LOOKUP branch is built first, so the lookup pair is by construction
-the earliest middle and earliest exit in record order. Rotation returns exactly those two
-records to the pool, still earliest, and first-match then hands them to the sibling
-branch. First-match creates the condition and then exploits it.
+Two seams were possible. Threading a reason down all four files would have widened two
+`exactObject`-pinned lists, `REPLACEMENT_FIELDS` and `REPLACEMENT_BRANCH_FIELDS`, to carry
+information the controller already had. The controller was also the wrong place to tell
+the directory directly, for a reason worth recording: **the controller holds no live
+directory handle.** `state.suspendedDirectory` is null except across suspend and resume,
+because the directory is owned by the route manager. Hooking there would have meant adding
+a handle to controller state and keeping it coherent across suspend, resume and
+unavailable.
 
-Under a uniform draw at four-plus-four the same reuse falls to roughly one in four:
-reduced, not eliminated. So the relationship to KI-6 is precise rather than merely
-"different question":
+The seam used is one hop upstream, where the handle is already in hand:
+`reportRouteManagerBranchLoss`. It is the manager's **exclusive** fault path — expiry
+reaches `issueBranchSink` from `armBranchExpiry` under the other suffix and never passes
+through it — it is where `branch.lost` is set, so it is the authoritative statement that
+this branch failed for cause, and every fault source funnels through it, including the
+physical-loss registration and L0's owned-route failure. The change there is one advisory
+call, deliberately wrapped so a directory that cannot record the demotion still cannot
+stop the branch being reported lost.
 
-- In the minimal three-plus-three shape, the one actually run, reuse is FORCED and a KI-6
-  fix changes nothing at all.
-- In a larger pool, reuse is CERTAIN under first-match and merely likely under a uniform
-  draw, so a KI-6 fix would weaken this without closing it.
-- Either way a just-failed relay remains QUALIFYING. Only fault-based exclusion removes
-  it, and there is none.
+#### Demotion, not exclusion, and why hard exclusion would have been worse
 
-Whether it is a gap depends on why the rotation fired. On material expiry it is
-harmless. On failure or suspected misbehaviour the directory hands the suspect straight
-to the sibling branch - and for a privacy system that is the wrong direction, because a
-relay that wants to observe more of a route can get there by failing. Guaranteed in the
-minimal pool; a probability in a larger one.
+Hard exclusion is the obvious reading of "fault-based exclusion" and it is wrong here.
+Because the exclusion set already leaves exactly one qualifying pair at three-plus-three,
+removing the just-failed pair makes the sibling rotation throw `ERR_INCOMPATIBLE_RELAY` —
+so **any relay could deny the endpoint a route by failing.** That trades rewarded
+observation for rewarded denial, which is a strictly worse bargain: the first costs
+privacy against one adversary, the second costs availability to anyone.
 
-It bears on KI-9: a loss signal that cannot be distinguished from an expiry signal
-leaves the directory unable to quarantine selectively, so whatever KI-9's fix delivers
-must carry a reason rather than only a trigger, even if nothing consumes it yet.
+Instead a faulted record is **demoted**: still eligible, but only after every unfaulted
+combination has been tried. Availability is bit-for-bit unchanged, and the pool can never
+be exhausted by exclusion. What the fix removes is not the suspect's eligibility but the
+_reward_ — failing can no longer be a way to get selected sooner.
+
+**This is expressed as a PARTITION, not as a position in a list, and that matters for
+KI-6.** `validCandidates` returns `{ preferred, all }`, and a selection exhausts
+`preferred` before admitting anything from `all`. Had the demotion been implemented as
+"move faulted records to the back", a future KI-6 fix that randomises selection would have
+silently disabled it. As a tier, a randomised selector may randomise _within_ a tier and
+the property survives; only a selector that draws from `all` directly discards it. That
+constraint is written into `relay-candidate-directory.js` as a comment on
+`validCandidates`, where a KI-6 fix will trip over it, rather than only here.
+
+One consequence recorded plainly: **candidate order — specifically the ordering between
+the two tiers — is now load-bearing for a security property.** Before this fix, order was
+merely an arbitrary artefact, which is what KI-6 exists to complain about.
+
+#### The two-pair build is deliberately NOT tiered, and the reason is a measured coupling
+
+The demotion applies to `chooseReplacementPair`, the rotation path, and NOT to
+`choosePairs`, which builds both branches at once — the initial route and the bootstrap
+pair after a reconnect. Two reasons, one principled and one measured.
+
+The principled one: KI-14's harm is a rotation handing the SIBLING branch the hop it just
+rotated away from, so the relay gains a second view of one live route. A build from
+scratch has no sibling to protect; there is no live branch for a demoted hop to see more
+of.
+
+The measured one is the finding worth keeping. Tiering `choosePairs` turns the
+eleven-role gate red: `process:node` fails at the assertion after the suspend step, with
+the guard's dial rejecting — `ROUTE_UNAVAILABLE` thrown at `guard-link.js:199` from the
+dial-rejected arm, reached through `openTailAdjacentLink`. **That failure is not caused by
+this fix.** On pristine HEAD, with no demotion anywhere, reversing the candidate order in
+`validCandidates` — one line, no faults involved — ALSO fails the gate, deadlocking at the
+first routed get without ever reaching the rotation. Three runs, isolation trees from the
+same commit:
+
+| tree                                          | process:node        |
+| --------------------------------------------- | ------------------- |
+| pristine HEAD                                 | pass, 125/125       |
+| HEAD + this fix, demotion on all paths        | FAIL at the suspend |
+| HEAD + this fix, demotion on rotations only   | pass, 125/125       |
+| pristine HEAD + candidate order reversed only | FAIL, deadlock      |
+
+So the eleven-role fixture cannot tolerate ANY change to which pair first-match returns.
+Tiering does not fail closed there — it succeeds and returns a different, equally valid
+pair, which the fixture then cannot service.
+
+**This is a hard blocker for KI-6 and is larger than this entry.** Randomising hop
+selection would not merely weaken this demotion; it would break the eleven-role gate
+outright, because the scenario depends on first-match's exact assignment of the six relay
+roles to branch positions. KI-6 cannot land until that coupling is fixed, and the coupling
+lives in the harness — `live-process-suite.js`, `role-runner.js`, `wire-services.js` — not
+in the directory.
+
+**What is NOT given up.** The demotion is not forgotten across a reconnect. It survives in
+the directory and still binds every later rotation, so a reconnect buys a faulted relay
+ONE bootstrap selection rather than a reset. That residual is asserted, with a control, by
+'a demotion survives a reconnect and still binds a later rotation'.
+
+#### The bound, and why this is not `quarantine`
+
+The demotion lasts until the LATER of the record's own `expiresAt` and
+`FAULT_DEMOTION_MS` — 60s, minted in `relay-candidate-directory.js` — from the moment of
+the fault.
+
+The floor was added after a fresh-context security review of this entry. The original
+bound was the record's own `expiresAt` and nothing else, which is **a number the demoted
+relay signs for itself**: the only checks on it are `expiresAt > now` at admission and
+`MAX_CAPABILITY_LIFETIME` (30 minutes) as a ceiling in `relay-capability.js`, and there is
+no minimum anywhere. Because a branch fault demotes BOTH hops of the failed pair, that is
+an asymmetry an attacker can exercise: a malicious middle advertises a two-second
+capability, blackholes the branch it is carrying, serves a two-second penalty and
+re-advertises, while the honest exit it dragged down — whose expiry it does not control —
+serves up to the full thirty minutes. Repeated across partners it drains honest hops out
+of `preferred` while the attacker cycles back in, biasing `chooseReplacementPair` toward
+attacker-controlled hops. For a heuristic penalty the duration IS the entire penalty, so
+an attacker-chosen duration removes the penalty for the attacker alone. Quarantine's bound
+did not carry over the way the original reasoning assumed: quarantine acts on proof of
+equivocation, where the identity is already forfeit and a self-chosen duration costs
+nothing. A heuristic demotion is not that.
+
+**The invariant traded away, stated plainly.** A demotion previously could not outlive the
+record it applied to, because `pruneInvalidRecords` dropped the record and the demotion on
+one sweep. Under the floor it can, and that is the point: shedding a penalty by
+advertising a short-lived capability and re-advertising is precisely the move being closed,
+so the penalty has to be able to outlive the advertisement it was earned on. What survives
+is the part that was load-bearing. The entry is still swept on `expiresAt <= now`, so a
+demotion stays temporary and never becomes a bar; and the map is still bounded by
+`MAX_IDENTITIES`, because only an identity already in `state.records` is ever inserted and
+that set is fixed at seal and only shrinks. The floor is computed from the same wall
+sample the sweep compares against, so a floored entry expires on the clock that prunes it.
+
+60s is minted locally rather than derived: four `MAX_ROUTE_LIFETIME_MS` route lifetimes and
+twelve `BRANCH_ROTATION_LEAD_MS` rotation leads, so a demotion binds several consecutive
+rotations instead of lapsing inside the one that earned it, and a thirtieth of the
+capability ceiling, so it stays far below the longest demotion an honest long-lived
+advertisement already accepts. Deriving it from either constant would tie this module to
+the route manager's and the extension's clocks for no gain, and both remain rejected as
+the bound itself: a demotion shorter than the record's selectable life reopens the window
+at the next rotation.
+
+The two mechanisms are kept **separate**, and conflating them would be unsafe in both
+directions. Quarantine answers a question about _identity_: one key advertising two digests
+at one epoch is proof of equivocation, so a hard bar there has no false positives. A fault
+is a _heuristic_ about _behaviour_ — a timeout or a physical loss can be the network, the
+local host, or an unlucky but honest relay, and attribution to the hop is unproven. This
+fix therefore never writes `quarantine`, and a test asserts `quarantineCount` stays zero
+across a reported fault. Attribution is also to the **branch**, not to a hop: nothing in a
+physical loss or an elapsed deadline says whether the middle or the exit failed, so both
+hops of the failed branch are demoted.
+
+#### What is proven, and by which test
+
+- **A faulted hop is not handed to the sibling, measured at four-plus-four** — the shape
+  where KI-14 measured reuse six times out of six. The test runs both arms over the same
+  pool, and the **control is the load-bearing half**: with no fault reported the vacated
+  middle and exit ARE reused, reproducing the original finding; with the fault reported
+  neither is. Without that control the test would only show that some pair was selected.
+- **A rotation never fails closed at three-plus-three**, on both the expiry-driven and the
+  fault-driven arm, and the demoted pair is confirmed to be the one selected — pinning the
+  no-effect caveat above as an assertion rather than a claim. Hard exclusion would throw on
+  both arms.
+- **A demotion survives a reconnect and still binds a later rotation**, with the same
+  control shape: without the fault report the demoted pair IS reused one reconnect later.
+  This is the property that makes scoping the fix to rotations defensible rather than a
+  quiet retreat.
+- **The bound is the later of the record's expiry and the 60s floor**, proven from both
+  sides. A middle that signs itself a two-second capability still carries its demotion ten
+  seconds later, when its own record has already been swept out of the candidate set; and a
+  record advertising two minutes carries its demotion for exactly those two minutes and not
+  a sweep longer. Three mutations were confirmed to bite: dropping the floor, replacing the
+  record's expiry with the floor, and adding the two rather than comparing them.
+- **Suspend/resume does not launder a demotion** — `retainForSuspend` clears the committed
+  pairs, so without this a reconnect would be a free pardon.
+
+#### Residual exposure, stated rather than implied
+
+Demoting on a heuristic creates an inverse move: an adversary who can induce false
+positives on honest relays shrinks the preferred tier toward itself. This is strictly
+weaker than the fault it replaces — that one required only failing once — and it degrades
+gracefully, because once every candidate is demoted the tier collapses and selection is
+identical to today's. So an adversary gains nothing by demoting everyone; it would have to
+demote exactly everyone else.
+
+#### Effect on the branch-liveness sub-gate
+
+`docs/private-routing-branch-liveness-design.md` records that L1's keepalive-driven
+teardown must not land before fault-based exclusion exists, or failing becomes a rewarded
+strategy. That precondition is now met **only for pools larger than three-plus-three**. In
+the minimal shape a relay that fails is still handed the sibling branch, so L1 remains
+blocked there, and the blocker is pool size rather than a missing mechanism.
+
+#### Open, recorded rather than patched: a stale loss registration would demote the wrong pair
+
+`createRouteManagerBranchLossRegistration` binds `{ manager, state, branchClass }` and NO
+branch generation, so a registration authorises a loss against whatever pair currently
+occupies that class. In the rotation path the directory commits the NEW pair inside the
+awaited `receiveRotationSeed`, and only after it resolves does the controller swap
+connections and destroy the previous one, which is what revokes the stale registration. A
+physical loss fired by the retired runtime inside that window reaches
+`reportRouteManagerBranchLoss`, which resolves the pair from `state.committed` at call time
+and would therefore demote two innocent hops.
+
+Two reasons this is recorded and not fixed here. The larger consequence - a stale loss
+marking the FRESH branch lost and triggering another rotation - predates this fix and is
+unchanged by it; the demotion is the marginal addition. And reachability is unproven: the
+controller's swap contains no `await`, so it hinges entirely on whether `receiveRotationSeed`
+yields to the macrotask queue after the directory commit, which was not traced. The cheap
+close, if someone takes it, is to bind the generation into the registration and compare it
+before reporting - which also hardens the older half.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
@@ -2020,21 +2292,26 @@ The eleven-role scenarios are not part of the portable aggregate. They bind the
 configuration (KI-2), so they run from their own scripts under the Linux CI job
 while `test/private-routing.js` stays green everywhere:
 
+Counts below are a MEASUREMENT taken at one commit, not a contract. Every added test
+moves them, and a stale total quoted as current has already caused four false findings
+in this document's history - so re-measure rather than cite, and if you change a suite,
+change this table in the same pass. Measured after the KI-15 clock-domain fix:
+
 | Suite                            | Command                                    | Result                                                       |
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
-| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 866/866 tests, 18,094/18,094 assertions, on Linux and Darwin |
-| Private aggregate, Bare          | `bare test/private-routing.js`             | 854/854 tests, 18,045/18,045 assertions, on Linux and Darwin |
-| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 125/125 assertions, Linux                                    |
-| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 125/125 assertions, Linux                                    |
+| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 902/902 tests, 18,326/18,326 assertions, on Linux and Darwin |
+| Private aggregate, Bare          | `bare test/private-routing.js`             | 881/881 tests, 18,267/18,267 assertions, on Linux and Darwin |
+| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 127/127 assertions, Linux                                    |
+| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 127/127 assertions, Linux                                    |
 | Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
-| Namespace live route and oracles | `npm run test:private:namespace:live`      | 135/135 assertions, privileged Linux                         |
+| Namespace live route and oracles | `npm run test:private:namespace:live`      | 137/137 assertions, privileged Linux                         |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
 `test/private/live-namespace-node.js` runs the same eleven-process scenario with
 every role in its own Linux network namespace, captures every packet on every
 veth, and decides the result from the captured bytes rather than from the
-implementation's own accounting. It passes `135/135` assertions on Linux.
+implementation's own accounting. It passes `137/137` assertions on Linux.
 
 Isolation is structural, not asserted. Each role holds routes only to the peers
 named by `ALLOW_EDGES`, and the root namespace forwards under a dedicated

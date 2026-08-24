@@ -119,7 +119,7 @@ function replyAuthorityFixture(seed = 0x21) {
     requestId,
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: 4_000n,
+    operationBudgetMs: 3_000n,
     destination: destinationRef,
     encodedBody: target
   })
@@ -488,7 +488,7 @@ function startProductionLookupRequest(authority, value) {
     requestId: b4a.alloc(16, value + 2),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: 14_000n,
+    operationBudgetMs: 2_000n,
     destination: destinationRef,
     encodedBody: b4a.alloc(32, value + 3)
   })
@@ -499,7 +499,9 @@ function startProductionLookupRequest(authority, value) {
       branch: BRANCH_CLASS.LOOKUP,
       destinationRef,
       encodedRequest,
-      attempt: 1
+      attempt: 1,
+      // Endpoint-local absolute, in the production state's own monotonic domain (10_000n).
+      operationDeadlineMs: 12_000n
     })
   }
 }
@@ -741,12 +743,15 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
 
   const requestId = b4a.alloc(16, 0x94)
   const target = b4a.alloc(32, 0x95)
-  const deadline = topology.clock.monotonicNow() + 4_000n
+  // The budget goes on the wire; `deadline` is the same budget resolved on this host's clock,
+  // and the bind below only succeeds because the referral and reply authorities agree on it.
+  const budget = 3_000n
+  const deadline = topology.clock.monotonicNow() + budget
   const encodedRequest = encodeRoutedRequest({
     requestId,
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: deadline,
+    operationBudgetMs: budget,
     destination: destinationRef,
     encodedBody: target
   })
@@ -759,7 +764,8 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
     branch: BRANCH_CLASS.LOOKUP,
     destinationRef,
     encodedRequest,
-    attempt: 1
+    attempt: 1,
+    operationDeadlineMs: deadline
   })
   const receivedRequest = decodeRoutedRequest(await receiveRequest())
   const expectedReply = await sendReply(receivedRequest, b4a.from([0xaa]))
@@ -799,7 +805,7 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
     requestId: b4a.alloc(16, 0xa1),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: deadline,
+    operationBudgetMs: budget,
     destination: destinationRef,
     encodedBody: target
   })
@@ -807,7 +813,8 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
     branch: BRANCH_CLASS.LOOKUP,
     destinationRef,
     encodedRequest: cancelledRequest,
-    attempt: 1
+    attempt: 1,
+    operationDeadlineMs: deadline
   })
   const cancellation = cancelled.promise.then(
     () => null,
@@ -819,7 +826,7 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
     requestId: b4a.alloc(16, 0xa2),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: deadline,
+    operationBudgetMs: budget,
     destination: destinationRef,
     encodedBody: target
   })
@@ -827,7 +834,8 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
     branch: BRANCH_CLASS.LOOKUP,
     destinationRef,
     encodedRequest: followupRequest,
-    attempt: 1
+    attempt: 1,
+    operationDeadlineMs: deadline
   })
   const receivedFollowup = decodeRoutedRequest(await receiveRequest())
   const lateReply = await sendReply(lateRequest, b4a.from([0xbb]))
@@ -859,8 +867,9 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
   exitCodec.destroy()
 })
 
-// The endpoint arms its own `absoluteDeadlineMs` on the route transport's injected
-// scheduler, so these fire that timer directly instead of waiting out any real interval.
+// The endpoint arms its OWN absolute deadline - `operationDeadlineMs`, never the request's
+// relative `operationBudgetMs` - on the route transport's injected scheduler, so these fire
+// that timer directly instead of waiting out any real interval.
 // Clock values mirror `routeClock` above; only `schedule` differs, by being observable.
 function instrumentedTransportClock() {
   const armed = []
@@ -893,10 +902,13 @@ function instrumentedTransportClock() {
   }
 }
 
-// Monotonic start is 10_000n, so this deadline leaves 3_137ms of budget: an unusual figure,
-// so the timer fired below cannot be confused with an adjacency lifetime timer.
-const DEADLINE_MS = 13_137n
-const DEADLINE_DELAY = 3_137
+// Monotonic start is 10_000n and the budget is 2_137ms: an unusual figure, so the timer fired
+// below cannot be confused with an adjacency lifetime timer. The budget is also inside the
+// exit's 3000ms ceiling for IMMUTABLE_GET_V1, so it is one a real exit would admit, and the
+// endpoint's absolute deadline is that same budget resolved on the production clock.
+const DEADLINE_BUDGET_MS = 2_137n
+const DEADLINE_MS = 10_000n + DEADLINE_BUDGET_MS
+const DEADLINE_DELAY = 2_137
 
 function deadlineRequest(authority, value = 0xc1) {
   const id = b4a.alloc(32, value)
@@ -906,7 +918,7 @@ function deadlineRequest(authority, value = 0xc1) {
     requestId: b4a.alloc(16, value + 2),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: DEADLINE_MS,
+    operationBudgetMs: DEADLINE_BUDGET_MS,
     destination: destinationRef,
     encodedBody: b4a.alloc(32, value + 3)
   })
@@ -914,7 +926,8 @@ function deadlineRequest(authority, value = 0xc1) {
     branch: BRANCH_CLASS.LOOKUP,
     destinationRef,
     encodedRequest,
-    attempt: 1
+    attempt: 1,
+    operationDeadlineMs: DEADLINE_MS
   })
 }
 
@@ -963,4 +976,83 @@ test('a cancelled production request disarms its deadline and reports no loss', 
     manager.branchCapability(BRANCH_CLASS.LOOKUP),
     'a caller cancellation must not mark the branch lost'
   )
+})
+
+test('production request refuses a zero budget or a deadline outside its own clock domain', async (t) => {
+  const timers = instrumentedTransportClock()
+  const { authority } = await productionAuthorityFixture(t, 47655, {
+    transportClock: timers.clock
+  })
+  const id = b4a.alloc(32, 0xd1)
+  const destinationRef = encodeDestinationRef({ id, handle: b4a.alloc(130, 0xd2) })
+  issueLiveRouteDestination(authority, { branch: BRANCH_CLASS.LOOKUP, id, destinationRef })
+  const encodedFor = (budget) =>
+    encodeRoutedRequest({
+      requestId: b4a.alloc(16, 0xd3),
+      operationClass: BRANCH_CLASS.LOOKUP,
+      commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+      operationBudgetMs: budget,
+      destination: destinationRef,
+      encodedBody: b4a.alloc(32, 0xd4)
+    })
+  const ask = (encodedRequest, operationDeadlineMs) =>
+    authority.request({
+      branch: BRANCH_CLASS.LOOKUP,
+      destinationRef,
+      encodedRequest,
+      attempt: 1,
+      operationDeadlineMs
+    })
+
+  // A zero budget is the one value the exit refuses outright, so the endpoint must not spend a
+  // branch carrying it there.
+  expectCode(t, () => ask(encodedFor(0n), DEADLINE_MS), 'ERR_AUTHENTICATION')
+
+  const valid = encodedFor(DEADLINE_BUDGET_MS)
+
+  // A budget the exit will refuse must not be armed here either. IMMUTABLE_GET_V1's ceiling is
+  // 3000ms, read from the same policy table the exit enforces, so 3_001n is refused and the
+  // ceiling itself is not - and a huge budget cannot be laundered into a long local wait.
+  expectCode(t, () => ask(encodedFor(3_001n), DEADLINE_MS), 'ERR_AUTHENTICATION')
+  expectCode(t, () => ask(encodedFor(1_000_000n), 10_000n + 1_000_000n), 'ERR_AUTHENTICATION')
+
+  // The local deadline may not outlast the budget advertised on the wire: one millisecond of
+  // budget cannot buy a minute of waiting.
+  expectCode(t, () => ask(encodedFor(1n), DEADLINE_MS), 'ERR_AUTHENTICATION')
+
+  // The endpoint's own bound has to be an absolute instant in the production state's monotonic
+  // domain, which reads 10_000n here. The first entry is the wire budget itself: handing that
+  // over as if it were a deadline is the confusion KI-15 was, and it lands in the past.
+  for (const deadline of [
+    DEADLINE_BUDGET_MS,
+    10_000n,
+    0n,
+    -1n,
+    0x1_0000_0000_0000_0000n,
+    12_137,
+    '12137',
+    null
+  ]) {
+    expectCode(t, () => ask(valid, deadline), 'ERR_AUTHENTICATION')
+  }
+
+  // Required rather than defaulted: a four-key call is malformed, not silently admitted.
+  expectCode(
+    t,
+    () =>
+      authority.request({
+        branch: BRANCH_CLASS.LOOKUP,
+        destinationRef,
+        encodedRequest: valid,
+        attempt: 1
+      }),
+    'INVALID_ROUTE'
+  )
+
+  // Every rejection above happened before any branch state was spent, so the same bytes with a
+  // live deadline are still admitted and still arm the timer.
+  const operation = ask(valid, DEADLINE_MS)
+  t.ok(timers.armedDelays().includes(DEADLINE_DELAY), 'a valid pair is admitted and armed')
+  t.is(operation.cancel(new Error('done')), true)
+  await operation.promise.catch(() => {})
 })

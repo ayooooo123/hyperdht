@@ -521,7 +521,7 @@ test('DHTExitIO terminal pump executes routed immutable get over owned M3 transp
     requestId: seed(0x31, 16),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: 2_000n,
+    operationBudgetMs: 2_000n,
     destination: { id: destination.id, handle: destination.handle },
     encodedBody: seed(0x32)
   })
@@ -560,6 +560,149 @@ test('DHTExitIO terminal pump executes routed immutable get over owned M3 transp
     value: b4a.from([0xaa])
   })
   expectCode(t, () => installDhtExitRoute(io, table), 'ERR_AUTHENTICATION')
+  encodedReply.fill(0)
+  replyReassembler.destroy()
+  endpointCodec.destroy()
+  closeDhtExitIO(io)
+  destroyDhtExitDestinationTable(table)
+  destroyM3RouteTransport(pair.endpoint)
+})
+
+test('DHTExitIO derives the routed operation deadline once for admission and reservation', async (t) => {
+  const fake = new FakeSocket()
+  const replies = []
+  const scheduled = []
+  const pair = routeTransportPair()
+  const route = {
+    payloadDigest: seed(0x81),
+    payloadForwardKey: seed(0x82),
+    payloadReverseKey: seed(0x83),
+    payloadForwardNoncePrefix: seed(0x84, 16),
+    payloadReverseNoncePrefix: seed(0x85, 16)
+  }
+  // KI-15: the routed request carries a relative budget, so the exit derives the operation's
+  // absolute deadline from its own clock, exactly once. Here the exit's clock steps forward the
+  // moment the destination check runs, and the table's absolute deadline - which is also the
+  // admitted entry's expiry - sits exactly on the deadline derived from the FIRST sample. A
+  // second sample would derive 3_500n, exceed the cap the destination was admitted against, and
+  // the reservation would be refused, silently dropping a live route's request.
+  const budget = 2_000n
+  const admissionNow = 1_000n
+  const reservationNow = 1_500n
+  const operationDeadline = admissionNow + budget
+  let armed = false
+  let checkedDestination = false
+  const exitNow = () => (checkedDestination ? reservationNow : admissionNow)
+  // The table's clock marks the boundary the exit's clock steps across. Once the request is
+  // injected the exit consults the table twice: first for the route binding, before the request
+  // is even decoded, and then from inside the destination check - which happens after the exit
+  // has sampled its own clock for the admission deadline. Stepping on the second consult puts
+  // the step strictly between the destination check and the reservation.
+  let tableConsults = 0
+  const tableNow = () => {
+    if (armed && ++tableConsults > 1) checkedDestination = true
+    return admissionNow
+  }
+  const authority = TEST_ONLY_DHT_EXIT_OPEN_ISSUER.create(
+    {
+      branchClass: BRANCH_CLASS.LOOKUP,
+      branchId: seed(0x11, 16),
+      circuitId: seed(0x12, 16),
+      generation: 7n,
+      exitIdentity: seed(0x13),
+      finalTranscriptDigest: seed(0x14),
+      expiresAt: 20_000n,
+      absoluteDeadline: operationDeadline,
+      controlKey: seed(0x15),
+      controlNoncePrefix: seed(0x16, 16)
+    },
+    { transport: pair.exit, ...route }
+  )
+  const opened = createDhtExitReservationChannel(authority)
+  const table = createDhtExitDestinationTable(opened.tableIssuer, {
+    local: { host: '10.1.2.3', port: 41234 },
+    configuredBootstrap: [{ host: '8.8.8.8', port: 49737 }],
+    monotonicNow: tableNow,
+    randomBytes: seed
+  })
+  const io = createDhtExitIOForTest(
+    {
+      host: '10.1.2.3',
+      port: 41234,
+      monotonicNow: exitNow,
+      schedule(callback, delay) {
+        const handle = Object.freeze({ callback, delay })
+        scheduled.push(handle)
+        return handle
+      },
+      cancelScheduled() {},
+      onReply(replyAuthority) {
+        replies.push(replyAuthority)
+      }
+    },
+    TEST_ONLY_DHT_EXIT_SOCKET_ISSUER.create(() => fake),
+    consumeDhtExitReservationIOConsumer(opened.ioConsumer)
+  )
+  const probe = reserveConfiguredBootstrapProbe(table, 0, 2_000n)
+  sendReservedExitDhtPacket(io, probe.sendAuthority)
+  fake.message(responseFor(fake.sends[0].packet, 0), { host: '8.8.8.8', port: 49737 })
+  const destinationRef = settleExitDhtReservation(probe.settlementAuthority, replies[0])
+  const destination = readDhtExitDestinationRef(table, destinationRef)
+  t.is(destination.expiresAt, operationDeadline)
+  t.is(installDhtExitRoute(io, table), true)
+
+  const endpointCodec = routePayloadCodec(ROUTE_ENDPOINT.SOURCE, route)
+  const replyReassembler = new Reassembler({
+    now: () => 1_000,
+    epochExpiresAt: 20_000
+  })
+  const encodedRequest = encodeRoutedRequest({
+    requestId: seed(0x41, 16),
+    operationClass: BRANCH_CLASS.LOOKUP,
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    operationBudgetMs: budget,
+    destination: { id: destination.id, handle: destination.handle },
+    encodedBody: seed(0x42)
+  })
+  const payloads = fragment(encodedRequest, {
+    randomBytes: (size) => seed(0x43, size)
+  })
+  armed = true
+  for (const payload of payloads) {
+    const frame = endpointCodec.seal({
+      direction: DIRECTION.FORWARD,
+      class: CELL_CLASS.DATAGRAM,
+      payload
+    })
+    await sendM3RouteFrame(pair.endpoint, frame)
+    frame.fill(0)
+    payload.fill(0)
+  }
+  encodedRequest.fill(0)
+  await waitFor(() => fake.sends.length === 2)
+  t.is(checkedDestination, true)
+  t.is(exitNow(), reservationNow)
+  t.is(BigInt(scheduled[1].delay) + reservationNow, operationDeadline)
+  fake.message(responseFor(fake.sends[1].packet, 0x10, b4a.from([1, 0xbb])), {
+    host: '8.8.8.8',
+    port: 49737
+  })
+
+  let encodedReply = null
+  while (encodedReply === null) {
+    const frame = await receiveM3RouteFrame(pair.endpoint)
+    const cell = endpointCodec.open({ direction: DIRECTION.REVERSE }, frame)
+    frame.fill(0)
+    encodedReply = replyReassembler.pushAuthenticated(cell.payload)
+    cell.payload.fill(0)
+  }
+  const reply = decodeRoutedReply(encodedReply)
+  t.is(reply.errorCode, 0)
+  t.alike(reply.requestId, seed(0x41, 16))
+  t.alike(decodeImmutableGetResponse(reply.encodedResponse), {
+    valuePresent: true,
+    value: b4a.from([0xbb])
+  })
   encodedReply.fill(0)
   replyReassembler.destroy()
   endpointCodec.destroy()

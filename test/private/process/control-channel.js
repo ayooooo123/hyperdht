@@ -28,6 +28,7 @@ const COMMANDS = Object.freeze([
   'immutable-get',
   'cancel',
   'rotate',
+  'blackhole',
   'suspend',
   'resume',
   'network-change',
@@ -89,6 +90,7 @@ const UNAVAILABLE_REASONS = new Set(['NETWORK_CHANGE', 'GUARD_LOSS', 'CANCELLED'
 const RUNTIMES = new Set(['node', 'bare'])
 const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
 const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
+const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
 
 const TAG = Object.freeze({
   NULL: 0,
@@ -758,6 +760,7 @@ const COMMAND_FIELDS = Object.freeze({
   'immutable-get': Object.freeze([...BASE_FIELDS, 'target']),
   cancel: Object.freeze([...BASE_FIELDS, 'operationSequence']),
   rotate: Object.freeze([...BASE_FIELDS, 'nextGeneration']),
+  blackhole: BASE_FIELDS,
   suspend: BASE_FIELDS,
   resume: BASE_FIELDS,
   'network-change': BASE_FIELDS,
@@ -806,7 +809,7 @@ const EVENT_FIELDS = Object.freeze({
     'replyDigest',
     'transactionId'
   ]),
-  ready: Object.freeze([...BASE_FIELDS, 'state']),
+  ready: Object.freeze([...BASE_FIELDS, 'answeredRequestCount', 'state']),
   value: Object.freeze([...BASE_FIELDS, 'target', 'value']),
   cancelled: Object.freeze([...BASE_FIELDS, 'operationSequence']),
   rotated: Object.freeze([...BASE_FIELDS, 'previousGeneration']),
@@ -1017,6 +1020,12 @@ function validateCommand(message, context) {
       )
         invalid()
       break
+    // Same role restriction as `rotate`, and for the same reason: the fault verbs exist to
+    // fault one named hop of the lookup branch. `blackhole` carries no generation, because
+    // unlike `rotate` it produces no notification for anything to rotate on.
+    case 'blackhole':
+      if (common.role !== 'lookup-middle-a') invalid()
+      break
     case 'guard-loss':
       if (common.role !== 'guard') invalid()
       break
@@ -1124,8 +1133,19 @@ function validateEvent(message, context) {
         invalid()
       break
     case 'phase':
-    case 'ready':
       if (!STATES.has(message.state)) invalid()
+      break
+    case 'ready':
+      // A role that owns no DHT node cannot have had a DHT request answered, so
+      // any count but zero from one is a shape fault rather than a small lie.
+      if (
+        !STATES.has(message.state) ||
+        !Number.isSafeInteger(message.answeredRequestCount) ||
+        message.answeredRequestCount < 0 ||
+        message.answeredRequestCount > 4096 ||
+        (!DHT_ROLES.has(common.role) && message.answeredRequestCount !== 0)
+      )
+        invalid()
       break
     case 'phase-pending':
       if (
