@@ -1263,10 +1263,11 @@ frozen clock cannot satisfy it vacuously. `test/private/live-route-authority.js`
 endpoint still arms a real timer off its own absolute deadline and still reports the branch
 lost when it fires; feeding the wire budget to that timer instead fails the test.
 
-Gates after the change, and after the three audit fixes it prompted: aggregate 902/902 tests
-and 18326/18326 asserts under Node, 881/881 and 18267/18267 under Bare, eleven-role live
-127/127 under both runtimes,
-namespace 27/27, namespace-live 137/137.
+Gates after the change, and after the three audit fixes it prompted, all at `e3cf206`: the
+aggregate is 902/902 tests and 18326/18326 asserts under Node and 881/881 and 18267/18267
+under Bare, measured in the Linux container and again on the macOS host with both agreeing
+exactly; and in the container only, because they cannot run anywhere else, eleven-role live
+127/127 under both runtimes, namespace 27/27, and namespace-live 137/137.
 
 #### The fault, as it stood before the fix
 
@@ -2295,7 +2296,11 @@ while `test/private-routing.js` stays green everywhere:
 Counts below are a MEASUREMENT taken at one commit, not a contract. Every added test
 moves them, and a stale total quoted as current has already caused four false findings
 in this document's history - so re-measure rather than cite, and if you change a suite,
-change this table in the same pass. Measured after the KI-15 clock-domain fix:
+change this table in the same pass. Measured at `e3cf206`, after the KI-15 clock-domain
+fix and the three audit fixes it prompted. Where a row claims two platforms, both were
+run: the two aggregates were measured in the Linux container AND on the macOS host, and
+agreed exactly. The Linux-only rows were measured only in the container, which is the
+only place they can run at all (KI-2, KI-3).
 
 | Suite                            | Command                                    | Result                                                       |
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
