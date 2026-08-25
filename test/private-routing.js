@@ -61,6 +61,7 @@ require('./private/final-exit-activation-session')
 require('./private/process-codec')
 require('./private/process-audit-event')
 require('./private/process-config-auditor')
+require('./private/process-route-cell-blackhole')
 require('./private/dht-setup-audit-udx')
 // The coordinator spawns role processes with `child_process`, so this stays
 // Node-only. The capture-oracle tests read pcap bytes from disk and are

@@ -67,6 +67,7 @@ class FakeRouteAuthority {
       destinationRef: b4a.from(options.destinationRef),
       encodedRequest: copied,
       attempt: options.attempt,
+      operationDeadlineMs: options.operationDeadlineMs,
       cancelled: false,
       cancelReason: null
     }
@@ -79,7 +80,8 @@ class FakeRouteAuthority {
             branch: state.branch,
             destinationRef: state.destinationRef,
             encodedRequest: state.encodedRequest,
-            attempt: state.attempt
+            attempt: state.attempt,
+            operationDeadlineMs: state.operationDeadlineMs
           },
           state
         )

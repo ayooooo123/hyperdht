@@ -139,9 +139,33 @@ function registerLiveProcessSuite(launch) {
       )
       t.is(prepared.length, 11, 'all roles bind before ordered DHT setup')
 
+      // t.is(ready.state, ...) alone is not a gate: role-runner sets that state
+      // unconditionally after dht.ready(), and dht.ready() resolves on a network
+      // where nothing was ever answered - a bootstrap query counts a request
+      // timeout and continues, and _bootstrapping is additionally caught. So also
+      // require a request to have been ANSWERED, for the roles that must have had
+      // one. Activation runs value first, then referral, then seed, which is the
+      // reverse of the fixture's one-way DHT edges (topology-fixture.js gives seed
+      // nodes:[referral], referral nodes:[value], value nodes:[] with bootstrap
+      // pointing at value's OWN tuple): each of referral and seed activates after
+      // the single peer it dials is up, so each MUST have been answered by it, and
+      // measures 0 answered with 1 timeout when that peer is deaf.
+      //
+      // dht-value is deliberately NOT asserted. It activates first, with nothing
+      // else running, and its only bootstrap address is itself - so it answers its
+      // own query and reports a non-zero count on a completely dead network.
+      // Asserting it would re-add exactly the assertion-that-cannot-fail this
+      // replaces.
+      const mustBeAnswered = new Set(['dht-referral', 'dht-seed'])
       for (const role of ['dht-value', 'dht-referral', 'dht-seed']) {
         const ready = await sendAndWait(role, 'activate', 'ready')
         t.is(ready.state, 'DHT_SETUP', `${role} binds in ordered DHT setup`)
+        if (mustBeAnswered.has(role)) {
+          t.ok(
+            ready.answeredRequestCount > 0,
+            `${role} had a DHT request answered in ordered DHT setup`
+          )
+        }
       }
 
       const preStoreSnapshots = []

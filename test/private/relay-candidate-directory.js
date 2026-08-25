@@ -318,6 +318,37 @@ function replacementExpiryFixture(expiredBranch) {
   }
 }
 
+// The asymmetry the fault floor exists for. `searchPairs` is first-match over
+// the records in insertion order, so the lookup pair is the first safety record
+// and the first private record: a middle that signed itself a two-second
+// capability, paired with an honest exit whose expiry it does not control.
+function faultFloorFixture() {
+  const clock = fakeClock()
+  const short = { expiresAtMs: NOW + 2_000n }
+  const long = { expiresAtMs: NOW + 120_000n }
+  const guard = candidate(ROLE.SAFETY, 0, 1, long)
+  const records = [
+    candidate(ROLE.SAFETY, 1, 2, short),
+    candidate(ROLE.SAFETY, 2, 3, long),
+    candidate(ROLE.SAFETY, 3, 4, long),
+    candidate(ROLE.PRIVATE, 0, 40, long),
+    candidate(ROLE.PRIVATE, 1, 41, long),
+    candidate(ROLE.PRIVATE, 2, 42, long)
+  ]
+  return {
+    clock,
+    guard,
+    records,
+    scope: {
+      guardIdentity: guard.identity,
+      guardEndpoint: guard.canonicalEndpointBytes,
+      guardAdvertisementDigest: guard.digest,
+      guardEpoch: guard.epoch,
+      guardExpiresAt: guard.expiresAt
+    }
+  }
+}
+
 function install(input) {
   const sink = createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
@@ -368,6 +399,52 @@ function installInitial(directory, generations = [1n, 1n]) {
   return evidence
 }
 
+function digestHex(entry) {
+  return b4a.toString(entry.advertisementDigest, 'hex')
+}
+
+function installInitialDigests(directory) {
+  const transaction = takeRelayPathReservation(
+    directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  const evidence = consumeInitial(transaction, splitRelayPathReservation(transaction))
+  const digests = {
+    lookupMiddle: digestHex(evidence[0]),
+    lookupExit: digestHex(evidence[1]),
+    announceMiddle: digestHex(evidence[2]),
+    announceExit: digestHex(evidence[3])
+  }
+  commitRelayPathReservation(transaction)
+  return digests
+}
+
+function rotateBranch(directory, branchClass, value) {
+  const transaction = takeRelayPathReservation(
+    directory.reserveReplacement({ branchClass, generation: value })
+  )
+  const split = splitRelayPathReservation(transaction)
+  const chosen = {
+    middle: digestHex(
+      consumeSelectedRelayEvidence(split.middle, {
+        transaction,
+        branchClass,
+        position: 'middle',
+        generation: value
+      })
+    ),
+    exit: digestHex(
+      consumeSelectedRelayEvidence(split.exit, {
+        transaction,
+        branchClass,
+        position: 'exit',
+        generation: value
+      })
+    )
+  }
+  commitRelayPathReservation(transaction)
+  return chosen
+}
+
 test('candidate transfer owns bytes and never reads dialing authority getters', (t) => {
   const input = fixture()
   const reads = []
@@ -392,6 +469,7 @@ test('candidate transfer owns bytes and never reads dialing authority getters', 
   t.alike(Object.getOwnPropertyNames(RelayCandidateDirectory.prototype).sort(), [
     'constructor',
     'destroy',
+    'reportBranchFault',
     'reserveInitialPair',
     'reserveReplacement',
     'resume',
@@ -716,6 +794,7 @@ test('wall rollback clears directory ownership and no generation or callback sur
     callbackCount: 0,
     generationRecordCount: 0,
     quarantineCount: 0,
+    faultedCount: 0,
     pendingCount: 0
   })
 
@@ -1191,6 +1270,7 @@ test('evidence and commit reject transaction or directory reentry from wall cloc
     callbackCount: 0,
     generationRecordCount: 0,
     quarantineCount: 0,
+    faultedCount: 0,
     pendingCount: 0
   })
 })
@@ -1439,4 +1519,244 @@ test('transfer record work is rejected before ownership or advertisement crypto'
   )
   t.alike(boundary.counts(), { decodeCalls: 32, digestCalls: 32 })
   boundary.fresh.destroySealedRelayCandidateDirectory(token)
+})
+
+// KI-14. Measured at four middles and four exits, the shape where reuse is not
+// forced but was still observed six times out of six: `choosePairs` is
+// first-match and the lookup branch is built first, so the lookup pair is by
+// construction the earliest record of each role; rotation returned it to the
+// pool still earliest and first-match handed it to the sibling. The control half
+// of this test is the load-bearing half. Without it the test would show only
+// that some pair was selected, not that the demotion is what changed it.
+test('a hop rotated off for cause is not handed to the sibling branch', (t) => {
+  for (const reportFault of [false, true]) {
+    const label = reportFault ? 'fault reported' : 'control, no fault reported'
+    const directory = install(fixture(2, 2))
+    const initial = installInitialDigests(directory)
+
+    if (reportFault) {
+      t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }), `${label}: recorded`)
+    }
+    const observed = directory[kInspectRelayCandidateDirectory]()
+    t.is(observed.faultedCount, reportFault ? 2 : 0, `${label}: both hops of the branch demoted`)
+    // A fault is a heuristic, not proof of equivocation, so it must never be
+    // written to the mechanism that bars an identity outright.
+    t.is(observed.quarantineCount, 0, `${label}: nothing quarantined`)
+
+    rotateBranch(directory, BRANCH_CLASS.LOOKUP, 2n)
+    const announce = rotateBranch(directory, BRANCH_CLASS.ANNOUNCE, 2n)
+
+    if (reportFault) {
+      t.not(announce.middle, initial.lookupMiddle, `${label}: vacated middle not reused`)
+      t.not(announce.exit, initial.lookupExit, `${label}: vacated exit not reused`)
+    } else {
+      t.is(announce.middle, initial.lookupMiddle, `${label}: vacated middle IS reused`)
+      t.is(announce.exit, initial.lookupExit, `${label}: vacated exit IS reused`)
+    }
+    directory.destroy()
+  }
+})
+
+// The honest limit of the demotion, pinned here so it cannot change unnoticed.
+// In the three-plus-three shape the eleven-role scenario runs, the exclusion set
+// already removes two of three middles and two of three exits, so the only
+// qualifying pair IS the one just vacated: the preferred tier comes back empty
+// and the fallback admits it. The demotion therefore has NO observable effect in
+// that topology - which is precisely why it cannot make a legitimate rotation
+// fail closed. Hard exclusion would throw ERR_INCOMPATIBLE_RELAY on both arms
+// below, and any relay could then deny the endpoint a route by failing.
+test('demotion never fails a rotation closed in the three-plus-three shape', (t) => {
+  for (const reportFault of [false, true]) {
+    const label = reportFault ? 'fault-driven' : 'expiry-driven'
+    const directory = install(fixture())
+    const initial = installInitialDigests(directory)
+    if (reportFault) directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP })
+
+    rotateBranch(directory, BRANCH_CLASS.LOOKUP, 2n)
+    let announce = null
+    let error = null
+    try {
+      announce = rotateBranch(directory, BRANCH_CLASS.ANNOUNCE, 2n)
+    } catch (err) {
+      error = err
+    }
+    t.absent(error, `${label}: sibling rotation still succeeds`)
+    t.is(announce && announce.middle, initial.lookupMiddle, `${label}: only qualifying middle`)
+    t.is(announce && announce.exit, initial.lookupExit, `${label}: only qualifying exit`)
+    directory.destroy()
+  }
+})
+
+test('a demotion is bounded by the later of its record and the fault floor', (t) => {
+  const input = replacementExpiryFixture(BRANCH_CLASS.LOOKUP)
+  const directory = install(input)
+  // Nothing is committed, so no pair can be blamed for the branch failing.
+  t.absent(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  expectCode(
+    t,
+    () => directory.reportBranchFault({ branchClass: 'lookup' }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  expectCode(
+    t,
+    () => directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+
+  // WAS 'a demotion is bounded by the record it applies to', asserting the count
+  // was 0 at the lookup records' own 30s expiry. `FAULT_DEMOTION_MS` breaks that
+  // premise on purpose - a relay must not be able to shed a penalty by signing a
+  // short-lived capability - so this is re-expressed at the test's intent, which
+  // is that a demotion is BOUNDED rather than permanent and that
+  // `pruneInvalidRecords` is what ends it. Both hops of this fixture's lookup
+  // pair expire before the floor, so the entries now outlive their records...
+  input.clock.advance(30_000)
+  t.absent(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+
+  // ...and the sweep that ends them is the first one past the floor. The guard
+  // has expired by then, but `reportBranchFault` needs no live guard to sweep.
+  input.clock.advance(30_001)
+  t.absent(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 0)
+  directory.destroy()
+})
+
+// A fault demotes BOTH hops of the pair and only one of them chose its own
+// expiry, so an unfloored demotion is one the attacker sets for itself and the
+// honest hop cannot. 60s is `FAULT_DEMOTION_MS`, pinned here because the
+// constant is not exported and its value is the entire penalty.
+test('a relay cannot shorten its own demotion with a short-lived capability', (t) => {
+  const input = faultFloorFixture()
+  const directory = install(input)
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2, 'both hops demoted')
+
+  // Past the two-second lifetime the middle signed for itself, far short of the
+  // floor. Its record is gone from the candidate set - its own doing - and this
+  // report can only re-demote the exit, so the count holding at two is the
+  // middle's floored entry surviving the sweep inside the same call.
+  input.clock.advance(10_000)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }), 'honest exit still live')
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2, 'floored entry survives')
+  directory.destroy()
+})
+
+// The other half: a floor, not an extension. A relay that advertises honestly
+// long-lived capabilities must not be penalised for longer than it would have
+// been before the floor existed.
+test('the fault floor never extends a demotion past a long-lived record', (t) => {
+  const input = longFixture(NOW + 120_000n)
+  const directory = install(input)
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+
+  // Past the floor, still well inside the records' own lifetime. The rotation is
+  // here only to force a sweep: `reserveReplacement` prunes and never writes
+  // `faulted`, so this observes the stored bound instead of refreshing it the
+  // way a second fault report would.
+  input.clock.advance(60_001)
+  rotateBranch(directory, BRANCH_CLASS.ANNOUNCE, 2n)
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2, 'the longer bound governs')
+
+  // At the records' own expiry the demotion goes with them. Were the floor added
+  // to that expiry rather than compared against it, both entries would still be
+  // here for another minute.
+  input.clock.advance(59_999)
+  t.absent(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 0, 'not extended')
+  directory.destroy()
+})
+
+test('suspend and resume do not launder a demotion', (t) => {
+  const directory = install(fixture(2, 2))
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+  // `retainForSuspend` clears the committed pairs, so the demoted hops are no
+  // longer live anywhere. The demotion has to outlive that or a reconnect would
+  // be a free pardon.
+  directory.retainForSuspend()
+  directory.resume()
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+  directory.destroy()
+})
+
+// Named for what it actually asserts. It checks that a demotion SURVIVES a
+// reconnect and that `reserveInitialPair` still succeeds with one in place - both
+// worth holding - but it never inspects which records were selected, so it passes
+// with or without the demotion being honoured. The selection property is the test
+// below it.
+test('resume keeps a demotion and still admits a reconnect bootstrap pair', (t) => {
+  const directory = install(fixture(2, 2))
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  directory.retainForSuspend()
+  directory.resume()
+  const reservation = directory.reserveInitialPair({
+    lookupGeneration: 2n,
+    announceGeneration: 2n
+  })
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+  abortRelayPathReservation(takeRelayPathReservation(reservation))
+  directory.destroy()
+})
+
+// The boundary of the fix, and the residual property that makes it defensible.
+//
+// A reconnect's BOOTSTRAP pair is not constrained by a demotion: `choosePairs`
+// builds both branches at once and is deliberately untiered, so a demoted hop can
+// reappear there. That is the cost of keeping the eleven-role gate green, and the
+// gate is red for that path for a reason unrelated to this fix - see the comment
+// on `choosePairs`.
+//
+// What is NOT given up is the penalty itself. The demotion survives the reconnect
+// and still binds every later rotation, so a reconnect buys a faulted relay one
+// bootstrap selection, not a reset. This test walks the whole sequence rather than
+// asserting a count, because the count surviving is what previously looked like
+// coverage while selection ignored it.
+test('a demotion survives a reconnect and still binds a later rotation', (t) => {
+  for (const reportFault of [false, true]) {
+    const label = reportFault ? 'fault reported' : 'control, no fault reported'
+    const directory = install(fixture(2, 2))
+    const initial = installInitialDigests(directory)
+    if (reportFault) t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }), label)
+
+    directory.retainForSuspend()
+    directory.resume()
+    t.is(
+      directory[kInspectRelayCandidateDirectory]().faultedCount,
+      reportFault ? 2 : 0,
+      `${label}: demotion survives the reconnect`
+    )
+
+    // The reconnect bootstrap is unconstrained, so this may reselect the demoted
+    // pair. That is the documented boundary, not an accident.
+    const bootstrap = takeRelayPathReservation(
+      directory.reserveInitialPair({ lookupGeneration: 2n, announceGeneration: 2n })
+    )
+    consumeInitial(bootstrap, splitRelayPathReservation(bootstrap), [2n, 2n])
+    commitRelayPathReservation(bootstrap)
+
+    // Rotate the lookup branch away, which frees the originally faulted pair from
+    // the live set, then rotate the sibling. THIS is where the demotion must still
+    // bite, one reconnect later.
+    rotateBranch(directory, BRANCH_CLASS.LOOKUP, 3n)
+    const announce = rotateBranch(directory, BRANCH_CLASS.ANNOUNCE, 3n)
+
+    if (reportFault) {
+      t.not(announce.middle, initial.lookupMiddle, `${label}: demoted middle still avoided`)
+      t.not(announce.exit, initial.lookupExit, `${label}: demoted exit still avoided`)
+    } else {
+      t.is(announce.middle, initial.lookupMiddle, `${label}: demoted middle IS reused`)
+      t.is(announce.exit, initial.lookupExit, `${label}: demoted exit IS reused`)
+    }
+    directory.destroy()
+  }
 })
