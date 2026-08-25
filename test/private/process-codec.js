@@ -534,11 +534,19 @@ test('physical lifecycle commands are bound only to their failing link owners', 
     validateControlMessage(middleRotate, messageContext('command', middleRotate)),
     middleRotate
   )
-  const wrongMiddle = {
+  const middleRotateB = {
     ...base('rotate', 'lookup-middle-b', 5),
     nextGeneration: 8n
   }
-  throwsCode(t, () => validateControlMessage(wrongMiddle, messageContext('command', wrongMiddle)))
+  t.alike(
+    validateControlMessage(middleRotateB, messageContext('command', middleRotateB)),
+    middleRotateB
+  )
+  const wrongRole = {
+    ...base('rotate', 'lookup-exit-a', 4),
+    nextGeneration: 8n
+  }
+  throwsCode(t, () => validateControlMessage(wrongRole, messageContext('command', wrongRole)))
   const endpointRotate = { ...base('rotate'), nextGeneration: 8n }
   throwsCode(t, () =>
     validateControlMessage(endpointRotate, messageContext('command', endpointRotate))

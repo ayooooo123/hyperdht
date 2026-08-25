@@ -88,6 +88,7 @@ const STATES = new Set([
 ])
 const UNAVAILABLE_REASONS = new Set(['NETWORK_CHANGE', 'GUARD_LOSS', 'CANCELLED', 'ERROR'])
 const RUNTIMES = new Set(['node', 'bare'])
+const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
 const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
 const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
@@ -1014,7 +1015,7 @@ function validateCommand(message, context) {
       break
     case 'rotate':
       if (
-        common.role !== 'lookup-middle-a' ||
+        !MIDDLE_ROLES.has(common.role) ||
         !uint64(message.nextGeneration, true) ||
         message.nextGeneration <= common.generation
       )
