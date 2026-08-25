@@ -35,7 +35,9 @@ const { PROCESS_PLANS } = require('./topology-fixture')
 const {
   acceptProjectedExtension,
   activateFinalExitActor,
+  blackholeRouteCells,
   createGuardProcessService,
+  createProjectedCellEndpoint,
   createProjectedLinkService
 } = require('./wire-services')
 
@@ -45,6 +47,13 @@ const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
 const RELAY_ROLES = new Set(['guard', 'lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
+// The one role the `blackhole` verb may be sent to. `control-channel.js` rejects the
+// message for any other role before it is dispatched, so this is not a second policy: it is
+// the same single fact, named once, read by the only two sites that need it - the endpoint
+// constructor below and the verb's dispatch. Every other role therefore keeps the
+// production `UdxCellEndpoint` and an unwrapped udx socket, which is what the eleven-role
+// gate exists to exercise.
+const BLACKHOLE_ROLE = 'lookup-middle-a'
 
 let projection = null
 let generation = 0n
@@ -447,7 +456,7 @@ function startIncomingExtension() {
 }
 
 async function createCellOwner() {
-  cellEndpoint = new UdxCellEndpoint({
+  const endpointOptions = {
     host: projection.bind.host,
     // On separate hosts the socket is bound locally and reached at a translated
     // address, which is the one the role's capability names.
@@ -461,7 +470,15 @@ async function createCellOwner() {
     onCell: receiveRoleCell,
     onLinkFailure: receiveRoleLinkFailure,
     port: projection.bind.port
-  })
+  }
+  // Only the role that can receive `blackhole` pays for the adapter seam. The projection is
+  // a JavaScript socket facade that classifies every datagram, so installing it everywhere
+  // would mean no role in this gate ever constructs the production endpoint or sends over an
+  // unwrapped udx socket - the exact paths the gate is the highest-fidelity check of.
+  cellEndpoint =
+    projection.role === BLACKHOLE_ROLE
+      ? createProjectedCellEndpoint(endpointOptions)
+      : new UdxCellEndpoint(endpointOptions)
   try {
     await cellEndpoint.bind()
   } catch {
@@ -616,6 +633,18 @@ async function activate() {
     if (projection.role !== 'guard') startIncomingExtension()
     state = 'READY'
   }
+}
+
+// dht.stats.requests is dht-rpc's live io counter (dht-rpc/lib/io.js, the
+// `stats.requests` object built in the IO constructor). `responses` increments
+// in exactly one place, io.js's RESPONSE_ID branch, and only after a reply
+// datagram has matched an inflight request - so it counts requests that were
+// ANSWERED. `total` counts requests SENT and `timeouts` counts the ones that
+// were not, and neither distinguishes a live peer from a deaf one. Roles that
+// own no DHT node report 0, which is the only value the control codec accepts
+// from them.
+function answeredRequestCount() {
+  return dht === null ? 0 : dht.stats.requests.responses
 }
 
 function auditSpec(auditClass, command, target, value) {
@@ -962,7 +991,7 @@ async function handle(message) {
     ) {
       throw Object.assign(new Error(), { code: 'PROCESS_LINK_SESSION_UNAVAILABLE' })
     }
-    await emit('ready', { state })
+    await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
     return
   }
   phaseSequence = message.phaseSequence
@@ -998,7 +1027,7 @@ async function handle(message) {
       return
     case 'activate':
       await activate()
-      await emit('ready', { state })
+      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
       return
     case 'store-immutable':
       await storeImmutable(message.value)
@@ -1045,7 +1074,21 @@ async function handle(message) {
       ) {
         throw Object.assign(new Error(), { code: 'PROCESS_LINK_SESSION_UNAVAILABLE' })
       }
-      await emit('ready', { state })
+      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+      return
+    // Silent death, and the only fault verb that destroys nothing. The route cells this
+    // role would relay are dropped in both directions at its UDX adapter, every local
+    // object stays alive and the socket stays bound, so no party anywhere forms the intent
+    // to notify - which is the one condition the two link-fault verbs cannot produce,
+    // because both make this relay emit BRANCH_DESTROY.
+    // Two independent reasons this throws for any other role, so a misdirected verb can
+    // never be a silent no-op: the role is not `BLACKHOLE_ROLE`, and - because only that
+    // role installs the adapter - `blackholeRouteCells` counted zero sockets and refuses.
+    case 'blackhole':
+      if (projection.role !== BLACKHOLE_ROLE || !blackholeRouteCells()) {
+        throw Object.assign(new Error(), { code: 'PROCESS_BLACKHOLE_UNAVAILABLE' })
+      }
+      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
       return
     case 'snapshot':
       await emit('snapshot', snapshotFields())

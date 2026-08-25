@@ -104,6 +104,9 @@ const {
 const { LinkDirectory, decodeTopologyGrant } = require('../../../lib/private/topology-grant')
 const endpointModule = require('../../../lib/private/udx-cell-endpoint')
 const sessionModule = require('../../../lib/private/link-bootstrap-session')
+// The role's cell endpoint and the silent-death verb that rides its UDX adapter. Re-exported
+// here so a role runner only ever imports transport wiring from this module.
+const { blackholeRouteCells, createProjectedCellEndpoint } = require('./route-cell-blackhole')
 
 const createDynamicResponderSetup =
   sessionModule[Symbol.for('hyperdht-private-routes/dynamic-responder-setup-factory')]
@@ -1541,8 +1544,10 @@ function createGuardProcessService(options) {
 module.exports = Object.freeze({
   acceptProjectedExtension,
   activateFinalExitActor,
+  blackholeRouteCells,
   createEndpointFinalRouteActor,
   createGuardProcessService,
+  createProjectedCellEndpoint,
   createProjectedLinkService,
   createTailRelayActor
 })

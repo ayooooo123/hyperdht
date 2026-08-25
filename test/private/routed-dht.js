@@ -75,7 +75,7 @@ function request(overrides = {}) {
     requestId: seed(0x21, 16),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: 4_000n,
+    operationBudgetMs: 2_000n,
     destination: destination(),
     encodedBody: seed(0x22, 32),
     ...overrides
@@ -121,7 +121,7 @@ function expectedRequest() {
     u32(4445),
     u32(1),
     u32(2),
-    u64(4_000n),
+    u64(2_000n),
     expectedDestination(),
     u16(32),
     seed(0x22, 32)
@@ -289,7 +289,7 @@ test('ROUTED_REQUEST_V1 has exact immutable-get bytes and bound policy fields', 
   t.is(decoded.maxAmplificationBytes, 4445)
   t.is(decoded.requestCost, 1)
   t.is(decoded.responseCost, 2)
-  t.is(decoded.absoluteDeadlineMs, 4_000n)
+  t.is(decoded.operationBudgetMs, 2_000n)
   t.alike(decoded.destination, destination())
   t.alike(decoded.destinationEncoded, expectedDestination())
   t.alike(decoded.encodedBody, seed(0x22, 32))
@@ -343,13 +343,13 @@ test('routed command table preserves every body bound and branch permission', (t
   }
 })
 
-test('routed request requires a 16-byte ID, uint64 deadline, and own data options', (t) => {
+test('routed request requires a 16-byte ID, uint64 budget, and own data options', (t) => {
   for (const invalid of [
     { requestId: seed(1, 15) },
     { requestId: seed(1, 17) },
-    { absoluteDeadlineMs: -1n },
-    { absoluteDeadlineMs: 0x1_0000_0000_0000_0000n },
-    { absoluteDeadlineMs: 1 },
+    { operationBudgetMs: -1n },
+    { operationBudgetMs: 0x1_0000_0000_0000_0000n },
+    { operationBudgetMs: 1 },
     { commandId: 0xffff }
   ]) {
     expectCode(t, () => request(invalid), 'INVALID_ROUTE')
@@ -359,7 +359,7 @@ test('routed request requires a 16-byte ID, uint64 deadline, and own data option
     requestId: seed(0x21, 16),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: 4_000n,
+    operationBudgetMs: 2_000n,
     destination: destination(),
     encodedBody: seed(0x22, 32)
   }
@@ -368,8 +368,9 @@ test('routed request requires a 16-byte ID, uint64 deadline, and own data option
     expectCode(t, () => encodeRoutedRequest(hostileOption(name, base)), 'INVALID_ROUTE')
   }
 
-  const maximum = decodeRoutedRequest(request({ absoluteDeadlineMs: 0xffff_ffff_ffff_ffffn }))
-  t.is(maximum.absoluteDeadlineMs, 0xffff_ffff_ffff_ffffn)
+  // The wire slot is still a full uint64; only exit ADMISSION bounds the value it may carry.
+  const maximum = decodeRoutedRequest(request({ operationBudgetMs: 0xffff_ffff_ffff_ffffn }))
+  t.is(maximum.operationBudgetMs, 0xffff_ffff_ffff_ffffn)
   clearRoutedRequest(maximum)
 })
 
@@ -444,7 +445,7 @@ test('tampered and malformed requests fail before destination authority IO', (t)
   t.is(authorityCalls, 0)
 })
 
-test('exit validation authenticates branch, deadline, and destination before route IO', (t) => {
+test('exit validation authenticates branch, budget, and destination before route IO', (t) => {
   const encoded = request()
   let verified = 0
   const decoded = validateRoutedRequestForExit(encoded, {
@@ -455,7 +456,7 @@ test('exit validation authenticates branch, deadline, and destination before rou
       t.alike(value.destination, destination())
       t.alike(value.destinationEncoded, expectedDestination())
       t.is(value.destinationValidationClass, 1)
-      t.is(value.absoluteDeadlineMs, 4_000n)
+      t.is(value.operationBudgetMs, 2_000n)
       t.is(value.commandId, M3_MESSAGE_ID.IMMUTABLE_GET_V1)
       return true
     }
@@ -463,10 +464,12 @@ test('exit validation authenticates branch, deadline, and destination before rou
   t.is(verified, 1)
   clearRoutedRequest(decoded)
 
-  for (const [overrides, code] of [
+  for (const [overrides, code, bytes = encoded] of [
     [{ branchClass: BRANCH_CLASS.ANNOUNCE }, 'ERR_AUTHENTICATION'],
-    [{ now: () => 4_001n }, 'ERR_AUTHENTICATION'],
-    [{ now: () => 999n }, 'ERR_AUTHENTICATION'],
+    // A zero budget buys no time, and one millisecond past the command's 3000ms exit ceiling
+    // is over it. Neither depends on what the exit's clock happens to read.
+    [{}, 'ERR_AUTHENTICATION', request({ operationBudgetMs: 0n })],
+    [{}, 'ERR_AUTHENTICATION', request({ operationBudgetMs: 3_001n })],
     [{ now: () => -1n }, 'INVALID_ROUTE'],
     [{ now: () => 1.5 }, 'INVALID_ROUTE']
   ]) {
@@ -474,7 +477,7 @@ test('exit validation authenticates branch, deadline, and destination before rou
     expectCode(
       t,
       () =>
-        validateRoutedRequestForExit(encoded, {
+        validateRoutedRequestForExit(bytes, {
           now: () => 1_000n,
           branchClass: BRANCH_CLASS.LOOKUP,
           verifyDestination() {
@@ -498,6 +501,63 @@ test('exit validation authenticates branch, deadline, and destination before rou
       }),
     'ERR_AUTHENTICATION'
   )
+})
+
+// KI-15. A monotonic clock is host-local: two exits on different hosts sample values with an
+// arbitrary boot-time offset between them. The wire therefore carries a relative budget, and
+// admission never compares it against a clock reading, so the SAME bytes are admitted by both.
+// The old code compared the endpoint's minted absolute against the exit's own sample and one of
+// these two exits necessarily refused.
+test('one encoded request is admitted by exits whose clocks are far apart', (t) => {
+  const encoded = request({ operationBudgetMs: 2_000n })
+
+  for (const exitClock of [0n, 10_000_000n]) {
+    let verified = 0
+    const decoded = validateRoutedRequestForExit(encoded, {
+      now: () => exitClock,
+      branchClass: BRANCH_CLASS.LOOKUP,
+      verifyDestination(value) {
+        verified++
+        t.is(value.operationBudgetMs, 2_000n)
+        return true
+      }
+    })
+    t.is(verified, 1)
+    t.is(decoded.operationBudgetMs, 2_000n)
+    clearRoutedRequest(decoded)
+  }
+
+  // The budget alone bounds admission, at either clock: no time at all is refused, and so is
+  // one millisecond past IMMUTABLE_GET_V1's 3000ms exit ceiling.
+  for (const budget of [0n, 3_001n]) {
+    const over = request({ operationBudgetMs: budget })
+    for (const exitClock of [0n, 10_000_000n]) {
+      let calls = 0
+      expectCode(
+        t,
+        () =>
+          validateRoutedRequestForExit(over, {
+            now: () => exitClock,
+            branchClass: BRANCH_CLASS.LOOKUP,
+            verifyDestination() {
+              calls++
+              return true
+            }
+          }),
+        'ERR_AUTHENTICATION'
+      )
+      t.is(calls, 0)
+    }
+  }
+
+  // The ceiling itself is admitted, again independent of the clock.
+  const ceiling = validateRoutedRequestForExit(request({ operationBudgetMs: 3_000n }), {
+    now: () => 10_000_000n,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    verifyDestination: () => true
+  })
+  t.is(ceiling.operationBudgetMs, 3_000n)
+  clearRoutedRequest(ceiling)
 })
 
 test('hostile validation options fail before destination authority', (t) => {

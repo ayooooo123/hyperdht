@@ -127,7 +127,7 @@ function fixture(options = {}) {
     requestId: seed(0x21, 16),
     operationClass: BRANCH_CLASS.LOOKUP,
     commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
-    absoluteDeadlineMs: 2_000n,
+    operationBudgetMs: 2_000n,
     destination: { id: destination.id, handle: destination.handle },
     encodedBody: seed(0x31)
   })
@@ -220,7 +220,9 @@ test('DHT exit immutable get settles late replies and aborts on close', (t) => {
   const lateOperation = requestDhtExitImmutableGet(late.io, late.table, late.encodedRequest, {
     onRoutedReply: (encoded) => late.routed.push(encoded)
   })
-  current = 2_000n
+  // The request's 2000ms budget is added to the exit's own clock, so the operation's deadline
+  // here is 3000n; a reply that lands on it is late.
+  current = 3_000n
   late.fake.message(responseFor(late.fake.sends[1].packet, 0), {
     host: '8.8.8.8',
     port: 49737
