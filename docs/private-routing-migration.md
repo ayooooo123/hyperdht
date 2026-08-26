@@ -2303,12 +2303,16 @@ while `test/private-routing.js` stays green everywhere:
 Counts below are a MEASUREMENT taken at one commit, not a contract. Every added test
 moves them, and a stale total quoted as current has already caused four false findings
 in this document's history - so re-measure rather than cite, and if you change a suite,
-change this table in the same pass. Measured after Gate C SURB, KI-13, KI-6, and Gate D Blinded Presence:
+change this table in the same pass. Measured at `e3cf206`, after the KI-15 clock-domain
+fix and the three audit fixes it prompted. Where a row claims two platforms, both were
+run: the two aggregates were measured in the Linux container AND on the macOS host, and
+agreed exactly. The Linux-only rows were measured only in the container, which is the
+only place they can run at all (KI-2, KI-3).
 
 | Suite                            | Command                                    | Result                                                       |
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
-| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 935/935 tests, 18,587/18,587 assertions, on Linux and Darwin |
-| Private aggregate, Bare          | `bare test/private-routing.js`             | 914/914 tests, 18,528/18,528 assertions, on Linux and Darwin |
+| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 902/902 tests, 18,326/18,326 assertions, on Linux and Darwin |
+| Private aggregate, Bare          | `bare test/private-routing.js`             | 881/881 tests, 18,267/18,267 assertions, on Linux and Darwin |
 | Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 127/127 assertions, Linux                                    |
 | Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 127/127 assertions, Linux                                    |
 | Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
@@ -2390,8 +2394,6 @@ The following files were authored in this fork and were not migrated from the pr
 - `lib/private/query-context.js` creates per-instance, unforgeable lookup/announce capabilities for that one command. Its focused coverage is in `test/private/dht-command-policy.js`.
 - `lib/private/opaque-destination.js` owns address-free, branch-bound destination capabilities for one adapter instance. Its focused coverage is in `test/private/routed-dht-io.js`.
 - `lib/private/routed-dht-io.js` implements the internal nine-method DHT-RPC request-transport contract against a trusted in-process authority. It supports only the reviewed immutable-get request body and normalizes a trusted logical response; it is not a live or remote authority interface. Its focused coverage is in `test/private/routed-dht-io.js`.
-- `lib/private/surb.js` implements Gate C Sphinx Single-Use Reply Blocks (SURBs) for receiver-anonymous connectionless DATAGRAM replies using X25519 DH, XChaCha20-Poly1305, and BLAKE2b. Focused coverage is in `test/private/surb.js`.
-- `lib/private/blinded-presence.js` implements Gate D blinded presence-record keys using Tor v3-style Ed25519 scalar blinding ($A' = h \cdot A, a' = h \cdot a \pmod L$) and XChaCha20-Poly1305 reader-credential access control. Focused coverage is in `test/private/blinded-presence.js`.
 
 `test/private/fake-route-authority.js` and `test/private/routed-dht-traversal.js` are also newly authored, test-only conformance scaffolding. They exercise deterministic five-node lookup and announce traversal through base DHT-RPC without hosts, ports, sockets, UDX, or network traffic. They do not model a live three-position route and are not an anonymity test.
 
