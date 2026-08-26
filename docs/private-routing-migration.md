@@ -1603,24 +1603,27 @@ strategy. That precondition is now met **only for pools larger than three-plus-t
 the minimal shape a relay that fails is still handed the sibling branch, so L1 remains
 blocked there, and the blocker is pool size rather than a missing mechanism.
 
-#### Open, recorded rather than patched: a stale loss registration would demote the wrong pair
+#### Stale loss registration: investigated, not reachable
 
-`createRouteManagerBranchLossRegistration` binds `{ manager, state, branchClass }` and NO
-branch generation, so a registration authorises a loss against whatever pair currently
-occupies that class. In the rotation path the directory commits the NEW pair inside the
-awaited `receiveRotationSeed`, and only after it resolves does the controller swap
-connections and destroy the previous one, which is what revokes the stale registration. A
-physical loss fired by the retired runtime inside that window reaches
-`reportRouteManagerBranchLoss`, which resolves the pair from `state.committed` at call time
-and would therefore demote two innocent hops.
+`createRouteManagerBranchLossRegistration` binds `{ manager, state, branchClass }`
+without a generation, which initially looked able to target whichever pair later
+occupied that class. The suspected window does not exist in the production event
+model.
 
-Two reasons this is recorded and not fixed here. The larger consequence - a stale loss
-marking the FRESH branch lost and triggering another rotation - predates this fix and is
-unchanged by it; the demotion is the marginal addition. And reachability is unproven: the
-controller's swap contains no `await`, so it hinges entirely on whether `receiveRotationSeed`
-yields to the macrotask queue after the directory commit, which was not traced. The cheap
-close, if someone takes it, is to bind the generation into the registration and compare it
-before reporting - which also hardens the older half.
+`receiveRotationSeed` awaits network input **before** calling
+`publishRotationSeed`. Publication then commits the new pair synchronously. The
+controller's `await` continuation is a microtask and, once resumed, executes
+`commitBranchConnection`, swaps the connection, and destroys/revokes the previous
+registration with no intervening `await`. A UDX physical-loss I/O event cannot
+interleave inside that synchronous continuation. If the old loss fires during the
+earlier network await, RouteManager is `ROTATING`, so the report returns false
+against the old state and spends that registration before publication; it cannot
+demote or rotate the new pair.
+
+Generation binding would therefore add state and migration surface without closing
+a reachable path. The relevant invariant is the no-yield publish/swap/revoke
+sequence; if a future change inserts an await there, this conclusion must be
+revisited before landing it.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
