@@ -45,6 +45,7 @@ require('./private/route-manager')
 require('./private/branch-expiry-rotation')
 require('./private/udx-loopback')
 require('./private/surb')
+require('./private/blinded-presence')
 
 require('./private/extension-setup-channel')
 require('./private/extension-link-completion')
