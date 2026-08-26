@@ -73,7 +73,7 @@ run-name: 'Live Route: roles ${{ inputs.remote_roles }}, coordinator ${{ inputs.
 # deciding variable was a cancel-to-reply window of about 3.4ms, which a
 # sub-millisecond loopback usually wins and a translated address usually loses. It
 # is fixed in lib/private/m3-adjacency-runtime.js, green in five unmapped and five
-# divergent rehearsals, so a dispatch is expected to complete all 123 assertions.
+# divergent rehearsals, so a dispatch is expected to complete all 132 assertions.
 # A real network loses that race more often than any rehearsal mode, so
 # this is where a regression of that class would resurface first.
 #

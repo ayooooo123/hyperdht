@@ -55,7 +55,13 @@ const ALLOW_EDGES = Object.freeze([
   Object.freeze([2, 5]),
   Object.freeze([2, 7]),
   Object.freeze([3, 4]),
+  Object.freeze([3, 6]),
+  Object.freeze([3, 8]),
+  Object.freeze([4, 5]),
+  Object.freeze([4, 7]),
   Object.freeze([5, 6]),
+  Object.freeze([5, 8]),
+  Object.freeze([6, 7]),
   Object.freeze([7, 8]),
   Object.freeze([4, 9]),
   Object.freeze([4, 10]),
@@ -758,13 +764,19 @@ function dhtOptions(tuple, nodes, bootstrap = []) {
 
 function createLiveProcessTopology(options) {
   if (options === null || typeof options !== 'object') invalid()
-  // endpoints belongs to the discovered plan only, so its presence is part of the
-  // exact shape rather than an extra that any plan may carry.
+  // endpoints belongs to the discovered plan only, and candidateOrder is a
+  // test-only mutation. Their presence is part of the exact shape.
   const supplied = Object.prototype.hasOwnProperty.call(options, 'endpoints')
-  exactObject(
-    options,
-    supplied ? ['clocks', 'endpoints', 'entropy', 'plan'] : ['clocks', 'entropy', 'plan']
-  )
+  const ordered = Object.prototype.hasOwnProperty.call(options, 'candidateOrder')
+  exactObject(options, [
+    'clocks',
+    ...(supplied ? ['endpoints'] : []),
+    'entropy',
+    ...(ordered ? ['candidateOrder'] : []),
+    'plan'
+  ])
+  const candidateOrder = ordered ? options.candidateOrder : 'normal'
+  if (candidateOrder !== 'normal' && candidateOrder !== 'reverse') invalid()
   const clocks = CLOCK_CAPABILITIES.get(options.clocks)
   const entropy = ENTROPY_CAPABILITIES.get(options.entropy)
   if (
@@ -857,11 +869,13 @@ function createLiveProcessTopology(options) {
       [1, 2, TOPOLOGY_ROLE.SOURCE, TOPOLOGY_ROLE.SAFETY_GUARD],
       [2, 3, TOPOLOGY_ROLE.SAFETY_GUARD, TOPOLOGY_ROLE.SAFETY_FINAL],
       [2, 5, TOPOLOGY_ROLE.SAFETY_GUARD, TOPOLOGY_ROLE.SAFETY_FINAL],
-      [2, 7, TOPOLOGY_ROLE.SAFETY_GUARD, TOPOLOGY_ROLE.SAFETY_FINAL],
-      [3, 4, TOPOLOGY_ROLE.SAFETY_FINAL, TOPOLOGY_ROLE.PRIVATE_ENTRY],
-      [5, 6, TOPOLOGY_ROLE.SAFETY_FINAL, TOPOLOGY_ROLE.PRIVATE_ENTRY],
-      [7, 8, TOPOLOGY_ROLE.SAFETY_FINAL, TOPOLOGY_ROLE.PRIVATE_ENTRY]
+      [2, 7, TOPOLOGY_ROLE.SAFETY_GUARD, TOPOLOGY_ROLE.SAFETY_FINAL]
     ]
+    for (const middle of [3, 5, 7]) {
+      for (const exit of [4, 6, 8]) {
+        linkSpecs.push([middle, exit, TOPOLOGY_ROLE.SAFETY_FINAL, TOPOLOGY_ROLE.PRIVATE_ENTRY])
+      }
+    }
     const linkGrants = linkSpecs.map(([left, right, leftRole, rightRole]) =>
       makeLinkGrant(
         entropy,
@@ -932,12 +946,16 @@ function createLiveProcessTopology(options) {
         ...topologyVerificationContext(),
         advertisement: copy(advertisements[1].bytes),
         advertisementDigest: copy(advertisements[1].digest, 32),
-        // Branch builds consume these in order, so the pairs are listed the way the
-        // scenario names them: lookup A first, then announce, leaving lookup B as the
-        // reserve that a faulted lookup branch rotates onto.
-        candidateAdvertisements: [2, 3, 6, 7, 4, 5].map((index) =>
-          copy(advertisements[index].bytes)
-        ),
+        // The mutation reverses the exact records fed to the production candidate
+        // directory. Keeping roleIndex beside each byte string makes reordering
+        // incapable of silently changing the harness's identity-to-role mapping.
+        candidateAdvertisements: (candidateOrder === 'normal'
+          ? [2, 3, 6, 7, 4, 5]
+          : [4, 3, 6, 7, 2, 5]
+        ).map((index) => ({
+          advertisement: copy(advertisements[index].bytes),
+          roleIndex: index + 1
+        })),
         endpointAdjacentBinding: { ...tuples[0] },
         identityPublicKey: copy(identities[1].publicKey, 32),
         identitySecretKey: identities[1].secretKey,
@@ -961,13 +979,15 @@ function createLiveProcessTopology(options) {
           ...topologyVerificationContext(),
           adjacencies: [
             contact('guard', identities[1].publicKey, tuples[1]),
-            contact(ROLES[exitIndex], identities[exitIndex].publicKey, tuples[exitIndex])
+            ...[3, 5, 7].map((index) =>
+              contact(ROLES[index], identities[index].publicKey, tuples[index])
+            )
           ],
           advertisement: copy(advertisements[middleIndex].bytes),
           advertisementDigest: copy(advertisements[middleIndex].digest, 32),
           grants: [
             copy(grantFor(2, middleIndex + 1)),
-            copy(grantFor(middleIndex + 1, exitIndex + 1))
+            ...[3, 5, 7].map((index) => copy(grantFor(middleIndex + 1, index + 1)))
           ],
           identityPublicKey: copy(identities[middleIndex].publicKey, 32),
           identitySecretKey: identities[middleIndex].secretKey,
@@ -1042,7 +1062,7 @@ function createLiveProcessTopology(options) {
           dhtSeedId: copy(dhtIds[0], 32),
           identityPublicKey: copy(identities[exitIndex].publicKey, 32),
           identitySecretKey: identities[exitIndex].secretKey,
-          immutableGetAuthority: exitIndex === 3 || exitIndex === 5,
+          immutableGetAuthority: true,
           initialSeedGrant,
           learnedReferralGrants,
           learnedValueGrants,
@@ -1051,12 +1071,10 @@ function createLiveProcessTopology(options) {
             publicKey: copy(isolatedAuthority.publicKey, 32),
             run: copy(run, 16)
           },
-          middleAdjacency: contact(
-            ROLES[middleIndex],
-            identities[middleIndex].publicKey,
-            tuples[middleIndex]
+          middleAdjacencies: [2, 4, 6].map((index) =>
+            contact(ROLES[index], identities[index].publicKey, tuples[index])
           ),
-          middleGrant: copy(grantFor(middleIndex + 1, exitIndex + 1)),
+          middleGrants: [2, 4, 6].map((index) => copy(grantFor(index + 1, exitIndex + 1))),
           payloadParametersDigest: copy(parametersDigest, 32),
           routePublicKey: copy(routes[exitIndex].publicKey, 32),
           routeSecretKey: routes[exitIndex].secretKey,
@@ -1119,27 +1137,6 @@ function createLiveProcessTopology(options) {
 
     const oracle = deepFreeze({
       auditorMarkerKey,
-      branches: {
-        announce: {
-          exit: 'announce-exit',
-          generation: 1n,
-          middle: 'announce-middle',
-          state: 'ready'
-        },
-        lookup: {
-          exit: 'lookup-exit-a',
-          generation: 1n,
-          middle: 'lookup-middle-a',
-          state: 'selected'
-        },
-        lookupStandby: {
-          exit: 'lookup-exit-b',
-          generation: 2n,
-          middle: 'lookup-middle-b',
-          rotations: 1,
-          state: 'standby'
-        }
-      },
       decoyMarkerKey,
       endpointAddress: tuples[0].host,
       eventForbiddenBytes,

@@ -238,9 +238,9 @@ throwaway DHT: eleven bridges answer with their addresses, the topology is minte
 from those answers, eleven control channels open, and the scenario runs.
 
 **Status: passing.** The rehearsal completes the whole scenario across eleven
-separately hosted roles: 1/1 test, 125/125 assertions, twice in a row. Roles
-activate, the route builds, traffic flows, every role stops on command and exits
-zero.
+separately hosted roles: 1/1 test, 132/132 assertions. Roles activate, the route
+builds, traffic flows, every role stops on command and exits zero. Earlier 125-count
+measurements below are retained as historical snapshots of their respective trees.
 
 The last failure was in the transport, not the protocol. `live-process-suite.js:415`
 ends the scenario by calling `expectExit` for every role, sending `stop`, and
@@ -1219,7 +1219,7 @@ Further dispatches separated protocol from runner/NAT allocation:
   rule correctly rejects during activation.
 
 These are named environmental outcomes, not reasons to relax the route. A standing
-remote gate needs placement/allocation control before a green 123/123 run is
+remote gate needs placement/allocation control before a green 132/132 run is
 repeatable; good allocations have exercised the complete lifecycle through
 teardown, and the reviewed protocol remains fail-closed on bad ones.
 
@@ -1230,7 +1230,7 @@ now carries a RELATIVE budget and each host derives its own absolute deadline fr
 its own clock, so no clock value is compared across hosts. This entry originally
 recorded the wrong cause - that the 3000ms budget was too small - and that diagnosis
 is retracted below because the way it was wrong is instructive. Full remote
-123/123 remains an infrastructure-allocation gate, not an open KI-15 claim.
+132/132 remains an infrastructure-allocation gate, not an open KI-15 claim.
 
 #### The fix
 
@@ -1815,9 +1815,9 @@ attack without bounding the attacker's share of the candidate set.
 
 ### KI-6: hop selection is first-match, not random
 
-**Status: open, and staying open. A fix was implemented, verified and reverted;
-the design below is known to work, and what blocks it is a measured structural
-fact about the eleven-role fixture rather than remaining effort.**
+**Status: harness blocker FIXED; production random selection remains open.** Normal
+and reversed candidate orders now pass the full Node and Bare process scenarios
+through teardown with different live branch pairings.
 
 `choosePairs` at `relay-candidate-directory.js:702` returns the first combination
 that passes the diversity rule, walking candidates in `state.records` order, and
@@ -1843,54 +1843,40 @@ under Bare, including a deterministic test that feeds draws zero through three,
 obtains four distinct combinations, and confirms draw four wraps onto draw zero,
 which pins the count at exactly four rather than at least four.
 
-It was reverted because the eleven-role process fixture is wired to matched
-adjacencies, and the size of that mismatch has now been measured. For a directory
-of three middles and three exits, which is the eleven-role shape, 36 ordered quads
-pass the diversity rule. That count is the module's own rule rather than a
-re-implementation of it: each quad was placed first in the record order and the
-directory returned it. Of the 36, six pair middle i with exit i, and only those
-six describe a topology the fixture holds grants for. A uniform draw would
-therefore build a servable topology one run in six. That is a design
-incompatibility, not a flake.
+The original blocker was the eleven-role fixture, not the directory. It minted only
+three matched middle-to-exit grants (`3-4`, `5-6`, `7-8`), while a directory of
+three middles and three exits has 36 ordered diverse quads and only six use those
+matched pairs. Uniform selection therefore produced a harness-servicable topology
+only one time in six.
 
-The replacement path is not exposed. Once both branches are committed the
-exclusion set leaves exactly one middle and one exit, so `chooseReplacementPair`
-has a single qualifying pair and a draw over it is forced; rotation onto the
-reserve stays deterministic whatever is done here. The whole exposure sits in
-`reserveInitialPair` and `resume`.
+The fixture now models the production contract:
 
-Landing the fix means generalising the fixture so any middle can serve any exit,
-which is the more faithful model anyway, and a second attempt mapped the work
-completely. Four layers are involved, all four unchanged as of this entry:
+1. `ALLOW_EDGES` and signed topology grants contain the full 3x3 middle/exit
+   bipartite matrix.
+2. Every middle receives all three exit contacts/grants and resolves the
+   authenticated selected identity and endpoint dynamically.
+3. Every exit atomically pre-arms all three possible predecessor grants. The
+   endpoint-selected opaque source handle is preserved through the role callback;
+   a boolean-only TEST_ONLY matcher dispatches the datagram only to the exact
+   session that owns that live source relation. No tuple, identity, or handle is
+   exposed.
+4. Winner/loser cleanup is one ownership transaction. A teardown lock and shared
+   completion promise prevent new acquisition or overlapping fault/destroy from
+   missing held sessions; cross-arm packets consume no grant.
+5. Snapshots expose only nullable reciprocal role indexes. The coordinator derives
+   active lookup, announce, standby, rotation, and the physical-fault target from
+   those relationships and observed counters rather than role labels.
 
-1. **Grants.** `linkSpecs` mints one grant per matched adjacency: of its seven
-   entries only `3-4`, `5-6` and `7-8` cross the middle-to-exit tier. Widening it
-   to all nine pairs, and `ALLOW_EDGES` with them, is mechanical; the namespace
-   routes and firewall rules derive from `ALLOW_EDGES` automatically, including
-   the expected rule count.
-2. **Middle downstreams.** A middle's projection carries `adjacencies[1]` and
-   `grants[1]` for one exit, chosen before any route exists. It needs all three,
-   selected by the identity the route names. `wire-services.js` already supports
-   this: `outgoing` may be `{ allowedRole, extensionIndex, resolve(selection) }`,
-   and `selection.relayIdentity` is the requested next hop, so no production
-   change is required.
-3. **Exit predecessors.** An exit pre-arms acceptance with a single
-   `middleGrant`. It needs one arm per possible middle, taking whichever the
-   route uses. `prearmAccept` opens an independent link per grant, so several
-   arms coexist.
-4. **Predecessor binding.** This is what stopped the second attempt.
-   `observedPredecessorEndpoint` is passed into the `acceptProjectedExtension`
-   call that constructs the actor, opened at `role-runner.js:386` with the field
-   at `:398`, and it must be the endpoint of the middle that actually connects. With several arms that identity is not
-   known until one resolves, so the exit branch has to be restructured to race
-   the arms first and construct the actor afterwards, carrying the winning arm's
-   endpoint and keeping both existing zeroization paths correct.
+Normal process Node/Bare runs select lookup-middle-a→lookup-exit-a and rotate to
+lookup-middle-b→lookup-exit-b. With `PR_CANDIDATE_ORDER=reverse`, both runtimes
+select lookup-middle-b→lookup-exit-a and rotate to
+lookup-middle-a→lookup-exit-b. All four runs pass 132/132 through teardown. Restoring
+the fixed lookup-middle-a fault target makes the reverse run fail at assertion 45,
+which proves the mutation reaches the formerly coupled path.
 
-Layer 4 is a lifecycle restructure inside the harness that produces the privacy
-evidence, and an earlier partial attempt turned the namespace live gate red.
-Reddening the gates that carry that evidence is not an acceptable trade for a fix
-whose practical impact begins only when a real relay population exists, so the
-gap stays recorded and the work is scoped for a deliberate change.
+This removes the structural block on production random selection. It does not
+itself change `relay-candidate-directory.js`; first-match selection remains the
+open half of KI-6.
 
 One shortcut is worth ruling out explicitly, because it looks cheap. Pinning the
 draw inside the harness so the first combination always wins would keep the gates
@@ -2284,7 +2270,7 @@ surface:
 native UDX loopback. It is test infrastructure, not a public API, and carries no
 anonymity claim.
 
-On Linux the scenario passes all 123 assertions deterministically with both Node
+On Linux the scenario passes all 132 assertions deterministically with both Node
 and Bare role children. It proves,
 live and cross-process: ordered DHT role bind and the audited setup store;
 endpoint bootstrap, guard pinning, and separate lookup/announce branches built
@@ -2333,19 +2319,19 @@ they can run at all (KI-2, KI-3).
 
 | Suite                            | Command                                    | Result                                                       |
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
-| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 906/906 tests, 18,375/18,375 assertions, on Linux and Darwin |
-| Private aggregate, Bare          | `bare test/private-routing.js`             | 885/885 tests, 18,316/18,316 assertions, on Linux and Darwin |
-| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 123/123 assertions, Linux                                    |
-| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 123/123 assertions, Linux                                    |
+| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 910/910 tests, 18,593/18,593 assertions, on Linux and Darwin |
+| Private aggregate, Bare          | `bare test/private-routing.js`             | 889/889 tests, 18,534/18,534 assertions, on Linux and Darwin |
+| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 132/132 assertions, Linux                                    |
+| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 132/132 assertions, Linux                                    |
 | Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
-| Namespace live route and oracles | `npm run test:private:namespace:live`      | 133/133 assertions, privileged Linux                         |
+| Namespace live route and oracles | `npm run test:private:namespace:live`      | 142/142 assertions, privileged Linux                         |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
 `test/private/live-namespace-node.js` runs the same eleven-process scenario with
 every role in its own Linux network namespace, captures every packet on every
 veth, and decides the result from the captured bytes rather than from the
-implementation's own accounting. It passes `133/133` assertions on Linux.
+implementation's own accounting. It passes `142/142` assertions on Linux.
 
 Isolation is structural, not asserted. Each role holds routes only to the peers
 named by `ALLOW_EDGES`, and the root namespace forwards under a dedicated

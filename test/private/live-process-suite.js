@@ -67,7 +67,9 @@ function registerLiveProcessSuite(launch) {
     // topology is then minted from, and a way to open their control channels. The
     // scenario below is identical either way: same protocol, same auditing.
     const prepared = launch.prepare ? await launch.prepare(t) : null
+    const candidateOrder = process.env.PR_CANDIDATE_ORDER || 'normal'
     const topology = createLiveProcessTopology({
+      candidateOrder,
       plan,
       ...(prepared && prepared.endpoints ? { endpoints: prepared.endpoints } : {}),
       ...capabilities(launch.runtime === 'node' ? 0x31 : 0x32)
@@ -112,6 +114,51 @@ function registerLiveProcessSuite(launch) {
       const waiting = control.expect(role, eventType, generation)
       await control.send(role, command(role, type, phaseSequence, fields))
       return waiting
+    }
+
+    const middleRoles = ROLES.filter((role) => role.includes('-middle'))
+    const exitRoles = ROLES.filter((role) => role.includes('-exit'))
+
+    async function routingSnapshots() {
+      const snapshots = new Map()
+      for (const role of [...middleRoles, ...exitRoles]) {
+        snapshots.set(role, await sendAndWait(role, 'snapshot', 'snapshot'))
+      }
+      return snapshots
+    }
+
+    function deriveRoutingState(snapshots, previousExitCounts = null) {
+      const activePairs = []
+      for (const middleRole of middleRoles) {
+        const middle = snapshots.get(middleRole)
+        if (middle.selectedExitRoleIndex === null) continue
+        const exitRole = ROLES[middle.selectedExitRoleIndex - 1]
+        const exit = snapshots.get(exitRole)
+        t.is(
+          exit.selectedMiddleRoleIndex,
+          middle.roleIndex,
+          `${middleRole} and ${exitRole} report a reciprocal active relationship`
+        )
+        activePairs.push({ exitRole, middleRole })
+      }
+      const lookupPair = activePairs.find(({ exitRole }) => {
+        const count = snapshots.get(exitRole).ordinaryRequestCount
+        return previousExitCounts === null ? count > 0 : count > previousExitCounts.get(exitRole)
+      })
+      if (lookupPair === undefined) throw new Error('active lookup pair unavailable')
+      const announcePair = activePairs.find((pair) => pair !== lookupPair)
+      if (announcePair === undefined) throw new Error('active announce pair unavailable')
+      return {
+        activePairs,
+        announcePair,
+        lookupPair,
+        standbyExits: exitRoles.filter(
+          (role) => !activePairs.some((pair) => pair.exitRole === role)
+        ),
+        standbyMiddles: middleRoles.filter(
+          (role) => !activePairs.some((pair) => pair.middleRole === role)
+        )
+      }
     }
 
     function assertOptionalGrantUsage(snapshot, role, stage) {
@@ -375,9 +422,23 @@ function registerLiveProcessSuite(launch) {
       const firstValue = await valueWaiting
       t.ok(firstValue.target.equals(topology.oracle.targetHash))
       t.ok(firstValue.value.equals(topology.oracle.immutableValue), 'first immutable get is exact')
-      const firstLookupSnapshot = await sendAndWait('lookup-exit-a', 'snapshot', 'snapshot')
-      assertOptionalGrantUsage(firstLookupSnapshot, 'lookup-exit-a', 'initial lookup')
-
+      const firstRoutingSnapshots = await routingSnapshots()
+      const initialRouting = deriveRoutingState(firstRoutingSnapshots)
+      const initialLookupExit = firstRoutingSnapshots.get(initialRouting.lookupPair.exitRole)
+      assertOptionalGrantUsage(
+        initialLookupExit,
+        initialRouting.lookupPair.exitRole,
+        'initial lookup'
+      )
+      t.comment(
+        `candidate-order=${candidateOrder} initial lookup=${initialRouting.lookupPair.middleRole}->${initialRouting.lookupPair.exitRole} ` +
+          `announce=${initialRouting.announcePair.middleRole}->${initialRouting.announcePair.exitRole}`
+      )
+      const firstExitCounts = new Map(
+        exitRoles.map((role) => [role, firstRoutingSnapshots.get(role).ordinaryRequestCount])
+      )
+      t.is(initialRouting.standbyExits.length, 1, 'one exit is inactive standby')
+      t.is(initialRouting.standbyMiddles.length, 1, 'one middle is inactive standby')
       const cancelPhase = nextPhase('endpoint')
       phases.set('endpoint', cancelPhase)
       control.setPhase('endpoint', endpointGeneration, cancelPhase)
@@ -396,10 +457,17 @@ function registerLiveProcessSuite(launch) {
       phases.set('endpoint', rotatePhase)
       generations.set('endpoint', 2n)
       const rotationEvent = control.expectEvent('endpoint', 'rotated', 2n, rotatePhase)
-      const faultAcknowledged = await sendAndWait('lookup-middle-a', 'rotate', 'ready', {
-        nextGeneration: 2n
-      })
-      t.is(faultAcknowledged.state, 'READY', 'lookup A physical link fault is acknowledged')
+      const faultAcknowledged = await sendAndWait(
+        initialRouting.lookupPair.middleRole,
+        'rotate',
+        'ready',
+        { nextGeneration: generations.get(initialRouting.lookupPair.middleRole) + 1n }
+      )
+      t.is(
+        faultAcknowledged.state,
+        'READY',
+        `${initialRouting.lookupPair.middleRole} physical lookup link fault is acknowledged`
+      )
       const rotated = await rotationEvent
       t.is(rotated.previousGeneration, endpointGeneration)
       const secondValueWaiting = control.expect('endpoint', 'value', 2n)
@@ -408,42 +476,51 @@ function registerLiveProcessSuite(launch) {
         command('endpoint', 'immutable-get', rotatePhase, { target: topology.oracle.targetHash })
       )
       t.ok((await secondValueWaiting).value.equals(topology.oracle.immutableValue))
-      const exitSnapshots = new Map()
-      for (const role of ['lookup-exit-a', 'lookup-exit-b', 'announce-exit']) {
-        exitSnapshots.set(role, await sendAndWait(role, 'snapshot', 'snapshot'))
-      }
+      const rotatedRoutingSnapshots = await routingSnapshots()
+      const rotatedRouting = deriveRoutingState(rotatedRoutingSnapshots, firstExitCounts)
+      t.comment(
+        `candidate-order=${candidateOrder} rotated lookup=${rotatedRouting.lookupPair.middleRole}->${rotatedRouting.lookupPair.exitRole} ` +
+          `announce=${rotatedRouting.announcePair.middleRole}->${rotatedRouting.announcePair.exitRole}`
+      )
+      t.not(
+        `${rotatedRouting.lookupPair.middleRole}->${rotatedRouting.lookupPair.exitRole}`,
+        `${initialRouting.lookupPair.middleRole}->${initialRouting.lookupPair.exitRole}`,
+        'rotation changes the active lookup pair'
+      )
       assertOptionalGrantUsage(
-        exitSnapshots.get('lookup-exit-b'),
-        'lookup-exit-b',
+        rotatedRoutingSnapshots.get(rotatedRouting.lookupPair.exitRole),
+        rotatedRouting.lookupPair.exitRole,
         'lookup after rotation'
       )
-      for (const role of ['lookup-exit-a', 'lookup-exit-b']) {
-        const snapshot = exitSnapshots.get(role)
+      for (const role of [initialRouting.lookupPair.exitRole, rotatedRouting.lookupPair.exitRole]) {
+        const snapshot = rotatedRoutingSnapshots.get(role)
         t.ok(
           (snapshot.ordinaryRequestCount === 0 &&
             snapshot.tableEntryCount === 0 &&
             snapshot.referralProbeCount === 0) ||
             (snapshot.ordinaryRequestCount >= 1 && snapshot.tableEntryCount >= 1),
-          `${role} is either retired cleanly or retains its admitted seed and request state`
+          `${role} is either retired cleanly or retains admitted request state`
         )
       }
-      const announceSnapshot = exitSnapshots.get('announce-exit')
+      const announceSnapshot = rotatedRoutingSnapshots.get(rotatedRouting.announcePair.exitRole)
       const announceGrantResponder = learnedGrantResponders.find(
-        (responder) => responder.role === 'announce-exit'
+        (responder) => responder.role === rotatedRouting.announcePair.exitRole
       )
       t.is(
         announceGrantResponder.observedCount(),
         0,
-        'coordinator observes no announce grant request'
+        'coordinator observes no grant request on the state-derived announce exit'
       )
       t.is(announceSnapshot.isolatedGrantRequestCount, 0, 'announce reports no grant request')
       t.is(announceSnapshot.ordinaryRequestCount, 0, 'announce transports no application request')
       t.is(announceSnapshot.referralProbeCount, 0, 'announce probes no application referral')
+      t.is(rotatedRouting.standbyExits.length, 1, 'rotation leaves one inactive exit standby')
+      t.is(rotatedRouting.standbyMiddles.length, 1, 'rotation leaves one inactive middle standby')
       const rotatedEndpointSnapshot = await sendAndWait('endpoint', 'snapshot', 'snapshot')
       t.is(rotatedEndpointSnapshot.guardOnly, true)
       t.ok(
         rotatedEndpointSnapshot.lookupGeneration > readyEndpointSnapshot.lookupGeneration,
-        'physical lookup A fault publishes a fresh lookup B generation'
+        `physical ${initialRouting.lookupPair.middleRole} fault publishes a fresh lookup generation`
       )
 
       const suspended = await sendAndWait('endpoint', 'suspend', 'suspended')

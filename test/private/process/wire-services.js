@@ -110,6 +110,8 @@ const { blackholeRouteCells, createProjectedCellEndpoint } = require('./route-ce
 
 const createDynamicResponderSetup =
   sessionModule[Symbol.for('hyperdht-private-routes/dynamic-responder-setup-factory')]
+const matchesLinkSessionSource =
+  endpointModule[endpointModule.TEST_ONLY_UDX_ADAPTER_ISSUER].matchesLinkSessionSource
 const LINK_DEADLINE_MS = 5_000
 const EXTENSION_INSTALLED_ACK = b4a.from('hyperdht-private-routes/process-extension-installed/v1')
 
@@ -173,6 +175,8 @@ function createProjectedLinkService(options) {
   let localRole = null
   let current = null
   let destroyed = false
+  let teardown = null
+  let teardownPromise = null
   // A `LinkDirectory` keeps one link handle per grant for as long as it lives, and
   // `UdxCellEndpoint.openLink` refuses a handle it already consumed. A rebuilt branch
   // reuses the same signed grant, so each authorization gets its own directory and
@@ -186,9 +190,10 @@ function createProjectedLinkService(options) {
   // which is what makes a relay emit BRANCH_DESTROY upstream.
   const linkSessions = new Map()
   const sessionGrants = new Map()
-
+  let receiveQueue = Promise.resolve()
   function assertLive() {
     if (destroyed) throw PrivateRouteError.ERR_DESTROYED()
+    if (teardown !== null) throw teardown
   }
 
   function endpoints(encoded) {
@@ -332,15 +337,10 @@ function createProjectedLinkService(options) {
     }
   }
 
-  function prearmAccept(encoded) {
-    assertLive()
-    if (!b4a.isBuffer(localRouteSecretKey) || localRouteSecretKey.byteLength !== 32) {
-      return Promise.reject(PrivateRouteError.UNAUTHORIZED())
-    }
+  function createAcceptSession(encoded) {
+    const authorized = authorize(encoded, LINK_OPERATION.ACCEPT)
     let session = null
-    let authorized = null
     try {
-      authorized = authorize(encoded, LINK_OPERATION.ACCEPT)
       session = endpoint.openLink(
         authorized.handle,
         sessionOptions(
@@ -352,17 +352,49 @@ function createProjectedLinkService(options) {
           })
         )
       )
-      const pending = new Promise((resolve, reject) =>
-        installSession(session, authorized, 'accept', resolve, reject)
-      )
-      void pending.catch(() => {})
-      return pending
+      sessions.add(session)
+      sessionGrants.set(session, { directory: authorized.directory, key: authorized.key })
+      return { authorized, session }
     } catch (err) {
       if (session) void session.close().catch(() => {})
       if (session === null || !sessionGrants.has(session)) releaseAuthorization(authorized)
       else releaseGrant(session)
+      throw err
+    }
+  }
+
+  function prearmAcceptAny(encodedGrants) {
+    assertLive()
+    if (
+      !b4a.isBuffer(localRouteSecretKey) ||
+      localRouteSecretKey.byteLength !== 32 ||
+      !Array.isArray(encodedGrants) ||
+      encodedGrants.length === 0 ||
+      encodedGrants.some((grant) => !b4a.isBuffer(grant))
+    ) {
+      return Promise.reject(PrivateRouteError.UNAUTHORIZED())
+    }
+    if (current !== null) return Promise.reject(PrivateRouteError.CIRCUIT_STATE())
+    const arms = []
+    try {
+      for (const encoded of encodedGrants) arms.push(createAcceptSession(encoded))
+      const pending = new Promise((resolve, reject) => {
+        current = { arms, mode: 'accept-many', reject, resolve }
+      })
+      void pending.catch(() => {})
+      return pending
+    } catch (err) {
+      for (const arm of arms) {
+        sessions.delete(arm.session)
+        void arm.session.close().catch(() => {})
+        releaseGrant(arm.session)
+      }
       return Promise.reject(err)
     }
+  }
+
+  function prearmAccept(encoded) {
+    return prearmAcceptAny([encoded]).then((accepted) => accepted.link)
   }
 
   async function initiate(encoded, values) {
@@ -412,16 +444,52 @@ function createProjectedLinkService(options) {
     }
   }
 
-  async function receiveBootstrap(packet) {
-    if (destroyed || current === null) return false
+  async function receiveBootstrapPacket(packet, sourceHandle) {
+    if (destroyed || teardown !== null || current === null) return false
     const operation = current
-    const result = await operation.session.receive(packet)
-    if (operation.mode === 'accept' && operation.session.established) {
-      current = null
-      const value = opened(operation.session)
-      operation.resolve(value)
+    if (operation.mode !== 'accept-many') {
+      if (!matchesLinkSessionSource(endpoint, operation.session, sourceHandle)) return false
+      return operation.session.receive(packet)
     }
-    return result
+    for (let index = 0; index < operation.arms.length; index++) {
+      const arm = operation.arms[index]
+      if (!matchesLinkSessionSource(endpoint, arm.session, sourceHandle)) continue
+      const result = await arm.session.receive(packet)
+      if (!arm.session.established) return result
+      if (current !== operation) return false
+      const closing = []
+      for (let other = 0; other < operation.arms.length; other++) {
+        if (other !== index) closing.push(operation.arms[other].session.close())
+      }
+      await Promise.allSettled(closing)
+      for (let other = 0; other < operation.arms.length; other++) {
+        if (other === index) continue
+        const loser = operation.arms[other].session
+        sessions.delete(loser)
+        releaseGrant(loser)
+      }
+      if (destroyed || teardown !== null) {
+        const reason = teardown || PrivateRouteError.ERR_DESTROYED()
+        current = null
+        sessions.delete(arm.session)
+        await arm.session.close().catch(() => {})
+        releaseGrant(arm.session)
+        operation.reject(reason)
+        return false
+      }
+      current = null
+      const link = opened(arm.session)
+      linkSessions.set(link, arm.session)
+      operation.resolve(Object.freeze({ grantIndex: index, link }))
+      return result
+    }
+    return false
+  }
+
+  function receiveBootstrap(packet, sourceHandle) {
+    const received = receiveQueue.then(() => receiveBootstrapPacket(packet, sourceHandle))
+    receiveQueue = received.catch(() => false)
+    return received
   }
 
   function receiveCell(packet, handle, metadata) {
@@ -488,34 +556,41 @@ function createProjectedLinkService(options) {
     return true
   }
 
+  async function closeOwnedSessions(reason, terminal) {
+    if (teardownPromise !== null) {
+      await teardownPromise
+      return false
+    }
+    const hadOwnership = current !== null || sessions.size > 0
+    teardown = reason
+    teardownPromise = (async () => {
+      await receiveQueue.catch(() => false)
+      if (current && current.reject) current.reject(reason)
+      current = null
+      const closingSessions = Array.from(sessions)
+      const closing = closingSessions.map((session) => session.close())
+      await Promise.allSettled(closing)
+      sessions.clear()
+      links.clear()
+      linkSessions.clear()
+      for (const session of closingSessions) releaseGrant(session)
+    })()
+    await teardownPromise
+    if (!terminal) {
+      teardown = null
+      teardownPromise = null
+    }
+    return hadOwnership
+  }
   async function faultPhysicalLink() {
     if (destroyed) return false
-    const closing = []
-    const closingSessions = Array.from(sessions)
-    for (const session of closingSessions) closing.push(session.close())
-    sessions.clear()
-    links.clear()
-    linkSessions.clear()
-    if (current && current.reject) current.reject(PrivateRouteError.ERR_PRIVACY_UNAVAILABLE())
-    current = null
-    await Promise.allSettled(closing)
-    for (const session of closingSessions) releaseGrant(session)
-    return closing.length > 0
+    return closeOwnedSessions(PrivateRouteError.ERR_PRIVACY_UNAVAILABLE(), false)
   }
 
   async function destroy() {
     if (destroyed) return false
     destroyed = true
-    if (current && current.reject) current.reject(PrivateRouteError.ERR_DESTROYED())
-    current = null
-    const closing = []
-    const closingSessions = Array.from(sessions)
-    for (const session of closingSessions) closing.push(session.close())
-    sessions.clear()
-    links.clear()
-    linkSessions.clear()
-    await Promise.allSettled(closing)
-    for (const session of closingSessions) releaseGrant(session)
+    await closeOwnedSessions(PrivateRouteError.ERR_DESTROYED(), true)
     consumed.clear()
     return true
   }
@@ -527,6 +602,7 @@ function createProjectedLinkService(options) {
     initiate,
     openSetupTransport,
     prearmAccept,
+    prearmAcceptAny,
     receiveBootstrap,
     receiveCell,
     receiveLinkFailure,
@@ -1317,10 +1393,32 @@ function createGuardProcessService(options) {
     onActor,
     onFailure
   } = options
+  const candidateRoleIndexes = new Set()
+  const validCandidates =
+    Array.isArray(candidateAdvertisements) &&
+    candidateAdvertisements.every((candidate) => {
+      if (
+        !candidate ||
+        typeof candidate !== 'object' ||
+        Reflect.ownKeys(candidate).length !== 2 ||
+        !Object.prototype.hasOwnProperty.call(candidate, 'advertisement') ||
+        !Object.prototype.hasOwnProperty.call(candidate, 'roleIndex') ||
+        !b4a.isBuffer(candidate.advertisement) ||
+        !Number.isSafeInteger(candidate.roleIndex) ||
+        candidate.roleIndex < 3 ||
+        candidate.roleIndex > 8 ||
+        candidateRoleIndexes.has(candidate.roleIndex)
+      ) {
+        return false
+      }
+      candidateRoleIndexes.add(candidate.roleIndex)
+      return true
+    })
   if (
     !endpoint ||
     !b4a.isBuffer(advertisement) ||
-    !Array.isArray(candidateAdvertisements) ||
+    !validCandidates ||
+    candidateRoleIndexes.size !== 6 ||
     !Array.isArray(middleRoutes) ||
     !same(identitySecretKey.subarray(32), identityPublicKey) ||
     !b4a.isBuffer(routeSecretKey) ||
@@ -1335,7 +1433,10 @@ function createGuardProcessService(options) {
     advertisement,
     identitySecretKey,
     routeEncryptionSecretKey: routeSecretKey,
-    selectAdvertisements: () => [advertisement, ...candidateAdvertisements]
+    selectAdvertisements: () => [
+      advertisement,
+      ...candidateAdvertisements.map((candidate) => candidate.advertisement)
+    ]
   })
   const takeBootstrapAccept = require('../../../lib/private/caps-responder')[
     Symbol.for('hyperdht-private-routes/bootstrap-accept-authority-taker')
@@ -1458,7 +1559,7 @@ function createGuardProcessService(options) {
     return true
   }
 
-  async function receiveBootstrap(packet) {
+  async function receiveBootstrap(packet, sourceHandle) {
     if (destroyed) return false
     if (packet[0] === 0xd3 && packet[1] === 0x01) {
       const bytes = (packet[2] << 8) | packet[3]
@@ -1504,7 +1605,7 @@ function createGuardProcessService(options) {
       if (bootstrapSession.established) registerGuardBranches(bootstrapSession.established)
       return result
     }
-    return linkService.receiveBootstrap(packet)
+    return linkService.receiveBootstrap(packet, sourceHandle)
   }
 
   function receiveCell(packet, handle, metadata) {
