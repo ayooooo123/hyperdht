@@ -3,8 +3,8 @@
 # Dispatches role bridges to runners and drives the eleven-role live route from
 # this machine.
 #
-#   scripts/live-route.sh up [-s 900] [-w 600] [-l 1,9,10,11]
-#   scripts/live-route.sh drive <run-id> [-w 600] [-l 1,9,10,11]
+#   scripts/live-route.sh up [-s 900] [-w 600] [-l 1,3,9]
+#   scripts/live-route.sh drive <run-id> [-w 600] [-l 1,3,9]
 #
 # Needs both local secrets; run scripts/remote-peer.sh secret --push once. Nothing
 # else has to be set up, and no repository secret beyond REMOTE_PEER_SECRET is ever
@@ -35,12 +35,15 @@
 # validatePathDiversity (lib/private/branch-path-authority.js:159) rejects a path
 # whose guard and four branch positions share a /24, and recordsDiverse
 # (relay-candidate-directory.js:355) applies the same rule when candidates are
-# chosen. Roles 2 to 8 are exactly the set that rule sees, so AT MOST ONE OF THEM
-# MAY RUN HERE; roles 1, 9, 10 and 11 are never compared by subnet and any number
-# of them can be local. So the largest safe local set is five: 1, 9, 10, 11 and one
-# of 2 to 8. This script refuses anything else before dispatching, because the
-# failure it would cause is ERR_INCOMPATIBLE_RELAY eleven steps later with nothing
-# naming the addresses.
+# chosen. Roles 2 to 8 are exactly the set that rule sees, so at most one may be
+# local.
+#
+# A second, independent constraint is NAT hairpinning. Every local role publishes
+# this machine's reflected public address, but this NAT does not deliver a local
+# socket's packet back to another local socket through that address. Two local roles
+# joined by an ALLOW_EDGES topology edge therefore cannot communicate even though
+# diversity may permit them. `plan_placement` rejects both constraints before
+# dispatch. Roles sharing the host but no required edge may coexist.
 #
 # ONE THING THIS CANNOT CHECK: whether this machine's NAT lets a runner reach a
 # local role at all. Roles send to each other's reflected addresses directly, so a
@@ -78,6 +81,9 @@ local_roles=""
 # The guard plus the six relay candidates: the roles validatePathDiversity compares
 # by subnet. Padded with spaces so a membership test cannot match a substring.
 diverse_roles=" 2 3 4 5 6 7 8 "
+# Must mirror test/private/process/topology-fixture.js ALLOW_EDGES. Space padding
+# makes exact pair membership safe under shell pattern matching.
+required_edges=" 1:2 2:3 2:5 2:7 3:4 5:6 7:8 4:9 4:10 4:11 6:9 6:10 6:11 8:9 8:10 8:11 9:10 9:11 10:11 "
 
 parse_flags() {
   while [ "$#" -gt 0 ]; do
@@ -134,7 +140,7 @@ parse_flags() {
 # Splits -l into a validated, space-padded list, and refuses a placement the
 # diversity rule would reject. Sets local_list and remote_list.
 plan_placement() {
-  local value diverse_count=0
+  local value left right pair diverse_count=0
   local_list=" "
   diverse_count=0
   if [ -n "$local_roles" ]; then
@@ -171,6 +177,23 @@ plan_placement() {
     echo "most one of 2,3,4,5,6,7,8 here; 1,9,10,11 are unconstrained." >&2
     exit 64
   fi
+  # This NAT has no public-address hairpin. Refuse any two local roles that the
+  # scenario requires to exchange packets, or the punch matrix will name those
+  # pairs silent and the first operation across one will time out.
+  for left in ${local_roles//,/ }; do
+    for right in ${local_roles//,/ }; do
+      [ "$left" -lt "$right" ] || continue
+      pair="$left:$right"
+      case "$required_edges" in
+        *" $pair "*)
+          echo "local roles $left and $right require a direct topology edge," >&2
+          echo "but this host's NAT does not hairpin its reflected address." >&2
+          echo "Keep at most one endpoint of ALLOW_EDGES on this machine." >&2
+          exit 64
+          ;;
+      esac
+    done
+  done
   remote_list=""
   for value in $(seq 1 "$roles"); do
     case "$local_list" in
@@ -309,7 +332,7 @@ case "${1:-}" in
     shift
     run_id="${1:-}"
     if [ -z "$run_id" ]; then
-      echo "usage: scripts/live-route.sh drive <run-id> [-w 600] [-l 1,9,10,11]" >&2
+      echo "usage: scripts/live-route.sh drive <run-id> [-w 600] [-l 1,3,9]" >&2
       exit 64
     fi
     shift

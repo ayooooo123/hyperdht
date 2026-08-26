@@ -792,6 +792,7 @@ function snapshotFields(closed = false) {
         Number(dht !== null) +
         (controllerSnapshot === null ? 0 : controllerSnapshot.endpointSockets),
     ordinaryRequestCount: exitSnapshot === null ? 0 : exitSnapshot.ordinaryRequestCount,
+    isolatedGrantRequestCount: Number(isolatedGrantRequestSequence),
     pendingGrantRequests: isolatedGrantPending === null ? 0 : 1,
     pendingLinks: wireSnapshot === null ? 0 : wireSnapshot.pending,
     pendingPackets: exitSnapshot === null ? 0 : exitSnapshot.pendingPackets,
