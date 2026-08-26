@@ -719,6 +719,7 @@ test('auditor binds sanitized post-setup DHT value state to the topology oracle'
     { endpointSockets: 1 },
     { guardOnly: true },
     { openLinks: 1 },
+    { isolatedGrantRequestCount: 1 },
     { openResources: 0 },
     { storedValueCount: 1 }
   ]) {

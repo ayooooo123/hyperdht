@@ -1191,30 +1191,46 @@ it turns an address nobody verified into one that is verified, but it bought a
 negative result rather than a fix.
 
 The order these were found matters for anyone repeating the exercise, because each
-one hid the next: the runtime attestation could never pass, so nothing beyond
-assertion 1 was reachable; then two roles could not be scheduled; then a laptop role
-could not be dialled; then a retransmission was called a replay; then the command
-budget was too small for real RTT; and only then did the setup store's own timeout
-become visible at assertion 11. Six distinct causes, each of which had to be removed
-before the next could be seen, and not one of them observable on loopback. Five are
-fixed and landed; the sixth is where a real dispatch now stops, at 10 of 11
-assertions with every role on a runner.
+one hid the next: runtime attestation, runner scheduling, laptop NAT filtering,
+retransmission classification, setup-store timeout, and finally the cross-host
+monotonic deadline. PR #45 removed that last protocol fault.
 
-So mixed placement works for roles that initiate and fails for roles that must be
-dialled, on this network. Whether that generalises depends entirely on the NAT in
-front of whoever runs it. The honest limit: nothing here distinguishes
-endpoint-independent filtering from endpoint-dependent filtering in advance, and
-the reflectors cannot, so a mixed dispatch is the test.
+The next reviewed dispatches crossed every boundary the earlier runs could not:
+140/140 directed punch pairs, answered DHT setup, immutable store/readback, every
+role READY, guard-only endpoint authority, no retained bootstrap socket, and the
+first exact routed immutable get across eleven Azure hosts. That closes KI-15
+end-to-end for the exercised request.
+
+The run then exposed a harness assumption: it awaited
+`isolated-grant-request` from `lookup-exit-a` as mandatory, but real DHT ordering
+returned the value directly without discovering a learned closer. The local
+deterministic topology always takes the referral path, so it had hidden the hang.
+Role snapshots now report `isolatedGrantRequestCount`; learned-closer events remain
+served when present, but scenario progress and accounting accept both valid paths.
+
+Further dispatches separated protocol from runner/NAT allocation:
+
+- eleven remote jobs can leave one queued beyond the workflow's maximum discovery
+  window, even though the eventual Actions jobs all pass;
+- one allocation opened only 2/140 punch pairs, while another opened 140/140;
+- co-located roles on this workstation cannot hairpin through their shared
+  reflected public address;
+- two Azure relay candidates can land in the same /24, which the privacy diversity
+  rule correctly rejects during activation.
+
+These are named environmental outcomes, not reasons to relax the route. A standing
+remote gate needs placement/allocation control before a green 129/129 run is
+repeatable; good allocations have exercised the complete lifecycle through
+teardown, and the reviewed protocol remains fail-closed on bad ones.
 
 ### KI-15: an absolute deadline is built on a host-local monotonic clock
 
-**Status: FIXED, by changing what the field MEANS rather than what it is worth. The wire
-now carries a RELATIVE budget and each host derives its own absolute deadline from its own
-clock, so no clock value is ever compared across hosts. This entry originally recorded the
-wrong cause - that the 3000ms budget was too small - and that diagnosis is retracted below,
-because the way it was wrong is instructive. NOT yet confirmed by a real two-host dispatch:
-the fault this removes was structural and is proven removed by construction and by test,
-but the dispatch that exposed it has not been re-run.**
+**Status: FIXED, including a real eleven-host routed immutable get.** The wire
+now carries a RELATIVE budget and each host derives its own absolute deadline from
+its own clock, so no clock value is compared across hosts. This entry originally
+recorded the wrong cause - that the 3000ms budget was too small - and that diagnosis
+is retracted below because the way it was wrong is instructive. Full remote
+129/129 remains an infrastructure-allocation gate, not an open KI-15 claim.
 
 #### The fix
 
@@ -2265,14 +2281,15 @@ surface:
 native UDX loopback. It is test infrastructure, not a public API, and carries no
 anonymity claim.
 
-On Linux (Ubuntu 24.04 under Colima, Node v22.19.0) the scenario passes all 125
-assertions deterministically with both Node and Bare role children. It proves,
+On Linux the scenario passes all 129 assertions deterministically with both Node
+and Bare role children. It proves,
 live and cross-process: ordered DHT role bind and the audited setup store;
 endpoint bootstrap, guard pinning, and separate lookup/announce branches built
 through authenticated adjacent links; an exact immutable get retrieved through
-the three-position route after the exit admits an isolated learned closer under a
-signed Task 12 grant; delayed-lookup cancellation; a physical lookup-A link fault
-that propagates `BRANCH_DESTROY` upstream and rotates the endpoint onto lookup B,
+the three-position route either directly from the configured DHT path or after
+the exit admits an isolated learned closer under a signed Task 12 grant;
+delayed-lookup cancellation; a physical lookup-A link fault that propagates
+`BRANCH_DESTROY` upstream and rotates the endpoint onto lookup B,
 followed by a second exact immutable get; exit accounting for referral probes and
 ordinary requests; endpoint suspend and resume, including a third exact immutable
 get over the rebuilt route; a terminal network change that leaves no endpoint
@@ -2313,19 +2330,19 @@ they can run at all (KI-2, KI-3).
 
 | Suite                            | Command                                    | Result                                                       |
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
-| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 906/906 tests, 18,373/18,373 assertions, on Linux and Darwin |
-| Private aggregate, Bare          | `bare test/private-routing.js`             | 885/885 tests, 18,314/18,314 assertions, on Linux and Darwin |
-| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 127/127 assertions, Linux                                    |
-| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 127/127 assertions, Linux                                    |
+| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 906/906 tests, 18,375/18,375 assertions, on Linux and Darwin |
+| Private aggregate, Bare          | `bare test/private-routing.js`             | 885/885 tests, 18,316/18,316 assertions, on Linux and Darwin |
+| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 129/129 assertions, Linux                                    |
+| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 129/129 assertions, Linux                                    |
 | Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
-| Namespace live route and oracles | `npm run test:private:namespace:live`      | 137/137 assertions, privileged Linux                         |
+| Namespace live route and oracles | `npm run test:private:namespace:live`      | 139/139 assertions, privileged Linux                         |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
 `test/private/live-namespace-node.js` runs the same eleven-process scenario with
 every role in its own Linux network namespace, captures every packet on every
 veth, and decides the result from the captured bytes rather than from the
-implementation's own accounting. It passes `137/137` assertions on Linux.
+implementation's own accounting. It passes `139/139` assertions on Linux.
 
 Isolation is structural, not asserted. Each role holds routes only to the peers
 named by `ALLOW_EDGES`, and the root namespace forwards under a dedicated

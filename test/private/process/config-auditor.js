@@ -183,6 +183,7 @@ const DHT_ZERO_SNAPSHOT_FIELDS = Object.freeze([
   'activeOperations',
   'endpointSockets',
   'openLinks',
+  'isolatedGrantRequestCount',
   'ordinaryRequestCount',
   'pendingGrantRequests',
   'pendingLinks',

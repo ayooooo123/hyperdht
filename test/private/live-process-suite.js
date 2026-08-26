@@ -115,10 +115,12 @@ function registerLiveProcessSuite(launch) {
     }
 
     function assertOptionalGrantUsage(snapshot, role, stage) {
+      const responder = learnedGrantResponders.find((candidate) => candidate.role === role)
+      const observed = responder === undefined ? -1 : responder.observedCount()
       const count = snapshot.isolatedGrantRequestCount
       t.ok(
-        Number.isSafeInteger(count) && count >= 0 && count <= 18,
-        `${role} keeps learned-closer requests inside the issued grant pool during ${stage}`
+        Number.isSafeInteger(count) && count === observed && count >= 0 && count <= 18,
+        `${role} matches coordinator-observed grant requests during ${stage}`
       )
       t.is(snapshot.pendingGrantRequests, 0, `${role} leaves no grant request pending`)
       t.ok(
@@ -274,6 +276,7 @@ function registerLiveProcessSuite(launch) {
         })
         const state = {
           granting: true,
+          observedCount: 0,
           stopped: false,
           waiter: null
         }
@@ -292,7 +295,6 @@ function registerLiveProcessSuite(launch) {
           state.waiter = waiter
           waiter.promise.then(async (request) => {
             state.waiter = null
-            arm()
             const allCandidates = learnedCandidates.flatMap((pools) => Object.values(pools))
             const learned = allCandidates.find(
               (candidate) =>
@@ -302,18 +304,19 @@ function registerLiveProcessSuite(launch) {
             const granted = allCandidates.find((candidate) =>
               request.tupleDigest.equals(candidate.digest)
             )
-            // The first request, if one exists, must be for a learned non-seed
-            // candidate and start at sequence one. Refuse malformed discovery
-            // silently here; the routed operation then fails instead of the
-            // harness blessing the wrong grant.
-            if (
-              request.requestSequence === 1n &&
-              (learned === undefined || request.tupleDigest.equals(seedDigest))
-            ) {
+            const expectedSequence = BigInt(state.observedCount + 1)
+            const valid =
+              request.requestSequence === expectedSequence &&
+              granted !== undefined &&
+              !request.tupleDigest.equals(seedDigest) &&
+              (state.observedCount !== 0 || learned !== undefined)
+            if (!valid) {
+              arm()
               return
             }
-            if (!state.granting) return
-            if (granted === undefined || granted.used >= granted.grants.length) return
+            state.observedCount++
+            arm()
+            if (!state.granting || granted.used >= granted.grants.length) return
             const grant = granted.grants[granted.used++]
             // `respondIsolatedGrant` throws SYNCHRONOUSLY when the role's expected phase
             // has moved since the request was observed, coordinator.js:516. A `.catch` on
@@ -330,6 +333,9 @@ function registerLiveProcessSuite(launch) {
         arm()
         return {
           role,
+          observedCount() {
+            return state.observedCount
+          },
           // Stops ANSWERING, and deliberately not listening. The standing waiter has to
           // stay armed so a request that still arrives is tolerated rather than becoming
           // PROCESS_UNEXPECTED_EVENT, and `state.stopped` is what disarms re-arming, so
@@ -432,6 +438,15 @@ function registerLiveProcessSuite(launch) {
         )
       }
       const announceSnapshot = exitSnapshots.get('announce-exit')
+      const announceGrantResponder = learnedGrantResponders.find(
+        (responder) => responder.role === 'announce-exit'
+      )
+      t.is(
+        announceGrantResponder.observedCount(),
+        0,
+        'coordinator observes no announce grant request'
+      )
+      t.is(announceSnapshot.isolatedGrantRequestCount, 0, 'announce reports no grant request')
       t.is(announceSnapshot.ordinaryRequestCount, 0, 'announce transports no application request')
       t.is(announceSnapshot.referralProbeCount, 0, 'announce probes no application referral')
       const rotatedEndpointSnapshot = await sendAndWait('endpoint', 'snapshot', 'snapshot')

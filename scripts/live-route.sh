@@ -3,8 +3,8 @@
 # Dispatches role bridges to runners and drives the eleven-role live route from
 # this machine.
 #
-#   scripts/live-route.sh up [-s 900] [-w 600] [-l 1,9,10,11]
-#   scripts/live-route.sh drive <run-id> [-w 600] [-l 1,9,10,11]
+#   scripts/live-route.sh up [-s 900] [-w 600] [-l 1,3,9]
+#   scripts/live-route.sh drive <run-id> [-w 600] [-l 1,3,9]
 #
 # Needs both local secrets; run scripts/remote-peer.sh secret --push once. Nothing
 # else has to be set up, and no repository secret beyond REMOTE_PEER_SECRET is ever
@@ -332,7 +332,7 @@ case "${1:-}" in
     shift
     run_id="${1:-}"
     if [ -z "$run_id" ]; then
-      echo "usage: scripts/live-route.sh drive <run-id> [-w 600] [-l 1,9,10,11]" >&2
+      echo "usage: scripts/live-route.sh drive <run-id> [-w 600] [-l 1,3,9]" >&2
       exit 64
     fi
     shift
