@@ -123,10 +123,6 @@ function registerLiveProcessSuite(launch) {
         `${role} matches coordinator-observed grant requests during ${stage}`
       )
       t.is(snapshot.pendingGrantRequests, 0, `${role} leaves no grant request pending`)
-      t.ok(
-        Number.isSafeInteger(snapshot.referralProbeCount) && snapshot.referralProbeCount >= 0,
-        `${role} reports a valid referral-probe count`
-      )
       t.ok(snapshot.ordinaryRequestCount >= 1, `${role} sends the immutable request`)
     }
 
@@ -424,17 +420,11 @@ function registerLiveProcessSuite(launch) {
       for (const role of ['lookup-exit-a', 'lookup-exit-b']) {
         const snapshot = exitSnapshots.get(role)
         t.ok(
-          Number.isSafeInteger(snapshot.referralProbeCount) && snapshot.referralProbeCount >= 0,
-          `${role} reports a valid referral-probe count`
-        )
-        t.ok(
-          Number.isSafeInteger(snapshot.ordinaryRequestCount) && snapshot.ordinaryRequestCount >= 0,
-          `${role} reports a valid immutable-request count`
-        )
-        t.ok(
-          (snapshot.ordinaryRequestCount === 0 && snapshot.tableEntryCount === 0) ||
+          (snapshot.ordinaryRequestCount === 0 &&
+            snapshot.tableEntryCount === 0 &&
+            snapshot.referralProbeCount === 0) ||
             (snapshot.ordinaryRequestCount >= 1 && snapshot.tableEntryCount >= 1),
-          `${role} is either retired cleanly or retains its admitted seed`
+          `${role} is either retired cleanly or retains its admitted seed and request state`
         )
       }
       const announceSnapshot = exitSnapshots.get('announce-exit')

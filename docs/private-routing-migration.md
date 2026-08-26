@@ -1219,7 +1219,7 @@ Further dispatches separated protocol from runner/NAT allocation:
   rule correctly rejects during activation.
 
 These are named environmental outcomes, not reasons to relax the route. A standing
-remote gate needs placement/allocation control before a green 129/129 run is
+remote gate needs placement/allocation control before a green 123/123 run is
 repeatable; good allocations have exercised the complete lifecycle through
 teardown, and the reviewed protocol remains fail-closed on bad ones.
 
@@ -1230,7 +1230,7 @@ now carries a RELATIVE budget and each host derives its own absolute deadline fr
 its own clock, so no clock value is compared across hosts. This entry originally
 recorded the wrong cause - that the 3000ms budget was too small - and that diagnosis
 is retracted below because the way it was wrong is instructive. Full remote
-129/129 remains an infrastructure-allocation gate, not an open KI-15 claim.
+123/123 remains an infrastructure-allocation gate, not an open KI-15 claim.
 
 #### The fix
 
@@ -2281,7 +2281,7 @@ surface:
 native UDX loopback. It is test infrastructure, not a public API, and carries no
 anonymity claim.
 
-On Linux the scenario passes all 129 assertions deterministically with both Node
+On Linux the scenario passes all 123 assertions deterministically with both Node
 and Bare role children. It proves,
 live and cross-process: ordered DHT role bind and the audited setup store;
 endpoint bootstrap, guard pinning, and separate lookup/announce branches built
@@ -2332,17 +2332,17 @@ they can run at all (KI-2, KI-3).
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
 | Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 906/906 tests, 18,375/18,375 assertions, on Linux and Darwin |
 | Private aggregate, Bare          | `bare test/private-routing.js`             | 885/885 tests, 18,316/18,316 assertions, on Linux and Darwin |
-| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 129/129 assertions, Linux                                    |
-| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 129/129 assertions, Linux                                    |
+| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 123/123 assertions, Linux                                    |
+| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 123/123 assertions, Linux                                    |
 | Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
-| Namespace live route and oracles | `npm run test:private:namespace:live`      | 139/139 assertions, privileged Linux                         |
+| Namespace live route and oracles | `npm run test:private:namespace:live`      | 133/133 assertions, privileged Linux                         |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
 `test/private/live-namespace-node.js` runs the same eleven-process scenario with
 every role in its own Linux network namespace, captures every packet on every
 veth, and decides the result from the captured bytes rather than from the
-implementation's own accounting. It passes `139/139` assertions on Linux.
+implementation's own accounting. It passes `133/133` assertions on Linux.
 
 Isolation is structural, not asserted. Each role holds routes only to the peers
 named by `ALLOW_EDGES`, and the root namespace forwards under a dedicated
