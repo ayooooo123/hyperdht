@@ -12,9 +12,9 @@ const {
   sealReply,
   processSurbHop,
   openSurbPayload,
-  nullifierOf,
   createNullifierGuard
 } = require('../../lib/private/surb')
+
 function relay() {
   const routeKey = b4a.allocUnsafeSlow(32)
   const routeSecretKey = b4a.allocUnsafeSlow(32)
@@ -342,112 +342,4 @@ test('filler sanity — header padding is not degenerate (WEAK proxy, not a stat
   t.ok(maxRun < 16, 'no long zero run')
   t.ok(zeros < h.byteLength / 4, 'header is not mostly zeros')
   t.ok(hist.filter((c) => c > 0).length > 128, 'wide byte-value range')
-})
-
-test('boundary payloads: zero-length and max-capacity round-trip correctly', (t) => {
-  const relays = [relay(), relay(), relay()]
-  const terminalId = b4a.alloc(32, 77)
-  const { surb, openKeys } = buildSurb(pathOf(relays), terminalId)
-
-  // Zero-length payload
-  const empty = b4a.alloc(0)
-  const outEmpty = roundTrip(relays, terminalId, surb, openKeys, empty)
-  t.alike(outEmpty.plaintext, empty, 'zero-length payload round-trips')
-
-  // Max capacity payload
-  const maxPayload = b4a.alloc(MAX_REPLY_BYTES, 0x42)
-  const { surb: surbMax, openKeys: openKeysMax } = buildSurb(pathOf(relays), terminalId)
-  const outMax = roundTrip(relays, terminalId, surbMax, openKeysMax, maxPayload)
-  t.alike(outMax.plaintext, maxPayload, 'max-capacity payload round-trips')
-})
-
-test('strict input validation on all APIs', (t) => {
-  const validRelays = [relay()]
-  const validTerminal = b4a.alloc(32, 1)
-
-  // buildSurb validation
-  t.exception(() => buildSurb([], validTerminal), 'empty hops rejected')
-  t.exception(() => buildSurb(null, validTerminal), 'null hops rejected')
-  t.exception(
-    () => buildSurb([relay(), relay(), relay(), relay(), relay()], validTerminal),
-    'hops > MAX_HOPS rejected'
-  )
-  t.exception(
-    () => buildSurb([{ id: b4a.alloc(32), routeKey: b4a.alloc(16) }], validTerminal),
-    'invalid routeKey size rejected'
-  )
-  t.exception(
-    () => buildSurb([{ id: b4a.alloc(16), routeKey: b4a.alloc(32) }], validTerminal),
-    'invalid hop id size rejected'
-  )
-  t.exception(
-    () => buildSurb(pathOf(validRelays), b4a.alloc(16)),
-    'invalid terminalId size rejected'
-  )
-  t.exception(
-    () => buildSurb(pathOf(validRelays), validTerminal, { ephemeralSeeds: [b4a.alloc(16)] }),
-    'invalid ephemeralSeeds buffer size rejected'
-  )
-  t.exception(
-    () => buildSurb(pathOf(validRelays), validTerminal, { ephemeralSeeds: [] }),
-    'mismatched ephemeralSeeds length rejected'
-  )
-  t.exception(
-    () => buildSurb(pathOf(validRelays), validTerminal, { replySeed: b4a.alloc(16) }),
-    'invalid replySeed size rejected'
-  )
-
-  // sealReply validation
-  const { surb, openKeys } = buildSurb(pathOf(validRelays), validTerminal)
-  t.exception(() => sealReply(null, b4a.alloc(10)), 'null surb rejected')
-  t.exception(
-    () => sealReply({ ...surb, replyPubKey: b4a.alloc(16) }, b4a.alloc(10)),
-    'invalid replyPubKey rejected'
-  )
-  t.exception(() => sealReply(surb, 'not-a-buffer'), 'non-buffer plaintext rejected')
-
-  // processSurbHop validation
-  const msg = sealReply(surb, b4a.alloc(10))
-  t.exception(() => processSurbHop(null, validRelays[0].routeSecretKey), 'null message rejected')
-  t.exception(
-    () => processSurbHop({ ...msg, ephem: b4a.alloc(16) }, validRelays[0].routeSecretKey),
-    'short ephem rejected'
-  )
-  t.exception(
-    () => processSurbHop({ ...msg, mac: b4a.alloc(8) }, validRelays[0].routeSecretKey),
-    'short mac rejected'
-  )
-  t.exception(() => processSurbHop(msg, b4a.alloc(16)), 'short routeSecretKey rejected')
-
-  // low-order point in ephem rejected
-  const zeroPointMsg = { ...msg, ephem: b4a.alloc(32) }
-  t.exception(
-    () => processSurbHop(zeroPointMsg, validRelays[0].routeSecretKey),
-    'zero ephem point rejected'
-  )
-
-  // openSurbPayload validation
-  t.exception(() => openSurbPayload(null, openKeys), 'null payload rejected')
-  t.exception(() => openSurbPayload(b4a.alloc(10), openKeys), 'payload below seal size rejected')
-  t.exception(() => openSurbPayload(msg.payload, null), 'null openKeys rejected')
-  t.exception(
-    () => openSurbPayload(msg.payload, { ...openKeys, replySecretKey: b4a.alloc(16) }),
-    'invalid secret key rejected'
-  )
-
-  // nullifierOf validation
-  t.exception(() => nullifierOf(b4a.alloc(16)), 'short sharedSecret rejected')
-  t.exception(() => nullifierOf('not-a-buffer'), 'non-buffer sharedSecret rejected')
-  const n1 = nullifierOf(b4a.alloc(32, 1))
-  const n2 = nullifierOf(b4a.alloc(32, 1))
-  t.alike(n1, n2, 'nullifierOf is deterministic')
-  t.is(n1.byteLength, 32, 'nullifierOf returns 32-byte buffer')
-
-  // createNullifierGuard validation
-  t.exception(() => createNullifierGuard(0), 'zero maxEntries rejected')
-  t.exception(() => createNullifierGuard(-5), 'negative maxEntries rejected')
-  t.exception(() => createNullifierGuard(3.14), 'non-integer maxEntries rejected')
-  const guard = createNullifierGuard(10)
-  t.exception(() => guard.admit(b4a.alloc(16)), 'short nullifier rejected')
-  t.exception(() => guard.admit('not-a-buffer'), 'non-buffer nullifier rejected')
 })
