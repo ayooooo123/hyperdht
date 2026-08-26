@@ -984,7 +984,7 @@ async function handle(message) {
     })
     phaseSequence = message.phaseSequence
     if (
-      !MIDDLE_ROLES.has(projection.role) ||
+      projection.role !== 'lookup-middle-a' ||
       incomingActor === null ||
       typeof incomingActor.faultOutgoingPhysicalLink !== 'function' ||
       !incomingActor.faultOutgoingPhysicalLink()

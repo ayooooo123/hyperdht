@@ -139,18 +139,11 @@ function blackholeRouteCells() {
 function routeCellBlackholeSnapshot() {
   return Object.freeze({ armed, droppedInbound, droppedOutbound, sockets: installedSockets })
 }
-function resetRouteCellBlackholeForTest() {
-  armed = false
-  installedSockets = 0
-  droppedInbound = 0
-  droppedOutbound = 0
-}
 
 module.exports = {
   blackholeRouteCells,
   createProjectedCellEndpoint,
   isRouteCellDatagram,
-  resetRouteCellBlackholeForTest,
   routeCellBlackholeAdapterFactory,
   routeCellBlackholeSnapshot
 }
