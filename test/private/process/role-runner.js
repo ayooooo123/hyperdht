@@ -31,7 +31,7 @@ const {
   destroyDhtSetupAuditController,
   drainDhtSetupAuditEvents
 } = require('./dht-setup-audit-udx')
-const { PROCESS_PLANS } = require('./topology-fixture')
+const { PROCESS_PLANS, ROLES } = require('./topology-fixture')
 const {
   acceptProjectedExtension,
   activateFinalExitActor,
@@ -82,6 +82,8 @@ let operationSequence = 0n
 let endpointMonitorHandle = null
 let endpointMonitorSnapshot = null
 let endpointMonitorBusy = false
+let selectedExitRoleIndex = null
+let selectedMiddleRoleIndex = null
 
 function sanitizeCode(err) {
   if (
@@ -255,15 +257,15 @@ function canonicalTuple(tuple) {
   })
 }
 
-function receiveRoleBootstrap(packet) {
-  if (guardProcessService) return guardProcessService.receiveBootstrap(packet)
+function receiveRoleBootstrap(packet, sourceHandle) {
+  if (guardProcessService) return guardProcessService.receiveBootstrap(packet, sourceHandle)
   if (wireService === null) return false
   // A predecessor rebuilding its branch retries `LINK_CREATE`, and this role has no
   // other way to learn that its old circuit is gone: a peer closing a link is silent
   // on the wire. An unmatched bootstrap packet therefore rearms the accept session,
   // and the retry lands on it.
   if (wireService.snapshot().pending === 0) scheduleIncomingRearm()
-  return wireService.receiveBootstrap(packet)
+  return wireService.receiveBootstrap(packet, sourceHandle)
 }
 
 function receiveRoleCell(packet, handle, metadata) {
@@ -319,6 +321,8 @@ async function rearmIncomingExtension() {
   if (stopped || rearming || wireService === null || state !== 'READY') return
   if (wireService.snapshot().pending > 0) return
   rearming = true
+  selectedExitRoleIndex = null
+  selectedMiddleRoleIndex = null
   try {
     for (const actor of roleActors) actor.destroy()
     roleActors.clear()
@@ -373,86 +377,122 @@ async function requestIsolatedGrant(tupleDigest) {
 }
 
 function startIncomingExtension() {
-  let accepted = null
-  let observedPredecessorEndpoint = null
-  let outgoing = null
-  if (MIDDLE_ROLES.has(projection.role)) {
-    accepted = wireService.prearmAccept(projection.grants[0])
-    observedPredecessorEndpoint = canonicalTuple(projection.adjacencies[0].tuple)
-    outgoing = {
-      allowedRole: ROLE.PRIVATE,
-      extensionIndex: 2,
-      grant: projection.grants[1],
+  selectedExitRoleIndex = null
+  selectedMiddleRoleIndex = null
+
+  const acceptActor = (accepted, observedPredecessorEndpoint, outgoing) => {
+    const actorPromise = acceptProjectedExtension({
+      accepted,
+      advertisement: projection.advertisement,
+      clocks: {
+        wallNow: runtime.wallNow,
+        monotonicNow: runtime.monotonicNow,
+        schedule,
+        cancelScheduled
+      },
+      identityPublicKey: projection.identityPublicKey,
+      identitySecretKey: projection.identitySecretKey,
       linkService: wireService,
-      peerIdentity: projection.adjacencies[1].identity
+      observedPredecessorEndpoint,
+      outgoing,
+      routeSecretKey: projection.routeSecretKey
+    })
+    return actorPromise.then(
+      (actor) => {
+        observedPredecessorEndpoint.fill(0)
+        incomingActor = actor
+        roleActors.add(actor)
+        if (outgoing) {
+          void actor
+            .serve()
+            .catch(actorFailure)
+            .finally(() => {
+              for (const route of outgoing.routes) route.endpoint.fill(0)
+            })
+        } else {
+          finalExitServicePromise = activateFinalExitActor({
+            actor,
+            advertisement: projection.advertisement,
+            identityPublicKey: projection.identityPublicKey,
+            identitySecretKey: projection.identitySecretKey,
+            clocks: {
+              wallNow: runtime.wallNow,
+              monotonicNow: runtime.monotonicNow,
+              schedule,
+              cancelScheduled
+            },
+            local: {
+              host: projection.bind.host,
+              port: 43_000 + projection.roleIndex
+            },
+            // Same divergence as the cell endpoint: the socket is bound locally and a DHT
+            // node observes it at the published DHT-exit address, which is the address a
+            // reply echoes back.
+            ...(projection.plan === PROCESS_PLANS.DHT_MESH.name
+              ? { advertised: exitDhtTupleForRole(projection.roleIndex) }
+              : {}),
+            dhtSeed: projection.dhtSeed,
+            dhtSeedId: projection.dhtSeedId,
+            exitRole: projection.roleIndex,
+            generation,
+            initialSeedGrant: projection.initialSeedGrant,
+            isolatedGrantVerifier: projection.isolatedGrantVerifier,
+            requestIsolatedGrant
+          }).then((service) => {
+            finalExitService = service
+            return service
+          })
+          void finalExitServicePromise.catch(actorFailure)
+        }
+        return actor
+      },
+      (err) => {
+        observedPredecessorEndpoint.fill(0)
+        throw err
+      }
+    )
+  }
+
+  if (MIDDLE_ROLES.has(projection.role)) {
+    const routes = projection.adjacencies.slice(1).map((contact, index) => ({
+      endpoint: canonicalTuple(contact.tuple),
+      extensionIndex: 2,
+      grant: projection.grants[index + 1],
+      linkService: wireService,
+      peerIdentity: contact.identity,
+      roleIndex: ROLES.indexOf(contact.role) + 1
+    }))
+    const outgoing = {
+      allowedRole: ROLE.PRIVATE,
+      routes,
+      resolve(selection) {
+        const route = routes.find(
+          (candidate) =>
+            same(candidate.peerIdentity, selection.relayIdentity) &&
+            same(candidate.endpoint, selection.reachableEndpoint)
+        )
+        if (route === undefined) throw Object.assign(new Error(), { code: 'ERR_AUTHENTICATION' })
+        selectedExitRoleIndex = route.roleIndex
+        return route
+      }
     }
+    incomingActorPromise = acceptActor(
+      wireService.prearmAccept(projection.grants[0]),
+      canonicalTuple(projection.adjacencies[0].tuple),
+      outgoing
+    )
   } else if (EXIT_ROLES.has(projection.role)) {
-    accepted = wireService.prearmAccept(projection.middleGrant)
-    observedPredecessorEndpoint = canonicalTuple(projection.middleAdjacency.tuple)
+    incomingActorPromise = wireService.prearmAcceptAny(projection.middleGrants).then((accepted) => {
+      const contact = projection.middleAdjacencies[accepted.grantIndex]
+      if (contact === undefined)
+        throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
+      selectedMiddleRoleIndex = ROLES.indexOf(contact.role) + 1
+      return acceptActor(Promise.resolve(accepted.link), canonicalTuple(contact.tuple), null)
+    })
   } else {
     return
   }
-  incomingActorPromise = acceptProjectedExtension({
-    accepted,
-    advertisement: projection.advertisement,
-    clocks: {
-      wallNow: runtime.wallNow,
-      monotonicNow: runtime.monotonicNow,
-      schedule,
-      cancelScheduled
-    },
-    identityPublicKey: projection.identityPublicKey,
-    identitySecretKey: projection.identitySecretKey,
-    linkService: wireService,
-    observedPredecessorEndpoint,
-    outgoing,
-    routeSecretKey: projection.routeSecretKey
-  }).then((actor) => {
-    observedPredecessorEndpoint.fill(0)
-    incomingActor = actor
-    roleActors.add(actor)
-    if (outgoing) void actor.serve().catch(actorFailure)
-    if (!outgoing) {
-      finalExitServicePromise = activateFinalExitActor({
-        actor,
-        advertisement: projection.advertisement,
-        identityPublicKey: projection.identityPublicKey,
-        identitySecretKey: projection.identitySecretKey,
-        clocks: {
-          wallNow: runtime.wallNow,
-          monotonicNow: runtime.monotonicNow,
-          schedule,
-          cancelScheduled
-        },
-        local: {
-          host: projection.bind.host,
-          port: 43_000 + projection.roleIndex
-        },
-        // Same divergence as the cell endpoint: the socket is bound locally and a DHT
-        // node observes it at the published DHT-exit address, which is the address a
-        // reply echoes back.
-        ...(projection.plan === PROCESS_PLANS.DHT_MESH.name
-          ? { advertised: exitDhtTupleForRole(projection.roleIndex) }
-          : {}),
-        dhtSeed: projection.dhtSeed,
-        dhtSeedId: projection.dhtSeedId,
-        exitRole: projection.roleIndex,
-        generation,
-        initialSeedGrant: projection.initialSeedGrant,
-        isolatedGrantVerifier: projection.isolatedGrantVerifier,
-        requestIsolatedGrant
-      }).then((service) => {
-        finalExitService = service
-        return service
-      })
-      void finalExitServicePromise.catch(actorFailure)
-    }
-    return actor
-  })
-  void incomingActorPromise.catch((err) => {
-    observedPredecessorEndpoint.fill(0)
-    actorFailure(err)
-  })
+  void incomingActorPromise.catch(actorFailure)
 }
 
 async function createCellOwner() {
@@ -798,6 +838,8 @@ function snapshotFields(closed = false) {
     pendingPackets: exitSnapshot === null ? 0 : exitSnapshot.pendingPackets,
     queuedBytes: cellEndpoint === null ? 0 : cellEndpoint.queuedBytes,
     referralProbeCount: exitSnapshot === null ? 0 : exitSnapshot.referralProbeCount,
+    selectedExitRoleIndex: closed ? null : selectedExitRoleIndex,
+    selectedMiddleRoleIndex: closed ? null : selectedMiddleRoleIndex,
     state: closed ? 'CLOSED' : state,
     tableEntryCount: exitSnapshot === null ? 0 : exitSnapshot.tableEntryCount
   }
@@ -985,7 +1027,7 @@ async function handle(message) {
     })
     phaseSequence = message.phaseSequence
     if (
-      projection.role !== 'lookup-middle-a' ||
+      !MIDDLE_ROLES.has(projection.role) ||
       incomingActor === null ||
       typeof incomingActor.faultOutgoingPhysicalLink !== 'function' ||
       !incomingActor.faultOutgoingPhysicalLink()

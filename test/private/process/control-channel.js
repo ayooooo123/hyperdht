@@ -89,6 +89,7 @@ const STATES = new Set([
 const UNAVAILABLE_REASONS = new Set(['NETWORK_CHANGE', 'GUARD_LOSS', 'CANCELLED', 'ERROR'])
 const RUNTIMES = new Set(['node', 'bare'])
 const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
+const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
 const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
 
@@ -832,6 +833,8 @@ const EVENT_FIELDS = Object.freeze({
     'pendingLinks',
     'pendingPackets',
     'referralProbeCount',
+    'selectedExitRoleIndex',
+    'selectedMiddleRoleIndex',
     'tableEntryCount',
     'openResources',
     'queuedBytes',
@@ -1016,7 +1019,7 @@ function validateCommand(message, context) {
       break
     case 'rotate':
       if (
-        common.role !== 'lookup-middle-a' ||
+        !MIDDLE_ROLES.has(common.role) ||
         !uint64(message.nextGeneration, true) ||
         message.nextGeneration <= common.generation
       )
@@ -1184,8 +1187,22 @@ function validateEvent(message, context) {
     case 'unavailable':
       if (common.role !== 'endpoint' || !UNAVAILABLE_REASONS.has(message.reason)) invalid()
       break
-    case 'snapshot':
+    case 'snapshot': {
+      const selectedExit = message.selectedExitRoleIndex
+      const selectedMiddle = message.selectedMiddleRoleIndex
+      const relationshipValid =
+        (MIDDLE_ROLES.has(common.role) &&
+          selectedMiddle === null &&
+          (selectedExit === null || [4, 6, 8].includes(selectedExit))) ||
+        (EXIT_ROLES.has(common.role) &&
+          selectedExit === null &&
+          (selectedMiddle === null || [3, 5, 7].includes(selectedMiddle))) ||
+        (!MIDDLE_ROLES.has(common.role) &&
+          !EXIT_ROLES.has(common.role) &&
+          selectedExit === null &&
+          selectedMiddle === null)
       if (
+        !relationshipValid ||
         SNAPSHOT_COUNT_FIELDS.some(
           (field) =>
             !Number.isSafeInteger(message[field]) || message[field] < 0 || message[field] > 4096
@@ -1227,6 +1244,7 @@ function validateEvent(message, context) {
         invalid()
       if (common.role === 'dht-seed' && message.storedValueCount !== 0) invalid()
       break
+    }
     case 'error':
       if (
         typeof message.code !== 'string' ||

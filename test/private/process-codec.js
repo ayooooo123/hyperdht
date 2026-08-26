@@ -176,6 +176,8 @@ function validEvent(type) {
         pendingLinks: 0,
         pendingPackets: 0,
         referralProbeCount: 0,
+        selectedExitRoleIndex: null,
+        selectedMiddleRoleIndex: null,
         tableEntryCount: 0,
         openResources: 1,
         queuedBytes: 0,
@@ -535,11 +537,22 @@ test('physical lifecycle commands are bound only to their failing link owners', 
     validateControlMessage(middleRotate, messageContext('command', middleRotate)),
     middleRotate
   )
-  const wrongMiddle = {
+  const middleRotateB = {
     ...base('rotate', 'lookup-middle-b', 5),
     nextGeneration: 8n
   }
-  throwsCode(t, () => validateControlMessage(wrongMiddle, messageContext('command', wrongMiddle)))
+  t.alike(
+    validateControlMessage(middleRotateB, messageContext('command', middleRotateB)),
+    middleRotateB
+  )
+  const announceMiddleRotate = {
+    ...base('rotate', 'announce-middle', 7),
+    nextGeneration: 8n
+  }
+  t.alike(
+    validateControlMessage(announceMiddleRotate, messageContext('command', announceMiddleRotate)),
+    announceMiddleRotate
+  )
   const endpointRotate = { ...base('rotate'), nextGeneration: 8n }
   throwsCode(t, () =>
     validateControlMessage(endpointRotate, messageContext('command', endpointRotate))
@@ -562,6 +575,32 @@ test('physical lifecycle commands are bound only to their failing link owners', 
   throwsCode(t, () =>
     validateControlMessage(endpointGuard, messageContext('command', endpointGuard))
   )
+})
+
+test('snapshot relationships expose only nullable role indexes for the owning tier', (t) => {
+  const middle = {
+    ...validEvent('snapshot'),
+    ...base('snapshot', 'lookup-middle-b', 5),
+    selectedExitRoleIndex: 8
+  }
+  t.alike(validateControlMessage(middle, messageContext('event', middle)), middle)
+
+  const exit = {
+    ...validEvent('snapshot'),
+    ...base('snapshot', 'announce-exit', 8),
+    selectedMiddleRoleIndex: 5
+  }
+  t.alike(validateControlMessage(exit, messageContext('event', exit)), exit)
+
+  for (const mutation of [
+    { selectedExitRoleIndex: 6, selectedMiddleRoleIndex: 3 },
+    { selectedExitRoleIndex: b4a.alloc(32) },
+    { selectedExitRoleIndex: 5 },
+    { selectedMiddleRoleIndex: 4 }
+  ]) {
+    const invalid = { ...middle, ...mutation }
+    throwsCode(t, () => validateControlMessage(invalid, messageContext('event', invalid)))
+  }
 })
 
 test('exact command and event registries are frozen and all schemas reject extras', (t) => {

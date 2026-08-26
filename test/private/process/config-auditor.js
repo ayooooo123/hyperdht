@@ -195,7 +195,9 @@ const DHT_ZERO_SNAPSHOT_FIELDS = Object.freeze([
 const DHT_NULL_SNAPSHOT_FIELDS = Object.freeze([
   'announceGeneration',
   'controllerGeneration',
-  'lookupGeneration'
+  'lookupGeneration',
+  'selectedExitRoleIndex',
+  'selectedMiddleRoleIndex'
 ])
 
 function scanOwnDataProperties(value, state, role, seen, depth) {
@@ -327,6 +329,27 @@ function validateDhtSnapshot(role, event, state) {
   }
 }
 
+const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
+const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
+
+function validateRelationshipSnapshot(role, event) {
+  const type = objectGetOwnPropertyDescriptor(event, 'type')
+  if (!type || !('value' in type) || type.value !== 'snapshot') return
+  const selectedExit = own(event, 'selectedExitRoleIndex')
+  const selectedMiddle = own(event, 'selectedMiddleRoleIndex')
+  if (MIDDLE_ROLES.has(role)) {
+    if (selectedMiddle !== null || (selectedExit !== null && ![4, 6, 8].includes(selectedExit)))
+      invalid()
+    return
+  }
+  if (EXIT_ROLES.has(role)) {
+    if (selectedExit !== null || (selectedMiddle !== null && ![3, 5, 7].includes(selectedMiddle)))
+      invalid()
+    return
+  }
+  if (selectedExit !== null || selectedMiddle !== null) invalid()
+}
+
 function validatePostSetupState(role, event, state) {
   if (
     event === null ||
@@ -379,7 +402,6 @@ function validatePostSetupState(role, event, state) {
 function createProcessConfigAuditor(oracle) {
   exactObject(oracle, [
     'auditorMarkerKey',
-    'branches',
     'decoyMarkerKey',
     'endpointAddress',
     'eventForbiddenBytes',
@@ -468,6 +490,7 @@ function createProcessConfigAuditor(oracle) {
       scanValue(event, state, role, new Set(), 0)
       validatePostSetupState(role, event, state)
       validateDhtSnapshot(role, event, state)
+      validateRelationshipSnapshot(role, event)
       return true
     },
     destroy() {

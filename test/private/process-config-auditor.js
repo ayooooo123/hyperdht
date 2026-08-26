@@ -36,8 +36,8 @@ function capabilities(seed = 7) {
   return { clocks, entropy }
 }
 
-function topology(plan = PROCESS_PLANS.PORTABLE_LOOPBACK, seed = 7) {
-  return createLiveProcessTopology({ plan, ...capabilities(seed) })
+function topology(plan = PROCESS_PLANS.PORTABLE_LOOPBACK, seed = 7, candidateOrder = 'normal') {
+  return createLiveProcessTopology({ candidateOrder, plan, ...capabilities(seed) })
 }
 
 function clone(value, seen = new Map()) {
@@ -187,19 +187,37 @@ test('topology authority derives only the exact plan tuples and allow edges', (t
   }
 })
 
-test('topology freezes initial lookup standby rotation announce and DHT referral layout', (t) => {
-  const fixture = topology()
-  t.alike(fixture.oracle.branches, {
-    announce: { exit: 'announce-exit', generation: 1n, middle: 'announce-middle', state: 'ready' },
-    lookup: { exit: 'lookup-exit-a', generation: 1n, middle: 'lookup-middle-a', state: 'selected' },
-    lookupStandby: {
-      exit: 'lookup-exit-b',
-      generation: 2n,
-      middle: 'lookup-middle-b',
-      rotations: 1,
-      state: 'standby'
+test('topology freezes full middle-exit matrix and reorder-safe candidate records', (t) => {
+  const normal = topology(PROCESS_PLANS.PORTABLE_LOOPBACK, 7, 'normal')
+  const reverse = topology(PROCESS_PLANS.PORTABLE_LOOPBACK, 8, 'reverse')
+  for (const fixture of [normal, reverse]) {
+    for (const middle of fixture.projections.filter((projection) =>
+      /-middle/.test(projection.role)
+    )) {
+      t.is(middle.adjacencies.length, 4)
+      t.is(middle.grants.length, 4)
     }
-  })
+    for (const exit of fixture.projections.filter((projection) => /-exit/.test(projection.role))) {
+      t.is(exit.middleAdjacencies.length, 3)
+      t.is(exit.middleGrants.length, 3)
+    }
+    const records = fixture.projections[1].candidateAdvertisements
+    t.alike(
+      records.map((record) => record.roleIndex).sort((left, right) => left - right),
+      [3, 4, 5, 6, 7, 8]
+    )
+    t.ok(records.every((record) => b4a.isBuffer(record.advertisement)))
+  }
+  t.unlike(
+    normal.projections[1].candidateAdvertisements.map((record) => record.roleIndex),
+    reverse.projections[1].candidateAdvertisements.map((record) => record.roleIndex)
+  )
+  normal.stop()
+  reverse.stop()
+})
+
+test('topology freezes DHT referral layout', (t) => {
+  const fixture = topology()
   const seed = fixture.projections[8]
   const referral = fixture.projections[9]
   const value = fixture.projections[10]
@@ -230,7 +248,13 @@ test('allow graph contains only frozen exact bidirectional role edges', (t) => {
     [2, 5],
     [2, 7],
     [3, 4],
+    [3, 6],
+    [3, 8],
+    [4, 5],
+    [4, 7],
     [5, 6],
+    [5, 8],
+    [6, 7],
     [7, 8],
     [4, 9],
     [4, 10],
@@ -553,7 +577,8 @@ test('role policies keep endpoint, relay, exit and DHT authority disjoint', (t) 
   t.is(guard.middleAdjacencies.length, 3)
   t.is(guard.endpointApplicationBytes, undefined)
   for (const role of ['lookup-middle-a', 'lookup-middle-b', 'announce-middle']) {
-    t.is(byRole[role].adjacencies.length, 2)
+    t.is(byRole[role].adjacencies.length, 4)
+    t.is(byRole[role].grants.length, 4)
     t.is(byRole[role].dhtOptions, undefined)
   }
   for (const role of ['lookup-exit-a', 'lookup-exit-b', 'announce-exit']) {
@@ -587,7 +612,7 @@ test('role policies keep endpoint, relay, exit and DHT authority disjoint', (t) 
   }
   t.is(byRole['lookup-exit-a'].immutableGetAuthority, true)
   t.is(byRole['lookup-exit-b'].immutableGetAuthority, true)
-  t.is(byRole['announce-exit'].immutableGetAuthority, false)
+  t.is(byRole['announce-exit'].immutableGetAuthority, true)
 
   for (const role of ['dht-seed', 'dht-referral', 'dht-value']) {
     const dht = byRole[role]
@@ -656,8 +681,31 @@ test('auditor traverses hidden containers and backing memory without invoking ac
   fixture.stop()
 })
 
+test('auditor accepts only sanitized relationship indexes for relay snapshots', (t) => {
+  const fixture = topology()
+  const auditor = createProcessConfigAuditor(fixture.oracle)
+  const snapshot = (role, selectedExitRoleIndex, selectedMiddleRoleIndex) => ({
+    role,
+    selectedExitRoleIndex,
+    selectedMiddleRoleIndex,
+    type: 'snapshot'
+  })
+  t.is(auditor.auditEvent('lookup-middle-a', snapshot('lookup-middle-a', 6, null)), true)
+  t.is(auditor.auditEvent('announce-exit', snapshot('announce-exit', null, 5)), true)
+  for (const event of [
+    snapshot('lookup-middle-a', 5, null),
+    snapshot('lookup-middle-a', b4a.alloc(32), null),
+    snapshot('lookup-exit-a', 4, 3),
+    snapshot('guard', 4, null)
+  ]) {
+    throwsCode(t, () => auditor.auditEvent(event.role, event))
+  }
+  auditor.destroy()
+  fixture.stop()
+})
 test('auditor rejects ambient names hosts subnets protocols endpoint material and secrets in events', (t) => {
   const fixture = topology()
+
   const auditor = createProcessConfigAuditor(fixture.oracle)
   const invalid = [
     { path: '/tmp/private-route' },
@@ -693,6 +741,8 @@ test('auditor binds sanitized post-setup DHT value state to the topology oracle'
     generation: 1n,
     guardOnly: false,
     lookupGeneration: null,
+    selectedExitRoleIndex: null,
+    selectedMiddleRoleIndex: null,
     openLinks: 0,
     isolatedGrantRequestCount: 0,
     openResources: state === 'CLOSED' ? 0 : 1,

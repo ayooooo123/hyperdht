@@ -510,6 +510,68 @@ test('fake UDX endpoint binds exact tuple, drops spoofing, and revokes post-clos
   links.right.directory.destroy()
 })
 
+test('test-only source matcher binds opaque endpoint handles to exact live sessions', async (t) => {
+  const network = new Map()
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const rightReceived = []
+  const leftA = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.1', 47113, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
+  )
+  const leftB = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.2', 47114, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
+  )
+  const right = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.3', 47115, rightReceived),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
+  )
+  await Promise.all([leftA.bind(), leftB.bind(), right.bind()])
+  const linksA = linkPair('127.0.0.1', 47113, '127.0.0.3', 47115)
+  const linksB = linkPair('127.0.0.2', 47114, '127.0.0.3', 47115)
+  const leftSessionA = leftA.openLink(linksA.left.handle, linkSessionOptions(linksA, 'left'))
+  const leftSessionB = leftB.openLink(linksB.left.handle, linkSessionOptions(linksB, 'left'))
+  const rightSessionA = right.openLink(linksA.right.handle, linkSessionOptions(linksA, 'right'))
+  const rightSessionB = right.openLink(linksB.right.handle, linkSessionOptions(linksB, 'right'))
+  const packet = b4a.alloc(BOOTSTRAP_SIZE)
+  packet[1] = BOOTSTRAP_CLASS
+  await issuer.sendBootstrapForTest(leftA, leftSessionA, packet)
+  await issuer.sendBootstrapForTest(leftB, leftSessionB, packet)
+  await settles()
+  const handleA = rightReceived[0].handle
+  const handleB = rightReceived[1].handle
+  t.is(issuer.matchesLinkSessionSource(right, rightSessionA, handleA), true, 'same arm matches')
+  t.is(issuer.matchesLinkSessionSource(right, rightSessionB, handleB), true, 'second arm matches')
+  t.is(
+    issuer.matchesLinkSessionSource(right, rightSessionB, handleA),
+    false,
+    'armed cross-arm handle does not match'
+  )
+  t.is(
+    issuer.matchesLinkSessionSource(right, rightSessionA, Object.freeze({})),
+    false,
+    'structural substitute does not match'
+  )
+  await rightSessionA.close()
+  t.is(
+    issuer.matchesLinkSessionSource(right, rightSessionA, handleA),
+    false,
+    'closed arm no longer matches'
+  )
+  await Promise.allSettled([
+    leftSessionA.close(),
+    leftSessionB.close(),
+    rightSessionB.close(),
+    leftA.close(),
+    leftB.close(),
+    right.close()
+  ])
+  linksA.left.directory.destroy()
+  linksA.right.directory.destroy()
+  linksB.left.directory.destroy()
+  linksB.right.directory.destroy()
+})
+
 test('UDX endpoint freezes 64-packet and 76,800-byte queue/inbound defaults', (t) => {
   t.is(DEFAULT_MAX_UDX_QUEUED_PACKETS, 64)
   t.is(DEFAULT_MAX_UDX_QUEUED_BYTES, 76_800)

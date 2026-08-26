@@ -101,6 +101,7 @@ for gate in "${expanded[@]}"; do
     --mount type=tmpfs,destination=/app/node_modules \
     --mount type=tmpfs,destination=/tmp \
     -e PR_ROLE_FATAL_LOG=/tmp/role-fatal.log \
+    -e PR_CANDIDATE_ORDER="${PR_CANDIDATE_ORDER:-normal}" \
     -w /app \
     "$image_tag" \
     bash -c "set -o pipefail; $(command_for "$gate"); code=\$?; if [ \$code -ne 0 ] && [ -s /tmp/role-fatal.log ]; then echo '--- role stacks ---'; cat /tmp/role-fatal.log; fi; exit \$code"; then
