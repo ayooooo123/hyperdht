@@ -371,19 +371,10 @@ function registerLiveProcessSuite(launch) {
       const firstValue = await valueWaiting
       t.ok(firstValue.target.equals(topology.oracle.targetHash))
       t.ok(firstValue.value.equals(topology.oracle.immutableValue), 'first immutable get is exact')
-      const firstGrantRequest = await Promise.race(
-        learnedGrantResponders.map((responder) => responder.firstRequest)
-      )
-      const lookupExitRole = firstGrantRequest.role
-      const middleForExit = (exitRole) => topology.projections[ROLES.indexOf(exitRole) - 1].role
-      const lookupMiddleRole = middleForExit(lookupExitRole)
-      const standbyExitRole = ['lookup-exit-a', 'lookup-exit-b'].find((r) => r !== lookupExitRole)
-      const standbyMiddleRole = middleForExit(standbyExitRole)
-      const announceExitRole = 'announce-exit'
       t.is(
-        (await isolatedGrantResponses.get(lookupExitRole)).requestSequence,
+        (await isolatedGrantResponses.get('lookup-exit-a')).requestSequence,
         1n,
-        `${lookupExitRole} consumes one learned closer grant`
+        'lookup A consumes one learned closer grant'
       )
 
       const cancelPhase = nextPhase('endpoint')
@@ -404,14 +395,10 @@ function registerLiveProcessSuite(launch) {
       phases.set('endpoint', rotatePhase)
       generations.set('endpoint', 2n)
       const rotationEvent = control.expectEvent('endpoint', 'rotated', 2n, rotatePhase)
-      const faultAcknowledged = await sendAndWait(lookupMiddleRole, 'rotate', 'ready', {
+      const faultAcknowledged = await sendAndWait('lookup-middle-a', 'rotate', 'ready', {
         nextGeneration: 2n
       })
-      t.is(
-        faultAcknowledged.state,
-        'READY',
-        `${lookupMiddleRole} physical link fault is acknowledged`
-      )
+      t.is(faultAcknowledged.state, 'READY', 'lookup A physical link fault is acknowledged')
       const rotated = await rotationEvent
       t.is(rotated.previousGeneration, endpointGeneration)
       const secondValueWaiting = control.expect('endpoint', 'value', 2n)
@@ -421,28 +408,28 @@ function registerLiveProcessSuite(launch) {
       )
       t.ok((await secondValueWaiting).value.equals(topology.oracle.immutableValue))
       t.is(
-        (await isolatedGrantResponses.get(standbyExitRole)).requestSequence,
+        (await isolatedGrantResponses.get('lookup-exit-b')).requestSequence,
         1n,
-        `${standbyExitRole} consumes one learned closer grant after physical rotation`
+        'lookup B consumes one learned closer grant after physical rotation'
       )
       const exitSnapshots = new Map()
       for (const role of ['lookup-exit-a', 'lookup-exit-b', 'announce-exit']) {
         exitSnapshots.set(role, await sendAndWait(role, 'snapshot', 'snapshot'))
       }
-      for (const role of [lookupExitRole, standbyExitRole]) {
+      for (const role of ['lookup-exit-a', 'lookup-exit-b']) {
         const snapshot = exitSnapshots.get(role)
         t.ok(snapshot.referralProbeCount >= 1, `${role} probes an admitted referral`)
         t.ok(snapshot.ordinaryRequestCount >= 2, `${role} sends seed and referral requests`)
         t.ok(snapshot.tableEntryCount >= 2, `${role} retains seed and admitted referral`)
       }
-      const announceSnapshot = exitSnapshots.get(announceExitRole)
+      const announceSnapshot = exitSnapshots.get('announce-exit')
       t.is(announceSnapshot.ordinaryRequestCount, 0, 'announce transports no application request')
       t.is(announceSnapshot.referralProbeCount, 0, 'announce probes no application referral')
       const rotatedEndpointSnapshot = await sendAndWait('endpoint', 'snapshot', 'snapshot')
       t.is(rotatedEndpointSnapshot.guardOnly, true)
       t.ok(
         rotatedEndpointSnapshot.lookupGeneration > readyEndpointSnapshot.lookupGeneration,
-        `physical ${lookupMiddleRole} fault publishes a fresh lookup generation`
+        'physical lookup A fault publishes a fresh lookup B generation'
       )
 
       const suspended = await sendAndWait('endpoint', 'suspend', 'suspended')

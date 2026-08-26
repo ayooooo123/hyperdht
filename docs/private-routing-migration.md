@@ -714,11 +714,13 @@ lookup rotation and asserts the redelivered signal rotates the announce branch.
 
 ### KI-10: an in-band branch loss is undeliverable to an idle endpoint, and only a lease bounds discovery
 
-**Status: BOTH HALVES RESOLVED AND CHARACTERIZED. The first half, head-of-line blocking
-in route transports, was closed in 919f822. The second half, branch liveness detection for
-an idle or silent branch, is now fully identified, tested, and formalized.**
+**Status: FIRST HALF FIXED, SECOND HALF OPEN. Two compounding production faults. The
+first, head-of-line blocking, is the same fault as KI-8 and was closed by the same
+change; it is retained here because this is where the mechanism is documented. The
+second, that nothing but a lease bounds discovery of a dead branch, is untouched and
+needs a reviewed design rather than a patch.**
 
-FIRST, FIXED: head-of-line blocking in the route transport. `pumpM3RouteTransport`,
+FIRST, NOW FIXED: head-of-line blocking in the route transport. `pumpM3RouteTransport`,
 `lib/private/m3-adjacency-runtime.js:866-916`, is the only caller of
 `consumeM3RouteBranchDestroy` at `:842`, and it stops reading the physical channel
 whenever a frame is already sitting unread in `record.received`: the guard at `:872`
@@ -761,64 +763,55 @@ one wedge. It has three consumers, and all three have the same reader gap:
 So the precondition is structurally available on an exit and on the activation path, not only
 on the endpoint, and because the pump is shared the fix covers all three at once.
 
-SECOND, CHARACTERIZED & FORMALIZED: native branch liveness detection mechanism.
+SECOND, STILL OPEN: no guaranteed branch-liveness mechanism is specified. If the
+in-band notification is lost, the remaining specified path to discovery is
+`BRANCH_ROTATION_LEAD_MS`, `route-manager.js:36`, a timer scheduled 5s before the branch
+material expires. That is a lease running down, not liveness detection. There is no
+keepalive or adjacency timeout in the private-routing design. In an instrumented
+rehearsal where the in-band notification never arrived and no lower-layer loss signal
+was observed, the endpoint learned nothing for 9656ms and then rotated on that timer,
+which would have fired at the same moment had nothing been faulted at all.
 
-The blackhole probing anomaly (~1.48-1.52s detection when idle, ~1.30-1.34s when busy vs
-14.7s no-fault control) is completely explained and grounded in source. The native
-detector is the authenticated adjacent `LinkControlSession` heartbeat monitor
-(`lib/private/link-control-session.js:13-14, 366-400, 555-634`).
+The lease-only premise was falsified by a separate blackhole probe on the same
+eleven-role topology. With `lookup-middle-a` route cells dropped in both
+directions, the endpoint reported a route change after about 1.48-1.52 seconds
+when idle, and about 1.30-1.34 seconds with an immutable get outstanding. The
+no-fault control remained silent for about 14.7 seconds before the lease. Reverting
+the L0 deadline arm made no material difference. This proves that the blackhole
+was detected before lease expiry; it does **not** identify the detector. The
+current evidence points at the physical-loss sink or UDX link progress, but that
+attribution remains unverified. The probe is deliberately not a gate because
+asserting the observed latency would pin an unexplained implementation detail.
 
-#### Native Detector Architecture & Constants
+This changes the open question from "does anything detect a silent branch?" to
+"which native layer detects this failure, and is that mechanism guaranteed for
+healthy-but-silent links?" No liveness feature is claimed or shipped from this
+measurement.
 
-1. **Constants (`lib/private/link-control-session.js:13-15`):**
-   - `LINK_PING_AFTER = 500` ms: interval between periodic heartbeat PINGs.
-   - `LINK_UNRESPONSIVE_AFTER = 1_500` ms: maximum tolerated duration of complete link silence.
-   - `STREAM_ACK_TIMEOUT = 5_000` ms: separate stream delivery ACK deadline (`trackStream`, `:710`).
+Stated precisely: in-band branch-loss notification is best-effort and silently
+lossy while an endpoint is idle, and it is unreliable by the design of the reader
+rather than by anything the network does. The only reliable **specified** discovery
+mechanism is the branch lease running down; the blackhole result proves an additional
+native mechanism exists in at least one failure mode, but its contract is unknown.
 
-2. **Heartbeat Protocol:**
-   - When an adjacent link session is installed (`installLinkControl`, `udx-cell-endpoint.js:505-570`),
-     a `LinkControlSession` is created with `state.lastActivity = now` and `state.nextPingAt = now + 500ms`.
-   - The initiator/forward node transmits a `CELL_CLASS.CONTROL` cell with `kind: LINK_CONTROL_KIND.PING`
-     carrying a 16-byte random challenge (`sendPing`, `:373-392`).
-   - A healthy peer responds with `LINK_CONTROL_KIND.PONG` on `CELL_CLASS.CONTROL` (`receiveLink`, `:454-465`).
-   - Any inbound route cell (`CELL_CLASS.CONTROL`, `CELL_CLASS.STREAM`, or `CELL_CLASS.DATAGRAM`)
-     updates `state.lastActivity = now`, resets `nextPingAt = now + 500ms`, and rearms the liveness timer
-     (`receiveAuthenticated`, `:732-735`).
+Together these mean a middle relay that dies without warning - power cut, host gone,
+process killed - **may** leave an endpoint routing into a black hole until branch
+material expires when no lower-layer loss signal arrives. The blackhole measurement
+shows that a lower-layer signal can arrive in at least one such failure mode, but
+does not establish coverage or a bound for healthy-but-silent links. An endpoint
+holding one unread datagram can still discard the in-band notification even when
+the dying peer does send it. The two faults are separable and should be fixed
+separately: the pump must not let one unread frame block control frames, and branch
+liveness needs a bound that does not depend on either an in-band message or the
+expiry lease.
 
-3. **Blackhole / Dead-Hop Detection Flow:**
-   - When a hop drops route cells (or a peer dies silently), neither PINGs reach the peer nor do PONGs/data return.
-   - At t = 500ms: first PING sent (dropped).
-   - At t = 1000ms: second PING sent (dropped).
-   - At t = 1500ms: `runLiveness` (`:394-400`) observes `current - state.lastActivity >= LINK_UNRESPONSIVE_AFTER` (1500ms).
-   - `runLiveness` executes `closeState(state, 'ROUTE_UNAVAILABLE')` (`:266-309`):
-     - Calls `state.notifyCircuit(heartbeatDirection, reason)` (`:290`), invoking `onLinkFailure` (`udx-cell-endpoint.js:559`).
-     - Calls `state.closeLink()` (`:293`), invoking `state.endpoint[UDX_LINK_CLOSE](record.handle)` (`udx-cell-endpoint.js:562`).
-
-4. **Propagation to Route Manager & Controller Physical Loss Sink:**
-   - `[UDX_LINK_CLOSE](handle)` (`udx-cell-endpoint.js:1840-1844`) invokes `invalidateRecord(state, record)` (`:821-891`).
-   - `invalidateRecord` marks `record.phase = 'CLOSED'` (`:835`) and calls `destroyRecordM3CellTransfers(record)` (`:836 -> :813-819`), passing `physicalLoss = true`.
-   - `destroyM3CellLinkTransferState(state, true)` (`:637-675`) invokes `physicalLossRegistration.sink()` (`:670-673`).
-   - `physicalLossRegistration.sink()` executes `issueM3RuntimePhysicalLoss(registration)` (`m3-adjacency-runtime.js:2718-2720 -> :1373-1380`), which calls `issueTakenM3RuntimePhysicalLoss(record)` (`:1363-1370`).
-   - The controller's registered sink `loseBranchConnection(state, branchClass, connection)` (`private-routing-controller.js:559-562 -> :513-532`) marks the branch connection lost, deletes it from `state.branchConnections`, and at **`private-routing-controller.js:523`** calls `issueRouteManagerBranchPhysicalLoss(managerRegistration)` (`route-manager.js:1285-1297`).
-   - `issueRouteManagerBranchPhysicalLoss` invokes `reportRouteManagerBranchLoss(manager, branchClass)` (`route-manager.js:1299-1375`):
-     - Demotes the failed branch's hops in `RelayCandidateDirectory` (`relay-candidate-directory.js:951-966`).
-     - Emits `lookupBranchLoss` / `announceBranchLoss` replacement signals (`registerRouteManagerReplacementSinks`, `private-routing-controller.js:500-511`) to immediately trigger branch replacement.
-
-5. **Timing Reconciliation:**
-   - **Idle blackholed branch (~1.48-1.52s):** Bounded by $T_{detect} = 1500\text{ms} - \Delta t_{\text{last\_activity}}$ where $\Delta t \in [0, 500\text{ms}]$. When blackholed immediately after a PONG or cell arrival, the detector fires exactly 1500ms later.
-   - **Busy blackholed branch (~1.30-1.34s):** Recent inbound traffic had $\Delta t_{\text{last\_activity}} \approx 160-200\text{ms}$ before blackholing, causing the 1500ms silence threshold to trigger $1500\text{ms} - 180\text{ms} \approx 1320\text{ms}$ after fault injection. In-flight operations are additionally bounded by the endpoint's L0 deadline timer (`live-route-authority.js:683-705`, `armOperationDeadline`).
-   - **No-fault control (~14.7s):** Healthy idle links exchange 500ms PING/PONG heartbeats continuously, resetting `lastActivity` every 500ms and never exceeding the 1500ms silence threshold; discovery occurs only at `BRANCH_ROTATION_LEAD_MS` (5s before 15s lease expiry = ~10-15s).
-
-6. **Verification & Regression Coverage:**
-   - Unit test coverage in `test/private/process-route-cell-blackhole.js` tests the exact 1500ms silence deadline, proves `onLinkFailure` and M3 physical loss sink invocation, and verifies that inbound route cells reset `lastActivity` preventing spurious early physical loss.
-   - Stream progress metrics (`UDX_LINK_STREAM_PROGRESS`, `udx-cell-endpoint.js:1887-1904`, reading `readLinkControlStreamProgress` in `link-control-session.js:834-853`) expose unacknowledged streams and byte counters, with the 5000ms `STREAM_ACK_TIMEOUT` acting as a distinct backstop for unacknowledged stream delivery.
-     Relationship to KI-8: this mechanism produces KI-8's Fault A exactly, but attribution is
-     not established. It requires the stale frame to reach the endpoint before the destroy,
-     and in identical mode the destroy is consumed 2.8ms after the fault while a routed get
-     takes about 70ms end to end, so the destroy would normally win - which is consistent
-     with identical addressing passing 28 of 28. Whether a failing divergent run actually has
-     a queued unread frame at the moment of the fault is a single line of a single capture and
-     is not yet answered.
+Relationship to KI-8: this mechanism produces KI-8's Fault A exactly, but attribution is
+not established. It requires the stale frame to reach the endpoint before the destroy,
+and in identical mode the destroy is consumed 2.8ms after the fault while a routed get
+takes about 70ms end to end, so the destroy would normally win - which is consistent
+with identical addressing passing 28 of 28. Whether a failing divergent run actually has
+a queued unread frame at the moment of the fault is a single line of a single capture and
+is not yet answered.
 
 ### KI-11: a teardown phase mismatch, window found and closed
 

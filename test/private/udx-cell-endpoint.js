@@ -3,33 +3,6 @@
 const test = require('brittle')
 const b4a = require('b4a')
 
-const AbortController =
-  globalThis.AbortController ||
-  class AbortController {
-    constructor() {
-      this.signal = {
-        aborted: false,
-        _listeners: new Set(),
-        addEventListener(event, listener) {
-          if (event === 'abort') this._listeners.add(listener)
-        },
-        removeEventListener(event, listener) {
-          if (event === 'abort') this._listeners.delete(listener)
-        }
-      }
-    }
-    abort() {
-      if (this.signal.aborted) return
-      this.signal.aborted = true
-      for (const listener of this.signal._listeners) {
-        try {
-          listener()
-        } catch {}
-      }
-      this.signal._listeners.clear()
-    }
-  }
-
 const { BOOTSTRAP_CLASS, BOOTSTRAP_SIZE } = require('../../lib/private/bootstrap-envelope')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { BootstrapEnvelopeCodec } = require('../../lib/private/bootstrap-envelope')
@@ -50,9 +23,6 @@ const {
   DEFAULT_MAX_UDX_INBOUND_PACKETS,
   DEFAULT_MAX_UDX_QUEUED_BYTES,
   DEFAULT_MAX_UDX_QUEUED_PACKETS,
-  PUNCH_TAG,
-  DEFAULT_PUNCH_ROUNDS,
-  DEFAULT_PUNCH_INTERVAL_MS,
   TEST_ONLY_UDX_ADAPTER_ISSUER,
   UdxCellEndpoint,
   admitBootstrapUdxGuard,
@@ -1245,106 +1215,5 @@ test('direct bootstrap receive reserves before allocation re-entry and rolls bac
   await settles()
   t.is(received, 2, 'direct allocation failure releases capacity for the next packet')
   destroyBootstrapUdxAuthority(authority)
-  await endpoint.close()
-})
-
-test('UdxCellEndpoint.prototype.punch executes 6-round UDP hole punching to peer reflected address', async (t) => {
-  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
-  const network = new Map()
-  const observer = { sends: 0, sentPackets: [] }
-  const endpoint = issuer.createUdxCellEndpointForTest(
-    options('127.0.0.1', 47171, []),
-    issuer.createTestUdxAdapterAuthority(fakeFactory(network, null, observer))
-  )
-  await endpoint.bind()
-
-  // 1. Punch to explicit host:port
-  const report = await endpoint.punch(
-    { host: '127.0.0.2', port: 47172 },
-    { rounds: 6, interval: 1 }
-  )
-  t.is(report.ok, true)
-  t.is(report.sent, 6)
-  t.is(report.refused, 0)
-  t.is(report.rounds, 6)
-  t.is(report.target.host, '127.0.0.2')
-  t.is(report.target.port, 47172)
-  t.ok(report.elapsedMs >= 0)
-
-  // 2. Punch to linkHandle
-  const links = linkPair('127.0.0.1', 47171, '127.0.0.3', 47173)
-  const reportLink = await endpoint.punch(links.left.handle, { rounds: 3, interval: 1 })
-  t.is(reportLink.ok, true)
-  t.is(reportLink.sent, 3)
-  t.is(reportLink.target.host, '127.0.0.3')
-  t.is(reportLink.target.port, 47173)
-
-  // 3. Punch with AbortController stopping mid-flight
-  const controller = new AbortController()
-  let abortTimer = null
-  const punching = endpoint.punch(
-    { host: '127.0.0.4', port: 47174 },
-    { rounds: 10, interval: 50, signal: controller.signal }
-  )
-  abortTimer = setTimeout(() => controller.abort(), 10)
-  const abortedReport = await punching
-  clearTimeout(abortTimer)
-  t.ok(abortedReport.sent < 10, 'stopped before 10 rounds')
-  links.left.directory.destroy()
-  links.right.directory.destroy()
-  // 4. Pre-aborted signal returns immediately
-  const preAborted = new AbortController()
-  preAborted.abort()
-  const preReport = await endpoint.punch(
-    { host: '127.0.0.5', port: 47175 },
-    { rounds: 6, signal: preAborted.signal }
-  )
-  t.is(preReport.ok, false)
-  t.is(preReport.sent, 0)
-  t.is(preReport.aborted, true)
-
-  // 5. Invalid target / options throws
-  await t.exception(() => endpoint.punch(null))
-  await t.exception(() => endpoint.punch({ host: 'invalid' }))
-  await t.exception(() => endpoint.punch({ host: '127.0.0.1', port: 0 }))
-  await t.exception(() => endpoint.punch({ host: '127.0.0.1', port: 70000 }))
-  await t.exception(() => endpoint.punch({ host: '127.0.0.1', port: 47171 }, { rounds: 0 }))
-
-  await endpoint.close()
-  // Unbound or closed endpoint throws CIRCUIT_STATE
-  let closedError = null
-  try {
-    await endpoint.punch({ host: '127.0.0.2', port: 47172 })
-  } catch (err) {
-    closedError = err
-  }
-  t.is(closedError && closedError.code, 'CIRCUIT_STATE')
-})
-
-test('UdxCellEndpoint receive ignores punch packets and notifies onPunch', async (t) => {
-  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
-  const network = new Map()
-  const punched = []
-  const receivedBootstrap = []
-  const endpoint = issuer.createUdxCellEndpointForTest(
-    options('127.0.0.1', 47181, receivedBootstrap, {
-      onPunch(packet, from) {
-        punched.push({ packet: b4a.from(packet), from })
-      }
-    }),
-    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
-  )
-  await endpoint.bind()
-
-  const fakeSocket = network.get('127.0.0.1:47181')
-  const punchPacket = b4a.concat([PUNCH_TAG, b4a.from([1, 2])])
-  fakeSocket.emit('message', punchPacket, { host: '127.0.0.2', port: 47182 })
-
-  await settles()
-  t.is(punched.length, 1)
-  t.is(punched[0].from.host, '127.0.0.2')
-  t.is(punched[0].from.port, 47182)
-  t.is(receivedBootstrap.length, 0, 'punch packet did not corrupt bootstrap receiver')
-
   await endpoint.close()
 })
