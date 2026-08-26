@@ -10,6 +10,7 @@ const guardLinks = require('../../lib/private/guard-link')
 const {
   M3AdjacencyAuthority,
   deriveM3CellIds,
+  destroyM3RouteTransport,
   revokeM3TailCapability
 } = require('../../lib/private/m3-adjacency-runtime')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
@@ -40,10 +41,10 @@ const { createExtensionLinkCompletion } = require('../../lib/private/extension-l
 const {
   EXTENDED_SIZE,
   EXTEND_REQUEST_MAX_SIZE,
-  borrowTailControlTransport,
   EXTEND_REQUEST_MIN_SIZE,
   abortTailExtend,
   admitTailExtend,
+  borrowTailControlTransport,
   completeTailExtend,
   createTailControlResponderAuthority,
   createTailControlSession,
@@ -60,7 +61,8 @@ const {
   openTailAdjacentLink,
   readTailControlDeadline,
   sealTailReady,
-  takeAdmittedExtendRequest
+  takeAdmittedExtendRequest,
+  takeTailControlRouteTransport
 } = require('../../lib/private/tail-control')
 const { signRedactedResponderProof } = require('../../lib/private/redacted-responder-proof')
 const { consumeFinalExitHandoff } = require('../../lib/private/final-exit-handoff')
@@ -1362,7 +1364,7 @@ test('TailControl responder admission reserves before reentrant clocks', async (
   t.alike(nestedEnvelope, b4a.alloc(1101), 'destroy clears reentrant rejected envelope')
 })
 
-test('TailControl responder admission clamps local projection to inherited deadline', async (t) => {
+test('TailControl responder admission projects from the retained route anchor', async (t) => {
   const initiatorClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const responderClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
@@ -1373,7 +1375,7 @@ test('TailControl responder admission clamps local projection to inherited deadl
     maxBytes: 65_536,
     maxCommands: 10,
     idleTimeoutMs: 5_000,
-    expiresAtMs: 20_000n
+    expiresAtMs: 19_000n
   })
   const initiatorOwner = authority(initiatorClock)
   const responderOwner = authority(responderClock)
@@ -1424,9 +1426,9 @@ test('TailControl responder admission clamps local projection to inherited deadl
   const received = await borrowTailControlTransport(responderSession).receive()
   const admitted = admitTailExtend(responderAuthority, received)
   const taken = takeAdmittedExtendRequest(admitted)
-  t.is(taken.wireExpiresAt, 20_000n)
-  t.is(taken.localDeadline, 29_000n)
-  t.is(readTailControlDeadline(responderSession), 29_000n)
+  t.is(taken.wireExpiresAt, 19_000n)
+  t.is(taken.localDeadline, 28_000n)
+  t.is(readTailControlDeadline(responderSession), 28_000n)
   t.is(destroyTailControlResponderAuthority(responderAuthority), true)
   t.is(destroyTailControlSession(initiatorSession), true)
   t.is(destroyTailControlSession(responderSession), true)
@@ -1541,6 +1543,49 @@ test('TailControl logical expiry releases session without closing physical link'
   t.exception(() => readTailControlDeadline(session))
   t.is(destroys, 0)
   t.is(clock.pending(), 1)
+})
+
+test('TailControl inherits the final M3 adoption monotonic high-water', (t) => {
+  const baseClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const samples = [10_000n, 11_000n, 10_500n]
+  const clock = {
+    ...baseClock,
+    monotonicNow() {
+      return samples.shift()
+    }
+  }
+  const adopted = authority(clock).adopt(syntheticLink({ wireExpiresAt: 20_000n }))
+
+  t.exception(
+    () =>
+      createTailControlSession(
+        adopted.tail,
+        tailSessionOptions(clock, { absoluteDeadline: 16_000n })
+      ),
+    'first TailControl sample cannot roll back behind final M3 publication'
+  )
+  t.alike(samples, [])
+  t.is(baseClock.pending(), 1, 'failed TailControl transfer leaves physical lifetime armed')
+  adopted.runtime.destroy()
+  t.is(baseClock.pending(), 0)
+})
+
+test('TailControl monotonic rollback destroys session before deadline reuse', (t) => {
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const adopted = authority(clock).adopt(syntheticLink({ wireExpiresAt: 20_000n }))
+  const session = createTailControlSession(
+    adopted.tail,
+    tailSessionOptions(clock, { absoluteDeadline: 16_000n })
+  )
+
+  clock.advance(11_000n)
+  t.is(clock.fireDelay(6_000), true, 'an early timer delivery records the high-water mark')
+  t.is(readTailControlDeadline(session), 16_000n)
+  clock.advance(10_500n)
+  t.is(clock.fireDelay(5_000), true, 'the rearmed timer observes the rollback')
+  t.exception(() => readTailControlDeadline(session), 'rollback revokes the session')
+  t.is(destroyTailControlSession(session), false)
+  t.is(clock.pending(), 1, 'physical route lifetime remains independently armed')
 })
 
 test('TailControlSession rejects synchronous scheduler reentry before publication', (t) => {
@@ -1765,7 +1810,17 @@ test('TailControl initiator sealExtend owns exact request fields', (t) => {
 })
 
 test('TailControl initiator keeps completion reusable after rejected ready', (t) => {
-  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const baseClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  let monotonicHook = null
+  const clock = {
+    ...baseClock,
+    monotonicNow() {
+      const hook = monotonicHook
+      monotonicHook = null
+      if (hook) hook()
+      return baseClock.monotonicNow()
+    }
+  }
   const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
   let responderSeed = null
   for (let byte = 0x50; byte <= 0xff; byte++) {
@@ -1785,7 +1840,7 @@ test('TailControl initiator keeps completion reusable after rejected ready', (t)
     maxBytes: 65_536,
     maxCommands: 10,
     idleTimeoutMs: 5_000,
-    expiresAtMs: 5_000n
+    expiresAtMs: 20_000n
   })
   const admittedLimitsDigest = digestAdmittedLimits(requestedLimits)
   const transcriptDigest = tailReadyTranscriptDigest(
@@ -1860,7 +1915,17 @@ test('TailControl initiator keeps completion reusable after rejected ready', (t)
       ),
     'a forged redacted responder proof is rejected'
   )
-  const completion = session.openExtended(encodeExtended(extended))
+  const encodedExtended = encodeExtended(extended)
+  let reentrantOpenCode = null
+  monotonicHook = () => {
+    try {
+      session.openExtended(encodedExtended)
+    } catch (err) {
+      reentrantOpenCode = err && err.code
+    }
+  }
+  const completion = session.openExtended(encodedExtended)
+  t.is(reentrantOpenCode, 'ERR_BUSY', 'open reserves completion ownership before clock sampling')
   t.exception(
     () =>
       session.completeClientExtension(
@@ -1897,15 +1962,24 @@ test('TailControl initiator keeps completion reusable after rejected ready', (t)
     'a mismatched TAIL_READY client nonce is rejected'
   )
   const preFinalTransport = borrowTailControlTransport(session)
+  const ready = encodeTailReadyFor(extended, request, responder, {
+    transcriptDigest,
+    expiresAtMs: proofValue.expiresAtMs
+  })
+  let reentrantCompleteCode = null
+  monotonicHook = () => {
+    try {
+      session.completeClientExtension(completion, ready)
+    } catch (err) {
+      reentrantCompleteCode = err && err.code
+    }
+  }
+  t.is(session.completeClientExtension(completion, ready), session)
+  t.is(reentrantCompleteCode, 'INVALID_ROUTE', 'completion commits ownership before clock sampling')
   t.is(
-    session.completeClientExtension(
-      completion,
-      encodeTailReadyFor(extended, request, responder, {
-        transcriptDigest,
-        expiresAtMs: proofValue.expiresAtMs
-      })
-    ),
-    session
+    readTailControlDeadline(session),
+    13_500n,
+    'proof projection uses routeLocalDeadline rather than the 16_000 operation deadline'
   )
   t.exception(
     () => borrowTailControlTransport(session),
@@ -2000,7 +2074,15 @@ test('TailControl initiator keeps completion reusable after rejected ready', (t)
   expiryClock.advance(16_000n)
   t.is(expiryClock.fireDelay(3_500), true)
   t.exception(() => consumeFinalExitHandoff(expiringHandoff), 'expired handoff is revoked')
-  const directClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const directBaseClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  let directMonotonicHook = null
+  const directClock = {
+    ...directBaseClock,
+    monotonicNow() {
+      if (directMonotonicHook) directMonotonicHook()
+      return directBaseClock.monotonicNow()
+    }
+  }
   const directOwner = authority(directClock)
   const directAdopted = directOwner.adopt(
     initiatorSealLink(signedAdvertisement, requestedLimits, {
@@ -2041,7 +2123,7 @@ test('TailControl initiator keeps completion reusable after rejected ready', (t)
     clientNonce: directRequest.clientNonce,
     advertisedRouteEncryptionPublicKey: decodedAdvertisement.routeEncryptionPublicKey,
     admittedLimitsDigest,
-    expiresAtMs: 4_500n,
+    expiresAtMs: 20_000n,
     responderProofNonce: seed(0x93)
   }
   const directExtended = {
@@ -2065,11 +2147,49 @@ test('TailControl initiator keeps completion reusable after rejected ready', (t)
     ),
     directSession
   )
-  const directHandoff = directSession.takeFinalExitHandoff()
-  t.exception(
-    () => consumeFinalExitHandoff(directHandoff),
-    'bridge handoff requires activation claim'
+  t.is(
+    readTailControlDeadline(directSession),
+    16_000n,
+    'proof equal to wire expiry is a no-op despite a shorter operation deadline'
   )
+  const directHandoff = directSession.takeFinalExitHandoff()
+  const tailControlModule = require('../../lib/private/tail-control')
+  const originalPrepare = tailControlModule.prepareTailControlFinalExitActivation
+  let directMaterial = null
+  tailControlModule.prepareTailControlFinalExitActivation = (...args) => {
+    const prepared = originalPrepare(...args)
+    directMaterial = prepared.material
+    return prepared
+  }
+  let directActivationOwner = null
+  try {
+    const directClaim = createFinalExitActivationClaim(directHandoff)
+    directActivationOwner = claimFinalExitActivation(directHandoff, directClaim)
+  } finally {
+    tailControlModule.prepareTailControlFinalExitActivation = originalPrepare
+  }
+  t.is(directMaterial.expiresAt, 20_000n)
+  t.is(directMaterial.localDeadline, 29_000n)
+  t.is(directMaterial.wireExpiresAt, 20_000n)
+  directClock.advance(15_999n)
+  let directTakeSamples = 0
+  directMonotonicHook = () => {
+    directTakeSamples++
+    if (directTakeSamples === 2) directClock.advance(16_000n)
+  }
+  t.is(
+    errorCode(() => takeTailControlRouteTransport(directSession, directActivationOwner)),
+    'ERR_PRIVACY_UNAVAILABLE',
+    'M3 transfer cannot cross the operation deadline between clock samples'
+  )
+  directMonotonicHook = null
+  t.is(directTakeSamples, 3, 'take rechecks the operation bound after M3 ownership moves')
+  t.exception(
+    () => takeTailControlRouteTransport(directSession, directActivationOwner),
+    'cross-deadline failure publishes no route transport'
+  )
+  t.is(directClock.pending(), 0, 'captured physical transport is destroyed fail closed')
+  t.is(destroyFinalExitActivationOwner(directActivationOwner), true)
 
   const handoff = session.takeFinalExitHandoff()
   const claim = createFinalExitActivationClaim(handoff)
@@ -2088,8 +2208,69 @@ test('TailControl initiator keeps completion reusable after rejected ready', (t)
   )
   t.exception(() => session.takeFinalExitHandoff(), 'handoff is one-shot')
   t.exception(() => consumeFinalExitHandoff(handoff), 'claimed handoff is spent')
+  const routeTransport = takeTailControlRouteTransport(session, activationOwner)
+  t.is(clock.pending(), 1, 'successful route ownership retires its operation timer')
+  clock.advance(13_500n)
+  t.is(clock.fireDelay(3_500), false, 'retired operation timer cannot fire')
+  t.is(clock.pending(), 1, 'physical route deadline remains armed')
+  t.is(destroyM3RouteTransport(routeTransport), true)
   t.is(destroyFinalExitActivationOwner(activationOwner), true)
   t.is(destroyFinalExitActivationOwner(activationOwner), false)
+  t.is(destroyTailControlSession(session), false)
+})
+test('TailControl route transfer fails closed on clock reentrant activation destruction', (t) => {
+  const baseClock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  let monotonicHook = null
+  const clock = {
+    ...baseClock,
+    monotonicNow() {
+      if (monotonicHook) monotonicHook()
+      return baseClock.monotonicNow()
+    }
+  }
+  const adopted = authority(clock).adopt(
+    syntheticLink({ initiator: false, extensionIndex: 2, wireExpiresAt: 20_000n })
+  )
+  const session = createTailControlSession(adopted.tail, tailSessionOptions(clock))
+  const options = responderAuthorityOptions(clock)
+  delete options.adjacencyAdopter
+  delete options.extensionCommitter
+  delete options.adjacentLinkFactory
+  const responderAuthority = createTailControlResponderAuthority(
+    session,
+    adopted.responderToken,
+    options
+  )
+  const handoff = session.takeFinalExitHandoff()
+  const claim = createFinalExitActivationClaim(handoff)
+  const activationOwner = claimFinalExitActivation(handoff, claim)
+  let samples = 0
+  let reentrantDestroy = null
+  monotonicHook = () => {
+    samples++
+    if (samples !== 2) return
+    monotonicHook = null
+    reentrantDestroy = destroyFinalExitActivationOwner(activationOwner)
+  }
+  const runtime = require('../../lib/private/m3-adjacency-runtime')
+  const originalDestroy = runtime.destroyM3RouteTransport
+  let routeDestroys = 0
+  runtime.destroyM3RouteTransport = (transport) => {
+    routeDestroys++
+    return originalDestroy(transport)
+  }
+  let code
+  try {
+    code = errorCode(() => takeTailControlRouteTransport(session, activationOwner))
+  } finally {
+    runtime.destroyM3RouteTransport = originalDestroy
+  }
+  t.is(samples, 2, 'take samples TailControl before the M3 transfer clock')
+  t.is(reentrantDestroy, true, 'M3 clock reentry spends activation ownership')
+  t.is(code, 'ERR_AUTHENTICATION', 'spent activation cannot publish the taken transport')
+  t.is(routeDestroys, 1, 'a transport captured across reentry is destroyed')
+  t.is(destroyFinalExitActivationOwner(activationOwner), false)
+  t.is(destroyTailControlResponderAuthority(responderAuthority), false)
   t.is(destroyTailControlSession(session), false)
 })
 
@@ -2382,7 +2563,7 @@ test('TailControl completion destroys session when deadline rearm throws', (t) =
   t.is(destroyTailControlSession(session), false)
 })
 
-test('TailControl initiator sealExtend rejects requested wire expiry beyond local budget', (t) => {
+test('TailControl initiator sealExtend authenticates wire expiry independently of operation budget', (t) => {
   const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
   const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
   const signedAdvertisement = advertisementForRole(ROLE.PRIVATE)
@@ -2408,20 +2589,16 @@ test('TailControl initiator sealExtend rejects requested wire expiry beyond loca
       crypto: cryptoSuite
     })
   )
-  let code = null
-  try {
-    session.sealExtend({
-      advertisement: signedAdvertisement,
-      advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
-      extensionIndex: 2,
-      requestedLimits,
-      absoluteDeadline: 16_000n,
-      randomBytes: () => seed(0x80)
-    })
-  } catch (err) {
-    code = err.code
-  }
-  t.is(code, 'ERR_PRIVACY_UNAVAILABLE')
+  const encoded = session.sealExtend({
+    advertisement: signedAdvertisement,
+    advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
+    extensionIndex: 2,
+    requestedLimits,
+    absoluteDeadline: 16_000n,
+    randomBytes: () => seed(0x80)
+  })
+  t.ok(encoded)
+  t.is(readTailControlDeadline(session), 16_000n)
   t.is(destroyTailControlSession(session), true)
 })
 
@@ -2481,17 +2658,12 @@ test('EXTEND_REQUEST_V1 and EXTENDED_V1 retain exact canonical bytes', (t) => {
   t.exception(() => decodeExtended(encodedExtended.subarray(0, EXTENDED_SIZE - 1)))
 })
 
-// Characterises KI-4 signature B in docs/private-routing-migration.md. This
-// pins today's behaviour so the mechanism is reproducible without a CI runner;
-// it is not an endorsement of it. Whoever fixes B should expect this test to
-// change, and should read the second assertion as the defect it documents.
-test('TailControl sealExtend rejects limits committed before the tail was shortened', (t) => {
+// Regression for KI-4 signature B: authenticated route lifetime and local
+// operation lifetime are independent bounds.
+test('TailControl sealExtend accepts committed wire lifetime after operation shortening', (t) => {
   const currentAdvertisement = advertisementForRole(ROLE.SAFETY)
   const signedAdvertisement = advertisementForRole(ROLE.PRIVATE)
-  // A peer commits these limits in LINK_ACCEPT and the transcript digest binds
-  // them, so the initiator must later present exactly this expiry. Measuring
-  // the private aggregate shows the committed value routinely equals the tail's
-  // wire deadline exactly, which leaves no room for the deadline to move.
+  // LINK_ACCEPT and the transcript bind this exact route expiry.
   const requestedLimits = Object.freeze({
     cellSize: 1200,
     maxCells: 64,
@@ -2501,10 +2673,8 @@ test('TailControl sealExtend rejects limits committed before the tail was shorte
     expiresAtMs: 20_000n
   })
 
-  // The tail's local deadline is monotonicNow + (wireExpiresAt - wallNow), so
-  // 10_000 + (20_000 - 1_000) = 29_000. An absoluteDeadline below that shortens
-  // the tail, and shortenM3TailLifetime moves wireExpiresAt down by the same
-  // delta.
+  // The route projection is 29_000. A shorter absoluteDeadline only tightens
+  // operationDeadline; it cannot rewrite the authenticated wire lifetime.
   const sealWith = (absoluteDeadline) => {
     const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
     const adopted = authority(clock).adopt(
@@ -2518,7 +2688,7 @@ test('TailControl sealExtend rejects limits committed before the tail was shorte
       tailSessionOptions(clock, { absoluteDeadline, crypto: cryptoSuite })
     )
     const randomSeeds = [seed(0x70), seed(0x71), seed(0x72)]
-    return session.sealExtend({
+    const encoded = session.sealExtend({
       advertisement: signedAdvertisement,
       advertisementDigest: digestRelayCapabilityAdvertisement(signedAdvertisement),
       extensionIndex: 2,
@@ -2526,19 +2696,11 @@ test('TailControl sealExtend rejects limits committed before the tail was shorte
       absoluteDeadline,
       randomBytes: () => randomSeeds.shift()
     })
+    t.is(readTailControlDeadline(session), absoluteDeadline)
+    t.is(destroyTailControlSession(session), true)
+    return encoded
   }
 
-  t.ok(sealWith(29_000n), 'committed limits seal while the tail keeps its full lifetime')
-
-  let code = null
-  try {
-    sealWith(28_999n)
-  } catch (err) {
-    code = err.code
-  }
-  t.is(
-    code,
-    'ERR_PRIVACY_UNAVAILABLE',
-    'one millisecond of tail shortening invalidates already committed limits'
-  )
+  t.ok(sealWith(29_000n), 'committed limits seal at the full operation lifetime')
+  t.ok(sealWith(28_999n), 'committed limits seal after operation-only shortening')
 })

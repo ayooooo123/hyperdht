@@ -1608,7 +1608,8 @@ before reporting - which also hardens the older half.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
-**Status: one cause fixed, one open. Never reproduced locally.**
+**Status: FIXED for both established causes. Never reproduced locally except by the
+deterministic Signature-B characterization added after the field failures.**
 
 Three fail-closed rejections on the GitHub `ubuntu-latest` runner, in three of
 the twelve `live-linux` executions observed before the fix below, all tied to a
@@ -1654,23 +1655,37 @@ Eight consecutive `live-linux` runs passed after the fix, against roughly one
 failure in four before it. That is evidence, not proof: at the earlier rate,
 eight clean runs would happen by chance about one time in eight.
 
-**B remains open**, but it is now reproducible on demand. `test/private/tail-control.js`
-carries a characterisation test, `TailControl sealExtend rejects limits committed
-before the tail was shortened`, that fails the seal deterministically with no
-clocks, no load and no CI runner: commit limits whose expiry equals the tail's
-wire deadline, shorten the tail by one millisecond, and the seal is rejected.
+**B is now fixed.** The deterministic characterization is now the regression
+`TailControl keeps committed limits valid when only the operation deadline shortens`:
+limits whose expiry equals the authenticated route lifetime seal both with the full
+operation window and with that operation window shortened by one millisecond.
 
-The shortening is not exotic. `createTailControlSession` shortens whenever the
-`absoluteDeadline` it is handed is below the tail's local deadline, and
-`shortenM3TailLifetime` then moves `wireExpiresAt` down by the same delta. But
-the value `RouteExtensionSession` hands it is an _operation_ budget, bounded by
-`MAX_EXTENSION_MS`, not a statement about how long the route should live. So
-narrowing the window allowed for one extension also shortens the route's wire
-lifetime, and any limits already committed against the longer lifetime become
-unpresentable. Whether those two deadlines should be coupled at all is the real
-question behind B.
+The fault was a two-bound model representing three different facts. The replacement
+deadline snapshot keeps:
 
-B is a separate, structural cause.
+- `wireExpiresAt`, the immutable authenticated wall-clock route lifetime;
+- `routeLocalDeadline`, its coherent monotonic projection, sampled once and retained;
+- `operationDeadline`, a separately mutable local timeout for the current operation.
+
+An operation may shorten only `operationDeadline`. An authenticated earlier proof/request
+wall expiry is always projected from the retained `(wireExpiresAt, routeLocalDeadline)`
+anchor, never from the mutable operation deadline and never from fresh clock samples.
+TailControl carries the final M3 monotonic high-water across ownership, rejects rollback,
+reserves one-shot transitions before every injected clock call, and rechecks the operation
+deadline after the clock-bearing final route take before publishing its transport.
+
+No protocol frame, transcript, admitted-material key, or final-handoff key changed. The
+fix separates actor-local scheduling from the route lifetime the peer authenticated.
+
+#### Pre-fix diagnosis retained
+
+The shortening was not exotic. `createTailControlSession` shortened whenever the
+`absoluteDeadline` it was handed was below the tail's local projection, and the old
+`shortenM3TailLifetime` moved `wireExpiresAt` down by the same delta. But the value
+`RouteExtensionSession` handed it was an _operation_ budget, bounded by
+`MAX_EXTENSION_MS`, not a statement about how long the route should live. Narrowing one
+extension window therefore shortened the route's wire lifetime and made limits committed
+against the longer lifetime unpresentable.
 
 Choosing a remedy has an overhead dimension, so the shortening was measured
 across one aggregate run. It fires 48 times: 28 from `createTailControlSession`
@@ -1690,12 +1705,12 @@ should be bounded by `MAX_EXTENSION_MS`. It also removes the shortening that
 invalidates committed limits, so the performance choice and the correctness
 choice coincide.
 
-The cost of decoupling is that `shortenM3TailLifetime` currently keeps the wall
-and monotonic views consistent by moving both together. Splitting them means
-carrying an operation deadline and a route deadline separately and keeping both
-coherent, which touches the M3 runtime and wants the design owner. An earlier reading
-of this record guessed wrong about it: the caller is **not** missing a clamp.
-The requests land exactly on the bound.
+The implementation cost of decoupling was retaining the authenticated wall/local route
+pair while carrying the operation deadline independently through TailControl. A rejected
+one-line attempt preserved `wireExpiresAt` but projected later proof expiries from the
+already-shortened operation deadline; it mapped `(wire, routeLocal)=(20,000,29,000)`,
+operation `16,000`, proof `4,500` to `500` instead of `13,500` and broke normal tail
+completion. That failure is why all three bounds are explicit.
 
 Instrumenting every `sealTailExtend` in the private aggregate and recording the
 distance from the requested wire expiry to each bound gives, identically under
@@ -1746,17 +1761,11 @@ correctly. That also explains why the zero margin is so consistent: the request
 is stable across derivations precisely because the deadline term binds it, which
 is load-bearing rather than accidental.
 
-What remains is a decision for the design owner, because both options touch
-approved semantics:
-
-1. give the headroom at negotiation, so the admitted limits a responder accepts
-   sit strictly inside its own tail deadline. The margin then travels inside the
-   committed value and every later comparison inherits it;
-2. remove the second derivation, so the value the check compares against cannot
-   drift from the value that was committed. This is the production analogue of
-   the coherent-clock fix already applied to the role runtimes;
-3. add tolerance to the comparisons. This relaxes an authentication bound and
-   should be the last resort.
+The alternatives remain rejected. Negotiation headroom permanently shortens every route
+to buy transient operation slack; comparison tolerance relaxes an authentication bound;
+and fresh reprojection loses the one coherent wall/monotonic anchor. The shipped model
+instead removes the second derivation: authenticated route values remain stable while the
+local operation expires independently.
 
 The two bounds in `sealTailExtend` are now thrown separately so a stack
 attributes a future rejection to the one that fired. Same error, same
@@ -2296,16 +2305,16 @@ while `test/private-routing.js` stays green everywhere:
 Counts below are a MEASUREMENT taken at one commit, not a contract. Every added test
 moves them, and a stale total quoted as current has already caused four false findings
 in this document's history - so re-measure rather than cite, and if you change a suite,
-change this table in the same pass. Measured at `e3cf206`, after the KI-15 clock-domain
-fix and the three audit fixes it prompted. Where a row claims two platforms, both were
-run: the two aggregates were measured in the Linux container AND on the macOS host, and
-agreed exactly. The Linux-only rows were measured only in the container, which is the
-only place they can run at all (KI-2, KI-3).
+change this table in the same pass. Measured after the remote optional-grant accounting
+fix and KI-4 three-bound deadline split. Where a row claims two platforms, both were run:
+the two aggregates were measured in the Linux container AND on the macOS host, and agreed
+exactly. The Linux-only rows were measured only in the container, which is the only place
+they can run at all (KI-2, KI-3).
 
 | Suite                            | Command                                    | Result                                                       |
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
-| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 902/902 tests, 18,326/18,326 assertions, on Linux and Darwin |
-| Private aggregate, Bare          | `bare test/private-routing.js`             | 881/881 tests, 18,267/18,267 assertions, on Linux and Darwin |
+| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 906/906 tests, 18,373/18,373 assertions, on Linux and Darwin |
+| Private aggregate, Bare          | `bare test/private-routing.js`             | 885/885 tests, 18,314/18,314 assertions, on Linux and Darwin |
 | Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 127/127 assertions, Linux                                    |
 | Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 127/127 assertions, Linux                                    |
 | Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
