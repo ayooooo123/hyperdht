@@ -170,14 +170,14 @@ async function signedLink(leftIdentity, rightIdentity, rightRoute, leftRole, rig
   const leftEndpoint = new UdxCellEndpoint({
     host: HOST,
     port: leftPort,
-    onBootstrap: (packet) => leftDispatch.bootstrap(packet),
+    onBootstrap: (packet, handle) => leftDispatch.bootstrap(packet, handle),
     onCell: (packet, handle, metadata) => leftDispatch.cell(packet, handle, metadata),
     onLinkFailure: (handle, direction, reason) => leftDispatch.failure(handle, direction, reason)
   })
   const rightEndpoint = new UdxCellEndpoint({
     host: HOST,
     port: rightPort,
-    onBootstrap: (packet) => rightDispatch.bootstrap(packet),
+    onBootstrap: (packet, handle) => rightDispatch.bootstrap(packet, handle),
     onCell: (packet, handle, metadata) => rightDispatch.cell(packet, handle, metadata),
     onLinkFailure: (handle, direction, reason) => rightDispatch.failure(handle, direction, reason)
   })
