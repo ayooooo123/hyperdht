@@ -39,7 +39,8 @@ const {
   revokeM3TailCapability,
   revokeM3TailForwardingLease,
   revokeTailResponderToken,
-  shortenM3TailLifetime,
+  projectM3TailWireDeadline,
+  shortenM3TailOperationDeadline,
   takeM3TailCapability,
   takeM3TailForwardingPublication,
   validateM3Install
@@ -474,9 +475,15 @@ test('adoption projects wire expiry once and moves one frozen actor-local deadli
     monotonicNow: clock.monotonicNow
   })
   t.ok(Object.isFrozen(moved.deadline))
-  t.alike(Object.keys(moved.deadline).sort(), ['clockIdentity', 'localDeadline', 'wireExpiresAt'])
+  t.alike(Object.keys(moved.deadline).sort(), [
+    'clockIdentity',
+    'operationDeadline',
+    'routeLocalDeadline',
+    'wireExpiresAt'
+  ])
   t.is(moved.deadline.wireExpiresAt, 1_250n)
-  t.is(moved.deadline.localDeadline, 10_250n)
+  t.is(moved.deadline.routeLocalDeadline, 10_250n)
+  t.is(moved.deadline.operationDeadline, 10_250n)
   t.is(moved.deadline.clockIdentity.wallNow, clock.wallNow)
   t.is(moved.deadline.clockIdentity.monotonicNow, clock.monotonicNow)
   t.is(clock.wallSamples, 1, 'moving the tail never reprojects wall expiry')
@@ -484,6 +491,30 @@ test('adoption projects wire expiry once and moves one frozen actor-local deadli
 
   adopted.runtime.destroy()
   revokeM3TailCapability(adopted.tail)
+})
+
+test('anchored tail projection never reuses a shortened operation deadline', (t) => {
+  const deadline = Object.freeze({
+    wireExpiresAt: 20_000n,
+    routeLocalDeadline: 29_000n,
+    operationDeadline: 16_000n,
+    clockIdentity: Object.freeze({
+      wallNow() {
+        throw new Error('anchored projection must not sample wall time')
+      },
+      monotonicNow() {
+        throw new Error('anchored projection must not sample monotonic time')
+      }
+    })
+  })
+
+  t.is(projectM3TailWireDeadline(deadline, 4_500n), 13_500n)
+  t.is(projectM3TailWireDeadline(deadline, 20_000n), 29_000n)
+  t.is(
+    projectM3TailWireDeadline(Object.freeze({ ...deadline, operationDeadline: 13_500n }), 4_000n),
+    13_000n,
+    'a sequential projection still uses the immutable route anchor'
+  )
 })
 
 test('projection rejects invalid intervals, regressing clocks, and alternate identities', (t) => {
@@ -747,11 +778,17 @@ test('forwarding publication claim and lease require object-identical synchronou
       ),
     'foreign lifetime cannot lease the forwarding claim'
   )
-  const shortenedDeadline = shortenM3TailLifetime(
+  const originalDeadline = previousTail.deadline
+  const shortenedDeadline = shortenM3TailOperationDeadline(
     previousTail,
-    previousTail.deadline.localDeadline - 1n
+    previousTail.deadline.operationDeadline - 1n
   )
-  t.is(shortenedDeadline, previousTail.deadline, 'shortening refreshes the exact leased lifetime')
+  t.is(shortenedDeadline, previousTail.deadline, 'shortening refreshes the exact lease snapshot')
+  t.not(shortenedDeadline, originalDeadline)
+  t.is(shortenedDeadline.wireExpiresAt, originalDeadline.wireExpiresAt)
+  t.is(shortenedDeadline.routeLocalDeadline, originalDeadline.routeLocalDeadline)
+  t.is(shortenedDeadline.operationDeadline, originalDeadline.operationDeadline - 1n)
+  t.is(shortenedDeadline.clockIdentity, originalDeadline.clockIdentity)
   const m3ForwardingLease = createM3TailForwardingLease(
     previousTail.transportOwner,
     previousTail.deadline,
@@ -765,8 +802,8 @@ test('forwarding publication claim and lease require object-identical synchronou
   const publication = publishM3TailForwarding(publicationClaim, m3ForwardingLease, forwarding)
   t.alike(
     clock.delays,
-    [1_000, 1_000, 999, 999],
-    'publication is capped by the leased tail deadline'
+    [1_000, 1_000],
+    'operation shortening does not cap physical forwarding lifetime'
   )
   const taken = takeM3TailForwardingPublication(publication, m3ForwardingLease, publicationClaim)
   t.alike(Object.keys(taken), [
@@ -1661,7 +1698,8 @@ test('responder binding owns the exact transcript, identity, role, and deadline 
   t.is(fields.initiator, false)
   t.is(fields.wireExpiresAt, 1_250n)
   t.is(deadline.wireExpiresAt, 1_250n)
-  t.is(deadline.localDeadline, 10_250n)
+  t.is(deadline.routeLocalDeadline, 10_250n)
+  t.is(deadline.operationDeadline, 10_250n)
   t.is(deadline.clockIdentity.wallNow, clock.wallNow)
   t.is(deadline.clockIdentity.monotonicNow, clock.monotonicNow)
 

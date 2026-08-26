@@ -102,6 +102,7 @@ function snapshot(phaseSequence, state) {
     guardOnly: false,
     lookupGeneration: null,
     openLinks: 0,
+    isolatedGrantRequestCount: 1,
     openResources: state === 'CLOSED' ? 0 : 1,
     ordinaryRequestCount: 2,
     pendingGrantRequests: 0,

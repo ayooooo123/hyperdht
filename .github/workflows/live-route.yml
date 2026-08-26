@@ -60,7 +60,7 @@ run-name: 'Live Route: roles ${{ inputs.remote_roles }}, coordinator ${{ inputs.
 # Dispatch and drive in one command, which handles the keys itself:
 #
 #   scripts/live-route.sh up                    # all eleven roles on runners
-#   scripts/live-route.sh up -l 1,9,10,11       # those four here, seven on runners
+#   scripts/live-route.sh up -l 1,3,9           # those three here, eight on runners
 #
 # Addressing needs no flag. Roles bind 0.0.0.0 and publish a reflected address, so
 # bound and published differ by construction, which is the class the rehearsal's
@@ -73,8 +73,8 @@ run-name: 'Live Route: roles ${{ inputs.remote_roles }}, coordinator ${{ inputs.
 # deciding variable was a cancel-to-reply window of about 3.4ms, which a
 # sub-millisecond loopback usually wins and a translated address usually loses. It
 # is fixed in lib/private/m3-adjacency-runtime.js, green in five unmapped and five
-# divergent rehearsals, so a first dispatch is expected to complete all 125
-# assertions. A real network loses that race more often than any rehearsal mode, so
+# divergent rehearsals, so a dispatch is expected to complete all 123 assertions.
+# A real network loses that race more often than any rehearsal mode, so
 # this is where a regression of that class would resurface first.
 #
 # If a run does stop, re-run the whole workflow rather than one job, and re-drive

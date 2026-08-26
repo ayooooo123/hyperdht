@@ -1191,30 +1191,46 @@ it turns an address nobody verified into one that is verified, but it bought a
 negative result rather than a fix.
 
 The order these were found matters for anyone repeating the exercise, because each
-one hid the next: the runtime attestation could never pass, so nothing beyond
-assertion 1 was reachable; then two roles could not be scheduled; then a laptop role
-could not be dialled; then a retransmission was called a replay; then the command
-budget was too small for real RTT; and only then did the setup store's own timeout
-become visible at assertion 11. Six distinct causes, each of which had to be removed
-before the next could be seen, and not one of them observable on loopback. Five are
-fixed and landed; the sixth is where a real dispatch now stops, at 10 of 11
-assertions with every role on a runner.
+one hid the next: runtime attestation, runner scheduling, laptop NAT filtering,
+retransmission classification, setup-store timeout, and finally the cross-host
+monotonic deadline. PR #45 removed that last protocol fault.
 
-So mixed placement works for roles that initiate and fails for roles that must be
-dialled, on this network. Whether that generalises depends entirely on the NAT in
-front of whoever runs it. The honest limit: nothing here distinguishes
-endpoint-independent filtering from endpoint-dependent filtering in advance, and
-the reflectors cannot, so a mixed dispatch is the test.
+The next reviewed dispatches crossed every boundary the earlier runs could not:
+140/140 directed punch pairs, answered DHT setup, immutable store/readback, every
+role READY, guard-only endpoint authority, no retained bootstrap socket, and the
+first exact routed immutable get across eleven Azure hosts. That closes KI-15
+end-to-end for the exercised request.
+
+The run then exposed a harness assumption: it awaited
+`isolated-grant-request` from `lookup-exit-a` as mandatory, but real DHT ordering
+returned the value directly without discovering a learned closer. The local
+deterministic topology always takes the referral path, so it had hidden the hang.
+Role snapshots now report `isolatedGrantRequestCount`; learned-closer events remain
+served when present, but scenario progress and accounting accept both valid paths.
+
+Further dispatches separated protocol from runner/NAT allocation:
+
+- eleven remote jobs can leave one queued beyond the workflow's maximum discovery
+  window, even though the eventual Actions jobs all pass;
+- one allocation opened only 2/140 punch pairs, while another opened 140/140;
+- co-located roles on this workstation cannot hairpin through their shared
+  reflected public address;
+- two Azure relay candidates can land in the same /24, which the privacy diversity
+  rule correctly rejects during activation.
+
+These are named environmental outcomes, not reasons to relax the route. A standing
+remote gate needs placement/allocation control before a green 123/123 run is
+repeatable; good allocations have exercised the complete lifecycle through
+teardown, and the reviewed protocol remains fail-closed on bad ones.
 
 ### KI-15: an absolute deadline is built on a host-local monotonic clock
 
-**Status: FIXED, by changing what the field MEANS rather than what it is worth. The wire
-now carries a RELATIVE budget and each host derives its own absolute deadline from its own
-clock, so no clock value is ever compared across hosts. This entry originally recorded the
-wrong cause - that the 3000ms budget was too small - and that diagnosis is retracted below,
-because the way it was wrong is instructive. NOT yet confirmed by a real two-host dispatch:
-the fault this removes was structural and is proven removed by construction and by test,
-but the dispatch that exposed it has not been re-run.**
+**Status: FIXED, including a real eleven-host routed immutable get.** The wire
+now carries a RELATIVE budget and each host derives its own absolute deadline from
+its own clock, so no clock value is compared across hosts. This entry originally
+recorded the wrong cause - that the 3000ms budget was too small - and that diagnosis
+is retracted below because the way it was wrong is instructive. Full remote
+123/123 remains an infrastructure-allocation gate, not an open KI-15 claim.
 
 #### The fix
 
@@ -1587,28 +1603,32 @@ strategy. That precondition is now met **only for pools larger than three-plus-t
 the minimal shape a relay that fails is still handed the sibling branch, so L1 remains
 blocked there, and the blocker is pool size rather than a missing mechanism.
 
-#### Open, recorded rather than patched: a stale loss registration would demote the wrong pair
+#### Stale loss registration: investigated, not reachable
 
-`createRouteManagerBranchLossRegistration` binds `{ manager, state, branchClass }` and NO
-branch generation, so a registration authorises a loss against whatever pair currently
-occupies that class. In the rotation path the directory commits the NEW pair inside the
-awaited `receiveRotationSeed`, and only after it resolves does the controller swap
-connections and destroy the previous one, which is what revokes the stale registration. A
-physical loss fired by the retired runtime inside that window reaches
-`reportRouteManagerBranchLoss`, which resolves the pair from `state.committed` at call time
-and would therefore demote two innocent hops.
+`createRouteManagerBranchLossRegistration` binds `{ manager, state, branchClass }`
+without a generation, which initially looked able to target whichever pair later
+occupied that class. The suspected window does not exist in the production event
+model.
 
-Two reasons this is recorded and not fixed here. The larger consequence - a stale loss
-marking the FRESH branch lost and triggering another rotation - predates this fix and is
-unchanged by it; the demotion is the marginal addition. And reachability is unproven: the
-controller's swap contains no `await`, so it hinges entirely on whether `receiveRotationSeed`
-yields to the macrotask queue after the directory commit, which was not traced. The cheap
-close, if someone takes it, is to bind the generation into the registration and compare it
-before reporting - which also hardens the older half.
+`receiveRotationSeed` awaits network input **before** calling
+`publishRotationSeed`. Publication then commits the new pair synchronously. The
+controller's `await` continuation is a microtask and, once resumed, executes
+`commitBranchConnection`, swaps the connection, and destroys/revokes the previous
+registration with no intervening `await`. A UDX physical-loss I/O event cannot
+interleave inside that synchronous continuation. If the old loss fires during the
+earlier network await, RouteManager is `ROTATING`, so the report returns false
+against the old state and spends that registration before publication; it cannot
+demote or rotate the new pair.
+
+Generation binding would therefore add state and migration surface without closing
+a reachable path. The relevant invariant is the no-yield publish/swap/revoke
+sequence; if a future change inserts an await there, this conclusion must be
+revisited before landing it.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
-**Status: one cause fixed, one open. Never reproduced locally.**
+**Status: FIXED for both established causes. Never reproduced locally except by the
+deterministic Signature-B characterization added after the field failures.**
 
 Three fail-closed rejections on the GitHub `ubuntu-latest` runner, in three of
 the twelve `live-linux` executions observed before the fix below, all tied to a
@@ -1654,23 +1674,37 @@ Eight consecutive `live-linux` runs passed after the fix, against roughly one
 failure in four before it. That is evidence, not proof: at the earlier rate,
 eight clean runs would happen by chance about one time in eight.
 
-**B remains open**, but it is now reproducible on demand. `test/private/tail-control.js`
-carries a characterisation test, `TailControl sealExtend rejects limits committed
-before the tail was shortened`, that fails the seal deterministically with no
-clocks, no load and no CI runner: commit limits whose expiry equals the tail's
-wire deadline, shorten the tail by one millisecond, and the seal is rejected.
+**B is now fixed.** The deterministic characterization is now the regression
+`TailControl keeps committed limits valid when only the operation deadline shortens`:
+limits whose expiry equals the authenticated route lifetime seal both with the full
+operation window and with that operation window shortened by one millisecond.
 
-The shortening is not exotic. `createTailControlSession` shortens whenever the
-`absoluteDeadline` it is handed is below the tail's local deadline, and
-`shortenM3TailLifetime` then moves `wireExpiresAt` down by the same delta. But
-the value `RouteExtensionSession` hands it is an _operation_ budget, bounded by
-`MAX_EXTENSION_MS`, not a statement about how long the route should live. So
-narrowing the window allowed for one extension also shortens the route's wire
-lifetime, and any limits already committed against the longer lifetime become
-unpresentable. Whether those two deadlines should be coupled at all is the real
-question behind B.
+The fault was a two-bound model representing three different facts. The replacement
+deadline snapshot keeps:
 
-B is a separate, structural cause.
+- `wireExpiresAt`, the immutable authenticated wall-clock route lifetime;
+- `routeLocalDeadline`, its coherent monotonic projection, sampled once and retained;
+- `operationDeadline`, a separately mutable local timeout for the current operation.
+
+An operation may shorten only `operationDeadline`. An authenticated earlier proof/request
+wall expiry is always projected from the retained `(wireExpiresAt, routeLocalDeadline)`
+anchor, never from the mutable operation deadline and never from fresh clock samples.
+TailControl carries the final M3 monotonic high-water across ownership, rejects rollback,
+reserves one-shot transitions before every injected clock call, and rechecks the operation
+deadline after the clock-bearing final route take before publishing its transport.
+
+No protocol frame, transcript, admitted-material key, or final-handoff key changed. The
+fix separates actor-local scheduling from the route lifetime the peer authenticated.
+
+#### Pre-fix diagnosis retained
+
+The shortening was not exotic. `createTailControlSession` shortened whenever the
+`absoluteDeadline` it was handed was below the tail's local projection, and the old
+`shortenM3TailLifetime` moved `wireExpiresAt` down by the same delta. But the value
+`RouteExtensionSession` handed it was an _operation_ budget, bounded by
+`MAX_EXTENSION_MS`, not a statement about how long the route should live. Narrowing one
+extension window therefore shortened the route's wire lifetime and made limits committed
+against the longer lifetime unpresentable.
 
 Choosing a remedy has an overhead dimension, so the shortening was measured
 across one aggregate run. It fires 48 times: 28 from `createTailControlSession`
@@ -1690,12 +1724,12 @@ should be bounded by `MAX_EXTENSION_MS`. It also removes the shortening that
 invalidates committed limits, so the performance choice and the correctness
 choice coincide.
 
-The cost of decoupling is that `shortenM3TailLifetime` currently keeps the wall
-and monotonic views consistent by moving both together. Splitting them means
-carrying an operation deadline and a route deadline separately and keeping both
-coherent, which touches the M3 runtime and wants the design owner. An earlier reading
-of this record guessed wrong about it: the caller is **not** missing a clamp.
-The requests land exactly on the bound.
+The implementation cost of decoupling was retaining the authenticated wall/local route
+pair while carrying the operation deadline independently through TailControl. A rejected
+one-line attempt preserved `wireExpiresAt` but projected later proof expiries from the
+already-shortened operation deadline; it mapped `(wire, routeLocal)=(20,000,29,000)`,
+operation `16,000`, proof `4,500` to `500` instead of `13,500` and broke normal tail
+completion. That failure is why all three bounds are explicit.
 
 Instrumenting every `sealTailExtend` in the private aggregate and recording the
 distance from the requested wire expiry to each bound gives, identically under
@@ -1746,17 +1780,11 @@ correctly. That also explains why the zero margin is so consistent: the request
 is stable across derivations precisely because the deadline term binds it, which
 is load-bearing rather than accidental.
 
-What remains is a decision for the design owner, because both options touch
-approved semantics:
-
-1. give the headroom at negotiation, so the admitted limits a responder accepts
-   sit strictly inside its own tail deadline. The margin then travels inside the
-   committed value and every later comparison inherits it;
-2. remove the second derivation, so the value the check compares against cannot
-   drift from the value that was committed. This is the production analogue of
-   the coherent-clock fix already applied to the role runtimes;
-3. add tolerance to the comparisons. This relaxes an authentication bound and
-   should be the last resort.
+The alternatives remain rejected. Negotiation headroom permanently shortens every route
+to buy transient operation slack; comparison tolerance relaxes an authentication bound;
+and fresh reprojection loses the one coherent wall/monotonic anchor. The shipped model
+instead removes the second derivation: authenticated route values remain stable while the
+local operation expires independently.
 
 The two bounds in `sealTailExtend` are now thrown separately so a stack
 attributes a future rejection to the one that fired. Same error, same
@@ -2256,14 +2284,15 @@ surface:
 native UDX loopback. It is test infrastructure, not a public API, and carries no
 anonymity claim.
 
-On Linux (Ubuntu 24.04 under Colima, Node v22.19.0) the scenario passes all 125
-assertions deterministically with both Node and Bare role children. It proves,
+On Linux the scenario passes all 123 assertions deterministically with both Node
+and Bare role children. It proves,
 live and cross-process: ordered DHT role bind and the audited setup store;
 endpoint bootstrap, guard pinning, and separate lookup/announce branches built
 through authenticated adjacent links; an exact immutable get retrieved through
-the three-position route after the exit admits an isolated learned closer under a
-signed Task 12 grant; delayed-lookup cancellation; a physical lookup-A link fault
-that propagates `BRANCH_DESTROY` upstream and rotates the endpoint onto lookup B,
+the three-position route either directly from the configured DHT path or after
+the exit admits an isolated learned closer under a signed Task 12 grant;
+delayed-lookup cancellation; a physical lookup-A link fault that propagates
+`BRANCH_DESTROY` upstream and rotates the endpoint onto lookup B,
 followed by a second exact immutable get; exit accounting for referral probes and
 ordinary requests; endpoint suspend and resume, including a third exact immutable
 get over the rebuilt route; a terminal network change that leaves no endpoint
@@ -2296,27 +2325,27 @@ while `test/private-routing.js` stays green everywhere:
 Counts below are a MEASUREMENT taken at one commit, not a contract. Every added test
 moves them, and a stale total quoted as current has already caused four false findings
 in this document's history - so re-measure rather than cite, and if you change a suite,
-change this table in the same pass. Measured at `e3cf206`, after the KI-15 clock-domain
-fix and the three audit fixes it prompted. Where a row claims two platforms, both were
-run: the two aggregates were measured in the Linux container AND on the macOS host, and
-agreed exactly. The Linux-only rows were measured only in the container, which is the
-only place they can run at all (KI-2, KI-3).
+change this table in the same pass. Measured after the remote optional-grant accounting
+fix and KI-4 three-bound deadline split. Where a row claims two platforms, both were run:
+the two aggregates were measured in the Linux container AND on the macOS host, and agreed
+exactly. The Linux-only rows were measured only in the container, which is the only place
+they can run at all (KI-2, KI-3).
 
 | Suite                            | Command                                    | Result                                                       |
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
-| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 902/902 tests, 18,326/18,326 assertions, on Linux and Darwin |
-| Private aggregate, Bare          | `bare test/private-routing.js`             | 881/881 tests, 18,267/18,267 assertions, on Linux and Darwin |
-| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 127/127 assertions, Linux                                    |
-| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 127/127 assertions, Linux                                    |
+| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 906/906 tests, 18,375/18,375 assertions, on Linux and Darwin |
+| Private aggregate, Bare          | `bare test/private-routing.js`             | 885/885 tests, 18,316/18,316 assertions, on Linux and Darwin |
+| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 123/123 assertions, Linux                                    |
+| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 123/123 assertions, Linux                                    |
 | Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
-| Namespace live route and oracles | `npm run test:private:namespace:live`      | 137/137 assertions, privileged Linux                         |
+| Namespace live route and oracles | `npm run test:private:namespace:live`      | 133/133 assertions, privileged Linux                         |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
 `test/private/live-namespace-node.js` runs the same eleven-process scenario with
 every role in its own Linux network namespace, captures every packet on every
 veth, and decides the result from the captured bytes rather than from the
-implementation's own accounting. It passes `137/137` assertions on Linux.
+implementation's own accounting. It passes `133/133` assertions on Linux.
 
 Isolation is structural, not asserted. Each role holds routes only to the peers
 named by `ALLOW_EDGES`, and the root namespace forwards under a dedicated
