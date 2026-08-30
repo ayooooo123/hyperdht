@@ -1813,35 +1813,38 @@ from elsewhere.
 Until relay identity has a cost, path diversity constrains the shape of an
 attack without bounding the attacker's share of the candidate set.
 
-### KI-6: hop selection is first-match, not random
+### KI-6: hop selection is first-match, not random — FIXED
 
-**Status: harness blocker FIXED; production random selection remains open.** Normal
-and reversed candidate orders now pass the full Node and Bare process scenarios
-through teardown with different live branch pairings.
+**Status: FIXED.** Initial, reconnect, and replacement selection now draw
+uniformly over the valid diverse ordered combinations in one chosen demotion
+tier. The preferred tier is counted and exhausted first; the all-candidate tier
+is considered only when the preferred count is zero. Candidate order is now only
+the enumeration order behind the random index.
 
-`choosePairs` at `relay-candidate-directory.js:702` returns the first combination
-that passes the diversity rule, walking candidates in `state.records` order, and
-`chooseReplacementPair` at `:728` does the same for one pair. Selection is
-therefore deterministic. Measured against a sealed directory through its public
-API: rotating the record order rotates the selection with it, and five identical
-runs return one distinct result. Whoever is discovered earliest is chosen every
-time they are eligible rather than occasionally, and an adversary who can
-influence discovery order converts that into permanent placement on the path.
+Selection is allocation-flat in the size of the combination space: one pass
+counts valid combinations, rejection sampling draws an unbiased index, and a
+second pass walks to that index. No combination array is materialized. A
+three-middle/three-exit directory has exactly 36 valid ordered quads. Fixed draws
+0 through 35 select all 36 in enumeration order; draw 0 selects
+`middle-1/exit-0, middle-2/exit-1`, and draw 35 selects
+`middle-3/exit-2, middle-2/exit-1`. The four valid replacement pairs after a
+four-plus-four fixture's initial two pairs are likewise reached by draws 0
+through 3.
 
-The remedy is to draw uniformly over the combinations that pass diversity.
-Counting the qualifying combinations and then walking to a drawn index keeps
-allocation flat, an injected `randomBytes` capability keeps the source testable,
-and rejection sampling avoids favouring low indices through modulo bias. No new
-capability has to be invented for it. `createEndpointBootstrapAuthority` already
-receives an injected `randomBytes` and builds the directory sink two statements
-later with clocks alone, at `endpoint-bootstrap-authority.js:128` and `:149`, and
-the reconnect site at `udx-cell-endpoint.js:3075` has `cryptoSuite.randomBytes` in
-scope and already hands it to bootstrap IO at `:3109`. What widens is the sink's
-`CLOCK_FIELDS` contract, which `exactObject` enforces at every construction site.
-With that in place the host suites were green at 877/877 under Node and 856/856
-under Bare, including a deterministic test that feeds draws zero through three,
-obtains four distinct combinations, and confirms draw four wraps onto draw zero,
-which pins the count at exactly four rather than at least four.
+Counts up to 256 use one random byte; larger bounded counts use two. The
+eight-plus-eight maximum-shape fixture has 3,136 valid ordered quads and requests
+two bytes. A singleton spends no entropy. For the 36-combination case, byte 252
+is rejected and byte 35 selects index 35 rather than introducing modulo bias.
+Repeated rejection is capped at 128 draws and invalidates the directory, so a
+hostile entropy callback cannot retain ownership or loop forever.
+
+The sink's exact source contract now owns `randomBytes` beside both clocks and
+threads it through the sealed token into the directory. The initial endpoint
+passes its already-injected capability; reconnect uses the existing
+`cryptoSuite.randomBytes` capability already passed to bootstrap IO at that
+construction seam. Every constructor validates own data exactly. Throwing,
+malformed, endlessly rejecting, reentrant, and destroy-during-draw callbacks
+clear candidate ownership, retain no callback, and publish no reservation.
 
 The original blocker was the eleven-role fixture, not the directory. It minted only
 three matched middle-to-exit grants (`3-4`, `5-6`, `7-8`), while a directory of
@@ -1867,16 +1870,12 @@ The fixture now models the production contract:
    active lookup, announce, standby, rotation, and the physical-fault target from
    those relationships and observed counters rather than role labels.
 
-Normal process Node/Bare runs select lookup-middle-a→lookup-exit-a and rotate to
-lookup-middle-b→lookup-exit-b. With `PR_CANDIDATE_ORDER=reverse`, both runtimes
-select lookup-middle-b→lookup-exit-a and rotate to
-lookup-middle-a→lookup-exit-b. All four runs pass 132/132 through teardown. Restoring
-the fixed lookup-middle-a fault target makes the reverse run fail at assertion 45,
-which proves the mutation reaches the formerly coupled path.
-
-This removes the structural block on production random selection. It does not
-itself change `relay-candidate-directory.js`; first-match selection remains the
-open half of KI-6.
+Before production randomness was enabled, the corrected harness proved both
+candidate orders with different fixed first-match paths and a state-derived fault
+target. Restoring the fixed `lookup-middle-a` target made the reverse run fail at
+assertion 45, proving the mutation reached the formerly coupled path. That was
+the structural prerequisite; selection is no longer pinned to either recorded
+pairing.
 
 One shortcut is worth ruling out explicitly, because it looks cheap. Pinning the
 draw inside the harness so the first combination always wins would keep the gates
@@ -1889,20 +1888,47 @@ make middle i with exit i a permanent fixture assumption, which is the coinciden
 the `exitPairs` correction below removed. It buys green gates by having them prove
 something production would not do.
 
-A future attempt must not be judged on the host aggregate. The eleven-role
-scenarios are excluded from `test/private-routing.js`, which is why the earlier
-attempt could be host-green and still have to be reverted; they run only under the
-`process:node`, `process:bare` and `namespace:live` gates. A change that leaves
-the host aggregate green has demonstrated nothing about this issue either way,
-whatever count it lands on.
+The production draw exposed a real reconnect race, not a harness race: the
+preferred tier can legitimately redraw a pair that was live immediately before
+suspend, while its remote circuit still owns the link grants. Waiting on the
+1.5-second link-liveness bound does not release it because the old middle and exit
+continue heartbeating each other.
 
-Two smaller findings from the attempt are worth keeping. The reconnect request
-built by `consumeGuardReconnectRequest` carries clocks but no randomness, so a
-selection capability threaded through that path has to source it from the crypto
-suite already in scope at that site. And `test/private/live-immutable-get.js`
-indexed `exitPairs` by a middle's index, which held only while selection paired
-middle i with exit i; that is corrected regardless, since it relied on a
-coincidence.
+Suspend now performs an authenticated end-to-end teardown before publishing
+reconnect authority. `BRANCH_TEARDOWN_V1` (`0x0027`) travels endpoint → guard →
+middle → exit and `BRANCH_TEARDOWN_ACK_V1` (`0x0028`) returns only after each
+downstream actor has drained operations and joined its link/grant release. Both
+carry the exact branch class, branch ID, circuit ID, generation, intentional
+suspend reason, and a nonzero 16-byte teardown ID in one 58-byte M3 datagram body.
+Same-ID retries are idempotent, completed exits can resend a bounded cached ACK,
+and a different ID is replay-fatal.
+
+The endpoint retries at the existing 500ms link-ping cadence under the existing
+5s circuit-teardown deadline. Timeout, malformed ACK, release failure, network
+change, or destroy cancels both branch transactions and enters `UNAVAILABLE`;
+release is never inferred. Success ordering is exact: stop applications, settle
+both exit releases, settle middle then guard downstream releases, receive both
+ACKs, destroy both branch materials, retain the directory, suspend the guard
+lease, then publish reconnect authority. The eleven-role test still calls
+suspend → resume directly; there is no coordinator-only prepare command or
+pre-resume barrier.
+
+Final Linux process gates pass through teardown in all four required modes:
+normal Node 132/132, normal Bare 132/132, reversed Node 132/132, and reversed
+Bare 132/132. Host-only aggregation remains insufficient evidence because the
+eleven-role scenarios are excluded from `test/private-routing.js`.
+
+Focused teardown proofs pass: M3 48/48 tests (373 assertions), DHT exit 8/8
+(52), route manager 19/19 (280), controller 8/8 (77), protocol 14/14 (755),
+live authority 11/11 (63), and process services 4/4 (46).
+
+Mutation proofs are load-bearing. Replacing the unbiased draw with fixed index
+zero makes the directory suite fail 27/31 tests with only one of 36 combinations
+reachable. Drawing reconnect bootstrap pairs directly from `all` makes the KI-14
+test fail both assertions that the faulted middle and exit are not redrawn.
+Removing teardown send, acknowledging before downstream release, accepting a
+different teardown ID, disabling retry, treating timeout as success, or
+publishing reconnect after only one ACK each fails its focused ordering gate.
 
 ## Comparison with Veilid
 
@@ -2319,8 +2345,8 @@ they can run at all (KI-2, KI-3).
 
 | Suite                            | Command                                    | Result                                                       |
 | -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
-| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 910/910 tests, 18,593/18,593 assertions, on Linux and Darwin |
-| Private aggregate, Bare          | `bare test/private-routing.js`             | 889/889 tests, 18,534/18,534 assertions, on Linux and Darwin |
+| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 925/925 tests, 18,818/18,818 assertions, on Linux and Darwin |
+| Private aggregate, Bare          | `bare test/private-routing.js`             | 904/904 tests, 18,759/18,759 assertions, on Linux and Darwin |
 | Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 132/132 assertions, Linux                                    |
 | Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 132/132 assertions, Linux                                    |
 | Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |

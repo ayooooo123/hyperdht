@@ -196,7 +196,8 @@ function directoryFixture(clock = routeClock(), options = {}) {
   ]
   const sink = createRelayCandidateDirectorySink({
     wallNow: clock.wallNow,
-    monotonicNow: clock.monotonicNow
+    monotonicNow: clock.monotonicNow,
+    randomBytes: options.randomBytes || ((size) => b4a.alloc(size))
   })
   return {
     clock,

@@ -138,6 +138,10 @@ function seed(value) {
   return b4a.alloc(32, value)
 }
 
+function zeroRandomBytes(size) {
+  return b4a.alloc(size)
+}
+
 function identityFor(role, ordinal) {
   let found = -1
   for (let value = 1; value < 256; value++) {
@@ -318,10 +322,9 @@ function replacementExpiryFixture(expiredBranch) {
   }
 }
 
-// The asymmetry the fault floor exists for. `searchPairs` is first-match over
-// the records in insertion order, so the lookup pair is the first safety record
-// and the first private record: a middle that signed itself a two-second
-// capability, paired with an honest exit whose expiry it does not control.
+// The asymmetry the fault floor exists for. The fixed-zero draw selects the first
+// valid enumeration entry: a middle that signed itself a two-second capability,
+// paired with an honest exit whose expiry it does not control.
 function faultFloorFixture() {
   const clock = fakeClock()
   const short = { expiresAtMs: NOW + 2_000n }
@@ -349,10 +352,11 @@ function faultFloorFixture() {
   }
 }
 
-function install(input) {
+function install(input, randomBytes = zeroRandomBytes) {
   const sink = createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes
   })
   const token = sealRelayCandidateDirectorySink(sink, input.records, input.scope)
   return consumeSealedRelayCandidateDirectory(token)
@@ -507,9 +511,31 @@ test('candidate transfer owns bytes and never reads dialing authority getters', 
 
 test('sink and sealed token are opaque, one-shot, bounded, and failure-atomic', (t) => {
   const input = fixture()
+  expectCode(
+    t,
+    () =>
+      createRelayCandidateDirectorySink({
+        wallNow: input.clock.wallNow,
+        monotonicNow: input.clock.monotonicNow
+      }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  expectCode(
+    t,
+    () =>
+      createRelayCandidateDirectorySink({
+        wallNow: input.clock.wallNow,
+        monotonicNow: input.clock.monotonicNow,
+        get randomBytes() {
+          return zeroRandomBytes
+        }
+      }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
   const sink = createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   t.ok(Object.isFrozen(sink))
   t.alike(Reflect.ownKeys(sink), [])
@@ -523,14 +549,16 @@ test('sink and sealed token are opaque, one-shot, bounded, and failure-atomic', 
 
   const revoked = createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   revokeRelayCandidateDirectorySink(revoked)
   expectCode(t, () => sealRelayCandidateDirectorySink(revoked, [], input.scope), 'ERR_REPLAY')
 
   const doomed = createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   const doomedToken = sealRelayCandidateDirectorySink(doomed, input.records, input.scope)
   destroySealedRelayCandidateDirectory(doomedToken)
@@ -542,7 +570,8 @@ test('sink and sealed token are opaque, one-shot, bounded, and failure-atomic', 
   }
   const overfull = createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   expectCode(t, () => sealRelayCandidateDirectorySink(overfull, tooMany, input.scope), 'ERR_REPLAY')
   t.ok(tooMany.every((record) => record.identity.some((byte) => byte !== 0)))
@@ -882,7 +911,8 @@ test('partial allocation and reentrant or throwing clocks clear without publicat
   for (const failureAt of [2, 3, 4, scopeStart + 2, scopeStart + 3]) {
     const sink = tracked.fresh.createRelayCandidateDirectorySink({
       wallNow: input.clock.wallNow,
-      monotonicNow: input.clock.monotonicNow
+      monotonicNow: input.clock.monotonicNow,
+      randomBytes: zeroRandomBytes
     })
     tracked.start(failureAt)
     expectCode(
@@ -907,7 +937,8 @@ test('partial allocation and reentrant or throwing clocks clear without publicat
       tracked.fresh.sealRelayCandidateDirectorySink(reentrantSink, input.records, input.scope)
       return NOW
     },
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   expectCode(
     t,
@@ -1017,7 +1048,8 @@ test('sealed transfer revalidates expiry, rollback, and hostile clocks before pu
   const tracked = trackedDirectoryModule()
   const expiredSink = tracked.fresh.createRelayCandidateDirectorySink({
     wallNow: expired.clock.wallNow,
-    monotonicNow: expired.clock.monotonicNow
+    monotonicNow: expired.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   tracked.start(null)
   const expiredToken = tracked.fresh.sealRelayCandidateDirectorySink(
@@ -1043,7 +1075,8 @@ test('sealed transfer revalidates expiry, rollback, and hostile clocks before pu
   const rollback = fixture()
   const rollbackSink = createRelayCandidateDirectorySink({
     wallNow: rollback.clock.wallNow,
-    monotonicNow: rollback.clock.monotonicNow
+    monotonicNow: rollback.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   const rollbackToken = sealRelayCandidateDirectorySink(
     rollbackSink,
@@ -1065,7 +1098,8 @@ test('sealed transfer revalidates expiry, rollback, and hostile clocks before pu
   })
   const throwingSink = createRelayCandidateDirectorySink({
     wallNow: throwing.clock.wallNow,
-    monotonicNow: throwing.clock.monotonicNow
+    monotonicNow: throwing.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   const throwingToken = sealRelayCandidateDirectorySink(
     throwingSink,
@@ -1087,7 +1121,8 @@ test('sealed transfer revalidates expiry, rollback, and hostile clocks before pu
   })
   const reentrantSink = createRelayCandidateDirectorySink({
     wallNow: reentrant.clock.wallNow,
-    monotonicNow: reentrant.clock.monotonicNow
+    monotonicNow: reentrant.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   reentrantToken = sealRelayCandidateDirectorySink(
     reentrantSink,
@@ -1122,7 +1157,11 @@ test('caught nested replay irreversibly poisons active seal and consume transfer
       }
       return NOW
     }
-    sink = createRelayCandidateDirectorySink({ wallNow, monotonicNow: () => 0n })
+    sink = createRelayCandidateDirectorySink({
+      wallNow,
+      monotonicNow: () => 0n,
+      randomBytes: zeroRandomBytes
+    })
     active = true
     let token = null
     let outerCode = null
@@ -1169,7 +1208,8 @@ test('caught nested replay irreversibly poisons active seal and consume transfer
     }
     const sink = tracked.fresh.createRelayCandidateDirectorySink({
       wallNow,
-      monotonicNow: () => 0n
+      monotonicNow: () => 0n,
+      randomBytes: zeroRandomBytes
     })
     tracked.start(null)
     token = tracked.fresh.sealRelayCandidateDirectorySink(sink, input.records, input.scope)
@@ -1206,7 +1246,8 @@ test('caught nested replay irreversibly poisons active seal and consume transfer
       }
       return NOW
     },
-    monotonicNow: () => 0n
+    monotonicNow: () => 0n,
+    randomBytes: zeroRandomBytes
   })
   uncaughtActive = true
   expectCode(
@@ -1320,7 +1361,8 @@ test('same-epoch equivocation quarantine cannot be bypassed by later transfer re
   }
   const sink = createRelayCandidateDirectorySink({
     wallNow: bounded.clock.wallNow,
-    monotonicNow: bounded.clock.monotonicNow
+    monotonicNow: bounded.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   let token = null
   let error = null
@@ -1387,7 +1429,8 @@ test('fresh wall after monotonic rejects exact guard and candidate expiry on eve
   const sealed = makeInput()
   const sink = createRelayCandidateDirectorySink({
     wallNow: sealed.clock.wallNow,
-    monotonicNow: sealed.clock.monotonicNow
+    monotonicNow: sealed.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   const token = sealRelayCandidateDirectorySink(sink, sealed.records, sealed.scope)
   sealed.clock.setCallback(() => sealed.clock.setWall(NOW + 30_000n))
@@ -1457,7 +1500,8 @@ test('monotonic callback destruction cannot resurrect directory state', (t) => {
   let token = null
   const sink = createRelayCandidateDirectorySink({
     wallNow: clock.wallNow,
-    monotonicNow: clock.monotonicNow
+    monotonicNow: clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   token = sealRelayCandidateDirectorySink(sink, input.records, input.scope)
   clock.setCallback(() => {
@@ -1481,7 +1525,8 @@ test('transfer record work is rejected before ownership or advertisement crypto'
   records.push(records[0])
   const sink = counted.fresh.createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   expectCode(
     t,
@@ -1498,7 +1543,8 @@ test('transfer record work is rejected before ownership or advertisement crypto'
   }
   const byteSink = countedBytes.fresh.createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   expectCode(
     t,
@@ -1510,7 +1556,8 @@ test('transfer record work is rejected before ownership or advertisement crypto'
   const boundary = countedVerificationDirectoryModule()
   const boundarySink = boundary.fresh.createRelayCandidateDirectorySink({
     wallNow: input.clock.wallNow,
-    monotonicNow: input.clock.monotonicNow
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
   })
   const token = boundary.fresh.sealRelayCandidateDirectorySink(
     boundarySink,
@@ -1518,16 +1565,199 @@ test('transfer record work is rejected before ownership or advertisement crypto'
     input.scope
   )
   t.alike(boundary.counts(), { decodeCalls: 32, digestCalls: 32 })
+
   boundary.fresh.destroySealedRelayCandidateDirectory(token)
 })
 
-// KI-14. Measured at four middles and four exits, the shape where reuse is not
-// forced but was still observed six times out of six: `choosePairs` is
-// first-match and the lookup branch is built first, so the lookup pair is by
-// construction the earliest record of each role; rotation returned it to the
-// pool still earliest and first-match handed it to the sibling. The control half
-// of this test is the load-bearing half. Without it the test would show only
-// that some pair was selected, not that the demotion is what changed it.
+test('uniform initial selection indexes all 36 valid three-plus-three combinations', (t) => {
+  const input = fixture()
+  const middles = input.records.filter((record) => record.role === ROLE.SAFETY)
+  const exits = input.records.filter((record) => record.role === ROLE.PRIVATE)
+  const expected = []
+  for (const firstMiddle of middles) {
+    for (const firstExit of exits) {
+      for (const secondMiddle of middles) {
+        if (secondMiddle === firstMiddle) continue
+        for (const secondExit of exits) {
+          if (secondExit === firstExit) continue
+          expected.push(
+            [
+              b4a.toString(firstMiddle.digest, 'hex'),
+              b4a.toString(firstExit.digest, 'hex'),
+              b4a.toString(secondMiddle.digest, 'hex'),
+              b4a.toString(secondExit.digest, 'hex')
+            ].join(':')
+          )
+        }
+      }
+    }
+  }
+  t.is(expected.length, 36, 'three middles and three exits have 36 valid ordered quads')
+
+  const observed = []
+  const randomSources = []
+  for (let draw = 0; draw < expected.length; draw++) {
+    const sizes = []
+    const directory = install(input, (size) => {
+      sizes.push(size)
+      const source = b4a.from([draw])
+      randomSources.push(source)
+      return source
+    })
+    const selected = installInitialDigests(directory)
+    observed.push(
+      [
+        selected.lookupMiddle,
+        selected.lookupExit,
+        selected.announceMiddle,
+        selected.announceExit
+      ].join(':')
+    )
+    t.alike(sizes, [1], `draw ${draw} uses one random byte`)
+    directory.destroy()
+  }
+  t.alike(observed, expected, 'each draw selects its exact enumeration index')
+  t.is(new Set(observed).size, 36, 'all valid combinations are reachable')
+  t.ok(
+    randomSources.every((source) => source.every((byte) => byte === 0)),
+    'draws are cleared'
+  )
+})
+
+test('uniform selection rejects modulo-biased draws and uses the minimum byte width', (t) => {
+  const input = fixture()
+  const draws = [252, 35]
+  const sources = []
+  const directory = install(input, (size) => {
+    t.is(size, 1, '36 combinations use one byte')
+    const source = b4a.from([draws.shift()])
+    sources.push(source)
+    return source
+  })
+  const selected = installInitialDigests(directory)
+  directory.destroy()
+
+  const expectedDirectory = install(input, () => b4a.from([35]))
+  const expected = installInitialDigests(expectedDirectory)
+  expectedDirectory.destroy()
+  t.alike(selected, expected, '252 is rejected rather than reduced modulo 36')
+  t.alike(draws, [], 'one rejected and one accepted draw consumed')
+  t.ok(
+    sources.every((source) => source.every((byte) => byte === 0)),
+    'rejected draws are cleared'
+  )
+
+  const wideInput = fixture(6, 6)
+  const sizes = []
+  const wide = install(wideInput, (size) => {
+    sizes.push(size)
+    return b4a.alloc(size)
+  })
+  const wideReservation = takeRelayPathReservation(
+    wide.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  abortRelayPathReservation(wideReservation)
+  wide.destroy()
+  t.alike(sizes, [2], '3,136 combinations use two bytes')
+})
+
+test('replacement selection uniformly indexes its chosen tier and a singleton spends no entropy', (t) => {
+  const input = fixture(2, 2)
+  const middles = input.records.filter((record) => record.role === ROLE.SAFETY)
+  const exits = input.records.filter((record) => record.role === ROLE.PRIVATE)
+  const expected = []
+  for (const middle of middles.slice(2)) {
+    for (const exit of exits.slice(2)) {
+      expected.push(`${b4a.toString(middle.digest, 'hex')}:${b4a.toString(exit.digest, 'hex')}`)
+    }
+  }
+  const observed = []
+  for (let draw = 0; draw < expected.length; draw++) {
+    const sizes = []
+    let randomCall = 0
+    const directory = install(input, (size) => {
+      sizes.push(size)
+      return b4a.from([randomCall++ === 0 ? 0 : draw])
+    })
+    installInitialDigests(directory)
+    const selected = rotateBranch(directory, BRANCH_CLASS.LOOKUP, 2n)
+    observed.push(`${selected.middle}:${selected.exit}`)
+    t.alike(sizes, [1, 1], `replacement draw ${draw} samples its four-combination tier once`)
+    directory.destroy()
+  }
+  t.alike(observed, expected)
+  t.is(new Set(observed).size, 4, 'all valid replacement pairs are reachable')
+
+  let calls = 0
+  const singleton = install(fixture(), (size) => {
+    calls++
+    return b4a.alloc(size)
+  })
+  installInitialDigests(singleton)
+  t.is(calls, 1, 'initial 36-combination selection samples once')
+  const reservation = takeRelayPathReservation(
+    singleton.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n })
+  )
+  t.is(calls, 1, 'the only valid replacement pair spends no randomness')
+  abortRelayPathReservation(reservation)
+  singleton.destroy()
+})
+
+test('throwing malformed rejecting and reentrant randomness invalidates without publication', (t) => {
+  for (const mode of ['throw', 'malformed', 'reject', 'reenter', 'destroy']) {
+    let directory = null
+    let nestedCode = null
+    let source = null
+    let draws = 0
+    const randomBytes = (size) => {
+      if (mode === 'throw') throw new Error('injected random failure')
+      if (mode === 'malformed') {
+        source = b4a.alloc(size + 1, 0x5a)
+        return source
+      }
+      if (mode === 'reject') {
+        draws++
+        source = b4a.alloc(size, 0xff)
+        return source
+      }
+      if (mode === 'reenter') {
+        try {
+          directory.reserveInitialPair({ lookupGeneration: 2n, announceGeneration: 2n })
+        } catch (err) {
+          nestedCode = err && err.code
+        }
+      } else {
+        directory.destroy()
+      }
+      source = b4a.alloc(size, 0x5a)
+      return source
+    }
+    directory = install(fixture(), randomBytes)
+    expectCode(
+      t,
+      () => directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+      'ERR_INCOMPATIBLE_RELAY'
+    )
+    const observed = directory[kInspectRelayCandidateDirectory]()
+    t.is(observed.identityCount, 0, `${mode}: candidate ownership cleared`)
+    t.is(observed.pendingCount, 0, `${mode}: no reservation published`)
+    t.is(observed.callbackCount, 0, `${mode}: no callback authority retained`)
+    t.is(observed.destroyed, mode === 'destroy', `${mode}: destruction state is atomic`)
+    if (mode === 'reenter') t.is(nestedCode, 'ERR_INCOMPATIBLE_RELAY', 'nested draw rejected')
+    if (mode === 'reject') t.is(draws, 128, 'rejection sampling has a fixed work bound')
+    if (source)
+      t.ok(
+        source.every((byte) => byte === 0),
+        `${mode}: random source cleared`
+      )
+    directory.destroy()
+  }
+})
+
+// KI-14. Fixed-zero randomness pins the control arm to the first valid entry.
+// Rotation returns that vacated pair to the pool, so the control redraws it while
+// the fault arm's preferred partition does not. Without both arms this would show
+// only that some pair was selected, not that demotion changed the chosen tier.
 test('a hop rotated off for cause is not handed to the sibling branch', (t) => {
   for (const reportFault of [false, true]) {
     const label = reportFault ? 'fault reported' : 'control, no fault reported'
@@ -1708,20 +1938,11 @@ test('resume keeps a demotion and still admits a reconnect bootstrap pair', (t) 
   directory.destroy()
 })
 
-// The boundary of the fix, and the residual property that makes it defensible.
-//
-// A reconnect's BOOTSTRAP pair is not constrained by a demotion: `choosePairs`
-// builds both branches at once and is deliberately untiered, so a demoted hop can
-// reappear there. That is the cost of keeping the eleven-role gate green, and the
-// gate is red for that path for a reason unrelated to this fix - see the comment
-// on `choosePairs`.
-//
-// What is NOT given up is the penalty itself. The demotion survives the reconnect
-// and still binds every later rotation, so a reconnect buys a faulted relay one
-// bootstrap selection, not a reset. This test walks the whole sequence rather than
-// asserting a count, because the count surviving is what previously looked like
-// coverage while selection ignored it.
-test('a demotion survives a reconnect and still binds a later rotation', (t) => {
+// Both initial reservations and reconnect bootstrap reservations exhaust the
+// preferred partition before falling back to all candidates. Drawing directly
+// from `all` makes the fault arm reselect the fixed-zero lookup pair and fails
+// these assertions.
+test('reconnect bootstrap selection exhausts the preferred demotion tier first', (t) => {
   for (const reportFault of [false, true]) {
     const label = reportFault ? 'fault reported' : 'control, no fault reported'
     const directory = install(fixture(2, 2))
@@ -1736,27 +1957,19 @@ test('a demotion survives a reconnect and still binds a later rotation', (t) => 
       `${label}: demotion survives the reconnect`
     )
 
-    // The reconnect bootstrap is unconstrained, so this may reselect the demoted
-    // pair. That is the documented boundary, not an accident.
     const bootstrap = takeRelayPathReservation(
       directory.reserveInitialPair({ lookupGeneration: 2n, announceGeneration: 2n })
     )
-    consumeInitial(bootstrap, splitRelayPathReservation(bootstrap), [2n, 2n])
-    commitRelayPathReservation(bootstrap)
-
-    // Rotate the lookup branch away, which frees the originally faulted pair from
-    // the live set, then rotate the sibling. THIS is where the demotion must still
-    // bite, one reconnect later.
-    rotateBranch(directory, BRANCH_CLASS.LOOKUP, 3n)
-    const announce = rotateBranch(directory, BRANCH_CLASS.ANNOUNCE, 3n)
-
+    const evidence = consumeInitial(bootstrap, splitRelayPathReservation(bootstrap), [2n, 2n])
+    const selected = evidence.map(digestHex)
     if (reportFault) {
-      t.not(announce.middle, initial.lookupMiddle, `${label}: demoted middle still avoided`)
-      t.not(announce.exit, initial.lookupExit, `${label}: demoted exit still avoided`)
+      t.absent(selected.includes(initial.lookupMiddle), `${label}: demoted middle not redrawn`)
+      t.absent(selected.includes(initial.lookupExit), `${label}: demoted exit not redrawn`)
     } else {
-      t.is(announce.middle, initial.lookupMiddle, `${label}: demoted middle IS reused`)
-      t.is(announce.exit, initial.lookupExit, `${label}: demoted exit IS reused`)
+      t.is(selected[0], initial.lookupMiddle, `${label}: fixed-zero middle repeats`)
+      t.is(selected[1], initial.lookupExit, `${label}: fixed-zero exit repeats`)
     }
+    commitRelayPathReservation(bootstrap)
     directory.destroy()
   }
 })

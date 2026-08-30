@@ -60,6 +60,7 @@ const {
   deriveM3CellIds,
   destroyM3RouteTransport,
   receiveM3RouteFrame,
+  registerM3RouteTeardownHandler,
   sendM3RouteFrame,
   takeM3RouteTransport,
   takeM3TailCapability
@@ -851,6 +852,7 @@ async function liveAuthorityHarness(configurePublications = null, existing = nul
 
   const announceCreated = openMaterialFor(draft.announce, 0xa1)
   const announcePair = routeTransportPair(draft.announce, announceNetwork, topology.clock)
+  registerM3RouteTeardownHandler(announcePair.exit, async () => true)
   announceCreated.material.endpointOpenAuthority = finalExitActivation[
     TEST_ONLY_ENDPOINT_DHT_EXIT_OPEN_ISSUER
   ].create({
@@ -958,7 +960,7 @@ async function liveAuthorityHarness(configurePublications = null, existing = nul
     existing === null && configurePublications === null
       ? new LiveRouteAuthority({ routeManager: manager })
       : null
-  installDhtExitRoute(exitIO, table)
+  installDhtExitRoute(exitIO, table, { releaseIncoming: async () => {} })
   return {
     authority,
     endpointEdges,
@@ -1214,7 +1216,7 @@ test('production exit seed delivery crosses the moved OPEN route into endpoint a
     })
     await waitFor(() => replies.length === 1)
     settleExitDhtReservation(probe.settlementAuthority, replies.shift())
-    installDhtExitRoute(io, table)
+    installDhtExitRoute(io, table, { releaseIncoming: async () => {} })
     const receiving = receiveOpenRouteSeedPayload(material, topology.clock.monotonicNow)
     const sent = sendDhtExitSeeds(
       io,
