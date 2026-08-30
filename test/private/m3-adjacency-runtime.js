@@ -22,10 +22,15 @@ const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const {
   M3AdjacencyAuthority,
   TEST_ONLY_M3_ADJACENCY_OBSERVER,
+  BRANCH_TEARDOWN_BODY_BYTES,
+  beginM3RouteTeardown,
   abortM3Install,
   beginM3Install,
   commitM3Install,
   createM3RelayForwardingFacade,
+  decodeBranchTeardown,
+  destroyM3RouteTransport,
+  encodeBranchTeardown,
   createM3ForwardingPublicationClaim,
   createM3TailForwardingLease,
   destroyM3TailForwardingPublication,
@@ -33,6 +38,7 @@ const {
   consumeTailResponderToken,
   deriveM3CellIds,
   readM3RouteTransportDiagnostics,
+  registerM3RouteTeardownHandler,
   receiveM3RouteFrame,
   sendM3RouteFrame,
   takeM3RouteTransport,
@@ -115,6 +121,16 @@ function authority(clock, overrides = {}) {
     ...overrides
   })
 }
+function relayOptions(clock, overrides = {}) {
+  return {
+    releaseDownstream: async () => {},
+    releaseUpstream: async () => {},
+    monotonicNow: clock.monotonicNow,
+    schedule: clock.schedule,
+    cancelScheduled: clock.cancelScheduled,
+    ...overrides
+  }
+}
 
 const TEST_ONLY_M3_ESTABLISHED_ISSUER = Symbol.for(
   'hyperdht-private-routes/test-only-m3-established-issuer'
@@ -143,20 +159,24 @@ function forwardingFacade(destroy = () => {}) {
   })
 }
 
-function relayChannel() {
+function relayChannel({ holdSends = false } = {}) {
   const packets = []
   const inbound = []
   const waiters = []
+  const sendWaiters = []
   let receiveError = null
   let sendError = null
   let destroys = 0
   const value = Object.freeze({
     send(packet) {
       packets.push(b4a.from(packet))
-      if (!sendError) return true
-      const error = sendError
-      sendError = null
-      return Promise.reject(error)
+      if (sendError) {
+        const error = sendError
+        sendError = null
+        return Promise.reject(error)
+      }
+      if (!holdSends) return true
+      return new Promise((resolve) => sendWaiters.push(resolve))
     },
     receive() {
       if (receiveError) {
@@ -199,6 +219,15 @@ function relayChannel() {
     },
     failSend(error) {
       sendError = error
+    },
+    releaseSend() {
+      const resolve = sendWaiters.shift()
+      if (!resolve) return false
+      resolve(true)
+      return true
+    },
+    get pendingSends() {
+      return sendWaiters.length
     },
     get destroys() {
       return destroys
@@ -340,10 +369,14 @@ function branchDestroyBody(state) {
   return encodeM3Object({ messageId: M3_MESSAGE_ID.BRANCH_DESTROY_V1, body })
 }
 
-async function routeTransportRig() {
+async function routeTransportRig(overrides = {}, authorityOverrides = {}) {
   const clock = fakeClock()
-  const link = syntheticLink({ channel: relayChannel(), wireExpiresAt: 2_000n })
-  const adopted = authority(clock).adopt(link.handle)
+  const link = syntheticLink({
+    channel: relayChannel(),
+    wireExpiresAt: 2_000n,
+    ...overrides
+  })
+  const adopted = authority(clock, authorityOverrides).adopt(link.handle)
   const moved = takeM3TailCapability(adopted.tail, {
     wallNow: clock.wallNow,
     monotonicNow: clock.monotonicNow
@@ -352,7 +385,35 @@ async function routeTransportRig() {
   // The pump arms its first receive on a microtask, so the channel holds no pending
   // reader until that has run.
   await microtasks(5)
-  return { transport, link, counter: new SenderCounter() }
+  return { transport, link, clock, counter: new SenderCounter() }
+}
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
+}
+
+async function takeRouteTransport(owner, link, clock) {
+  const adopted = owner.adopt(link.handle)
+  const moved = takeM3TailCapability(adopted.tail, {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow
+  })
+  const transport = takeM3RouteTransport(moved.transportOwner)
+  await microtasks(5)
+  return transport
+}
+
+async function transferPackets(source, target, cursor) {
+  while (cursor.index < source.packets.length) {
+    target.deliverUnread(source.packets[cursor.index++])
+  }
+  await microtasks()
 }
 
 test('a route transport delivers every frame that arrived while no reader was pending', async (t) => {
@@ -417,7 +478,12 @@ test('a route transport caps residency and still consumes a destroy behind a ful
       received: MAX_FRAGMENTS,
       waiters: 0,
       droppedFrames: 0,
-      branchDestroyConsumed: false
+      branchDestroyConsumed: false,
+      endpointTeardown: null,
+      exitTeardown: null,
+      cachedTeardownAckBytes: 0,
+      teardownTimer: false,
+      teardownCallback: false
     },
     'residency is capped at the most route frames one reply can occupy'
   )
@@ -438,6 +504,415 @@ test('a route transport caps residency and still consumes a destroy behind a ful
     () => sendM3RouteFrame(rig.transport, b4a.alloc(1100, 0x01)),
     'a destroy arriving behind a full buffer is still consumed'
   )
+})
+test('branch teardown codecs have fixed 58-byte vectors and reject malformed tuples', (t) => {
+  const state = syntheticLink().state
+  const teardownId = b4a.from(Array.from({ length: 16 }, (_, index) => 0xa0 + index))
+  const encoded = encodeBranchTeardown(state, teardownId)
+  const expected = b4a.alloc(8 + BRANCH_TEARDOWN_BODY_BYTES)
+  expected.set([0, 0, 0, 1, 0, 0x27, 0, 58])
+  expected[8] = state.branchClass
+  expected.set(state.branchId, 9)
+  expected.set(state.circuitId, 25)
+  writeU64(expected, state.generation, 41)
+  expected[49] = 2
+  expected.set(teardownId, 50)
+  t.alike(encoded, expected, 'request vector fixes header, offsets, u64 order, reason, and id')
+  const ack = encodeBranchTeardown(state, teardownId, M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1)
+  expected[5] = 0x28
+  t.alike(ack, expected, 'ACK differs only by its fixed message id')
+  const decoded = decodeBranchTeardown(ack, state, M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1)
+  t.alike(decoded.body, expected.subarray(8))
+  t.alike(decoded.teardownId, teardownId)
+  decoded.body.fill(0)
+  decoded.teardownId.fill(0)
+
+  for (const [offset, name] of [
+    [8, 'branch class'],
+    [9, 'branch id'],
+    [25, 'circuit id'],
+    [41, 'generation'],
+    [49, 'reason']
+  ]) {
+    const malformed = b4a.from(ack)
+    malformed[offset] ^= 1
+    let error = null
+    try {
+      decodeBranchTeardown(malformed, state, M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1)
+    } catch (err) {
+      error = err
+    }
+    t.is(error && error.code, 'ERR_AUTHENTICATION', `${name} fails authentication`)
+    malformed.fill(0)
+  }
+  const truncated = ack.subarray(0, ack.byteLength - 1)
+  t.is(
+    decodeBranchTeardown(truncated, state, M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1),
+    null,
+    'non-exact body length is never decoded as teardown'
+  )
+  encoded.fill(0)
+  ack.fill(0)
+  expected.fill(0)
+  teardownId.fill(0)
+})
+
+test('endpoint teardown retries one id, authenticates ACK, and times out fail closed', async (t) => {
+  const rig = await routeTransportRig({ wireExpiresAt: 20_000n })
+  const teardownId = b4a.alloc(16, 0x91)
+  const pending = beginM3RouteTeardown(rig.transport, teardownId)
+  await microtasks()
+  t.is(rig.link.channel.packets.length, 1, 'first request is sent after operation publication')
+  t.is(readM3RouteTransportDiagnostics(rig.transport).teardownTimer, true)
+  rig.clock.fireNext()
+  await microtasks()
+  t.is(rig.link.channel.packets.length, 2, 'dropped request retries with a fresh M3 cell')
+
+  const ack = encodeBranchTeardown(rig.link.state, teardownId, M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1)
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, ack))
+  ack.fill(0)
+  t.is(await pending, true)
+  t.alike(
+    {
+      state: readM3RouteTransportDiagnostics(rig.transport).endpointTeardown,
+      timer: readM3RouteTransportDiagnostics(rig.transport).teardownTimer
+    },
+    { state: 'ACKED', timer: false },
+    'matching ACK settles exactly once and retires its retry timer'
+  )
+  const duplicate = encodeBranchTeardown(
+    rig.link.state,
+    teardownId,
+    M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1
+  )
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, duplicate))
+  duplicate.fill(0)
+  await microtasks()
+  t.is(readM3RouteTransportDiagnostics(rig.transport), null, 'duplicate ACK is replay-fatal')
+
+  const wrong = await routeTransportRig({ wireExpiresAt: 20_000n })
+  const wrongPending = beginM3RouteTeardown(wrong.transport, teardownId)
+  const wrongAck = encodeBranchTeardown(
+    wrong.link.state,
+    b4a.alloc(16, 0x92),
+    M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1
+  )
+  wrong.link.channel.deliverUnread(routeCell(wrong.link.state, wrong.counter, wrongAck))
+  wrongAck.fill(0)
+  const wrongError = await wrongPending.then(
+    () => null,
+    (err) => err
+  )
+  t.is(wrongError.code, 'ERR_AUTHENTICATION', 'wrong teardown id closes without authority')
+  t.is(readM3RouteTransportDiagnostics(wrong.transport), null)
+  const wrongClass = await routeTransportRig({ wireExpiresAt: 20_000n })
+  const classPending = beginM3RouteTeardown(wrongClass.transport, teardownId)
+  const classAck = encodeBranchTeardown(
+    wrongClass.link.state,
+    teardownId,
+    M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1
+  )
+  const streamContext = wrongClass.link.state.contexts[CELL_CLASS.STREAM].rx
+  const streamPacket = new CellCodec({ crypto: cryptoSuite, cellSize: 1200 }).seal({
+    key: streamContext.key,
+    noncePrefix: streamContext.noncePrefix,
+    senderCounter: new SenderCounter(),
+    class: CELL_CLASS.STREAM,
+    direction: DIRECTION.REVERSE,
+    epoch: wrongClass.link.state.generation,
+    circuitId: wrongClass.link.state.localId,
+    payload: classAck
+  })
+  wrongClass.link.channel.deliverUnread(streamPacket)
+  streamPacket.fill(0)
+  classAck.fill(0)
+  const classError = await classPending.then(
+    () => null,
+    (err) => err
+  )
+  t.is(classError.code, 'INVALID_ROUTE', 'fragmented or wrong-class control closes')
+  t.is(readM3RouteTransportDiagnostics(wrongClass.transport), null)
+
+  const wrongDirection = await routeTransportRig({ wireExpiresAt: 20_000n })
+  const directionPending = beginM3RouteTeardown(wrongDirection.transport, teardownId)
+  const directionAck = encodeBranchTeardown(
+    wrongDirection.link.state,
+    teardownId,
+    M3_MESSAGE_ID.BRANCH_TEARDOWN_ACK_V1
+  )
+  const datagramContext = wrongDirection.link.state.contexts[CELL_CLASS.DATAGRAM].rx
+  const directionPacket = new CellCodec({ crypto: cryptoSuite, cellSize: 1200 }).seal({
+    key: datagramContext.key,
+    noncePrefix: datagramContext.noncePrefix,
+    senderCounter: new SenderCounter(),
+    class: CELL_CLASS.DATAGRAM,
+    direction: DIRECTION.FORWARD,
+    epoch: wrongDirection.link.state.generation,
+    circuitId: wrongDirection.link.state.localId,
+    payload: directionAck
+  })
+  wrongDirection.link.channel.deliverUnread(directionPacket)
+  directionPacket.fill(0)
+  directionAck.fill(0)
+  const directionError = await directionPending.then(
+    () => null,
+    (err) => err
+  )
+  t.ok(directionError, 'wrong AEAD direction closes fail closed')
+  t.is(readM3RouteTransportDiagnostics(wrongDirection.transport), null)
+
+  const timed = await routeTransportRig({ wireExpiresAt: 20_000n })
+  const timedPending = beginM3RouteTeardown(timed.transport, b4a.alloc(16, 0x93))
+  for (let retry = 0; retry < 10; retry++) {
+    t.is(timed.clock.fireNext(), true)
+    await microtasks()
+  }
+  const timedError = await timedPending.then(
+    () => null,
+    (err) => err
+  )
+  t.is(timedError.code, 'ERR_PRIVACY_UNAVAILABLE')
+  t.is(readM3RouteTransportDiagnostics(timed.transport), null, 'timeout owns no transport')
+  t.is(timed.clock.pending(), 0, 'timeout owns no retry or runtime timer')
+})
+test('endpoint teardown rejects synchronous retry timer fire without rearming', async (t) => {
+  let synchronous = false
+  const handles = new Set()
+  const rig = await routeTransportRig(
+    { wireExpiresAt: 20_000n },
+    {
+      schedule(callback) {
+        if (synchronous) {
+          callback()
+          return Object.freeze({})
+        }
+        const handle = Object.freeze({})
+        handles.add(handle)
+        return handle
+      },
+      cancelScheduled(handle) {
+        handles.delete(handle)
+      }
+    }
+  )
+  synchronous = true
+  const pending = beginM3RouteTeardown(rig.transport, b4a.alloc(16, 0x95))
+  const error = await pending.then(
+    () => null,
+    (err) => err
+  )
+  t.is(error.code, 'ERR_PRIVACY_UNAVAILABLE')
+  t.is(readM3RouteTransportDiagnostics(rig.transport), null)
+  t.is(handles.size, 0, 'synchronous fire leaves no runtime or retry handle')
+})
+
+test('exit teardown joins release before ACK and bounds duplicate replay state', async (t) => {
+  const exitChannel = relayChannel({ holdSends: true })
+  const rig = await routeTransportRig({
+    initiator: false,
+    wireExpiresAt: 20_000n,
+    channel: exitChannel
+  })
+  const release = deferred()
+  let cleanupCalls = 0
+  registerM3RouteTeardownHandler(rig.transport, async () => {
+    cleanupCalls++
+    await release.promise
+  })
+  const teardownId = b4a.alloc(16, 0xa1)
+  const request = encodeBranchTeardown(rig.link.state, teardownId)
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, request))
+  request.fill(0)
+  await microtasks()
+  t.is(cleanupCalls, 1)
+  t.is(rig.link.channel.packets.length, 0, 'ACK is not emitted before joined release')
+  t.alike(
+    {
+      state: readM3RouteTransportDiagnostics(rig.transport).exitTeardown,
+      callback: readM3RouteTransportDiagnostics(rig.transport).teardownCallback
+    },
+    { state: 'DRAINING', callback: false },
+    'handler ownership moves before invocation'
+  )
+  release.resolve()
+  await microtasks()
+  t.is(rig.link.channel.packets.length, 1, 'ACK emits only after release resolves')
+  t.is(
+    readM3RouteTransportDiagnostics(rig.transport).cachedTeardownAckBytes,
+    BRANCH_TEARDOWN_BODY_BYTES,
+    'only one bounded ACK body is cached'
+  )
+
+  const duplicate = encodeBranchTeardown(rig.link.state, teardownId)
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, duplicate))
+  duplicate.fill(0)
+  await microtasks()
+  t.is(cleanupCalls, 1, 'same-id duplicate cannot run cleanup twice')
+  const duplicateWhileSending = encodeBranchTeardown(rig.link.state, teardownId)
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, duplicateWhileSending))
+  duplicateWhileSending.fill(0)
+  await microtasks()
+  t.is(rig.link.channel.packets.length, 1, 'duplicate ACK sends coalesce while one is pending')
+  t.is(rig.link.channel.pendingSends, 1)
+  t.is(rig.link.channel.releaseSend(), true)
+  await microtasks()
+  t.is(rig.link.channel.packets.length, 2, 'coalesced retry emits once after pending send')
+  t.is(rig.link.channel.pendingSends, 1)
+  t.is(rig.link.channel.releaseSend(), true)
+  await microtasks()
+  t.is(rig.link.channel.packets.length, 2, 'same-id duplicate resends cached ACK')
+
+  const replayed = encodeBranchTeardown(rig.link.state, b4a.alloc(16, 0xa2))
+  rig.link.channel.deliverUnread(routeCell(rig.link.state, rig.counter, replayed))
+  replayed.fill(0)
+  await microtasks()
+  t.is(readM3RouteTransportDiagnostics(rig.transport), null, 'different id closes fail closed')
+  t.is(rig.clock.pending(), 0, 'replay clears ACK, callback, and timer ownership')
+})
+
+test('endpoint, guard, middle, and exit enforce joined reverse ACK ordering', async (t) => {
+  const clock = fakeClock()
+  const owner = authority(clock)
+  const tuple = {
+    branchId: b4a.alloc(16, 0xb1),
+    circuitId: b4a.alloc(16, 0xb2),
+    generation: 9n,
+    wireExpiresAt: 100_000n
+  }
+  const endpointChannel = relayChannel()
+  const guardPreviousChannel = relayChannel()
+  const guardNextChannel = relayChannel()
+  const middlePreviousChannel = relayChannel()
+  const middleNextChannel = relayChannel()
+  const exitChannel = relayChannel()
+  const endpointLink = syntheticLink({
+    ...tuple,
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0xc1),
+    channel: endpointChannel
+  })
+  const guardPreviousLink = syntheticLink({
+    ...tuple,
+    initiator: false,
+    completeOfferDigest: b4a.alloc(32, 0xc1),
+    channel: guardPreviousChannel
+  })
+  const guardNextLink = syntheticLink({
+    ...tuple,
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0xc2),
+    channel: guardNextChannel
+  })
+  const middlePreviousLink = syntheticLink({
+    ...tuple,
+    initiator: false,
+    completeOfferDigest: b4a.alloc(32, 0xc2),
+    channel: middlePreviousChannel
+  })
+  const middleNextLink = syntheticLink({
+    ...tuple,
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0xc3),
+    channel: middleNextChannel
+  })
+  const exitLink = syntheticLink({
+    ...tuple,
+    initiator: false,
+    completeOfferDigest: b4a.alloc(32, 0xc3),
+    channel: exitChannel
+  })
+  const endpoint = await takeRouteTransport(owner, endpointLink, clock)
+  const exit = await takeRouteTransport(owner, exitLink, clock)
+  const guardPrevious = owner.adopt(guardPreviousLink.handle)
+  const guardNext = owner.adopt(guardNextLink.handle)
+  const middlePrevious = owner.adopt(middlePreviousLink.handle)
+  const middleNext = owner.adopt(middleNextLink.handle)
+  const trace = []
+  const exitRelease = deferred()
+  const middleRelease = deferred()
+  const guardRelease = deferred()
+  const guard = createM3RelayForwardingFacade(
+    guardPrevious.runtime,
+    guardNext.runtime,
+    relayOptions(clock, {
+      async releaseDownstream() {
+        trace.push('guard')
+        await guardRelease.promise
+        guardNextChannel.fail(new Error('intentional guard downstream close'))
+      }
+    })
+  )
+  const middle = createM3RelayForwardingFacade(
+    middlePrevious.runtime,
+    middleNext.runtime,
+    relayOptions(clock, {
+      async releaseDownstream() {
+        trace.push('middle')
+        await middleRelease.promise
+        middleNextChannel.fail(new Error('intentional middle downstream close'))
+      }
+    })
+  )
+  registerM3RouteTeardownHandler(exit, async () => {
+    trace.push('exit')
+    await exitRelease.promise
+  })
+  const cursors = Array.from({ length: 6 }, () => ({ index: 0 }))
+  const teardownId = b4a.alloc(16, 0xd1)
+  const pending = beginM3RouteTeardown(endpoint, teardownId)
+  await transferPackets(endpointChannel, guardPreviousChannel, cursors[0])
+  await transferPackets(guardNextChannel, middlePreviousChannel, cursors[1])
+  await transferPackets(middleNextChannel, exitChannel, cursors[2])
+  t.alike(trace, ['exit'])
+  t.is(exitChannel.packets.length, 0, 'exit holds ACK until route/link/grant release')
+
+  exitRelease.resolve()
+  await microtasks()
+  await transferPackets(exitChannel, middleNextChannel, cursors[3])
+  t.alike(trace, ['exit', 'middle'])
+  t.is(middlePreviousChannel.packets.length, 0, 'middle holds reverse ACK')
+  t.is(clock.fireNext(), true, 'endpoint retry fires while middle release is held')
+  await microtasks()
+  await transferPackets(endpointChannel, guardPreviousChannel, cursors[0])
+  await transferPackets(guardNextChannel, middlePreviousChannel, cursors[1])
+  t.is(
+    middleNextChannel.packets.length,
+    1,
+    'ACK-received middle suppresses retry instead of forwarding onto closing link'
+  )
+
+  middleRelease.resolve()
+  await microtasks()
+  t.is(middlePreviousChannel.packets.length, 1, 'first middle ACK is emitted')
+  cursors[4].index = 1
+  t.is(clock.fireNext(), true, 'endpoint retries after dropped middle ACK')
+  await microtasks()
+  await transferPackets(endpointChannel, guardPreviousChannel, cursors[0])
+  await transferPackets(guardNextChannel, middlePreviousChannel, cursors[1])
+  await transferPackets(middlePreviousChannel, guardNextChannel, cursors[4])
+  t.is(middlePreviousChannel.packets.length, 2, 'middle cached ACK answers retry')
+  t.alike(trace, ['exit', 'middle', 'guard'])
+  t.is(guardPreviousChannel.packets.length, 0, 'guard holds reverse ACK')
+
+  guardRelease.resolve()
+  await microtasks()
+  t.is(guardPreviousChannel.packets.length, 1, 'first guard ACK is emitted')
+  cursors[5].index = 1
+  t.is(clock.fireNext(), true, 'endpoint retries after dropped guard ACK')
+  await microtasks()
+  await transferPackets(endpointChannel, guardPreviousChannel, cursors[0])
+  await transferPackets(guardPreviousChannel, endpointChannel, cursors[5])
+  t.is(guardPreviousChannel.packets.length, 2, 'guard cached ACK answers retry')
+  t.is(await pending, true)
+  t.alike(trace, ['exit', 'middle', 'guard'], 'release order is exact and one-shot')
+  destroyM3RouteTransport(endpoint)
+  destroyM3RouteTransport(exit)
+  guardPrevious.runtime.destroy()
+  guardNext.runtime.destroy()
+  middlePrevious.runtime.destroy()
+  middleNext.runtime.destroy()
+  guard.destroy()
+  middle.destroy()
 })
 
 test('M3 authority requires separate wall, monotonic, scheduler, and canceller capabilities', (t) => {
@@ -652,7 +1127,11 @@ test('terminal relay loss retires every installed logical pair after upstream de
     })
     const previous = owner.adopt(previousLink.handle)
     const next = owner.adopt(nextLink.handle)
-    const forwarding = createM3RelayForwardingFacade(previous.runtime, next.runtime)
+    const forwarding = createM3RelayForwardingFacade(
+      previous.runtime,
+      next.runtime,
+      relayOptions(clock)
+    )
     const plan = beginM3Install(previous.runtime, next.runtime)
     validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
     const installed = commitM3Install(plan, 2_000n, forwarding)
@@ -687,7 +1166,11 @@ test('received BRANCH_DESTROY retires the installed logical pair without a casca
   })
   const previous = owner.adopt(previousLink.handle)
   const next = owner.adopt(nextLink.handle)
-  const forwarding = createM3RelayForwardingFacade(previous.runtime, next.runtime)
+  const forwarding = createM3RelayForwardingFacade(
+    previous.runtime,
+    next.runtime,
+    relayOptions(clock)
+  )
   const plan = beginM3Install(previous.runtime, next.runtime)
   validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
   const installed = commitM3Install(plan, 2_000n, forwarding)
@@ -724,7 +1207,11 @@ test('received BRANCH_DESTROY rejection still retires the installed logical pair
   })
   const previous = owner.adopt(previousLink.handle)
   const next = owner.adopt(nextLink.handle)
-  const forwarding = createM3RelayForwardingFacade(previous.runtime, next.runtime)
+  const forwarding = createM3RelayForwardingFacade(
+    previous.runtime,
+    next.runtime,
+    relayOptions(clock)
+  )
   const plan = beginM3Install(previous.runtime, next.runtime)
   validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
   const installed = commitM3Install(plan, 2_000n, forwarding)

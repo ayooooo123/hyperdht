@@ -524,7 +524,8 @@ async function nativeM3TransferPair(basePort) {
 function selectedPath(guard, middle, exit) {
   const sink = createRelayCandidateDirectorySink({
     wallNow: () => NOW,
-    monotonicNow: () => 10_000n
+    monotonicNow: () => 10_000n,
+    randomBytes: (size) => b4a.alloc(size)
   })
   const alternateMiddle = candidate(ROLE.SAFETY, 2, 3)
   const alternateExit = candidate(ROLE.PRIVATE, 1, 41)

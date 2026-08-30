@@ -233,7 +233,7 @@ function createProjectedLinkService(options) {
     const record = sessionGrants.get(session)
     if (!record) return false
     sessionGrants.delete(session)
-    consumed.delete(record.key)
+    if (record.key !== null) consumed.delete(record.key)
     try {
       record.directory.destroy()
     } catch {}
@@ -544,6 +544,19 @@ function createProjectedLinkService(options) {
     return endpointModule.createM3CellLinkTransferIssuer(endpoint, link.established)
   }
 
+  function releaseLinkGrant(link) {
+    if (destroyed) return false
+    const session = linkSessions.get(link)
+    const record = session ? sessionGrants.get(session) : null
+    if (!record || record.releasing) return false
+    // Keep the replay key until the ACK recipient tears down this physical route.
+    // That prevents a second live session from racing the signed grant through the
+    // ACK window; receiveLinkFailure then closes the old session and releaseGrant
+    // deletes exactly its still-owned key before reconnect can authorize reuse.
+    record.releasing = true
+    return true
+  }
+
   async function faultLink(link) {
     if (destroyed) return false
     const session = linkSessions.get(link)
@@ -602,6 +615,7 @@ function createProjectedLinkService(options) {
     initiate,
     openSetupTransport,
     prearmAccept,
+    releaseLinkGrant,
     prearmAcceptAny,
     receiveBootstrap,
     receiveCell,
@@ -643,6 +657,9 @@ function createTailRelayActor(options) {
     identitySecretKey,
     clocks,
     outgoing = null,
+    incomingLink: initialIncomingLink = null,
+    incomingLinkService: initialIncomingLinkService = null,
+    incomingRelease: initialIncomingRelease = null,
     incomingPhysicalChannel: initialIncomingPhysicalChannel = null,
     attachments = []
   } = options
@@ -655,7 +672,9 @@ function createTailRelayActor(options) {
     typeof clocks.wallNow !== 'function' ||
     typeof clocks.monotonicNow !== 'function' ||
     typeof clocks.schedule !== 'function' ||
-    typeof clocks.cancelScheduled !== 'function'
+    typeof clocks.cancelScheduled !== 'function' ||
+    (initialIncomingRelease !== null && typeof initialIncomingRelease !== 'function') ||
+    (initialIncomingLink === null) !== (initialIncomingLinkService === null)
   ) {
     throw PrivateRouteError.INVALID_ROUTE()
   }
@@ -683,7 +702,12 @@ function createTailRelayActor(options) {
   let outgoingPhysicalChannel = null
   let outgoingLink = null
   let outgoingLinkService = null
+  let outgoingFaultRelease = null
   let incomingPhysicalChannel = initialIncomingPhysicalChannel
+  let incomingLink = initialIncomingLink
+  let incomingLinkService = initialIncomingLinkService
+  let incomingRelease = initialIncomingRelease
+  let incomingReleaseTaken = false
   let destroyed = false
   const sends = []
 
@@ -781,12 +805,41 @@ function createTailRelayActor(options) {
       cancelScheduled: clocks.cancelScheduled,
       destroy() {}
     })
+    const takeOutgoingRelease = () => {
+      if (outgoingLink === null || outgoingLinkService === null) {
+        throw PrivateRouteError.ERR_PRIVACY_UNAVAILABLE()
+      }
+      let link = outgoingLink
+      let service = outgoingLinkService
+      outgoingLink = null
+      outgoingLinkService = null
+      const release = async () => {
+        if (link === null || service === null) return false
+        const ownedLink = link
+        const ownedService = service
+        link = null
+        service = null
+        outgoingPhysicalChannel = null
+        return ownedService.faultLink(ownedLink)
+      }
+      outgoingFaultRelease = release
+      return release
+    }
+    const takeUpstreamRelease = () =>
+      typeof incomingRelease === 'function' ? takeIncomingRelease() : takeIncomingGrantRelease()
+
     committer = createTailExtensionCommitter({
       enqueue(value) {
         sends.push(transport.send(value))
       },
       install(nextRuntime, expiresAt) {
-        forwarding = createM3RelayForwardingFacade(adjacency.runtime, nextRuntime)
+        forwarding = createM3RelayForwardingFacade(adjacency.runtime, nextRuntime, {
+          releaseDownstream: takeOutgoingRelease(),
+          releaseUpstream: takeUpstreamRelease(),
+          monotonicNow: clocks.monotonicNow,
+          schedule: clocks.schedule,
+          cancelScheduled: clocks.cancelScheduled
+        })
         const install = beginM3Install(adjacency.runtime, nextRuntime)
         validateM3Install(install, identityPublicKey, 128, clocks.wallNow())
         return commitM3Install(install, expiresAt, forwarding)
@@ -850,6 +903,48 @@ function createTailRelayActor(options) {
     ready.fill(0)
   }
 
+  function takeIncomingRelease() {
+    if (incomingReleaseTaken) throw PrivateRouteError.ERR_REPLAY()
+    if (typeof incomingRelease === 'function') {
+      incomingReleaseTaken = true
+      const release = incomingRelease
+      incomingRelease = null
+      return async () => {
+        incomingPhysicalChannel = null
+        return release()
+      }
+    }
+    if (incomingLink === null || incomingLinkService === null) {
+      throw PrivateRouteError.ERR_REPLAY()
+    }
+    incomingReleaseTaken = true
+    const link = incomingLink
+    const service = incomingLinkService
+    incomingLink = null
+    incomingLinkService = null
+    return async () => {
+      incomingPhysicalChannel = null
+      return service.faultLink(link)
+    }
+  }
+
+  function takeIncomingGrantRelease() {
+    if (
+      incomingReleaseTaken ||
+      incomingLink === null ||
+      incomingLinkService === null ||
+      typeof incomingLinkService.releaseLinkGrant !== 'function'
+    ) {
+      throw PrivateRouteError.ERR_REPLAY()
+    }
+    incomingReleaseTaken = true
+    const link = incomingLink
+    const service = incomingLinkService
+    incomingLink = null
+    incomingLinkService = null
+    return async () => service.releaseLinkGrant(link)
+  }
+
   function faultIncomingPhysicalLink() {
     if (destroyed || !incomingPhysicalChannel) return false
     const channel = incomingPhysicalChannel
@@ -862,13 +957,10 @@ function createTailRelayActor(options) {
     // The M3 install replaces the taken issuer with its own transfer, so destroying
     // the issuer is a no-op. Closing the owning link session invalidates the UDX
     // record, which reports a physical loss and makes this relay emit BRANCH_DESTROY.
-    if (destroyed || outgoingLink === null || outgoingLinkService === null) return false
-    const link = outgoingLink
-    const service = outgoingLinkService
-    outgoingLink = null
-    outgoingLinkService = null
-    outgoingPhysicalChannel = null
-    void service.faultLink(link).catch(() => {})
+    if (destroyed || typeof outgoingFaultRelease !== 'function') return false
+    const release = outgoingFaultRelease
+    outgoingFaultRelease = null
+    void release().catch(() => {})
     return true
   }
 
@@ -886,6 +978,11 @@ function createTailRelayActor(options) {
       outgoingLink = null
       outgoingLinkService = null
       void service.faultLink(link).catch(() => {})
+    }
+    if (typeof outgoingFaultRelease === 'function') {
+      const release = outgoingFaultRelease
+      outgoingFaultRelease = null
+      void release().catch(() => {})
     }
     clearSelection(selection)
     selection = null
@@ -920,6 +1017,8 @@ function createTailRelayActor(options) {
     authority,
     destroy,
     faultIncomingPhysicalLink,
+    takeIncomingRelease,
+    takeIncomingGrantRelease,
     faultOutgoingPhysicalLink,
     get forwarding() {
       return forwarding
@@ -1016,6 +1115,8 @@ async function acceptProjectedExtension(options) {
       identitySecretKey,
       clocks,
       outgoing,
+      incomingLink: opened,
+      incomingLinkService: linkService,
       incomingPhysicalChannel,
       attachments: [
         {
@@ -1155,6 +1256,13 @@ async function activateFinalExitActor(options) {
   ) {
     throw PrivateRouteError.INVALID_ROUTE()
   }
+  const releaseIncoming = actor.takeIncomingGrantRelease()
+  let incomingReleaseInvoked = false
+  const releaseOwnedIncoming = async () => {
+    if (incomingReleaseInvoked) return false
+    incomingReleaseInvoked = true
+    return releaseIncoming()
+  }
   // What the reservation calls its local address, which a peer's reply must echo.
   const observedLocal = advertised === undefined ? local : advertised
   const tupleDigest = digestTestIsolatedAddressTuple({
@@ -1268,6 +1376,7 @@ async function activateFinalExitActor(options) {
     await sendReservedExitDhtPacket(io, probe.sendAuthority)
     settleExitDhtReservation(probe.settlementAuthority, await waitReply())
     installDhtExitRoute(io, table, {
+      releaseIncoming: releaseOwnedIncoming,
       async reserveReferralCandidate({ candidate, referralReplyAuthority, absoluteDeadline }) {
         if (isolatedGrantOutstanding) throw PrivateRouteError.COUNTER_EXHAUSTED()
         isolatedGrantOutstanding = true
@@ -1354,6 +1463,7 @@ async function activateFinalExitActor(options) {
     })
   } catch (err) {
     if (io) await destroyDhtExitIO(io)
+    if (!incomingReleaseInvoked) await releaseOwnedIncoming().catch(() => {})
     if (table) destroyDhtExitDestinationTable(table)
     if (responder) responder.destroy()
     if (signingOwner) destroyRelayIdentitySigningAuthority(signingOwner)
@@ -1509,6 +1619,9 @@ function createGuardProcessService(options) {
               allowedRole: ROLE.SAFETY,
               resolve: resolveMiddle
             },
+            // The route runtime closes this endpoint-owned logical channel after the
+            // ACK is observed; closing it in the send turn can discard the queued ACK.
+            incomingRelease: async () => true,
             attachments: [
               {
                 destroy() {

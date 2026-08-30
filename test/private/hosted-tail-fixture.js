@@ -195,7 +195,13 @@ function createHostedTailResponder({
       sends.push(transport.send(value))
     },
     install(nextRuntime, expiresAt) {
-      forwarding = createM3RelayForwardingFacade(adjacency.runtime, nextRuntime)
+      forwarding = createM3RelayForwardingFacade(adjacency.runtime, nextRuntime, {
+        releaseDownstream: async () => {},
+        releaseUpstream: async () => {},
+        monotonicNow: clocks.monotonicNow,
+        schedule: clocks.schedule,
+        cancelScheduled: clocks.cancelScheduled
+      })
       const install = beginM3Install(adjacency.runtime, nextRuntime)
       validateM3Install(install, identity.publicKey, 128, clocks.wallNow())
       return commitM3Install(install, expiresAt, forwarding)

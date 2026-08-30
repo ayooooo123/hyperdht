@@ -1704,7 +1704,13 @@ test('TailControl responder installs a native next tail through production exten
         },
         install(nextRuntime) {
           try {
-            const forwarding = createM3RelayForwardingFacade(responder.runtime, nextRuntime)
+            const forwarding = createM3RelayForwardingFacade(responder.runtime, nextRuntime, {
+              releaseDownstream: async () => {},
+              releaseUpstream: async () => {},
+              monotonicNow: clock.monotonicNow,
+              schedule: clock.schedule,
+              cancelScheduled: clock.cancelScheduled
+            })
             const plan = beginM3Install(responder.runtime, nextRuntime)
             validateM3Install(plan, currentIdentity.publicKey, 128, clock.wallNow())
             return commitM3Install(plan, 4_500n, forwarding)

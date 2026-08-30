@@ -13,6 +13,7 @@ const {
 const { fragment, Reassembler } = require('../../lib/private/fragments')
 const {
   M3AdjacencyAuthority,
+  beginM3RouteTeardown,
   deriveM3CellIds,
   destroyM3RouteTransport,
   receiveM3RouteFrame,
@@ -454,6 +455,7 @@ test('DHTExitIO terminal pump executes routed immutable get over owned M3 transp
   const fake = new FakeSocket()
   const replies = []
   const pair = routeTransportPair()
+  let incomingReleases = 0
   const route = {
     payloadDigest: seed(0x21),
     payloadForwardKey: seed(0x22),
@@ -502,7 +504,14 @@ test('DHTExitIO terminal pump executes routed immutable get over owned M3 transp
   fake.message(responseFor(fake.sends[0].packet, 0), { host: '8.8.8.8', port: 49737 })
   const destinationRef = settleExitDhtReservation(probe.settlementAuthority, replies[0])
   const destination = readDhtExitDestinationRef(table, destinationRef)
-  t.is(installDhtExitRoute(io, table), true)
+  t.is(
+    installDhtExitRoute(io, table, {
+      async releaseIncoming() {
+        incomingReleases++
+      }
+    }),
+    true
+  )
 
   const endpointCodec = routePayloadCodec(ROUTE_ENDPOINT.SOURCE, route)
   const replyReassembler = new Reassembler({
@@ -559,11 +568,17 @@ test('DHTExitIO terminal pump executes routed immutable get over owned M3 transp
     valuePresent: true,
     value: b4a.from([0xaa])
   })
-  expectCode(t, () => installDhtExitRoute(io, table), 'ERR_AUTHENTICATION')
+  expectCode(
+    t,
+    () => installDhtExitRoute(io, table, { releaseIncoming: async () => {} }),
+    'ERR_AUTHENTICATION'
+  )
   encodedReply.fill(0)
   replyReassembler.destroy()
   endpointCodec.destroy()
   closeDhtExitIO(io)
+  await waitFor(() => incomingReleases === 1)
+  t.is(incomingReleases, 1, 'ordinary close joins transferred incoming release exactly once')
   destroyDhtExitDestinationTable(table)
   destroyM3RouteTransport(pair.endpoint)
 })
@@ -649,7 +664,7 @@ test('DHTExitIO derives the routed operation deadline once for admission and res
   const destinationRef = settleExitDhtReservation(probe.settlementAuthority, replies[0])
   const destination = readDhtExitDestinationRef(table, destinationRef)
   t.is(destination.expiresAt, operationDeadline)
-  t.is(installDhtExitRoute(io, table), true)
+  t.is(installDhtExitRoute(io, table, { releaseIncoming: async () => {} }), true)
 
   const endpointCodec = routePayloadCodec(ROUTE_ENDPOINT.SOURCE, route)
   const replyReassembler = new Reassembler({
@@ -709,4 +724,115 @@ test('DHTExitIO derives the routed operation deadline once for admission and res
   closeDhtExitIO(io)
   destroyDhtExitDestinationTable(table)
   destroyM3RouteTransport(pair.endpoint)
+})
+test('DHTExitIO drains active route ownership and joins incoming release before ACK', async (t) => {
+  const fake = new FakeSocket()
+  const replies = []
+  const pair = routeTransportPair()
+  const route = {
+    payloadDigest: seed(0xa1),
+    payloadForwardKey: seed(0xa2),
+    payloadReverseKey: seed(0xa3),
+    payloadForwardNoncePrefix: seed(0xa4, 16),
+    payloadReverseNoncePrefix: seed(0xa5, 16)
+  }
+  const authority = TEST_ONLY_DHT_EXIT_OPEN_ISSUER.create(
+    {
+      branchClass: BRANCH_CLASS.LOOKUP,
+      branchId: seed(0x11, 16),
+      circuitId: seed(0x12, 16),
+      generation: 7n,
+      exitIdentity: seed(0x13),
+      finalTranscriptDigest: seed(0x14),
+      expiresAt: 20_000n,
+      absoluteDeadline: 19_000n,
+      controlKey: seed(0x15),
+      controlNoncePrefix: seed(0x16, 16)
+    },
+    { transport: pair.exit, ...route }
+  )
+  const channel = createDhtExitReservationChannel(authority)
+  const table = createDhtExitDestinationTable(channel.tableIssuer, {
+    local: { host: '10.1.2.3', port: 41234 },
+    configuredBootstrap: [{ host: '8.8.8.8', port: 49737 }],
+    monotonicNow: () => 1_000n,
+    randomBytes: seed
+  })
+  const io = createDhtExitIOForTest(
+    {
+      host: '10.1.2.3',
+      port: 41234,
+      monotonicNow: () => 1_000n,
+      schedule: () => Object.freeze({}),
+      cancelScheduled() {},
+      onReply(replyAuthority) {
+        replies.push(replyAuthority)
+      }
+    },
+    TEST_ONLY_DHT_EXIT_SOCKET_ISSUER.create(() => fake),
+    consumeDhtExitReservationIOConsumer(channel.ioConsumer)
+  )
+  const probe = reserveConfiguredBootstrapProbe(table, 0, 2_000n)
+  sendReservedExitDhtPacket(io, probe.sendAuthority)
+  fake.message(responseFor(fake.sends[0].packet, 0), { host: '8.8.8.8', port: 49737 })
+  const destinationRef = settleExitDhtReservation(probe.settlementAuthority, replies.shift())
+  const destination = readDhtExitDestinationRef(table, destinationRef)
+  let releaseIncoming
+  const releaseHeld = new Promise((resolve) => {
+    releaseIncoming = resolve
+  })
+  let releases = 0
+  t.is(
+    installDhtExitRoute(io, table, {
+      async releaseIncoming() {
+        releases++
+        t.is(
+          TEST_ONLY_DHT_EXIT_IO_STATE.snapshot(io).activeOperations,
+          0,
+          'active operation is cancelled before incoming release begins'
+        )
+        await releaseHeld
+      }
+    }),
+    true
+  )
+  const endpointCodec = routePayloadCodec(ROUTE_ENDPOINT.SOURCE, route)
+  const encodedRequest = encodeRoutedRequest({
+    requestId: seed(0x91, 16),
+    operationClass: BRANCH_CLASS.LOOKUP,
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    operationBudgetMs: 2_000n,
+    destination: { id: destination.id, handle: destination.handle },
+    encodedBody: seed(0x92)
+  })
+  for (const payload of fragment(encodedRequest, { randomBytes: (size) => seed(0x93, size) })) {
+    const frame = endpointCodec.seal({
+      direction: DIRECTION.FORWARD,
+      class: CELL_CLASS.DATAGRAM,
+      payload
+    })
+    await sendM3RouteFrame(pair.endpoint, frame)
+    frame.fill(0)
+    payload.fill(0)
+  }
+  encodedRequest.fill(0)
+  await waitFor(() => fake.sends.length === 2)
+  t.is(TEST_ONLY_DHT_EXIT_IO_STATE.snapshot(io).activeOperations, 1)
+
+  let settled = false
+  const teardown = beginM3RouteTeardown(pair.endpoint, seed(0x94, 16)).then(() => {
+    settled = true
+  })
+  await waitFor(() => releases === 1)
+  t.is(settled, false, 'endpoint observes no ACK while incoming close/grant release is held')
+  t.is(TEST_ONLY_DHT_EXIT_IO_STATE.snapshot(io).pendingPackets, 0)
+  releaseIncoming()
+  await teardown
+  t.is(settled, true, 'ACK follows the joined release')
+  t.is(releases, 1, 'cleanup is one-shot')
+  endpointCodec.destroy()
+  closeDhtExitIO(io)
+  destroyDhtExitDestinationTable(table)
+  destroyM3RouteTransport(pair.endpoint)
+  destroyM3RouteTransport(pair.exit)
 })

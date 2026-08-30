@@ -3,6 +3,7 @@
 const test = require('brittle')
 const b4a = require('b4a')
 
+const { PrivateRouteError } = require('../../lib/private/errors')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const {
   createEndpointBootstrapAuthority
@@ -12,6 +13,17 @@ const {
   TEST_ONLY_PRIVATE_ROUTING_CONTROLLER_ISSUER,
   createPrivateRoutingController
 } = require('../../lib/private/private-routing-controller')
+const { BRANCH_CLASS } = require('../../lib/private/protocol')
+const {
+  createFinalExitActivationFactory,
+  createRouteExtensionFactory,
+  createRouteManager,
+  TEST_ONLY_ROUTE_MANAGER_OBSERVER,
+  TEST_ONLY_ROUTE_MANAGER_FACTORY_ISSUER
+} = require('../../lib/private/route-manager')
+const openRouteHandoff = require('../../lib/private/open-route-handoff')
+const opaqueDestination = require('../../lib/private/opaque-destination')
+const { liveTopologyFixture } = require('./live-topology-fixture')
 
 const seed = (value) => b4a.alloc(32, value)
 
@@ -35,6 +47,153 @@ function methodNames(controller) {
   return Object.getOwnPropertyNames(Object.getPrototypeOf(controller))
     .filter((name) => name !== 'constructor')
     .sort()
+}
+function sequenceId(first) {
+  return (size) => b4a.alloc(size, first++)
+}
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
+}
+
+const TEST_ONLY_BRANCH_SEED_READY_ISSUER = Symbol.for(
+  'hyperdht-private-routes/test-only-branch-seed-ready-issuer'
+)
+
+function openMaterial(branch, value) {
+  return {
+    expiresAt: 20_000n,
+    branchClass: branch.branchClass,
+    branchId: b4a.from(branch.branchId),
+    circuitId: b4a.from(branch.circuitId),
+    generation: branch.generation,
+    exitIdentity: b4a.from(branch.exit.identity),
+    policyDigest: b4a.alloc(32, value + 1),
+    payloadDigest: b4a.alloc(32, value + 2),
+    payloadForwardKey: b4a.alloc(32, value + 3),
+    payloadReverseKey: b4a.alloc(32, value + 4),
+    payloadForwardNoncePrefix: b4a.alloc(16, value + 5),
+    payloadReverseNoncePrefix: b4a.alloc(16, value + 6),
+    controlForwardKey: b4a.alloc(32, value + 7),
+    controlReverseKey: b4a.alloc(32, value + 8),
+    controlForwardNoncePrefix: b4a.alloc(16, value + 9),
+    controlReverseNoncePrefix: b4a.alloc(16, value + 10)
+  }
+}
+
+async function readySuspendFixture(t, port, handlers) {
+  const topology = await liveTopologyFixture(port, port + 1)
+  const randomBytes = sequenceId(0x31)
+  const manager = createRouteManager({
+    guardLease: topology.guardLease,
+    candidateDirectory: topology.directory,
+    extensionFactory: createRouteExtensionFactory({
+      wallNow: topology.clock.wallNow,
+      monotonicNow: topology.clock.monotonicNow,
+      randomBytes,
+      schedule: topology.clock.schedule,
+      cancelScheduled: topology.clock.cancelScheduled
+    }),
+    terminalFactory: createFinalExitActivationFactory({
+      wallNow: topology.clock.wallNow,
+      monotonicNow: topology.clock.monotonicNow,
+      randomBytes,
+      schedule: topology.clock.schedule,
+      cancelScheduled: topology.clock.cancelScheduled
+    }),
+    monotonicNow: topology.clock.monotonicNow,
+    randomBytes
+  })
+  manager.buildInitialPair()
+  const draft = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().draft
+  const lookupMaterial = openMaterial(draft.lookup, 0x91)
+  const announceMaterial = openMaterial(draft.announce, 0xa1)
+  const handoffs = { lookup: Object.freeze({}), announce: Object.freeze({}) }
+  const handoffMaterials = new Map([
+    [handoffs.lookup, lookupMaterial],
+    [handoffs.announce, announceMaterial]
+  ])
+  const originals = {
+    consumeOpenRouteHandoff: openRouteHandoff.consumeOpenRouteHandoff,
+    revokeOpenRouteHandoff: openRouteHandoff.revokeOpenRouteHandoff,
+    destroyOpenRouteMaterial: openRouteHandoff.destroyOpenRouteMaterial
+  }
+  Object.assign(openRouteHandoff, {
+    consumeOpenRouteHandoff(handoff) {
+      const material = handoffMaterials.get(handoff)
+      if (!material) throw PrivateRouteError.UNAUTHORIZED()
+      handoffMaterials.delete(handoff)
+      return material
+    },
+    revokeOpenRouteHandoff() {
+      return false
+    },
+    destroyOpenRouteMaterial: handlers.destroyOpenRouteMaterial
+  })
+  const restoreTeardown = TEST_ONLY_ROUTE_MANAGER_FACTORY_ISSUER.installTeardown(
+    handlers.teardownOpenRouteMaterial
+  )
+  manager.publishInitialPair(handoffs)
+  manager.publishInitialSeedPair({
+    lookup: opaqueDestination[TEST_ONLY_BRANCH_SEED_READY_ISSUER].create({
+      branchClass: BRANCH_CLASS.LOOKUP,
+      branchId: lookupMaterial.branchId,
+      circuitId: lookupMaterial.circuitId,
+      generation: lookupMaterial.generation,
+      exitIdentity: lookupMaterial.exitIdentity,
+      expiresAt: lookupMaterial.expiresAt
+    }),
+    announce: opaqueDestination[TEST_ONLY_BRANCH_SEED_READY_ISSUER].create({
+      branchClass: BRANCH_CLASS.ANNOUNCE,
+      branchId: announceMaterial.branchId,
+      circuitId: announceMaterial.circuitId,
+      generation: announceMaterial.generation,
+      exitIdentity: announceMaterial.exitIdentity,
+      expiresAt: announceMaterial.expiresAt
+    })
+  })
+  const controller = createPrivateRoutingController({
+    endpointBootstrapAuthority: authority(port & 0xff, port + 2)
+  })
+  const trace = handlers.trace
+  const routedDHTIO = {
+    async suspend() {
+      trace.push('applications-stopped')
+    },
+    async destroy() {
+      trace.push('transport-destroyed')
+    }
+  }
+  const liveRouteAuthority = {
+    destroy() {
+      trace.push('authority-destroyed')
+    }
+  }
+  TEST_ONLY_PRIVATE_ROUTING_CONTROLLER_ISSUER.installReadyForSuspend(controller, {
+    routeManager: manager,
+    routedDHTIO,
+    liveRouteAuthority,
+    guardLease: topology.guardLease
+  })
+  return {
+    announceMaterial,
+    controller,
+    lookupMaterial,
+    manager,
+    topology,
+    async close() {
+      restoreTeardown()
+      Object.assign(openRouteHandoff, originals)
+      await controller.destroy()
+      await topology.close()
+    }
+  }
 }
 
 test('private routing controller exposes only the internal lifecycle surface', async (t) => {
@@ -218,4 +377,138 @@ test('BOOTSTRAPPING network change closes endpoint ownership before start can co
   t.is(controller.snapshot().generation, generation)
   t.alike(controller.snapshot().packetEdges, [])
   await controller.destroy()
+})
+test('controller suspend awaits the manager teardown transaction before reconnect publication', async (t) => {
+  const trace = []
+  const lookupAck = deferred()
+  const announceAck = deferred()
+  let fixture
+  try {
+    fixture = await readySuspendFixture(t, 48131, {
+      trace,
+      teardownOpenRouteMaterial(material) {
+        trace.push(`teardown:${material.branchClass}`)
+        return material.branchClass === BRANCH_CLASS.LOOKUP
+          ? lookupAck.promise
+          : announceAck.promise
+      },
+      destroyOpenRouteMaterial(material) {
+        trace.push(`destroy:${material.branchClass}`)
+        return true
+      }
+    })
+    let settled = false
+    const suspending = fixture.controller.suspend().then(() => {
+      settled = true
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    t.alike(trace, [
+      'applications-stopped',
+      `teardown:${BRANCH_CLASS.LOOKUP}`,
+      `teardown:${BRANCH_CLASS.ANNOUNCE}`
+    ])
+    t.is(settled, false)
+    t.is(fixture.controller.snapshot().reconnect, false)
+    lookupAck.resolve(true)
+    await Promise.resolve()
+    t.is(settled, false, 'one branch cannot publish reconnect')
+    announceAck.resolve(true)
+    await suspending
+    t.is(fixture.controller.snapshot().state, PRIVATE_ROUTING_STATE.SUSPENDED)
+    t.is(fixture.controller.snapshot().reconnect, true)
+    t.alike(trace, [
+      'applications-stopped',
+      `teardown:${BRANCH_CLASS.LOOKUP}`,
+      `teardown:${BRANCH_CLASS.ANNOUNCE}`,
+      `destroy:${BRANCH_CLASS.LOOKUP}`,
+      `destroy:${BRANCH_CLASS.ANNOUNCE}`,
+      'transport-destroyed',
+      'authority-destroyed'
+    ])
+    t.is(await fixture.controller.networkChanged(), true)
+    t.is(fixture.controller.snapshot().state, PRIVATE_ROUTING_STATE.UNAVAILABLE)
+  } finally {
+    if (fixture) await fixture.close()
+  }
+})
+
+test('network change during teardown cancels both branches and leaves zero ownership', async (t) => {
+  const trace = []
+  const held = new Map()
+  let fixture
+  try {
+    fixture = await readySuspendFixture(t, 48141, {
+      trace,
+      teardownOpenRouteMaterial(material) {
+        const operation = deferred()
+        held.set(material, operation)
+        trace.push(`teardown:${material.branchClass}`)
+        return operation.promise
+      },
+      destroyOpenRouteMaterial(material) {
+        trace.push(`destroy:${material.branchClass}`)
+        const operation = held.get(material)
+        if (operation) operation.reject(PrivateRouteError.ERR_DESTROYED())
+        return true
+      }
+    })
+    const suspending = fixture.controller.suspend()
+    await Promise.resolve()
+    await Promise.resolve()
+    t.is(await fixture.controller.networkChanged(), true)
+    await t.exception(suspending)
+    const snapshot = fixture.controller.snapshot()
+    t.is(snapshot.state, PRIVATE_ROUTING_STATE.UNAVAILABLE)
+    t.is(snapshot.routeManager, false)
+    t.is(snapshot.guardLease, false)
+    t.is(snapshot.reconnect, false)
+    t.is(snapshot.routedDHTIO, false)
+    t.is(snapshot.liveRouteAuthority, false)
+    t.is(snapshot.timers, 0)
+    t.is(
+      new Set(trace.filter((value) => value.startsWith('destroy:'))).size,
+      2,
+      'both exact branch owners are destroyed'
+    )
+  } finally {
+    if (fixture) await fixture.close()
+  }
+})
+
+test('destroy during teardown joins cancellation and reaches zero-state', async (t) => {
+  const trace = []
+  const held = new Map()
+  let fixture
+  try {
+    fixture = await readySuspendFixture(t, 48151, {
+      trace,
+      teardownOpenRouteMaterial(material) {
+        const operation = deferred()
+        held.set(material, operation)
+        return operation.promise
+      },
+      destroyOpenRouteMaterial(material) {
+        const operation = held.get(material)
+        if (operation) operation.reject(PrivateRouteError.ERR_DESTROYED())
+        return true
+      }
+    })
+    const suspending = fixture.controller.suspend()
+    await Promise.resolve()
+    await Promise.resolve()
+    await fixture.controller.destroy()
+    await t.exception(suspending)
+    const snapshot = fixture.controller.snapshot()
+    t.is(snapshot.state, PRIVATE_ROUTING_STATE.DESTROYED)
+    t.is(snapshot.routeManager, false)
+    t.is(snapshot.guardLease, false)
+    t.is(snapshot.reconnect, false)
+    t.is(snapshot.endpointSockets, 0)
+    t.is(snapshot.timers, 0)
+    t.is(snapshot.handles, 0)
+    t.is(snapshot.callbacks, 0)
+  } finally {
+    if (fixture) await fixture.close()
+  }
 })

@@ -372,6 +372,10 @@ function fixture(options = {}) {
     monotonicDeadline:
       options.reconnectDeadline === undefined ? 10_000 : Number(options.reconnectDeadline)
   })
+  const randomBytes = (size) => {
+    if (options.onRandomBytes) options.onRandomBytes({ io, clock, size })
+    return b4a.alloc(size, 0x44)
+  }
   const sink = createRelayCandidateDirectorySink({
     wallNow() {
       if (options.onSinkWall) options.onSinkWall({ io, clock })
@@ -380,7 +384,8 @@ function fixture(options = {}) {
     monotonicNow() {
       if (options.onSinkMonotonic) options.onSinkMonotonic({ io, clock })
       return clock.monotonicNow()
-    }
+    },
+    randomBytes
   })
   const ioOptions = {
     endpoints: configured,
@@ -389,10 +394,7 @@ function fixture(options = {}) {
     datagrams: datagramAuthority,
     wallNow: clock.wallNow,
     monotonicNow: clock.monotonicNow,
-    randomBytes(size) {
-      if (options.onRandomBytes) options.onRandomBytes({ io, clock, size })
-      return b4a.alloc(size, 0x44)
-    },
+    randomBytes,
     candidateDirectorySink: sink
   }
   io =
@@ -457,7 +459,8 @@ test('BootstrapIO rejects a generic datagram send and destroy object', (t) => {
   const local = cryptoSuite.keyPair(seed(201))
   const sink = createRelayCandidateDirectorySink({
     wallNow: () => NOW,
-    monotonicNow: () => 0n
+    monotonicNow: () => 0n,
+    randomBytes: (size) => b4a.alloc(size)
   })
   expectCode(
     t,

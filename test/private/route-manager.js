@@ -15,6 +15,7 @@ const { kInspectRelayCandidateDirectory } = require('../../lib/private/relay-can
 const {
   INITIAL_PAIR_DEADLINE_MS,
   TEST_ONLY_ROUTE_MANAGER_OBSERVER,
+  TEST_ONLY_ROUTE_MANAGER_FACTORY_ISSUER,
   createFinalExitActivationFactory,
   createRouteExtensionFactory,
   createRouteManager,
@@ -55,8 +56,17 @@ function expectCode(t, fn, code) {
 }
 
 function sequenceId(first) {
-  let value = first
-  return (size) => b4a.alloc(size, value++)
+  return (size) => b4a.alloc(size, first++)
+}
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
 }
 
 function managerOptions(fixture, randomBytes = sequenceId(0x31)) {
@@ -179,8 +189,16 @@ function stubOpenRouteHandoff(t, handlers) {
     revokeOpenRouteHandoff: openRouteHandoff.revokeOpenRouteHandoff,
     destroyOpenRouteMaterial: openRouteHandoff.destroyOpenRouteMaterial
   }
-  Object.assign(openRouteHandoff, handlers)
-  t.teardown(() => Object.assign(openRouteHandoff, originals))
+  const { teardownOpenRouteMaterial, ...handoffHandlers } = handlers
+  Object.assign(openRouteHandoff, handoffHandlers)
+  const restoreTeardown = teardownOpenRouteMaterial
+    ? TEST_ONLY_ROUTE_MANAGER_FACTORY_ISSUER.installTeardown(teardownOpenRouteMaterial)
+    : () => {}
+  t.teardown(() => {
+    Object.assign(openRouteHandoff, originals)
+    delete openRouteHandoff.teardownOpenRouteMaterial
+    restoreTeardown()
+  })
 }
 
 test('RouteManager factories are empty exact clock graph capabilities', async (t) => {
@@ -1044,34 +1062,111 @@ test('RouteManager rejects rotation before terminal OPEN publication', async (t)
   await fixture.close()
 })
 
-test('RouteManager suspend seals directory and leaves only one reconnect authority', async (t) => {
-  const records = [
-    candidate(ROLE.SAFETY, 1, 2),
-    candidate(ROLE.SAFETY, 2, 3),
-    candidate(ROLE.PRIVATE, 0, 40),
-    candidate(ROLE.PRIVATE, 1, 41),
-    candidate(ROLE.SAFETY, 3, 4),
-    candidate(ROLE.PRIVATE, 2, 42)
-  ]
+test('RouteManager suspend publishes reconnect only after both branch ACKs', async (t) => {
   const fixture = await liveTopologyFixture(
     47419,
     47420,
     { left: '127.0.0.1', right: '127.0.0.2' },
-    { records }
+    {
+      records: [
+        candidate(ROLE.SAFETY, 1, 2),
+        candidate(ROLE.SAFETY, 2, 3),
+        candidate(ROLE.PRIVATE, 0, 40),
+        candidate(ROLE.PRIVATE, 1, 41),
+        candidate(ROLE.SAFETY, 3, 4),
+        candidate(ROLE.PRIVATE, 2, 42)
+      ]
+    }
   )
   const manager = createRouteManager(managerOptions(fixture))
-  const destroyed = []
   const handoffs = {
     lookup: Object.freeze({}),
     announce: Object.freeze({})
   }
-  const rotationHandoff = Object.freeze({})
   const materials = new Map()
-
+  const destroyed = []
+  const teardown = new Map()
+  const trace = []
   t.is(manager.buildInitialPair(), false)
   const draft = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().draft
   const lookupMaterial = openMaterial(draft.lookup, 0xf1)
   const announceMaterial = openMaterial(draft.announce, 0xf2)
+  lookupMaterial.expiresAt = NOW + 20_000n
+  announceMaterial.expiresAt = NOW + 20_000n
+  materials.set(handoffs.lookup, lookupMaterial)
+  materials.set(handoffs.announce, announceMaterial)
+  const lookupAck = deferred()
+  const announceAck = deferred()
+  stubOpenRouteHandoff(t, {
+    consumeOpenRouteHandoff(handoff) {
+      const material = materials.get(handoff)
+      if (!material) throw PrivateRouteError.UNAUTHORIZED()
+      materials.delete(handoff)
+      return material
+    },
+    revokeOpenRouteHandoff() {
+      return false
+    },
+    teardownOpenRouteMaterial(material, teardownId) {
+      t.is(teardownId.byteLength, 16)
+      trace.push(`teardown:${material.branchClass}`)
+      teardown.set(material, b4a.from(teardownId))
+      return material === lookupMaterial ? lookupAck.promise : announceAck.promise
+    },
+    destroyOpenRouteMaterial(material) {
+      trace.push(`destroy:${material.branchClass}`)
+      destroyed.push(material)
+      return true
+    }
+  })
+  t.is(manager.publishInitialPair(handoffs), true)
+  t.is(publishInitialSeeds(manager, draft, lookupMaterial, announceMaterial), true)
+
+  let published = false
+  const suspending = manager.suspend().then((reconnect) => {
+    published = true
+    return reconnect
+  })
+  await Promise.resolve()
+  t.alike(trace, [`teardown:${BRANCH_CLASS.LOOKUP}`, `teardown:${BRANCH_CLASS.ANNOUNCE}`])
+  t.is(published, false)
+  t.is(destroyed.length, 0, 'route material remains owned before ACK')
+  lookupAck.resolve(true)
+  await Promise.resolve()
+  t.is(published, false, 'one held ACK prevents suspension from advancing')
+  t.is(destroyed.length, 0, 'one ACK cannot destroy either committed branch')
+  announceAck.resolve(true)
+  const reconnect = await suspending
+  t.is(published, true)
+  t.alike(
+    trace,
+    [
+      `teardown:${BRANCH_CLASS.LOOKUP}`,
+      `teardown:${BRANCH_CLASS.ANNOUNCE}`,
+      `destroy:${BRANCH_CLASS.LOOKUP}`,
+      `destroy:${BRANCH_CLASS.ANNOUNCE}`
+    ],
+    'both ACKs precede both material destroys'
+  )
+  t.not(teardown.get(lookupMaterial), teardown.get(announceMaterial), 'teardown IDs are distinct')
+  t.alike(Reflect.ownKeys(reconnect), ['reconnect'])
+  t.is(isRouteManager(manager), false)
+  t.is(fixture.directory[kInspectRelayCandidateDirectory]().pendingCount, 0)
+  t.is(revokeGuardReconnectAuthority(reconnect, 'test-cleanup'), true)
+  await fixture.close()
+})
+
+test('RouteManager suspend failure cancels its sibling and publishes no reconnect', async (t) => {
+  const fixture = await liveTopologyFixture(47429, 47430)
+  const manager = createRouteManager(managerOptions(fixture))
+  const handoffs = { lookup: Object.freeze({}), announce: Object.freeze({}) }
+  const materials = new Map()
+  const lookupHeld = deferred()
+  const destroyed = []
+  t.is(manager.buildInitialPair(), false)
+  const draft = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().draft
+  const lookupMaterial = openMaterial(draft.lookup, 0xe1)
+  const announceMaterial = openMaterial(draft.announce, 0xe2)
   lookupMaterial.expiresAt = NOW + 20_000n
   announceMaterial.expiresAt = NOW + 20_000n
   materials.set(handoffs.lookup, lookupMaterial)
@@ -1086,48 +1181,96 @@ test('RouteManager suspend seals directory and leaves only one reconnect authori
     revokeOpenRouteHandoff() {
       return false
     },
+    teardownOpenRouteMaterial(material) {
+      if (material === lookupMaterial) return lookupHeld.promise
+      return Promise.reject(PrivateRouteError.ERR_PRIVACY_UNAVAILABLE())
+    },
+    destroyOpenRouteMaterial(material) {
+      destroyed.push(material)
+      if (material === lookupMaterial) lookupHeld.reject(PrivateRouteError.ERR_DESTROYED())
+      return true
+    }
+  })
+  t.is(manager.publishInitialPair(handoffs), true)
+  t.is(publishInitialSeeds(manager, draft, lookupMaterial, announceMaterial), true)
+  const error = await manager.suspend().then(
+    () => null,
+    (err) => err
+  )
+  t.is(error.code, 'ERR_PRIVACY_UNAVAILABLE')
+  t.is(isRouteManager(manager), false)
+  t.is(manager.destroy(), false)
+  t.is(new Set(destroyed).size, 2, 'failure destroys both branch materials exactly once')
+  expectCode(t, () => issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease), 'ERR_DESTROYED')
+  await fixture.close()
+})
+test('RouteManager zeroizes staged teardown ID and retires on second random draw failure', async (t) => {
+  const fixture = await liveTopologyFixture(47439, 47440)
+  let manager = null
+  let teardownMode = false
+  let teardownDraws = 0
+  let firstTeardownId = null
+  let reentered = null
+  let nextByte = 0x31
+  const randomBytes = (size) => {
+    if (!teardownMode) return b4a.alloc(size, nextByte++)
+    teardownDraws++
+    if (teardownDraws === 1) {
+      firstTeardownId = b4a.alloc(size, 0xd1)
+      return firstTeardownId
+    }
+    reentered = manager.suspend()
+    return b4a.alloc(size - 1, 0xd2)
+  }
+  manager = createRouteManager(managerOptions(fixture, randomBytes))
+  const handoffs = { lookup: Object.freeze({}), announce: Object.freeze({}) }
+  const materials = new Map()
+  const destroyed = []
+  let teardownCalls = 0
+  t.is(manager.buildInitialPair(), false)
+  const draft = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().draft
+  const lookupMaterial = openMaterial(draft.lookup, 0xd3)
+  const announceMaterial = openMaterial(draft.announce, 0xd4)
+  lookupMaterial.expiresAt = NOW + 20_000n
+  announceMaterial.expiresAt = NOW + 20_000n
+  materials.set(handoffs.lookup, lookupMaterial)
+  materials.set(handoffs.announce, announceMaterial)
+  stubOpenRouteHandoff(t, {
+    consumeOpenRouteHandoff(handoff) {
+      const material = materials.get(handoff)
+      if (!material) throw PrivateRouteError.UNAUTHORIZED()
+      materials.delete(handoff)
+      return material
+    },
+    revokeOpenRouteHandoff() {
+      return false
+    },
+    teardownOpenRouteMaterial() {
+      teardownCalls++
+      return Promise.resolve(true)
+    },
     destroyOpenRouteMaterial(material) {
       destroyed.push(material)
       return true
     }
   })
-
   t.is(manager.publishInitialPair(handoffs), true)
   t.is(publishInitialSeeds(manager, draft, lookupMaterial, announceMaterial), true)
-  t.is(manager.rotate(BRANCH_CLASS.LOOKUP), false)
-  const rotation = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().rotations.lookup
-  const rotationMaterial = openMaterial(rotation.branch, 0xf3)
-  materials.set(rotationHandoff, rotationMaterial)
-  t.is(manager.publishRotation(BRANCH_CLASS.LOOKUP, rotationHandoff), true)
-  t.is(fixture.directory[kInspectRelayCandidateDirectory]().pendingCount, 1)
-  const reconnect = manager.suspend()
-
-  t.alike(Reflect.ownKeys(reconnect), ['reconnect'])
-  t.is(typeof reconnect.reconnect, 'function')
-  t.is(isRouteManager(manager), false)
-  expectCode(t, () => manager.branchCapability(BRANCH_CLASS.LOOKUP), 'ERR_DESTROYED')
-  t.is(manager.destroy(), false)
-  t.is(destroyed.length, 3)
-  t.is(fixture.directory[kInspectRelayCandidateDirectory]().pendingCount, 0)
+  teardownMode = true
+  const suspending = manager.suspend()
+  const error = await suspending.then(
+    () => null,
+    (err) => err
+  )
+  t.is(error.code, 'INVALID_ROUTE')
+  t.is(reentered, suspending, 'random callback reentry observes the published suspend promise')
+  t.is(teardownCalls, 0, 'no request publishes with a half-minted ID pair')
+  t.ok(
+    firstTeardownId.every((byte) => byte === 0),
+    'first exact-owned ID is zeroized'
+  )
+  t.is(isRouteManager(manager), false, 'acquisition failure retires the manager')
+  t.is(new Set(destroyed).size, 2, 'acquisition failure destroys both committed branches')
   expectCode(t, () => issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease), 'ERR_DESTROYED')
-  t.is(revokeGuardReconnectAuthority(reconnect, 'test-cleanup'), true)
-  expectCode(t, () => reconnect.reconnect(), 'ERR_DESTROYED')
-  for (
-    let attempt = 0;
-    attempt < 100 && !fixture.guardFixture.leftObserver.sockets[0].closed;
-    attempt++
-  ) {
-    await new Promise((resolve) => setTimeout(resolve, 1))
-  }
-  t.is(fixture.guardFixture.leftObserver.sockets[0].closed, true)
-
   await fixture.close()
-
-  const failureFixture = await liveTopologyFixture(47429, 47430)
-  const failedManager = createRouteManager(managerOptions(failureFixture))
-  t.is(destroyGuardLease(failureFixture.guardLease), true)
-  expectCode(t, () => failedManager.suspend(), 'ERR_DESTROYED')
-  t.is(failureFixture.directory.destroy(), undefined)
-  t.is(failedManager.destroy(), false)
-  await failureFixture.close()
 })
