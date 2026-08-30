@@ -279,7 +279,11 @@ function selectedMiddle() {
     candidate(ROLE.PRIVATE, 0, 40),
     candidate(ROLE.PRIVATE, 1, 41)
   ]
-  const sink = createRelayCandidateDirectorySink({ wallNow: () => NOW, monotonicNow: () => 0n })
+  const sink = createRelayCandidateDirectorySink({
+    wallNow: () => NOW,
+    monotonicNow: () => 0n,
+    randomBytes: (size) => b4a.alloc(size)
+  })
   const directory = consumeSealedRelayCandidateDirectory(
     sealRelayCandidateDirectorySink(sink, records, {
       guardIdentity: guard.identity,

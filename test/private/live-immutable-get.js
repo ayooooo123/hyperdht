@@ -772,7 +772,7 @@ async function driveHostedFinal(exit, exitRecords, wallNow, monotonicNow, immuta
   socket.message(hostedDhtResponse(socket.sends[0].packet), { host: '8.8.8.8', port: 49737 })
   await waitHosted(() => replies.length === 1)
   settleExitDhtReservation(probe.settlementAuthority, replies.shift())
-  installDhtExitRoute(io, table)
+  installDhtExitRoute(io, table, { releaseIncoming: async () => {} })
   await sendDhtExitSeeds(
     io,
     createDhtExitSeedsDeliveryAuthority(table),

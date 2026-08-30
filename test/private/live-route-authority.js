@@ -852,7 +852,10 @@ test('LiveRouteAuthority production request owns exact reply authority and drops
   authority.suspend()
   t.is(authority.ready(), false)
   expectCode(t, () => authority.resume(), 'ERR_DESTROYED')
-  expectCode(t, () => snapshotLiveRouteDestination(authority, destination), 'ERR_DESTROYED')
+  t.ok(
+    snapshotLiveRouteDestination(authority, destination),
+    'suspend blocks applications without destroying route material before ACK'
+  )
   t.ok(
     manager.branchCapability(BRANCH_CLASS.LOOKUP),
     'intentional suspend does not report transport destruction as branch loss'
