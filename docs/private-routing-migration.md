@@ -2490,3 +2490,98 @@ the privileged packet/semantic leak oracles. The announce branch is constructed
 but carries no DHT mutation in that slice. Remaining DHT commands, private
 presence, public required mode, peer streams, Hyperswarm, and mobile device
 evidence remain disabled for later separately reviewed sub-gates.
+
+## Gate D: blinded presence host-path boundary (delivered, partially blocked)
+
+PR #47 implemented the Tor-style blinded presence scheme but was reverted
+(#48) for a variable-time JavaScript BigInt scalar multiply, an experimental
+signer primitive, zero callers, mutable accessors, an unbound record key, and
+no external test vectors. This sub-gate re-delivers the host-path boundary of
+that scheme with only vetted primitives and states plainly what remains
+blocked and why.
+
+### What is delivered
+
+`lib/private/blinded-presence.js` provides, package-private as before:
+
+- **Epoch addressing.** `k_e = H(EPOCH_ADDRESS_DOMAIN || A || epoch)` with
+  keyed BLAKE2b via the existing `cryptoSuite`, separating storage location
+  per epoch and identity without exposing the stable key.
+- **Tor's public blinding half.** `A' = h*A` with `h` derived in the shape of
+  torspec rend-spec-v3 Appendix A.2 (BLIND_STRING | A | basepoint string |
+  "key-blind" | INT_8(period)) and Tor's exact Ed25519 clamp
+  (`h[0] &= 248; h[31] &= 63; h[31] |= 64`), computed with the native
+  constant-time `crypto_scalarmult_ed25519_noclamp`. The digest is keyed
+  BLAKE2b-256 rather than Tor's SHA3-256 because bare-crypto exports no
+  SHA3; no byte-compat with Tor's `param` is claimed. The point-multiply
+  path itself is pinned **byte-exactly against Tor's published blinding
+  vector** (`test_hs_common.c::test_blinding_basics`: identity
+  `833990B0...7BC6`, period 1234/1440, blinded
+  `3A50BF210E8F9EE955AE0014F7A6917FB65EBF098A86305ABB508D1A7291B6D5`), which
+  is external proof that the native primitive matches
+  `ed25519_ref10_blind_public_key` algebraically.
+- **Canonical fixed padded records.** Exactly 1,023 bytes — the exit wire's
+  `MAX_IMMUTABLE_VALUE_BYTES` — with a fixed header (version, epoch
+  big-endian, zero reserved padding, epoch address as AEAD associated data),
+  a random 16-byte nonce prefix, a zero counter slot, and an
+  XChaCha20-Poly1305 body from the existing `cryptoSuite.seal`/`open`.
+- **Owner authentication without `a'`.** The epoch keypair is hash-ratcheted
+  from the identity seed (`H(EPOCH_KEY_DOMAIN || seed || epoch)`, the same
+  pattern as session-key derivation in crypto-suite). The stable secret key
+  signs a certificate over `(identity pk, epoch pk, epoch, k_e,
+hash(descriptor region))` that travels **inside** the encrypted body. A
+  reader credential holder can decrypt and verify ownership but cannot mint
+  records or tombstones: the certificate is made with the stable secret key,
+  which readers never hold, and the digest binds the exact canonical
+  descriptor region, so re-encryption under a copied certificate fails
+  authentication.
+- **Epochs and overlap.** Seven-day epochs with a one-day overlap: hosts
+  announce into the current and next epoch; readers resolve the current and
+  previous epoch, matching Tor's overlapping-descriptor window.
+- **Tombstones.** An owner-signed record version that retires the whole
+  epoch (zero digest) or one exact record (digest of its record bytes), with
+  tombstone-over-descriptor precedence in `resolvePresence`.
+
+Verification: 16 new brittle tests / 80 assertions in
+`test/private/blinded-presence.js`, registered in the portable aggregate.
+Node aggregate 1,034/1,034 tests (19,261 asserts); Bare aggregate 1,013/1,013
+tests (19,202 asserts); both include this module. Prettier clean.
+
+### What is blocked, and the exact blocker
+
+**Tor's algebraic secret blinding (`a' = h·a mod L`) and public verification
+under the blinded key are not implemented.** The scheme in [KEYBLIND] A.2
+needs a constant-time scalar-on-scalar multiply modulo the group order.
+`sodium-universal` 5.x (libsodium bindings in this tree) exports the point
+multiply (`crypto_scalarmult_ed25519_noclamp`) but **not**
+`crypto_core_ed25519_scalar_mul`; the only in-tree scalar multiplier is the
+experimental `sodium-native` tweak extension, whose own header marks the API
+experimental with a non-standard nonce — the exact primitive class PR47 was
+reverted for. JavaScript BigInt carries the same variable-time rejection.
+
+Consequences, stated rather than implied:
+
+- Presence records authenticate via the stable-identity certificate inside
+  the encrypted body, so **only credential holders can verify ownership**.
+  A storage node or passive observer cannot attribute records to an identity
+  — the addressing privacy goal holds — but neither can it verify ownership
+  without the credential, unlike a Tor descriptor which any client can
+  verify under the blinded public key.
+- The routed fetch integration uses `target = hash(record)` because
+  `controller.immutableGet` binds `hash(value) === target` by construction;
+  storage-key-addressed presence lookup needs the exit-side private presence
+  commands (`PRIVATE_LOOKUP_V1`/`PRIVATE_ANNOUNCE_V1`), which are still
+  disabled, and those in turn want this gate's ownership model finished.
+
+Unblocking requires one of: a vetted native `crypto_core_ed25519_scalar_mul`
+binding added to the dependency tree (its own review gate, since no current
+dependency exports it), or acceptance of Tor's `ref10` scalar-mul source
+compiled as a new native extension. Until then, Gate D remains stopped at
+this boundary by design; no export, no public required mode, and no
+exit-side presence command is added.
+
+The rejected properties of PR #47 are each addressed: no BigInt arithmetic
+anywhere in the module; no experimental signer; the record key is bound to
+identity and epoch through the AEAD header and the certificate digest;
+accessors return frozen snapshots; and the external vector is Tor's own
+published test bytes, not locally generated ones.
