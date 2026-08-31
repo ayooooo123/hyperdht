@@ -47,7 +47,6 @@ const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
 const RELAY_ROLES = new Set(['guard', 'lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
-const BLACKHOLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b'])
 
 let projection = null
 let generation = 0n
@@ -505,9 +504,9 @@ async function createCellOwner() {
     onLinkFailure: receiveRoleLinkFailure,
     port: projection.bind.port
   }
-  // Only lookup middles pay for the datagram-dropping test adapter. Every other role
-  // constructs the production endpoint with an unwrapped UDX socket.
-  cellEndpoint = BLACKHOLE_ROLES.has(projection.role)
+  // Every selectable middle pays for the datagram-dropping test adapter. Every other
+  // role constructs the production endpoint with an unwrapped UDX socket.
+  cellEndpoint = MIDDLE_ROLES.has(projection.role)
     ? createProjectedCellEndpoint(endpointOptions)
     : new UdxCellEndpoint(endpointOptions)
   try {
@@ -1113,7 +1112,7 @@ async function handle(message) {
     // Silent death: drop both directions while every local object and socket stays live.
     // The native link detector must discover the loss and drive route rotation.
     case 'blackhole':
-      if (!BLACKHOLE_ROLES.has(projection.role) || !blackholeRouteCells()) {
+      if (!MIDDLE_ROLES.has(projection.role) || !blackholeRouteCells()) {
         throw Object.assign(new Error(), { code: 'PROCESS_BLACKHOLE_UNAVAILABLE' })
       }
       await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
