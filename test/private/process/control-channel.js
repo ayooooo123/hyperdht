@@ -90,7 +90,6 @@ const UNAVAILABLE_REASONS = new Set(['NETWORK_CHANGE', 'GUARD_LOSS', 'CANCELLED'
 const RUNTIMES = new Set(['node', 'bare'])
 const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
 const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
-const LOOKUP_MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b'])
 const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
 const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
 
@@ -1026,10 +1025,10 @@ function validateCommand(message, context) {
       )
         invalid()
       break
-    // A blackhole silently faults the selected lookup middle. It carries no generation
+    // A blackhole silently faults the selected middle. It carries no generation
     // because the native detector, not the command, starts route rotation.
     case 'blackhole':
-      if (!LOOKUP_MIDDLE_ROLES.has(common.role)) invalid()
+      if (!MIDDLE_ROLES.has(common.role)) invalid()
       break
     case 'guard-loss':
       if (common.role !== 'guard') invalid()
