@@ -1,6 +1,7 @@
 require('./private/transport-seam')
 require('./private/protocol')
 require('./private/crypto-suite')
+require('./private/blinded-presence')
 require('./private/counters')
 require('./private/cell-codec')
 require('./private/route-payload')
