@@ -46,6 +46,8 @@ require('./private/branch-expiry-rotation')
 require('./private/udx-loopback')
 
 require('./private/extension-setup-channel')
+require('./private/nat-punch')
+require('./private/nat-traversal-live')
 require('./private/extension-link-completion')
 require('./private/redacted-responder-proof')
 require('./private/tail-control')

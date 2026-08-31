@@ -2490,3 +2490,66 @@ the privileged packet/semantic leak oracles. The announce branch is constructed
 but carries no DHT mutation in that slice. Remaining DHT commands, private
 presence, public required mode, peer streams, Hyperswarm, and mobile device
 evidence remain disabled for later separately reviewed sub-gates.
+
+### KI-13: the punch moved into production, with an authorization chain
+
+**Status: production path landed on this branch (`586e21a`), exercised end to
+end on real UDX sockets; cross-host traversal still needs a dispatch, because
+no loopback rehearsal can produce a genuine NAT.** The harness change that
+unblocked a dispatch is landed; what this entry adds is the production half
+the harness was standing in for, plus the authorization the harness version
+never had.
+
+What the harness punch could not be: it took the plan as a bare JSON list the
+coordinator pushed, verified nothing, counted nothing, and sat outside
+`lib/private`. The production replacement is three pieces:
+
+`lib/private/nat-reflect.js` — the endpoint owns its published address. The
+socket route cells travel on is reflected off the DHT bootstraps using the
+exit wire format (`dht-exit-wire.js` gained
+`createDhtExitPingReservation` and `observeDhtExitPingReply`; the reply decoder
+reads `to` WITHOUT the local-tuple equality check, because the tuple `to`
+names is the answer — that check is exactly right for `decodeDhtExitReply` and
+exactly wrong here). Only two-reflector agreement is publishable; disagreement
+means no publishable value exists and says so.
+
+`lib/private/nat-punch.js` — the punch plan is a signed artifact over the new
+`NAT_PUNCH_PLAN` domain: both peer identities, both published tuples, epoch,
+run id, validity window, plan id, signed by the topology authority. The
+signature is the authorization: a peer cannot name an arbitrary victim, a
+plan for someone else is dead on arrival, a captured plan dies with its
+window. A wrong signature, a stranger identity, a wrong advertised address,
+or one flipped byte each fail closed before a datagram is sent.
+
+`udx-cell-endpoint.js` — the endpoint punches on its own socket.
+`punchPeer` runs the six-round simultaneous send; every udx send
+`Promise<boolean>` is observed and counted (no silent rejections), no timer
+outlives the round, `stop()` resolves waiters so `close()` cannot hang, and
+`close()` stops a live round. `punchPlan` verifies, pins the plan to the
+endpoint's advertised pair, bounds accepted plans, and reports
+`sent/refused/received/strayReceived`. Punch-tagged datagrams count only from
+the verified peer tuple; anything else is stray. AND THE LIMIT, stated as a
+rule: a punch authorizes the send round and nothing else — it never advances
+a bootstrap session and never substitutes for the link grant. The
+`dispatchLinkedPacket` routing gives an armed ACCEPT session its CREATE only
+under the explicit `acceptDirect` opt-in; every other path keeps the existing
+`onBootstrap` contract byte for byte.
+
+`LinkBootstrapSession.open({ punch })` joins the caller's round: the first
+CREATE dispatches only after the round settles, and the round is stopped when
+the session fails, closes, or tombstones. The projected link service exposes
+`punchPlanFor(encoding)`, verifying against the authority it already pins.
+
+Evidence on this host: `nat-punch.js` 8 tests / 21 asserts;
+`nat-traversal-live.js` 5 tests / 12 asserts — two real `UdxCellEndpoint`s on
+distinct tuples, no pre-opened path, one signed plan driving the simultaneous
+round, a stranger's spoofed punches counted stray, then the authenticated
+handshake reaching OPEN on both sides. Aggregate suite 1029/1029 tests,
+19216/19216 asserts, prettier clean. The connection test 18 failure seen
+during development reproduces on the unmodified base branch (same-LAN
+keypair test, network-dependent ETIMEDOUT) and is not caused by this work.
+
+What this still does not prove: mapping survival for the length of a 900s
+run, per-destination NATs (no publishable value exists there by definition),
+and the un-measured closed-and-rebind hop from the KI-13 record above. Those
+are dispatch questions; a loopback rehearsal cannot narrow them.

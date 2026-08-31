@@ -40,6 +40,7 @@ const {
   decodeTestIsolatedAddressGrant,
   digestTestIsolatedAddressTuple
 } = require('../../../lib/private/dht-exit-test-topology-grant')
+const { verifyNatPunchPlan } = require('../../../lib/private/nat-punch')
 const { cryptoSuite } = require('../../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../../lib/private/errors')
 const {
@@ -425,11 +426,15 @@ function createProjectedLinkService(options) {
     }
     let session = null
     try {
+      // PUNCH-BEFORE-CREATE on the initiator side: when the caller hands in the
+      // peer's punch round (started from a verified plan), the session opens
+      // with it joined, so its first CREATE waits for the round to settle. The
+      // session stops the round if it dies first.
       session = endpoint.openLink(authorized.handle, sessionOptions(authorized, 'initiate', setup))
       installSession(session, authorized, 'initiate')
-      const established = await session.open()
+      const opened = await session.open(values.punch === undefined ? {} : { punch: values.punch })
       if (current && current.session === session) current = null
-      const result = Object.freeze({ established })
+      const result = Object.freeze({ established: opened })
       links.add(result)
       linkSessions.set(result, session)
       return result
@@ -608,6 +613,25 @@ function createProjectedLinkService(options) {
     return true
   }
 
+  // THE ROLE-SIDE PUNCH PLAN ENTRY. A projection hands this role its signed
+  // punch plan; the plan is verified here against the topology authority this
+  // service already pins, and only then does the round run on the role's own
+  // endpoint socket. The verified plan's peer tuple is what a later
+  // `initiate()` may wait on through `options.punch`. A plan whose local side is
+  // not this role's identity, or whose signature does not verify, never reaches
+  // the socket.
+  function punchPlanFor(encoding) {
+    assertLive()
+    if (!b4a.isBuffer(encoding)) throw PrivateRouteError.INVALID_ROUTE()
+    const verified = verifyNatPunchPlan(encoding, authorityPublicKey, {
+      localIdentity32: b4a.from(localIdentity),
+      now: BigInt(numberNow(wallNow))
+    })
+    const punch = endpoint.punchPeer({ host: verified.peer.host, port: verified.peer.port })
+    punch.plan = verified
+    return punch
+  }
+
   return Object.freeze({
     destroy,
     faultLink,
@@ -617,6 +641,7 @@ function createProjectedLinkService(options) {
     prearmAccept,
     releaseLinkGrant,
     prearmAcceptAny,
+    punchPlanFor,
     receiveBootstrap,
     receiveCell,
     receiveLinkFailure,
