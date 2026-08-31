@@ -52,6 +52,16 @@ jobs:
         env:
           PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
         run: npm run test:private:process:bare
+      - name: Eleven-process live scenario, reverse candidates (Node roles)
+        env:
+          PR_CANDIDATE_ORDER: reverse
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+        run: npm run test:private:process:node
+      - name: Eleven-process live scenario, reverse candidates (Bare roles)
+        env:
+          PR_CANDIDATE_ORDER: reverse
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+        run: npm run test:private:process:bare
       - name: Role failure stacks
         if: failure()
         run: cat "${{ runner.temp }}/role-fatal.log" || echo "no role stacks recorded"

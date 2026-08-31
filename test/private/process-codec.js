@@ -562,7 +562,12 @@ test('physical lifecycle commands are bound only to their failing link owners', 
     validateControlMessage(middleBlackhole, messageContext('command', middleBlackhole)),
     middleBlackhole
   )
-  const wrongBlackhole = base('blackhole', 'lookup-middle-b', 5)
+  const middleBlackholeB = base('blackhole', 'lookup-middle-b', 5)
+  t.alike(
+    validateControlMessage(middleBlackholeB, messageContext('command', middleBlackholeB)),
+    middleBlackholeB
+  )
+  const wrongBlackhole = base('blackhole', 'announce-middle', 7)
   throwsCode(t, () =>
     validateControlMessage(wrongBlackhole, messageContext('command', wrongBlackhole))
   )
