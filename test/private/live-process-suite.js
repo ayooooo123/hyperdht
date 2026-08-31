@@ -9,12 +9,16 @@ const { createCoherentTestClock } = require('./coherent-clock')
 const { createProcessConfigAuditor } = require('./process/config-auditor')
 const { CODEC_VECTOR_DIGEST_HEX } = require('./process/codec-vectors')
 const { createProcessControl, spawnRoleProcesses } = require('./process/coordinator')
+const { LINK_UNRESPONSIVE_AFTER } = require('../../lib/private/link-control-session')
 const {
   PROCESS_PLANS,
   ROLES,
   TEST_ONLY_PROCESS_TOPOLOGY_ISSUER,
   createLiveProcessTopology
 } = require('./process/topology-fixture')
+
+const HEALTHY_SILENCE_MS = LINK_UNRESPONSIVE_AFTER + 500
+const BLACKHOLE_ROTATION_BOUND_MS = LINK_UNRESPONSIVE_AFTER + 3_500
 
 function capabilities(seed) {
   return {
@@ -453,23 +457,36 @@ function registerLiveProcessSuite(launch) {
       )
       t.is((await cancelled).operationSequence, 2n, 'delayed lookup cancels without retry')
 
+      const healthyGeneration = readyEndpointSnapshot.lookupGeneration
+      await new Promise((resolve) => setTimeout(resolve, HEALTHY_SILENCE_MS))
+      const healthySnapshot = await sendAndWait('endpoint', 'snapshot', 'snapshot')
+      t.is(
+        healthySnapshot.lookupGeneration,
+        healthyGeneration,
+        'healthy silent lookup branch survives the native detector window'
+      )
+
       const rotatePhase = nextPhase('endpoint')
       phases.set('endpoint', rotatePhase)
       generations.set('endpoint', 2n)
       const rotationEvent = control.expectEvent('endpoint', 'rotated', 2n, rotatePhase)
+      const blackholeStartedAt = Date.now()
       const faultAcknowledged = await sendAndWait(
         initialRouting.lookupPair.middleRole,
-        'rotate',
-        'ready',
-        { nextGeneration: generations.get(initialRouting.lookupPair.middleRole) + 1n }
+        'blackhole',
+        'ready'
       )
       t.is(
         faultAcknowledged.state,
         'READY',
-        `${initialRouting.lookupPair.middleRole} physical lookup link fault is acknowledged`
+        `${initialRouting.lookupPair.middleRole} silently drops route cells`
       )
       const rotated = await rotationEvent
       t.is(rotated.previousGeneration, endpointGeneration)
+      t.ok(
+        Date.now() - blackholeStartedAt <= BLACKHOLE_ROTATION_BOUND_MS,
+        'native detector rotates the blackholed branch within the process deadline'
+      )
       const secondValueWaiting = control.expect('endpoint', 'value', 2n)
       await control.send(
         'endpoint',

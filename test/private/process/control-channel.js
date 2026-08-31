@@ -90,6 +90,7 @@ const UNAVAILABLE_REASONS = new Set(['NETWORK_CHANGE', 'GUARD_LOSS', 'CANCELLED'
 const RUNTIMES = new Set(['node', 'bare'])
 const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
 const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
+const LOOKUP_MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b'])
 const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
 const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
 
@@ -1025,11 +1026,10 @@ function validateCommand(message, context) {
       )
         invalid()
       break
-    // Same role restriction as `rotate`, and for the same reason: the fault verbs exist to
-    // fault one named hop of the lookup branch. `blackhole` carries no generation, because
-    // unlike `rotate` it produces no notification for anything to rotate on.
+    // A blackhole silently faults the selected lookup middle. It carries no generation
+    // because the native detector, not the command, starts route rotation.
     case 'blackhole':
-      if (common.role !== 'lookup-middle-a') invalid()
+      if (!LOOKUP_MIDDLE_ROLES.has(common.role)) invalid()
       break
     case 'guard-loss':
       if (common.role !== 'guard') invalid()

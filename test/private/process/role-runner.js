@@ -47,13 +47,7 @@ const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
 const RELAY_ROLES = new Set(['guard', 'lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
-// The one role the `blackhole` verb may be sent to. `control-channel.js` rejects the
-// message for any other role before it is dispatched, so this is not a second policy: it is
-// the same single fact, named once, read by the only two sites that need it - the endpoint
-// constructor below and the verb's dispatch. Every other role therefore keeps the
-// production `UdxCellEndpoint` and an unwrapped udx socket, which is what the eleven-role
-// gate exists to exercise.
-const BLACKHOLE_ROLE = 'lookup-middle-a'
+const BLACKHOLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b'])
 
 let projection = null
 let generation = 0n
@@ -511,14 +505,11 @@ async function createCellOwner() {
     onLinkFailure: receiveRoleLinkFailure,
     port: projection.bind.port
   }
-  // Only the role that can receive `blackhole` pays for the adapter seam. The projection is
-  // a JavaScript socket facade that classifies every datagram, so installing it everywhere
-  // would mean no role in this gate ever constructs the production endpoint or sends over an
-  // unwrapped udx socket - the exact paths the gate is the highest-fidelity check of.
-  cellEndpoint =
-    projection.role === BLACKHOLE_ROLE
-      ? createProjectedCellEndpoint(endpointOptions)
-      : new UdxCellEndpoint(endpointOptions)
+  // Only lookup middles pay for the datagram-dropping test adapter. Every other role
+  // constructs the production endpoint with an unwrapped UDX socket.
+  cellEndpoint = BLACKHOLE_ROLES.has(projection.role)
+    ? createProjectedCellEndpoint(endpointOptions)
+    : new UdxCellEndpoint(endpointOptions)
   try {
     await cellEndpoint.bind()
   } catch {
@@ -1119,16 +1110,10 @@ async function handle(message) {
       }
       await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
       return
-    // Silent death, and the only fault verb that destroys nothing. The route cells this
-    // role would relay are dropped in both directions at its UDX adapter, every local
-    // object stays alive and the socket stays bound, so no party anywhere forms the intent
-    // to notify - which is the one condition the two link-fault verbs cannot produce,
-    // because both make this relay emit BRANCH_DESTROY.
-    // Two independent reasons this throws for any other role, so a misdirected verb can
-    // never be a silent no-op: the role is not `BLACKHOLE_ROLE`, and - because only that
-    // role installs the adapter - `blackholeRouteCells` counted zero sockets and refuses.
+    // Silent death: drop both directions while every local object and socket stays live.
+    // The native link detector must discover the loss and drive route rotation.
     case 'blackhole':
-      if (projection.role !== BLACKHOLE_ROLE || !blackholeRouteCells()) {
+      if (!BLACKHOLE_ROLES.has(projection.role) || !blackholeRouteCells()) {
         throw Object.assign(new Error(), { code: 'PROCESS_BLACKHOLE_UNAVAILABLE' })
       }
       await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
