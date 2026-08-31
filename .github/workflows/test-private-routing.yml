@@ -1,0 +1,75 @@
+name: Private Routing
+
+# The eleven-process live scenario binds the 127.64.x.1 role tuples, which only
+# Linux provides without per-address configuration. macOS and Windows runners
+# fail that bind with PROCESS_BIND_UNAVAILABLE, so the live job is Linux-only
+# and the deterministic job covers the other platforms.
+
+on:
+  push:
+    branches:
+      - main
+      - private-routing-v1
+  pull_request:
+    branches:
+      - main
+      - private-routing-v1
+
+jobs:
+  deterministic:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
+        with:
+          node-version: lts/*
+      - run: npm install
+      - run: npx prettier --check .
+      - name: Deterministic private-routing suite (Node)
+        run: npx brittle-node test/private/protocol.js test/private/cell-codec.js test/private/route-payload.js test/private/fragments.js
+
+  live-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
+        with:
+          node-version: lts/*
+      - run: npm install
+      - name: Aggregate private-routing suite (Node)
+        run: npx brittle-node test/private-routing.js
+      - name: Aggregate private-routing suite (Bare)
+        run: $(node -p "require('bare-runtime')('bare')") test/private-routing.js
+      - name: Eleven-process live scenario (Node roles)
+        env:
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+        run: npm run test:private:process:node
+      - name: Eleven-process live scenario (Bare roles)
+        env:
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+        run: npm run test:private:process:bare
+      - name: Eleven-process live scenario, reverse candidates (Node roles)
+        env:
+          PR_CANDIDATE_ORDER: reverse
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+        run: npm run test:private:process:node
+      - name: Eleven-process live scenario, reverse candidates (Bare roles)
+        env:
+          PR_CANDIDATE_ORDER: reverse
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+        run: npm run test:private:process:bare
+      - name: Role failure stacks
+        if: failure()
+        run: cat "${{ runner.temp }}/role-fatal.log" || echo "no role stacks recorded"
+      - name: Namespace projection enforcement (privileged)
+        run: |
+          sudo -n true
+          npm run test:private:namespace
+      - name: Namespace live route with capture oracles (privileged)
+        run: |
+          sudo -n apt-get install -y -q tcpdump
+          npm run test:private:namespace:live

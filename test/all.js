@@ -15,10 +15,11 @@ async function runTests() {
   await import('./messages.js')
   await import('./nat.js')
   await import('./noncustodial.js')
+  await import('./plugins.js')
   await import('./pool.js')
+  await import('./private-routing.js')
   await import('./relaying.js')
   await import('./storing.js')
-  await import('./plugins.js')
 
   test.resume()
 }

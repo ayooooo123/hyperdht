@@ -1,0 +1,1975 @@
+'use strict'
+
+const test = require('brittle')
+const b4a = require('b4a')
+
+const { moduleCacheKey: resolveModuleCacheKey } = require('./module-cache')
+
+const { cryptoSuite } = require('../../lib/private/crypto-suite')
+const { PrivateRouteError } = require('../../lib/private/errors')
+const {
+  BRANCH_CLASS,
+  CAPACITY_CLASS,
+  RELAY_CAPABILITY,
+  ROLE,
+  roleForIdentity
+} = require('../../lib/private/protocol')
+const {
+  deriveM3DhtNodeId,
+  digestRelayCapabilityAdvertisement,
+  encodeCanonicalEndpoint,
+  encodeRelayCapabilityAdvertisement,
+  providerServicePolicyForCapabilities,
+  signRelayCapabilityAdvertisement
+} = require('../../lib/private/relay-capability')
+const {
+  MAX_RELAY_CANDIDATE_IDENTITIES,
+  RelayCandidateDirectory,
+  abortRelayPathReservation,
+  commitRelayPathReservation,
+  consumeSealedRelayCandidateDirectory,
+  consumeSelectedRelayEvidence,
+  createRelayCandidateDirectorySink,
+  destroySealedRelayCandidateDirectory,
+  kInspectRelayCandidateDirectory,
+  revokeRelayCandidateDirectorySink,
+  sealRelayCandidateDirectorySink,
+  splitRelayPathReservation,
+  takeRelayPathReservation
+} = require('../../lib/private/relay-candidate-directory')
+
+const NOW = 1_000_000n
+
+function expectCode(t, fn, code) {
+  let error = null
+  try {
+    fn()
+  } catch (err) {
+    error = err
+  }
+  t.ok(error instanceof PrivateRouteError)
+  t.is(error && error.code, code)
+}
+
+function trackedDirectoryModule() {
+  const modulePath = require.resolve('../../lib/private/relay-candidate-directory')
+  const moduleCacheKey = resolveModuleCacheKey(require.cache, modulePath)
+  const cached = require.cache[moduleCacheKey]
+  const BufferConstructor = b4a.alloc(0).constructor
+  const originalB4a = b4a.allocUnsafeSlow
+  const originalBuffer = BufferConstructor.allocUnsafeSlow
+  const allocations = []
+  let tracking = false
+  let allocation = 0
+  let failAt = null
+  const allocate = (size) => {
+    if (tracking) allocation++
+    if (tracking && allocation === failAt) throw new Error('injected allocation failure')
+    const value = Reflect.apply(originalBuffer, BufferConstructor, [size])
+    if (tracking) allocations.push(value)
+    return value
+  }
+  b4a.allocUnsafeSlow = allocate
+  BufferConstructor.allocUnsafeSlow = allocate
+  let fresh
+  try {
+    delete require.cache[moduleCacheKey]
+    fresh = require(modulePath)
+  } finally {
+    b4a.allocUnsafeSlow = originalB4a
+    BufferConstructor.allocUnsafeSlow = originalBuffer
+    delete require.cache[moduleCacheKey]
+    if (cached) require.cache[moduleCacheKey] = cached
+  }
+  return {
+    fresh,
+    start(position) {
+      allocations.length = 0
+      allocation = 0
+      failAt = position
+      tracking = true
+    },
+    take() {
+      tracking = false
+      failAt = null
+      return allocations.splice(0)
+    }
+  }
+}
+
+function countedVerificationDirectoryModule() {
+  const modulePath = require.resolve('../../lib/private/relay-candidate-directory')
+  const relayPath = require.resolve('../../lib/private/relay-capability')
+  const cacheKey = (path) => resolveModuleCacheKey(require.cache, path)
+  const moduleCacheKey = cacheKey(modulePath)
+  const relayCacheKey = cacheKey(relayPath)
+  const cached = require.cache[moduleCacheKey]
+  const relayCache = require.cache[relayCacheKey]
+  const originalRelay = relayCache.exports
+  let decodeCalls = 0
+  let digestCalls = 0
+  relayCache.exports = {
+    ...originalRelay,
+    decodeRelayCapabilityAdvertisement(...args) {
+      decodeCalls++
+      return originalRelay.decodeRelayCapabilityAdvertisement(...args)
+    },
+    digestRelayCapabilityAdvertisement(...args) {
+      digestCalls++
+      return originalRelay.digestRelayCapabilityAdvertisement(...args)
+    }
+  }
+  let fresh
+  try {
+    delete require.cache[moduleCacheKey]
+    fresh = require(modulePath)
+  } finally {
+    relayCache.exports = originalRelay
+    delete require.cache[moduleCacheKey]
+    if (cached) require.cache[moduleCacheKey] = cached
+  }
+  return {
+    fresh,
+    counts: () => ({ decodeCalls, digestCalls })
+  }
+}
+
+function seed(value) {
+  return b4a.alloc(32, value)
+}
+
+function zeroRandomBytes(size) {
+  return b4a.alloc(size)
+}
+
+function identityFor(role, ordinal) {
+  let found = -1
+  for (let value = 1; value < 256; value++) {
+    const pair = cryptoSuite.keyPair(seed(value))
+    if (roleForIdentity(pair.publicKey) !== role) continue
+    found++
+    if (found === ordinal) return pair
+  }
+  throw new Error('missing deterministic identity')
+}
+
+function endpoint(index, port = 40_000 + index) {
+  return encodeCanonicalEndpoint({
+    addressFamily: 4,
+    addressBytes: b4a.from([198, 18, index, 1]),
+    port
+  })
+}
+
+function candidate(role, ordinal, index, overrides = {}) {
+  const {
+    endpointBytes = endpoint(index),
+    validationNow = NOW,
+    ...advertisementOverrides
+  } = overrides
+  const signer = identityFor(role, ordinal)
+  const route = cryptoSuite.encryptionKeyPair(seed(128 + index))
+  const reachableEndpoint = endpointBytes
+  const capabilityMask =
+    role === ROLE.SAFETY
+      ? RELAY_CAPABILITY.CIRCUIT_RELAY_V1
+      : RELAY_CAPABILITY.CIRCUIT_RELAY_V1 | RELAY_CAPABILITY.DHT_EXIT_V1
+  const value = {
+    relayIdentity: signer.publicKey,
+    currentDhtNodeId: deriveM3DhtNodeId(reachableEndpoint),
+    reachableEndpoint,
+    routeEncryptionPublicKey: route.publicKey,
+    capabilityMask,
+    minimumProtocolVersion: 1,
+    maximumProtocolVersion: 1,
+    cellSize: 1200,
+    maxCellPayload: 1146,
+    contextEnvelopeSize: 1101,
+    routeFrameSize: 1100,
+    maxRoutePayload: 1073,
+    datagramReplayWindow: 64,
+    maxConcurrentCircuits: 32,
+    capacityClass: CAPACITY_CLASS.MEDIUM,
+    maxCellsPerCircuit: 10_000,
+    maxBytesPerCircuit: 10_000_000,
+    maxCommandsPerCircuit: 256,
+    idleTimeoutMs: 30_000,
+    maxQueuedBytes: 262_144,
+    epoch: 1n,
+    issuedAtMs: NOW,
+    expiresAtMs: NOW + 30_000n,
+    providerServicePolicyEntries: providerServicePolicyForCapabilities(capabilityMask),
+    ...advertisementOverrides
+  }
+  const signed = signRelayCapabilityAdvertisement(value, signer.secretKey)
+  const canonicalBytes = encodeRelayCapabilityAdvertisement(signed)
+  return {
+    canonicalBytes,
+    digest: digestRelayCapabilityAdvertisement(canonicalBytes, { now: validationNow }),
+    identity: b4a.from(value.relayIdentity),
+    canonicalEndpointBytes: b4a.from(value.reachableEndpoint),
+    routePublicKey: b4a.from(value.routeEncryptionPublicKey),
+    role,
+    capabilityMask,
+    epoch: value.epoch,
+    issuedAt: value.issuedAtMs,
+    expiresAt: value.expiresAtMs
+  }
+}
+
+function fakeClock(start = NOW) {
+  let wall = start
+  let monotonic = 0n
+  return {
+    wallNow: () => wall,
+    monotonicNow: () => monotonic,
+    advance(value) {
+      wall += BigInt(value)
+      monotonic += BigInt(value)
+    },
+    jumpWall(value) {
+      wall += BigInt(value)
+    }
+  }
+}
+
+function callbackClock(start = NOW) {
+  let wall = start
+  let monotonic = 0n
+  let callback = null
+  return {
+    wallNow: () => wall,
+    monotonicNow() {
+      const current = callback
+      callback = null
+      if (current !== null) current()
+      return monotonic
+    },
+    setCallback(value) {
+      callback = value
+    },
+    setWall(value) {
+      wall = BigInt(value)
+    }
+  }
+}
+
+function fixture(extraSafety = 1, extraExits = 1, clock = fakeClock()) {
+  const guard = candidate(ROLE.SAFETY, 0, 1)
+  const records = []
+  for (let i = 0; i < 2 + extraSafety; i++) records.push(candidate(ROLE.SAFETY, i + 1, i + 2))
+  for (let i = 0; i < 2 + extraExits; i++) records.push(candidate(ROLE.PRIVATE, i, i + 40))
+  const scope = {
+    guardIdentity: guard.identity,
+    guardEndpoint: guard.canonicalEndpointBytes,
+    guardAdvertisementDigest: guard.digest,
+    guardEpoch: guard.epoch,
+    guardExpiresAt: guard.expiresAt
+  }
+  return { clock, guard, records, scope }
+}
+
+function longFixture(expiresAt, extraSafety = 2, extraExits = 1, clock = fakeClock()) {
+  const advertisementTime = { expiresAtMs: expiresAt }
+  const guard = candidate(ROLE.SAFETY, 0, 1, advertisementTime)
+  const records = []
+  for (let i = 0; i < 2 + extraSafety; i++) {
+    records.push(candidate(ROLE.SAFETY, i + 1, i + 2, advertisementTime))
+  }
+  for (let i = 0; i < 2 + extraExits; i++) {
+    records.push(candidate(ROLE.PRIVATE, i, i + 40, advertisementTime))
+  }
+  return {
+    clock,
+    guard,
+    records,
+    scope: {
+      guardIdentity: guard.identity,
+      guardEndpoint: guard.canonicalEndpointBytes,
+      guardAdvertisementDigest: guard.digest,
+      guardEpoch: guard.epoch,
+      guardExpiresAt: guard.expiresAt
+    }
+  }
+}
+
+function replacementExpiryFixture(expiredBranch) {
+  const clock = fakeClock()
+  const short = { expiresAtMs: NOW + 30_000n }
+  const long = { expiresAtMs: NOW + 60_000n }
+  const lookupExpiry = expiredBranch === BRANCH_CLASS.LOOKUP ? short : long
+  const announceExpiry = expiredBranch === BRANCH_CLASS.ANNOUNCE ? short : long
+  const guard = candidate(ROLE.SAFETY, 0, 1, long)
+  const records = [
+    candidate(ROLE.SAFETY, 1, 2, lookupExpiry),
+    candidate(ROLE.SAFETY, 2, 3, announceExpiry),
+    candidate(ROLE.SAFETY, 3, 4, long),
+    candidate(ROLE.PRIVATE, 0, 40, lookupExpiry),
+    candidate(ROLE.PRIVATE, 1, 41, announceExpiry),
+    candidate(ROLE.PRIVATE, 2, 42, long)
+  ]
+  return {
+    clock,
+    guard,
+    records,
+    scope: {
+      guardIdentity: guard.identity,
+      guardEndpoint: guard.canonicalEndpointBytes,
+      guardAdvertisementDigest: guard.digest,
+      guardEpoch: guard.epoch,
+      guardExpiresAt: guard.expiresAt
+    }
+  }
+}
+
+// The asymmetry the fault floor exists for. The fixed-zero draw selects the first
+// valid enumeration entry: a middle that signed itself a two-second capability,
+// paired with an honest exit whose expiry it does not control.
+function faultFloorFixture() {
+  const clock = fakeClock()
+  const short = { expiresAtMs: NOW + 2_000n }
+  const long = { expiresAtMs: NOW + 120_000n }
+  const guard = candidate(ROLE.SAFETY, 0, 1, long)
+  const records = [
+    candidate(ROLE.SAFETY, 1, 2, short),
+    candidate(ROLE.SAFETY, 2, 3, long),
+    candidate(ROLE.SAFETY, 3, 4, long),
+    candidate(ROLE.PRIVATE, 0, 40, long),
+    candidate(ROLE.PRIVATE, 1, 41, long),
+    candidate(ROLE.PRIVATE, 2, 42, long)
+  ]
+  return {
+    clock,
+    guard,
+    records,
+    scope: {
+      guardIdentity: guard.identity,
+      guardEndpoint: guard.canonicalEndpointBytes,
+      guardAdvertisementDigest: guard.digest,
+      guardEpoch: guard.epoch,
+      guardExpiresAt: guard.expiresAt
+    }
+  }
+}
+
+function install(input, randomBytes = zeroRandomBytes) {
+  const sink = createRelayCandidateDirectorySink({
+    wallNow: input.clock.wallNow,
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes
+  })
+  const token = sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+  return consumeSealedRelayCandidateDirectory(token)
+}
+
+function consumeInitial(transaction, split, generations = [1n, 1n]) {
+  return [
+    consumeSelectedRelayEvidence(split.lookup.middle, {
+      transaction,
+      branchClass: BRANCH_CLASS.LOOKUP,
+      position: 'middle',
+      generation: generations[0]
+    }),
+    consumeSelectedRelayEvidence(split.lookup.exit, {
+      transaction,
+      branchClass: BRANCH_CLASS.LOOKUP,
+      position: 'exit',
+      generation: generations[0]
+    }),
+    consumeSelectedRelayEvidence(split.announce.middle, {
+      transaction,
+      branchClass: BRANCH_CLASS.ANNOUNCE,
+      position: 'middle',
+      generation: generations[1]
+    }),
+    consumeSelectedRelayEvidence(split.announce.exit, {
+      transaction,
+      branchClass: BRANCH_CLASS.ANNOUNCE,
+      position: 'exit',
+      generation: generations[1]
+    })
+  ]
+}
+
+function installInitial(directory, generations = [1n, 1n]) {
+  const transaction = takeRelayPathReservation(
+    directory.reserveInitialPair({
+      lookupGeneration: generations[0],
+      announceGeneration: generations[1]
+    })
+  )
+  const evidence = consumeInitial(transaction, splitRelayPathReservation(transaction), generations)
+  commitRelayPathReservation(transaction)
+  return evidence
+}
+
+function digestHex(entry) {
+  return b4a.toString(entry.advertisementDigest, 'hex')
+}
+
+function installInitialDigests(directory) {
+  const transaction = takeRelayPathReservation(
+    directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  const evidence = consumeInitial(transaction, splitRelayPathReservation(transaction))
+  const digests = {
+    lookupMiddle: digestHex(evidence[0]),
+    lookupExit: digestHex(evidence[1]),
+    announceMiddle: digestHex(evidence[2]),
+    announceExit: digestHex(evidence[3])
+  }
+  commitRelayPathReservation(transaction)
+  return digests
+}
+
+function rotateBranch(directory, branchClass, value) {
+  const transaction = takeRelayPathReservation(
+    directory.reserveReplacement({ branchClass, generation: value })
+  )
+  const split = splitRelayPathReservation(transaction)
+  const chosen = {
+    middle: digestHex(
+      consumeSelectedRelayEvidence(split.middle, {
+        transaction,
+        branchClass,
+        position: 'middle',
+        generation: value
+      })
+    ),
+    exit: digestHex(
+      consumeSelectedRelayEvidence(split.exit, {
+        transaction,
+        branchClass,
+        position: 'exit',
+        generation: value
+      })
+    )
+  }
+  commitRelayPathReservation(transaction)
+  return chosen
+}
+
+test('candidate transfer owns bytes and never reads dialing authority getters', (t) => {
+  const input = fixture()
+  const reads = []
+  for (const record of input.records) {
+    for (const name of ['host', 'port', 'send', 'socket', 'discover']) {
+      Object.defineProperty(record, name, {
+        enumerable: true,
+        get() {
+          reads.push(name)
+          throw new Error('dialing getter was read')
+        }
+      })
+    }
+  }
+  const original = b4a.from(input.records[0].canonicalBytes)
+  const directory = install(input)
+  input.records[0].canonicalBytes.fill(0)
+  input.records[0].digest.fill(0)
+  t.alike(reads, [])
+  t.ok(Object.isFrozen(directory))
+  t.alike(Object.keys(directory), [])
+  t.alike(Object.getOwnPropertyNames(RelayCandidateDirectory.prototype).sort(), [
+    'constructor',
+    'destroy',
+    'reportBranchFault',
+    'reserveInitialPair',
+    'reserveReplacement',
+    'resume',
+    'retainForSuspend'
+  ])
+  const reservation = directory.reserveInitialPair({
+    lookupGeneration: 1n,
+    announceGeneration: 1n
+  })
+  const transaction = takeRelayPathReservation(reservation)
+  const split = splitRelayPathReservation(transaction)
+  const evidence = consumeInitial(transaction, split)
+  t.ok(evidence.some((entry) => b4a.equals(entry.canonicalAdvertisement, original)))
+  for (const entry of evidence) {
+    t.alike(
+      Object.keys(entry).sort(),
+      [
+        'advertisementDigest',
+        'branchClass',
+        'canonicalAdvertisement',
+        'generation',
+        'position',
+        'role'
+      ].sort()
+    )
+    t.absent('host' in entry)
+    t.absent('port' in entry)
+    t.absent('send' in entry)
+    t.absent('socket' in entry)
+  }
+  commitRelayPathReservation(transaction)
+  t.ok(evidence.every((entry) => entry.canonicalAdvertisement.every((byte) => byte === 0)))
+  directory.destroy()
+})
+
+test('sink and sealed token are opaque, one-shot, bounded, and failure-atomic', (t) => {
+  const input = fixture()
+  expectCode(
+    t,
+    () =>
+      createRelayCandidateDirectorySink({
+        wallNow: input.clock.wallNow,
+        monotonicNow: input.clock.monotonicNow
+      }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  expectCode(
+    t,
+    () =>
+      createRelayCandidateDirectorySink({
+        wallNow: input.clock.wallNow,
+        monotonicNow: input.clock.monotonicNow,
+        get randomBytes() {
+          return zeroRandomBytes
+        }
+      }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  const sink = createRelayCandidateDirectorySink({
+    wallNow: input.clock.wallNow,
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  t.ok(Object.isFrozen(sink))
+  t.alike(Reflect.ownKeys(sink), [])
+  const token = sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+  t.ok(Object.isFrozen(token))
+  t.alike(Reflect.ownKeys(token), [])
+  expectCode(t, () => sealRelayCandidateDirectorySink(sink, [], input.scope), 'ERR_REPLAY')
+  const directory = consumeSealedRelayCandidateDirectory(token)
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(token), 'ERR_REPLAY')
+  directory.destroy()
+
+  const revoked = createRelayCandidateDirectorySink({
+    wallNow: input.clock.wallNow,
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  revokeRelayCandidateDirectorySink(revoked)
+  expectCode(t, () => sealRelayCandidateDirectorySink(revoked, [], input.scope), 'ERR_REPLAY')
+
+  const doomed = createRelayCandidateDirectorySink({
+    wallNow: input.clock.wallNow,
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  const doomedToken = sealRelayCandidateDirectorySink(doomed, input.records, input.scope)
+  destroySealedRelayCandidateDirectory(doomedToken)
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(doomedToken), 'ERR_REPLAY')
+
+  const tooMany = []
+  for (let i = 0; i < MAX_RELAY_CANDIDATE_IDENTITIES + 1; i++) {
+    tooMany.push(candidate(i & 1 ? ROLE.PRIVATE : ROLE.SAFETY, i >> 1, 70 + i))
+  }
+  const overfull = createRelayCandidateDirectorySink({
+    wallNow: input.clock.wallNow,
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  expectCode(t, () => sealRelayCandidateDirectorySink(overfull, tooMany, input.scope), 'ERR_REPLAY')
+  t.ok(tooMany.every((record) => record.identity.some((byte) => byte !== 0)))
+})
+
+test('initial reservation is atomic, exactly bound, abortable, and committed once', (t) => {
+  const directory = install(fixture())
+  expectCode(
+    t,
+    () => directory.reserveInitialPair({ lookupGeneration: 0n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  const reservation = directory.reserveInitialPair({
+    lookupGeneration: 7n,
+    announceGeneration: 9n
+  })
+  t.alike(Reflect.ownKeys(reservation), [])
+  expectCode(
+    t,
+    () => directory.reserveInitialPair({ lookupGeneration: 8n, announceGeneration: 10n }),
+    'ERR_REPLAY'
+  )
+  const transaction = takeRelayPathReservation(reservation)
+  t.alike(Reflect.ownKeys(transaction), [])
+  expectCode(t, () => takeRelayPathReservation(reservation), 'ERR_REPLAY')
+  const split = splitRelayPathReservation(transaction)
+  t.ok(Object.isFrozen(split))
+  t.ok(Object.isFrozen(split.lookup.middle))
+  expectCode(t, () => splitRelayPathReservation(transaction), 'ERR_REPLAY')
+  expectCode(
+    t,
+    () =>
+      consumeSelectedRelayEvidence(split.lookup.middle, {
+        transaction,
+        branchClass: BRANCH_CLASS.ANNOUNCE,
+        position: 'middle',
+        generation: 7n
+      }),
+    'ERR_REPLAY'
+  )
+  const evidence = consumeInitial(transaction, split, [7n, 9n])
+  expectCode(
+    t,
+    () =>
+      consumeSelectedRelayEvidence(split.lookup.middle, {
+        transaction,
+        branchClass: BRANCH_CLASS.LOOKUP,
+        position: 'middle',
+        generation: 7n
+      }),
+    'ERR_REPLAY'
+  )
+  abortRelayPathReservation(transaction)
+  t.ok(evidence.every((entry) => entry.advertisementDigest.every((byte) => byte === 0)))
+  expectCode(t, () => abortRelayPathReservation(transaction), 'ERR_REPLAY')
+
+  const retry = directory.reserveInitialPair({ lookupGeneration: 7n, announceGeneration: 9n })
+  const retryTransaction = takeRelayPathReservation(retry)
+  consumeInitial(retryTransaction, splitRelayPathReservation(retryTransaction), [7n, 9n])
+  commitRelayPathReservation(retryTransaction)
+  expectCode(
+    t,
+    () => directory.reserveInitialPair({ lookupGeneration: 7n, announceGeneration: 10n }),
+    'ERR_REPLAY'
+  )
+  directory.destroy()
+})
+
+test('commit requires every evidence capability and replacement excludes both live paths', (t) => {
+  // Only one spare middle/exit pair remains after the two live branches.
+  const directory = install(fixture())
+  const initial = takeRelayPathReservation(
+    directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  const selections = splitRelayPathReservation(initial)
+  consumeSelectedRelayEvidence(selections.lookup.middle, {
+    transaction: initial,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    position: 'middle',
+    generation: 1n
+  })
+  expectCode(t, () => commitRelayPathReservation(initial), 'ERR_REPLAY')
+  consumeSelectedRelayEvidence(selections.lookup.exit, {
+    transaction: initial,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    position: 'exit',
+    generation: 1n
+  })
+  consumeSelectedRelayEvidence(selections.announce.middle, {
+    transaction: initial,
+    branchClass: BRANCH_CLASS.ANNOUNCE,
+    position: 'middle',
+    generation: 1n
+  })
+  consumeSelectedRelayEvidence(selections.announce.exit, {
+    transaction: initial,
+    branchClass: BRANCH_CLASS.ANNOUNCE,
+    position: 'exit',
+    generation: 1n
+  })
+  commitRelayPathReservation(initial)
+
+  const replacement = takeRelayPathReservation(
+    directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n })
+  )
+  const selected = splitRelayPathReservation(replacement)
+  t.is(selected.branchClass, BRANCH_CLASS.LOOKUP)
+  consumeSelectedRelayEvidence(selected.middle, {
+    transaction: replacement,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    position: 'middle',
+    generation: 2n
+  })
+  consumeSelectedRelayEvidence(selected.exit, {
+    transaction: replacement,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    position: 'exit',
+    generation: 2n
+  })
+  commitRelayPathReservation(replacement)
+  expectCode(
+    t,
+    () => directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n }),
+    'ERR_REPLAY'
+  )
+  directory.destroy()
+})
+
+test('replacement can rotate an expired target branch', (t) => {
+  const expiringTarget = replacementExpiryFixture(BRANCH_CLASS.LOOKUP)
+  const directory = install(expiringTarget)
+  installInitial(directory)
+  expiringTarget.clock.advance(30_000)
+
+  let replacement = null
+  let error = null
+  try {
+    replacement = takeRelayPathReservation(
+      directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n })
+    )
+  } catch (err) {
+    error = err
+  }
+  t.is(error, null, 'expired target can be replaced')
+  if (replacement === null) {
+    directory.destroy()
+    return
+  }
+  const selected = splitRelayPathReservation(replacement)
+  consumeSelectedRelayEvidence(selected.middle, {
+    transaction: replacement,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    position: 'middle',
+    generation: 2n
+  })
+  consumeSelectedRelayEvidence(selected.exit, {
+    transaction: replacement,
+    branchClass: BRANCH_CLASS.LOOKUP,
+    position: 'exit',
+    generation: 2n
+  })
+  commitRelayPathReservation(replacement)
+  const observed = directory[kInspectRelayCandidateDirectory]()
+  t.absent(observed.destroyed)
+  t.is(observed.identityCount, 4)
+  t.is(observed.generationRecordCount, 2)
+  expectCode(
+    t,
+    () => directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n }),
+    'ERR_REPLAY'
+  )
+  directory.destroy()
+})
+
+test('replacement requires the opposite committed branch to remain live', (t) => {
+  const expiringOpposite = replacementExpiryFixture(BRANCH_CLASS.ANNOUNCE)
+  const rejected = install(expiringOpposite)
+  installInitial(rejected)
+  expiringOpposite.clock.advance(30_000)
+  expectCode(
+    t,
+    () => rejected.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  const rejectedState = rejected[kInspectRelayCandidateDirectory]()
+  t.absent(rejectedState.destroyed)
+  t.is(rejectedState.pendingCount, 0)
+  rejected.destroy()
+})
+
+test('identity, endpoint /24, role, capability, and cross-branch diversity fail closed', (t) => {
+  const input = fixture(0, 0)
+  const sameSubnet = encodeCanonicalEndpoint({
+    addressFamily: 4,
+    addressBytes: b4a.from([198, 18, 2, 2]),
+    port: 49_999
+  })
+  input.records[1] = candidate(ROLE.SAFETY, 2, 30, { endpointBytes: sameSubnet })
+  const directory = install(input)
+  expectCode(
+    t,
+    () => directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  directory.destroy()
+})
+
+test('suspend retains only sealed evidence and resume revalidates exact expiry', (t) => {
+  const input = fixture()
+  const directory = install(input)
+  directory.retainForSuspend()
+  expectCode(
+    t,
+    () => directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  directory.resume()
+  const reservation = directory.reserveInitialPair({
+    lookupGeneration: 1n,
+    announceGeneration: 1n
+  })
+  abortRelayPathReservation(takeRelayPathReservation(reservation))
+  directory.retainForSuspend()
+  input.clock.advance(30_000)
+  expectCode(t, () => directory.resume(), 'ERR_INCOMPATIBLE_RELAY')
+  const observed = directory[kInspectRelayCandidateDirectory]()
+  t.is(observed.identityCount, 0)
+  directory.destroy()
+})
+
+test('wall rollback clears directory ownership and no generation or callback survives destroy', (t) => {
+  const input = fixture()
+  const directory = install(input)
+  input.clock.advance(40_000)
+  // Forward expiry clears on the next operation before any reservation publishes.
+  expectCode(
+    t,
+    () => directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  directory.destroy()
+  const observed = directory[kInspectRelayCandidateDirectory]()
+  t.alike(observed, {
+    destroyed: true,
+    identityCount: 0,
+    byteBufferCount: 0,
+    digestCount: 0,
+    timerCount: 0,
+    callbackCount: 0,
+    generationRecordCount: 0,
+    quarantineCount: 0,
+    faultedCount: 0,
+    pendingCount: 0
+  })
+
+  const rollback = fixture(1, 1, fakeClock(NOW + 100_000n))
+  for (const record of rollback.records) {
+    record.issuedAt = NOW + 100_000n
+    record.expiresAt = NOW + 130_000n
+  }
+  // Use freshly signed records valid at the later clock.
+  rollback.records = [
+    candidate(ROLE.SAFETY, 1, 2, {
+      issuedAtMs: NOW + 100_000n,
+      expiresAtMs: NOW + 130_000n,
+      validationNow: NOW + 100_000n
+    }),
+    candidate(ROLE.SAFETY, 2, 3, {
+      issuedAtMs: NOW + 100_000n,
+      expiresAtMs: NOW + 130_000n,
+      validationNow: NOW + 100_000n
+    }),
+    candidate(ROLE.SAFETY, 3, 4, {
+      issuedAtMs: NOW + 100_000n,
+      expiresAtMs: NOW + 130_000n,
+      validationNow: NOW + 100_000n
+    }),
+    candidate(ROLE.PRIVATE, 0, 40, {
+      issuedAtMs: NOW + 100_000n,
+      expiresAtMs: NOW + 130_000n,
+      validationNow: NOW + 100_000n
+    }),
+    candidate(ROLE.PRIVATE, 1, 41, {
+      issuedAtMs: NOW + 100_000n,
+      expiresAtMs: NOW + 130_000n,
+      validationNow: NOW + 100_000n
+    }),
+    candidate(ROLE.PRIVATE, 2, 42, {
+      issuedAtMs: NOW + 100_000n,
+      expiresAtMs: NOW + 130_000n,
+      validationNow: NOW + 100_000n
+    })
+  ]
+  rollback.scope.guardExpiresAt = NOW + 130_000n
+  const rolled = install(rollback)
+  rollback.clock.jumpWall(-30_001)
+  expectCode(
+    t,
+    () => rolled.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.is(rolled[kInspectRelayCandidateDirectory]().identityCount, 0)
+  rolled.destroy()
+})
+
+test('same-identity higher epoch replaces old evidence and equivocation removes it', (t) => {
+  const input = fixture()
+  const old = input.records[0]
+  const replacement = candidate(ROLE.SAFETY, 1, 20, { epoch: 2n })
+  input.records.push(replacement)
+  const directory = install(input)
+  const transaction = takeRelayPathReservation(
+    directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  const evidence = consumeInitial(transaction, splitRelayPathReservation(transaction))
+  t.ok(evidence.some((entry) => b4a.equals(entry.advertisementDigest, replacement.digest)))
+  t.absent(evidence.some((entry) => b4a.equals(entry.advertisementDigest, old.digest)))
+  abortRelayPathReservation(transaction)
+  directory.destroy()
+
+  const conflictInput = fixture(0, 0)
+  conflictInput.records.push(candidate(ROLE.SAFETY, 1, 21, { epoch: 1n }))
+  const conflicted = install(conflictInput)
+  expectCode(
+    t,
+    () => conflicted.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  conflicted.destroy()
+})
+
+test('partial allocation and reentrant or throwing clocks clear without publication', (t) => {
+  const tracked = trackedDirectoryModule()
+  const input = fixture()
+  const source = b4a.from(input.records[0].canonicalBytes)
+  const scopeStart = input.records.length * 4
+  for (const failureAt of [2, 3, 4, scopeStart + 2, scopeStart + 3]) {
+    const sink = tracked.fresh.createRelayCandidateDirectorySink({
+      wallNow: input.clock.wallNow,
+      monotonicNow: input.clock.monotonicNow,
+      randomBytes: zeroRandomBytes
+    })
+    tracked.start(failureAt)
+    expectCode(
+      t,
+      () => tracked.fresh.sealRelayCandidateDirectorySink(sink, input.records, input.scope),
+      'ERR_REPLAY'
+    )
+    const allocations = tracked.take()
+    t.ok(allocations.length > 0)
+    t.ok(allocations.every((value) => value.every((byte) => byte === 0)))
+    t.alike(input.records[0].canonicalBytes, source)
+    expectCode(
+      t,
+      () => tracked.fresh.sealRelayCandidateDirectorySink(sink, input.records, input.scope),
+      'ERR_REPLAY'
+    )
+  }
+
+  let reentrantSink = null
+  reentrantSink = tracked.fresh.createRelayCandidateDirectorySink({
+    wallNow() {
+      tracked.fresh.sealRelayCandidateDirectorySink(reentrantSink, input.records, input.scope)
+      return NOW
+    },
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  expectCode(
+    t,
+    () => tracked.fresh.sealRelayCandidateDirectorySink(reentrantSink, input.records, input.scope),
+    'ERR_REPLAY'
+  )
+  t.alike(input.records[0].canonicalBytes, source)
+
+  let directory = null
+  const reentrantClock = fakeClock()
+  const hostile = fixture(1, 1, {
+    wallNow() {
+      if (directory !== null) directory.destroy()
+      return reentrantClock.wallNow()
+    },
+    monotonicNow: reentrantClock.monotonicNow
+  })
+  directory = install(hostile)
+  expectCode(
+    t,
+    () => directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.is(directory[kInspectRelayCandidateDirectory]().identityCount, 0)
+
+  let throwNow = false
+  const throwingBase = fakeClock()
+  const throwing = fixture(1, 1, {
+    wallNow() {
+      if (throwNow) throw new Error('injected clock failure')
+      return throwingBase.wallNow()
+    },
+    monotonicNow: throwingBase.monotonicNow
+  })
+  const throwingDirectory = install(throwing)
+  throwingDirectory.retainForSuspend()
+  throwNow = true
+  expectCode(t, () => throwingDirectory.resume(), 'ERR_INCOMPATIBLE_RELAY')
+  t.is(throwingDirectory[kInspectRelayCandidateDirectory]().identityCount, 0)
+  throwingDirectory.destroy()
+})
+
+test('concurrent opposite replacements revalidate diversity at commit', (t) => {
+  const directory = install(fixture())
+  installInitial(directory)
+
+  const lookup = takeRelayPathReservation(
+    directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n })
+  )
+  const announce = takeRelayPathReservation(
+    directory.reserveReplacement({ branchClass: BRANCH_CLASS.ANNOUNCE, generation: 2n })
+  )
+  const lookupSelections = splitRelayPathReservation(lookup)
+  const announceSelections = splitRelayPathReservation(announce)
+  const lookupEvidence = [
+    consumeSelectedRelayEvidence(lookupSelections.middle, {
+      transaction: lookup,
+      branchClass: BRANCH_CLASS.LOOKUP,
+      position: 'middle',
+      generation: 2n
+    }),
+    consumeSelectedRelayEvidence(lookupSelections.exit, {
+      transaction: lookup,
+      branchClass: BRANCH_CLASS.LOOKUP,
+      position: 'exit',
+      generation: 2n
+    })
+  ]
+  const announceEvidence = [
+    consumeSelectedRelayEvidence(announceSelections.middle, {
+      transaction: announce,
+      branchClass: BRANCH_CLASS.ANNOUNCE,
+      position: 'middle',
+      generation: 2n
+    }),
+    consumeSelectedRelayEvidence(announceSelections.exit, {
+      transaction: announce,
+      branchClass: BRANCH_CLASS.ANNOUNCE,
+      position: 'exit',
+      generation: 2n
+    })
+  ]
+  t.alike(
+    lookupEvidence.map((entry) => entry.advertisementDigest),
+    announceEvidence.map((entry) => entry.advertisementDigest)
+  )
+  commitRelayPathReservation(lookup)
+  expectCode(t, () => commitRelayPathReservation(announce), 'ERR_INCOMPATIBLE_RELAY')
+  t.ok(announceEvidence.every((entry) => entry.canonicalAdvertisement.every((byte) => byte === 0)))
+
+  let retry = null
+  let retryError = null
+  try {
+    retry = takeRelayPathReservation(
+      directory.reserveReplacement({ branchClass: BRANCH_CLASS.ANNOUNCE, generation: 2n })
+    )
+  } catch (err) {
+    retryError = err
+  }
+  t.absent(retryError)
+  if (retry !== null) abortRelayPathReservation(retry)
+  directory.destroy()
+})
+
+test('sealed transfer revalidates expiry, rollback, and hostile clocks before publication', (t) => {
+  const expired = fixture()
+  const tracked = trackedDirectoryModule()
+  const expiredSink = tracked.fresh.createRelayCandidateDirectorySink({
+    wallNow: expired.clock.wallNow,
+    monotonicNow: expired.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  tracked.start(null)
+  const expiredToken = tracked.fresh.sealRelayCandidateDirectorySink(
+    expiredSink,
+    expired.records,
+    expired.scope
+  )
+  const sealedAllocations = tracked.take()
+  expired.clock.advance(30_000)
+  expectCode(
+    t,
+    () => tracked.fresh.consumeSealedRelayCandidateDirectory(expiredToken),
+    'ERR_REPLAY'
+  )
+  t.ok(sealedAllocations.length > 0)
+  t.ok(sealedAllocations.every((value) => value.every((byte) => byte === 0)))
+  expectCode(
+    t,
+    () => tracked.fresh.consumeSealedRelayCandidateDirectory(expiredToken),
+    'ERR_REPLAY'
+  )
+
+  const rollback = fixture()
+  const rollbackSink = createRelayCandidateDirectorySink({
+    wallNow: rollback.clock.wallNow,
+    monotonicNow: rollback.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  const rollbackToken = sealRelayCandidateDirectorySink(
+    rollbackSink,
+    rollback.records,
+    rollback.scope
+  )
+  rollback.clock.jumpWall(-30_001)
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(rollbackToken), 'ERR_REPLAY')
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(rollbackToken), 'ERR_REPLAY')
+
+  const base = fakeClock()
+  let throwClock = false
+  const throwing = fixture(1, 1, {
+    wallNow() {
+      if (throwClock) throw new Error('injected sealed clock failure')
+      return base.wallNow()
+    },
+    monotonicNow: base.monotonicNow
+  })
+  const throwingSink = createRelayCandidateDirectorySink({
+    wallNow: throwing.clock.wallNow,
+    monotonicNow: throwing.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  const throwingToken = sealRelayCandidateDirectorySink(
+    throwingSink,
+    throwing.records,
+    throwing.scope
+  )
+  throwClock = true
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(throwingToken), 'ERR_REPLAY')
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(throwingToken), 'ERR_REPLAY')
+
+  let reenter = false
+  let reentrantToken = null
+  const reentrant = fixture(1, 1, {
+    wallNow() {
+      if (reenter) destroySealedRelayCandidateDirectory(reentrantToken)
+      return NOW
+    },
+    monotonicNow: () => 0n
+  })
+  const reentrantSink = createRelayCandidateDirectorySink({
+    wallNow: reentrant.clock.wallNow,
+    monotonicNow: reentrant.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  reentrantToken = sealRelayCandidateDirectorySink(
+    reentrantSink,
+    reentrant.records,
+    reentrant.scope
+  )
+  reenter = true
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(reentrantToken), 'ERR_REPLAY')
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(reentrantToken), 'ERR_REPLAY')
+})
+
+test('caught nested replay irreversibly poisons active seal and consume transfers', (t) => {
+  for (const operation of ['seal', 'revoke']) {
+    const input = fixture()
+    let sink = null
+    let active = false
+    let nestedCode = null
+    let clockCalls = 0
+    const wallNow = () => {
+      clockCalls++
+      if (active) {
+        active = false
+        try {
+          if (operation === 'seal') {
+            sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+          } else {
+            revokeRelayCandidateDirectorySink(sink)
+          }
+        } catch (err) {
+          nestedCode = err && err.code
+        }
+      }
+      return NOW
+    }
+    sink = createRelayCandidateDirectorySink({
+      wallNow,
+      monotonicNow: () => 0n,
+      randomBytes: zeroRandomBytes
+    })
+    active = true
+    let token = null
+    let outerCode = null
+    try {
+      token = sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+    } catch (err) {
+      outerCode = err && err.code
+    }
+    t.is(nestedCode, 'ERR_REPLAY', `${operation} nested replay`)
+    t.is(outerCode, 'ERR_REPLAY', `${operation} outer replay`)
+    t.is(token, null, `${operation} publishes no token`)
+    const callsAfterFailure = clockCalls
+    expectCode(
+      t,
+      () => sealRelayCandidateDirectorySink(sink, input.records, input.scope),
+      'ERR_REPLAY'
+    )
+    t.is(clockCalls, callsAfterFailure, `${operation} retains no clock authority`)
+    if (token !== null) destroySealedRelayCandidateDirectory(token)
+  }
+
+  for (const operation of ['consume', 'destroy']) {
+    const tracked = trackedDirectoryModule()
+    const input = fixture()
+    let token = null
+    let active = false
+    let nestedCode = null
+    let clockCalls = 0
+    const wallNow = () => {
+      clockCalls++
+      if (active) {
+        active = false
+        try {
+          if (operation === 'consume') {
+            tracked.fresh.consumeSealedRelayCandidateDirectory(token)
+          } else {
+            tracked.fresh.destroySealedRelayCandidateDirectory(token)
+          }
+        } catch (err) {
+          nestedCode = err && err.code
+        }
+      }
+      return NOW
+    }
+    const sink = tracked.fresh.createRelayCandidateDirectorySink({
+      wallNow,
+      monotonicNow: () => 0n,
+      randomBytes: zeroRandomBytes
+    })
+    tracked.start(null)
+    token = tracked.fresh.sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+    const transferAllocations = tracked.take()
+    active = true
+    let directory = null
+    let outerCode = null
+    try {
+      directory = tracked.fresh.consumeSealedRelayCandidateDirectory(token)
+    } catch (err) {
+      outerCode = err && err.code
+    }
+    t.is(nestedCode, 'ERR_REPLAY', `${operation} nested replay`)
+    t.is(outerCode, 'ERR_REPLAY', `${operation} outer replay`)
+    t.is(directory, null, `${operation} publishes no directory`)
+    t.ok(
+      transferAllocations.every((value) => value.every((byte) => byte === 0)),
+      `${operation} clears owned transfer bytes`
+    )
+    const callsAfterFailure = clockCalls
+    expectCode(t, () => tracked.fresh.consumeSealedRelayCandidateDirectory(token), 'ERR_REPLAY')
+    t.is(clockCalls, callsAfterFailure, `${operation} retains no clock authority`)
+    if (directory !== null) directory.destroy()
+  }
+
+  const uncaught = fixture()
+  let uncaughtSink = null
+  let uncaughtActive = false
+  uncaughtSink = createRelayCandidateDirectorySink({
+    wallNow() {
+      if (uncaughtActive) {
+        uncaughtActive = false
+        sealRelayCandidateDirectorySink(uncaughtSink, uncaught.records, uncaught.scope)
+      }
+      return NOW
+    },
+    monotonicNow: () => 0n,
+    randomBytes: zeroRandomBytes
+  })
+  uncaughtActive = true
+  expectCode(
+    t,
+    () => sealRelayCandidateDirectorySink(uncaughtSink, uncaught.records, uncaught.scope),
+    'ERR_REPLAY'
+  )
+})
+
+test('evidence and commit reject transaction or directory reentry from wall clock', (t) => {
+  let action = null
+  const base = fakeClock()
+  const input = fixture(1, 1, {
+    wallNow() {
+      const current = action
+      action = null
+      if (current !== null) current()
+      return base.wallNow()
+    },
+    monotonicNow: base.monotonicNow
+  })
+  const directory = install(input)
+  const reservation = directory.reserveInitialPair({
+    lookupGeneration: 1n,
+    announceGeneration: 1n
+  })
+  const transaction = takeRelayPathReservation(reservation)
+  const selections = splitRelayPathReservation(transaction)
+  action = () => abortRelayPathReservation(transaction)
+  expectCode(
+    t,
+    () =>
+      consumeSelectedRelayEvidence(selections.lookup.middle, {
+        transaction,
+        branchClass: BRANCH_CLASS.LOOKUP,
+        position: 'middle',
+        generation: 1n
+      }),
+    'ERR_REPLAY'
+  )
+  const retry = takeRelayPathReservation(
+    directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  abortRelayPathReservation(retry)
+
+  const commitReservation = directory.reserveInitialPair({
+    lookupGeneration: 1n,
+    announceGeneration: 1n
+  })
+  const commitTransaction = takeRelayPathReservation(commitReservation)
+  const evidence = consumeInitial(commitTransaction, splitRelayPathReservation(commitTransaction))
+  action = () => directory.destroy()
+  expectCode(t, () => commitRelayPathReservation(commitTransaction), 'ERR_INCOMPATIBLE_RELAY')
+  t.ok(evidence.every((entry) => entry.advertisementDigest.every((byte) => byte === 0)))
+  t.alike(directory[kInspectRelayCandidateDirectory](), {
+    destroyed: true,
+    identityCount: 0,
+    byteBufferCount: 0,
+    digestCount: 0,
+    timerCount: 0,
+    callbackCount: 0,
+    generationRecordCount: 0,
+    quarantineCount: 0,
+    faultedCount: 0,
+    pendingCount: 0
+  })
+})
+
+test('same-epoch equivocation quarantine cannot be bypassed by later transfer records', (t) => {
+  const expiresAt = NOW + 180_000n
+  const input = longFixture(expiresAt)
+  const original = candidate(ROLE.SAFETY, 1, 2, { expiresAtMs: NOW + 60_000n })
+  input.records[0] = original
+  const conflicting = candidate(ROLE.SAFETY, 1, 20, {
+    epoch: original.epoch,
+    expiresAtMs: NOW + 120_000n
+  })
+  const higher = candidate(ROLE.SAFETY, 1, 21, {
+    epoch: original.epoch + 1n,
+    expiresAtMs: expiresAt
+  })
+  input.records.push(conflicting, higher)
+  const directory = install(input)
+  t.is(directory[kInspectRelayCandidateDirectory]().quarantineCount, 1)
+  const transaction = takeRelayPathReservation(
+    directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  const evidence = consumeInitial(transaction, splitRelayPathReservation(transaction))
+  for (const rejected of [original, conflicting, higher]) {
+    t.absent(evidence.some((entry) => b4a.equals(entry.advertisementDigest, rejected.digest)))
+  }
+  abortRelayPathReservation(transaction)
+
+  directory.retainForSuspend()
+  input.clock.advance(119_999)
+  directory.resume()
+  t.is(directory[kInspectRelayCandidateDirectory]().quarantineCount, 1)
+  directory.retainForSuspend()
+  input.clock.advance(1)
+  directory.resume()
+  t.is(directory[kInspectRelayCandidateDirectory]().quarantineCount, 0)
+  directory.destroy()
+
+  const bounded = fixture()
+  const conflicts = []
+  for (let i = 0; i < MAX_RELAY_CANDIDATE_IDENTITIES + 1; i++) {
+    const role = i & 1 ? ROLE.PRIVATE : ROLE.SAFETY
+    const ordinal = i >> 1
+    conflicts.push(candidate(role, ordinal, 80 + i * 2))
+    conflicts.push(candidate(role, ordinal, 81 + i * 2))
+  }
+  const sink = createRelayCandidateDirectorySink({
+    wallNow: bounded.clock.wallNow,
+    monotonicNow: bounded.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  let token = null
+  let error = null
+  try {
+    token = sealRelayCandidateDirectorySink(sink, conflicts, bounded.scope)
+  } catch (err) {
+    error = err
+  }
+  t.is(error && error.code, 'ERR_REPLAY')
+  if (token !== null) destroySealedRelayCandidateDirectory(token)
+})
+
+test('fresh wall after monotonic rejects exact guard and candidate expiry on every handoff', (t) => {
+  const makeInput = () => {
+    const clock = callbackClock()
+    const input = fixture(1, 1, clock)
+    const guard = candidate(ROLE.SAFETY, 0, 1, { expiresAtMs: NOW + 60_000n })
+    input.guard = guard
+    input.scope = {
+      guardIdentity: guard.identity,
+      guardEndpoint: guard.canonicalEndpointBytes,
+      guardAdvertisementDigest: guard.digest,
+      guardEpoch: guard.epoch,
+      guardExpiresAt: guard.expiresAt
+    }
+    return input
+  }
+
+  const initial = makeInput()
+  const initialDirectory = install(initial)
+  initial.clock.setCallback(() => initial.clock.setWall(NOW + 30_000n))
+  expectCode(
+    t,
+    () => initialDirectory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.is(initialDirectory[kInspectRelayCandidateDirectory]().pendingCount, 0)
+  initialDirectory.destroy()
+
+  const replacement = makeInput()
+  const replacementDirectory = install(replacement)
+  installInitial(replacementDirectory)
+  replacement.clock.setCallback(() => replacement.clock.setWall(NOW + 30_000n))
+  expectCode(
+    t,
+    () =>
+      replacementDirectory.reserveReplacement({
+        branchClass: BRANCH_CLASS.LOOKUP,
+        generation: 2n
+      }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.is(replacementDirectory[kInspectRelayCandidateDirectory]().pendingCount, 0)
+  replacementDirectory.destroy()
+
+  const resumed = makeInput()
+  const resumedDirectory = install(resumed)
+  resumedDirectory.retainForSuspend()
+  resumed.clock.setCallback(() => resumed.clock.setWall(NOW + 30_000n))
+  expectCode(t, () => resumedDirectory.resume(), 'ERR_INCOMPATIBLE_RELAY')
+  t.is(resumedDirectory[kInspectRelayCandidateDirectory]().pendingCount, 0)
+  resumedDirectory.destroy()
+
+  const sealed = makeInput()
+  const sink = createRelayCandidateDirectorySink({
+    wallNow: sealed.clock.wallNow,
+    monotonicNow: sealed.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  const token = sealRelayCandidateDirectorySink(sink, sealed.records, sealed.scope)
+  sealed.clock.setCallback(() => sealed.clock.setWall(NOW + 30_000n))
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(token), 'ERR_REPLAY')
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(token), 'ERR_REPLAY')
+
+  const guardExpired = makeInput()
+  const expiringGuard = candidate(ROLE.SAFETY, 0, 1)
+  guardExpired.scope = {
+    guardIdentity: expiringGuard.identity,
+    guardEndpoint: expiringGuard.canonicalEndpointBytes,
+    guardAdvertisementDigest: expiringGuard.digest,
+    guardEpoch: expiringGuard.epoch,
+    guardExpiresAt: expiringGuard.expiresAt
+  }
+  guardExpired.guard = expiringGuard
+  for (let i = 0; i < guardExpired.records.length; i++) {
+    const role = i < 3 ? ROLE.SAFETY : ROLE.PRIVATE
+    const ordinal = role === ROLE.SAFETY ? i + 1 : i - 3
+    guardExpired.records[i] = candidate(role, ordinal, 100 + i, {
+      expiresAtMs: NOW + 60_000n
+    })
+  }
+  const guardDirectory = install(guardExpired)
+  guardExpired.clock.setCallback(() => guardExpired.clock.setWall(NOW + 30_000n))
+  expectCode(
+    t,
+    () => guardDirectory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.is(guardDirectory[kInspectRelayCandidateDirectory]().identityCount, 0)
+  guardDirectory.destroy()
+})
+
+test('monotonic callback destruction cannot resurrect directory state', (t) => {
+  const run = (operation) => {
+    const clock = callbackClock()
+    const input = fixture(1, 1, clock)
+    const directory = install(input)
+    if (operation === 'replacement') installInitial(directory)
+    if (operation === 'resume') directory.retainForSuspend()
+    clock.setCallback(() => directory.destroy())
+    expectCode(
+      t,
+      () => {
+        if (operation === 'initial') {
+          directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+        } else if (operation === 'replacement') {
+          directory.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n })
+        } else if (operation === 'retain') {
+          directory.retainForSuspend()
+        } else {
+          directory.resume()
+        }
+      },
+      'ERR_INCOMPATIBLE_RELAY'
+    )
+    const observed = directory[kInspectRelayCandidateDirectory]()
+    t.ok(observed.destroyed, `${operation} remains destroyed`)
+    t.is(observed.identityCount, 0, `${operation} resurrects no records`)
+    t.is(observed.pendingCount, 0, `${operation} publishes no claim`)
+  }
+  for (const operation of ['initial', 'replacement', 'retain', 'resume']) run(operation)
+
+  const clock = callbackClock()
+  const input = fixture(1, 1, clock)
+  let token = null
+  const sink = createRelayCandidateDirectorySink({
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  token = sealRelayCandidateDirectorySink(sink, input.records, input.scope)
+  clock.setCallback(() => {
+    try {
+      destroySealedRelayCandidateDirectory(token)
+    } catch {}
+  })
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(token), 'ERR_REPLAY')
+  expectCode(t, () => consumeSealedRelayCandidateDirectory(token), 'ERR_REPLAY')
+})
+
+test('transfer record work is rejected before ownership or advertisement crypto', (t) => {
+  const counted = countedVerificationDirectoryModule()
+  const input = fixture()
+  const records = []
+  for (let i = 0; i < 16; i++) {
+    const role = i & 1 ? ROLE.PRIVATE : ROLE.SAFETY
+    records.push(candidate(role, i >> 1, 130 + i))
+    records.push(records[records.length - 1])
+  }
+  records.push(records[0])
+  const sink = counted.fresh.createRelayCandidateDirectorySink({
+    wallNow: input.clock.wallNow,
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  expectCode(
+    t,
+    () => counted.fresh.sealRelayCandidateDirectorySink(sink, records, input.scope),
+    'ERR_REPLAY'
+  )
+  t.alike(counted.counts(), { decodeCalls: 0, digestCalls: 0 })
+
+  const countedBytes = countedVerificationDirectoryModule()
+  const oversized = records.slice(0, 32)
+  oversized[0] = {
+    ...oversized[0],
+    canonicalBytes: b4a.alloc(389)
+  }
+  const byteSink = countedBytes.fresh.createRelayCandidateDirectorySink({
+    wallNow: input.clock.wallNow,
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  expectCode(
+    t,
+    () => countedBytes.fresh.sealRelayCandidateDirectorySink(byteSink, oversized, input.scope),
+    'ERR_REPLAY'
+  )
+  t.alike(countedBytes.counts(), { decodeCalls: 0, digestCalls: 0 })
+
+  const boundary = countedVerificationDirectoryModule()
+  const boundarySink = boundary.fresh.createRelayCandidateDirectorySink({
+    wallNow: input.clock.wallNow,
+    monotonicNow: input.clock.monotonicNow,
+    randomBytes: zeroRandomBytes
+  })
+  const token = boundary.fresh.sealRelayCandidateDirectorySink(
+    boundarySink,
+    records.slice(0, 32),
+    input.scope
+  )
+  t.alike(boundary.counts(), { decodeCalls: 32, digestCalls: 32 })
+
+  boundary.fresh.destroySealedRelayCandidateDirectory(token)
+})
+
+test('uniform initial selection indexes all 36 valid three-plus-three combinations', (t) => {
+  const input = fixture()
+  const middles = input.records.filter((record) => record.role === ROLE.SAFETY)
+  const exits = input.records.filter((record) => record.role === ROLE.PRIVATE)
+  const expected = []
+  for (const firstMiddle of middles) {
+    for (const firstExit of exits) {
+      for (const secondMiddle of middles) {
+        if (secondMiddle === firstMiddle) continue
+        for (const secondExit of exits) {
+          if (secondExit === firstExit) continue
+          expected.push(
+            [
+              b4a.toString(firstMiddle.digest, 'hex'),
+              b4a.toString(firstExit.digest, 'hex'),
+              b4a.toString(secondMiddle.digest, 'hex'),
+              b4a.toString(secondExit.digest, 'hex')
+            ].join(':')
+          )
+        }
+      }
+    }
+  }
+  t.is(expected.length, 36, 'three middles and three exits have 36 valid ordered quads')
+
+  const observed = []
+  const randomSources = []
+  for (let draw = 0; draw < expected.length; draw++) {
+    const sizes = []
+    const directory = install(input, (size) => {
+      sizes.push(size)
+      const source = b4a.from([draw])
+      randomSources.push(source)
+      return source
+    })
+    const selected = installInitialDigests(directory)
+    observed.push(
+      [
+        selected.lookupMiddle,
+        selected.lookupExit,
+        selected.announceMiddle,
+        selected.announceExit
+      ].join(':')
+    )
+    t.alike(sizes, [1], `draw ${draw} uses one random byte`)
+    directory.destroy()
+  }
+  t.alike(observed, expected, 'each draw selects its exact enumeration index')
+  t.is(new Set(observed).size, 36, 'all valid combinations are reachable')
+  t.ok(
+    randomSources.every((source) => source.every((byte) => byte === 0)),
+    'draws are cleared'
+  )
+})
+
+test('uniform selection rejects modulo-biased draws and uses the minimum byte width', (t) => {
+  const input = fixture()
+  const draws = [252, 35]
+  const sources = []
+  const directory = install(input, (size) => {
+    t.is(size, 1, '36 combinations use one byte')
+    const source = b4a.from([draws.shift()])
+    sources.push(source)
+    return source
+  })
+  const selected = installInitialDigests(directory)
+  directory.destroy()
+
+  const expectedDirectory = install(input, () => b4a.from([35]))
+  const expected = installInitialDigests(expectedDirectory)
+  expectedDirectory.destroy()
+  t.alike(selected, expected, '252 is rejected rather than reduced modulo 36')
+  t.alike(draws, [], 'one rejected and one accepted draw consumed')
+  t.ok(
+    sources.every((source) => source.every((byte) => byte === 0)),
+    'rejected draws are cleared'
+  )
+
+  const wideInput = fixture(6, 6)
+  const sizes = []
+  const wide = install(wideInput, (size) => {
+    sizes.push(size)
+    return b4a.alloc(size)
+  })
+  const wideReservation = takeRelayPathReservation(
+    wide.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n })
+  )
+  abortRelayPathReservation(wideReservation)
+  wide.destroy()
+  t.alike(sizes, [2], '3,136 combinations use two bytes')
+})
+
+test('replacement selection uniformly indexes its chosen tier and a singleton spends no entropy', (t) => {
+  const input = fixture(2, 2)
+  const middles = input.records.filter((record) => record.role === ROLE.SAFETY)
+  const exits = input.records.filter((record) => record.role === ROLE.PRIVATE)
+  const expected = []
+  for (const middle of middles.slice(2)) {
+    for (const exit of exits.slice(2)) {
+      expected.push(`${b4a.toString(middle.digest, 'hex')}:${b4a.toString(exit.digest, 'hex')}`)
+    }
+  }
+  const observed = []
+  for (let draw = 0; draw < expected.length; draw++) {
+    const sizes = []
+    let randomCall = 0
+    const directory = install(input, (size) => {
+      sizes.push(size)
+      return b4a.from([randomCall++ === 0 ? 0 : draw])
+    })
+    installInitialDigests(directory)
+    const selected = rotateBranch(directory, BRANCH_CLASS.LOOKUP, 2n)
+    observed.push(`${selected.middle}:${selected.exit}`)
+    t.alike(sizes, [1, 1], `replacement draw ${draw} samples its four-combination tier once`)
+    directory.destroy()
+  }
+  t.alike(observed, expected)
+  t.is(new Set(observed).size, 4, 'all valid replacement pairs are reachable')
+
+  let calls = 0
+  const singleton = install(fixture(), (size) => {
+    calls++
+    return b4a.alloc(size)
+  })
+  installInitialDigests(singleton)
+  t.is(calls, 1, 'initial 36-combination selection samples once')
+  const reservation = takeRelayPathReservation(
+    singleton.reserveReplacement({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n })
+  )
+  t.is(calls, 1, 'the only valid replacement pair spends no randomness')
+  abortRelayPathReservation(reservation)
+  singleton.destroy()
+})
+
+test('throwing malformed rejecting and reentrant randomness invalidates without publication', (t) => {
+  for (const mode of ['throw', 'malformed', 'reject', 'reenter', 'destroy']) {
+    let directory = null
+    let nestedCode = null
+    let source = null
+    let draws = 0
+    const randomBytes = (size) => {
+      if (mode === 'throw') throw new Error('injected random failure')
+      if (mode === 'malformed') {
+        source = b4a.alloc(size + 1, 0x5a)
+        return source
+      }
+      if (mode === 'reject') {
+        draws++
+        source = b4a.alloc(size, 0xff)
+        return source
+      }
+      if (mode === 'reenter') {
+        try {
+          directory.reserveInitialPair({ lookupGeneration: 2n, announceGeneration: 2n })
+        } catch (err) {
+          nestedCode = err && err.code
+        }
+      } else {
+        directory.destroy()
+      }
+      source = b4a.alloc(size, 0x5a)
+      return source
+    }
+    directory = install(fixture(), randomBytes)
+    expectCode(
+      t,
+      () => directory.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+      'ERR_INCOMPATIBLE_RELAY'
+    )
+    const observed = directory[kInspectRelayCandidateDirectory]()
+    t.is(observed.identityCount, 0, `${mode}: candidate ownership cleared`)
+    t.is(observed.pendingCount, 0, `${mode}: no reservation published`)
+    t.is(observed.callbackCount, 0, `${mode}: no callback authority retained`)
+    t.is(observed.destroyed, mode === 'destroy', `${mode}: destruction state is atomic`)
+    if (mode === 'reenter') t.is(nestedCode, 'ERR_INCOMPATIBLE_RELAY', 'nested draw rejected')
+    if (mode === 'reject') t.is(draws, 128, 'rejection sampling has a fixed work bound')
+    if (source)
+      t.ok(
+        source.every((byte) => byte === 0),
+        `${mode}: random source cleared`
+      )
+    directory.destroy()
+  }
+})
+
+// KI-14. Fixed-zero randomness pins the control arm to the first valid entry.
+// Rotation returns that vacated pair to the pool, so the control redraws it while
+// the fault arm's preferred partition does not. Without both arms this would show
+// only that some pair was selected, not that demotion changed the chosen tier.
+test('a hop rotated off for cause is not handed to the sibling branch', (t) => {
+  for (const reportFault of [false, true]) {
+    const label = reportFault ? 'fault reported' : 'control, no fault reported'
+    const directory = install(fixture(2, 2))
+    const initial = installInitialDigests(directory)
+
+    if (reportFault) {
+      t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }), `${label}: recorded`)
+    }
+    const observed = directory[kInspectRelayCandidateDirectory]()
+    t.is(observed.faultedCount, reportFault ? 2 : 0, `${label}: both hops of the branch demoted`)
+    // A fault is a heuristic, not proof of equivocation, so it must never be
+    // written to the mechanism that bars an identity outright.
+    t.is(observed.quarantineCount, 0, `${label}: nothing quarantined`)
+
+    rotateBranch(directory, BRANCH_CLASS.LOOKUP, 2n)
+    const announce = rotateBranch(directory, BRANCH_CLASS.ANNOUNCE, 2n)
+
+    if (reportFault) {
+      t.not(announce.middle, initial.lookupMiddle, `${label}: vacated middle not reused`)
+      t.not(announce.exit, initial.lookupExit, `${label}: vacated exit not reused`)
+    } else {
+      t.is(announce.middle, initial.lookupMiddle, `${label}: vacated middle IS reused`)
+      t.is(announce.exit, initial.lookupExit, `${label}: vacated exit IS reused`)
+    }
+    directory.destroy()
+  }
+})
+
+// The honest limit of the demotion, pinned here so it cannot change unnoticed.
+// In the three-plus-three shape the eleven-role scenario runs, the exclusion set
+// already removes two of three middles and two of three exits, so the only
+// qualifying pair IS the one just vacated: the preferred tier comes back empty
+// and the fallback admits it. The demotion therefore has NO observable effect in
+// that topology - which is precisely why it cannot make a legitimate rotation
+// fail closed. Hard exclusion would throw ERR_INCOMPATIBLE_RELAY on both arms
+// below, and any relay could then deny the endpoint a route by failing.
+test('demotion never fails a rotation closed in the three-plus-three shape', (t) => {
+  for (const reportFault of [false, true]) {
+    const label = reportFault ? 'fault-driven' : 'expiry-driven'
+    const directory = install(fixture())
+    const initial = installInitialDigests(directory)
+    if (reportFault) directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP })
+
+    rotateBranch(directory, BRANCH_CLASS.LOOKUP, 2n)
+    let announce = null
+    let error = null
+    try {
+      announce = rotateBranch(directory, BRANCH_CLASS.ANNOUNCE, 2n)
+    } catch (err) {
+      error = err
+    }
+    t.absent(error, `${label}: sibling rotation still succeeds`)
+    t.is(announce && announce.middle, initial.lookupMiddle, `${label}: only qualifying middle`)
+    t.is(announce && announce.exit, initial.lookupExit, `${label}: only qualifying exit`)
+    directory.destroy()
+  }
+})
+
+test('a demotion is bounded by the later of its record and the fault floor', (t) => {
+  const input = replacementExpiryFixture(BRANCH_CLASS.LOOKUP)
+  const directory = install(input)
+  // Nothing is committed, so no pair can be blamed for the branch failing.
+  t.absent(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  expectCode(
+    t,
+    () => directory.reportBranchFault({ branchClass: 'lookup' }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  expectCode(
+    t,
+    () => directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP, generation: 2n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+
+  // WAS 'a demotion is bounded by the record it applies to', asserting the count
+  // was 0 at the lookup records' own 30s expiry. `FAULT_DEMOTION_MS` breaks that
+  // premise on purpose - a relay must not be able to shed a penalty by signing a
+  // short-lived capability - so this is re-expressed at the test's intent, which
+  // is that a demotion is BOUNDED rather than permanent and that
+  // `pruneInvalidRecords` is what ends it. Both hops of this fixture's lookup
+  // pair expire before the floor, so the entries now outlive their records...
+  input.clock.advance(30_000)
+  t.absent(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+
+  // ...and the sweep that ends them is the first one past the floor. The guard
+  // has expired by then, but `reportBranchFault` needs no live guard to sweep.
+  input.clock.advance(30_001)
+  t.absent(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 0)
+  directory.destroy()
+})
+
+// A fault demotes BOTH hops of the pair and only one of them chose its own
+// expiry, so an unfloored demotion is one the attacker sets for itself and the
+// honest hop cannot. 60s is `FAULT_DEMOTION_MS`, pinned here because the
+// constant is not exported and its value is the entire penalty.
+test('a relay cannot shorten its own demotion with a short-lived capability', (t) => {
+  const input = faultFloorFixture()
+  const directory = install(input)
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2, 'both hops demoted')
+
+  // Past the two-second lifetime the middle signed for itself, far short of the
+  // floor. Its record is gone from the candidate set - its own doing - and this
+  // report can only re-demote the exit, so the count holding at two is the
+  // middle's floored entry surviving the sweep inside the same call.
+  input.clock.advance(10_000)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }), 'honest exit still live')
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2, 'floored entry survives')
+  directory.destroy()
+})
+
+// The other half: a floor, not an extension. A relay that advertises honestly
+// long-lived capabilities must not be penalised for longer than it would have
+// been before the floor existed.
+test('the fault floor never extends a demotion past a long-lived record', (t) => {
+  const input = longFixture(NOW + 120_000n)
+  const directory = install(input)
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+
+  // Past the floor, still well inside the records' own lifetime. The rotation is
+  // here only to force a sweep: `reserveReplacement` prunes and never writes
+  // `faulted`, so this observes the stored bound instead of refreshing it the
+  // way a second fault report would.
+  input.clock.advance(60_001)
+  rotateBranch(directory, BRANCH_CLASS.ANNOUNCE, 2n)
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2, 'the longer bound governs')
+
+  // At the records' own expiry the demotion goes with them. Were the floor added
+  // to that expiry rather than compared against it, both entries would still be
+  // here for another minute.
+  input.clock.advance(59_999)
+  t.absent(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 0, 'not extended')
+  directory.destroy()
+})
+
+test('suspend and resume do not launder a demotion', (t) => {
+  const directory = install(fixture(2, 2))
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+  // `retainForSuspend` clears the committed pairs, so the demoted hops are no
+  // longer live anywhere. The demotion has to outlive that or a reconnect would
+  // be a free pardon.
+  directory.retainForSuspend()
+  directory.resume()
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+  directory.destroy()
+})
+
+// Named for what it actually asserts. It checks that a demotion SURVIVES a
+// reconnect and that `reserveInitialPair` still succeeds with one in place - both
+// worth holding - but it never inspects which records were selected, so it passes
+// with or without the demotion being honoured. The selection property is the test
+// below it.
+test('resume keeps a demotion and still admits a reconnect bootstrap pair', (t) => {
+  const directory = install(fixture(2, 2))
+  installInitialDigests(directory)
+  t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }))
+  directory.retainForSuspend()
+  directory.resume()
+  const reservation = directory.reserveInitialPair({
+    lookupGeneration: 2n,
+    announceGeneration: 2n
+  })
+  t.is(directory[kInspectRelayCandidateDirectory]().faultedCount, 2)
+  abortRelayPathReservation(takeRelayPathReservation(reservation))
+  directory.destroy()
+})
+
+// Both initial reservations and reconnect bootstrap reservations exhaust the
+// preferred partition before falling back to all candidates. Drawing directly
+// from `all` makes the fault arm reselect the fixed-zero lookup pair and fails
+// these assertions.
+test('reconnect bootstrap selection exhausts the preferred demotion tier first', (t) => {
+  for (const reportFault of [false, true]) {
+    const label = reportFault ? 'fault reported' : 'control, no fault reported'
+    const directory = install(fixture(2, 2))
+    const initial = installInitialDigests(directory)
+    if (reportFault) t.ok(directory.reportBranchFault({ branchClass: BRANCH_CLASS.LOOKUP }), label)
+
+    directory.retainForSuspend()
+    directory.resume()
+    t.is(
+      directory[kInspectRelayCandidateDirectory]().faultedCount,
+      reportFault ? 2 : 0,
+      `${label}: demotion survives the reconnect`
+    )
+
+    const bootstrap = takeRelayPathReservation(
+      directory.reserveInitialPair({ lookupGeneration: 2n, announceGeneration: 2n })
+    )
+    const evidence = consumeInitial(bootstrap, splitRelayPathReservation(bootstrap), [2n, 2n])
+    const selected = evidence.map(digestHex)
+    if (reportFault) {
+      t.absent(selected.includes(initial.lookupMiddle), `${label}: demoted middle not redrawn`)
+      t.absent(selected.includes(initial.lookupExit), `${label}: demoted exit not redrawn`)
+    } else {
+      t.is(selected[0], initial.lookupMiddle, `${label}: fixed-zero middle repeats`)
+      t.is(selected[1], initial.lookupExit, `${label}: fixed-zero exit repeats`)
+    }
+    commitRelayPathReservation(bootstrap)
+    directory.destroy()
+  }
+})
