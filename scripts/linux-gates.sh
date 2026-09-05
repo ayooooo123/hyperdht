@@ -12,6 +12,8 @@
 #   aggregate:bare   deterministic aggregate under Bare
 #   process:node     eleven-role live scenario, Node roles
 #   process:bare     eleven-role live scenario, Bare roles
+#   process:node:reverse  eleven-role live scenario, reversed candidates, Node roles
+#   process:bare:reverse  eleven-role live scenario, reversed candidates, Bare roles
 #   namespace        namespace projection enforcement
 #   namespace:live   namespace live route with capture oracles
 #   all              every gate above, in that order (default)
@@ -62,9 +64,9 @@ expanded=()
 for gate in "${gates[@]}"; do
   case "$gate" in
     all)
-      expanded+=(aggregate:node aggregate:bare process:node process:bare namespace namespace:live)
+      expanded+=(aggregate:node aggregate:bare process:node process:bare process:node:reverse process:bare:reverse namespace namespace:live)
       ;;
-    aggregate:node | aggregate:bare | process:node | process:bare | namespace | namespace:live)
+    aggregate:node | aggregate:bare | process:node | process:bare | process:node:reverse | process:bare:reverse | namespace | namespace:live)
       expanded+=("$gate")
       ;;
     *)
@@ -78,8 +80,10 @@ command_for() {
   case "$1" in
     aggregate:node) echo 'brittle-node test/private-routing.js' ;;
     aggregate:bare) echo '"$(node -p "require(\"bare-runtime\")(\"bare\")")" test/private-routing.js' ;;
-    process:node) echo 'npm run --silent test:private:process:node' ;;
-    process:bare) echo 'npm run --silent test:private:process:bare' ;;
+    process:node) echo 'PR_CANDIDATE_ORDER=normal npm run --silent test:private:process:node' ;;
+    process:bare) echo 'PR_CANDIDATE_ORDER=normal npm run --silent test:private:process:bare' ;;
+    process:node:reverse) echo 'PR_CANDIDATE_ORDER=reverse npm run --silent test:private:process:node' ;;
+    process:bare:reverse) echo 'PR_CANDIDATE_ORDER=reverse npm run --silent test:private:process:bare' ;;
     namespace) echo 'npm run --silent test:private:namespace' ;;
     namespace:live) echo 'npm run --silent test:private:namespace:live' ;;
   esac

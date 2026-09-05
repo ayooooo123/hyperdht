@@ -19,6 +19,111 @@ adds no root public constructor, export, user-selectable required mode, or
 anonymity claim, although its internal path uses the production UDX, relay,
 final-exit, and DHT-exit owners rather than a structural or fake transport.
 
+### Continuation checkpoint — 2026-09-05
+
+Reviewed the accepted branch through `6468028`, the current live owners, gate
+scripts, and prior review records. The next completed work is verification
+hardening, not a new public routing feature:
+
+- The local `all` runner now includes normal and reversed candidate order under
+  both Node and Bare role runtimes, like CI.
+  Each process gate explicitly sets its order. Running all four process gates
+  with the caller exporting either `normal` or `reverse` produced
+  `normal, normal, reverse, reverse`; all eight runs passed 136 assertions each.
+- The blackhole scenario uses monotonic elapsed time and checks both healthy
+  idle generations plus preservation of the announce generation during lookup
+  replacement.
+- An isolated mutation that suppresses `runLiveness` timeout closure, while
+  leaving PING scheduling intact, fails the native scenario with
+  `PROCESS_COMMAND_DEADLINE` after the blackhole is armed. The unmodified
+  scenario passes. Lease-only recovery cannot substitute for the native detector.
+- KI-10 and the historical branch-liveness proposal now name the existing
+  detector. KI-14's headline now reflects preferred-tier selection on all three
+  construction paths, without implying hard exclusion in small pools.
+
+Remaining work, in dependency order:
+
+1. **KI-10 refused-loss redelivery:** a loss report refused during rotation
+   still falls back to expiry. Design and verify generation-bound redelivery
+   without applying a retired branch's loss to its replacement.
+2. **KI-13 production NAT traversal:** design and review the production owner
+   path for same-socket reflection, signed plan creation/distribution, topology
+   and run binding, replay limits, and mapping lifetime. Then prove authenticated
+   route startup across real NAT'd hosts without harness pre-punching. The
+   isolated NAT branch's positive worker report is not acceptance evidence.
+3. **Gate C and private-presence/Gate D:** meet their protocol and cryptographic
+   review gates, then integrate the actual reply and record paths. The reverted
+   and rejected branches are not completed implementations. Gate D still needs
+   a vetted native scalar multiplication path for full blinded-key signing.
+4. **Complete Gate 3B:** remaining DHT commands, private presence, and peer
+   streams need reviewed end-to-end implementations. Public required mode must
+   remain disabled until all aggregate criteria below pass together in CI.
+5. **Consumer integration:** Hyperswarm, mobile, and PearTube follow the public
+   controller gate. Real-device and real-network evidence cannot be replaced by
+   the local container gates.
+
+KI-1 timing/volume correlation and KI-5 operator diversity remain explicit
+limits. This checkpoint adds no production constructor, protocol, or anonymity
+claim. Current local measurements are in the Task 17 table below.
+
+### Single-branch work collection — 2026-09-05
+
+All related work is centralized on `private-routing-v1` in
+`ayooooo123/hyperdht`. The accepted runtime remains active. Rejected and
+unaccepted implementations are preserved under `research/private-routing/`,
+not merged into `lib/private`. Preservation does not close their review gates.
+The complete inventory covers all 33 local branch refs found at collection
+time, both detached experiments, and external handoff/workflow notes.
+Original worktree commits are also retained as parents of an explicitly
+archive-only merge. That merge keeps the accepted tree unchanged: it preserves
+Git history without installing rejected implementations. Thus the one pushed
+branch contains both the original commits and the reconstructable research
+copies; separate remote feature branches are not required.
+
+| Archive directory        | Preserved work                                              | Acceptance status                                                                                        |
+| ------------------------ | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `ki10-blackhole-history` | Original `5a53851` / `7aeee57` history                      | Tip tree equals accepted `6468028`; no second runtime merge is needed                                    |
+| `pr50-history`           | Original six-commit PR #50 history through `ba1f87e`        | Tip tree equals accepted `c035cf8`; no second runtime merge is needed                                    |
+| `production-nat`         | `924fd55` NAT work and preservation status                  | Unaccepted; production ownership and real NAT evidence remain required                                   |
+| `presence-gate-d`        | `5c77a50` / `2ac6b64` presence work and rejection status    | Rejected: record-type authentication, trailing-zero handling, overlap, and integration remain unresolved |
+| `gate-c-surb`            | SURB rewrite and `check_vectors.js`                         | Incomplete; checker needs absent `/tmp/surb_vectors.txt` and undefined relay `sec` fields                |
+| `blackhole-isolation`    | Detached `ab818f9` blackhole/demotion source and tests      | Historical research only; generated `choose.log` and `hook.log` are excluded                             |
+| `baseline`               | Detached `ab818f9` baseline demotion and diagnostic changes | Historical comparison only; not a merge candidate                                                        |
+| `handoff`                | External handoff and two Task 6 workflow briefs             | Historical instructions, not current authority                                                           |
+
+Each archive has a `manifest.json` with its exact base/head, status, changed
+paths, and SHA-256 file hashes. `history.patch`, when present, preserves the
+original commits in `git am` format. `working.patch`, when present, preserves
+the pending tracked and approved untracked files. Neither patch changes the
+active runtime merely by being stored here.
+
+To continue an experiment, create a separate worktree at its manifest's
+`base_commit`, apply `history.patch` with `git am`, then apply `working.patch`
+with `git apply --index`. Skip whichever patch the manifest marks `null`.
+For example, from the canonical checkout:
+
+```sh
+ARCHIVE="$PWD/research/private-routing/production-nat"
+git worktree add --detach ../hyperdht-nat-study 6c307fa8edbd380be4ff9a6a1bce0c1fd926e903
+git -C ../hyperdht-nat-study am "$ARCHIVE/history.patch"
+git -C ../hyperdht-nat-study apply --index "$ARCHIVE/working.patch"
+```
+
+Verification reconstructed all eight archives in temporary worktrees. Every
+original committed tree matched exactly, and all 55 final changed files
+matched their SHA-256 records; live source files were also compared directly.
+This proves preservation, not correctness of the rejected implementations.
+The temporary verification worktrees were removed.
+
+`research/private-routing/inventory.json` records every original local ref and
+its location on the fork or in these archives. Other local routing branches
+already match their fork refs. The second `projects/Hyperdht-private-routing`
+checkout has no unique edits or commits. The clean `source-hyperdht` reference
+tip `b329b8b` is already on the fork. The clean DHT-RPC dependency tip
+`fe04496` is already on its own `ayooooo123/dht-rpc` fork and is not copied here.
+The stale `/private/tmp` baseline worktree entry points to a missing directory;
+the live detached experiments are preserved without pruning that entry.
+
 ## Known issues
 
 ### KI-1: routes are correlatable by timing and volume
@@ -70,12 +175,15 @@ a stated reason. They are not part of the portable aggregate suite.
 Both limits are limits of the host kernel, not of the gates, so a Linux
 container satisfies them. `npm run test:private:linux-gates -- <gate ...>`
 builds `docker/linux-gates.Dockerfile` and runs any of `aggregate:node`,
-`aggregate:bare`, `process:node`, `process:bare`, `namespace`,
-`namespace:live`, or `all` in a privileged container with the working tree
-bind-mounted. Dependencies live at `/node_modules` inside the image and a tmpfs
-shadows `/app/node_modules`, so a host `node_modules` built for another platform
-is never loaded. This gives a macOS or Windows workstation the same six gates
-the Linux CI job runs, before pushing. It does not replace that job: the
+`aggregate:bare`, `process:node`, `process:bare`, `process:node:reverse`,
+`process:bare:reverse`, `namespace`, `namespace:live`, or `all` in a privileged
+container with the working tree bind-mounted. `all` includes both candidate
+orders for both role runtimes, matching the Linux CI matrix. Explicit reverse
+gates set their own candidate order even when the caller exports `normal`.
+Dependencies live at `/node_modules` inside the image and a tmpfs shadows
+`/app/node_modules`, so a host build for another platform is never loaded.
+This gives a macOS or Windows workstation the same eight gates as Linux CI.
+It does not replace that job: the
 container shares the host kernel and its clock, so it is local evidence only,
 and KI-4 timing behaviour still has to be judged on the runner.
 
@@ -708,110 +816,80 @@ own clock at `BRANCH_EXPIRY_RETRY_MS` of 250ms - well inside
 any particular state. Only an empty slot can be filled, so a live sink is never
 displaced. A branch LOSS is deliberately not renewed this way: it is a past event with
 no timer behind it, its expiry timer remains the backstop, and that residual gap is
-KI-10's second half rather than this path's. Regression coverage is
+a separate refused-loss delivery limit, not an absent native detector. Regression coverage is
 `test/private/branch-expiry-rotation.js:271`, which refuses an announce expiry during a
 lookup rotation and asserts the redelivered signal rotates the announce branch.
 
-### KI-10: an in-band branch loss is undeliverable to an idle endpoint, and only a lease bounds discovery
+### KI-10: native blackhole detection and refused-loss redelivery
 
-**Status: FIRST HALF FIXED, SECOND HALF OPEN. Two compounding production faults. The
-first, head-of-line blocking, is the same fault as KI-8 and was closed by the same
-change; it is retained here because this is where the mechanism is documented. The
-second, that nothing but a lease bounds discovery of a dead branch, is untouched and
-needs a reviewed design rather than a patch.**
+**Status: native blackhole detection fixed; refused-loss redelivery remains open.**
+A branch-loss report refused during rotation is not redelivered; expiry remains
+its backstop. This is separate from the verified silent-link detector. The
+head-of-line blocking fault was closed with KI-8. Commits `d00ecef` and `6468028`
+then added an eleven-process proof of the existing native link detector; they
+did not introduce a new heartbeat protocol.
 
-FIRST, NOW FIXED: head-of-line blocking in the route transport. `pumpM3RouteTransport`,
-`lib/private/m3-adjacency-runtime.js:866-916`, is the only caller of
-`consumeM3RouteBranchDestroy` at `:842`, and it stops reading the physical channel
-whenever a frame is already sitting unread in `record.received`: the guard at `:872`
-returns when `record.received.length !== 0`, with the same condition again at the
-recursion gate `:893` and the re-pump gate `:903-909`. So a single unread route frame
-halts the transport, and a `BRANCH_DESTROY` queued behind it is never consumed. Not
-delayed: never. Nothing rearms it and no timer covers it.
+`installLinkControl` in `lib/private/udx-cell-endpoint.js` installs a production
+`LinkControlSession` on each authenticated adjacency. Its `runLiveness` sends
+PING at `LINK_PING_AFTER` (500ms) and closes an adjacency after
+`LINK_UNRESPONSIVE_AFTER` (1,500ms) without accepted activity. `closeState`
+notifies circuit ownership and closes the physical link. M3 propagates that
+loss to the controller and RouteManager. This is application link control
+carried by UDX datagrams, not a native UDX per-peer close event.
 
-Measured on the endpoint's own receive context, two cases differing only in whether one
-unread frame precedes the destroy:
+`test/private/live-process-suite.js` leaves both healthy branches without
+application traffic for two seconds, then blackholes the selected lookup
+middle's route cells in both directions. The middle's process, bound socket,
+bootstrap traffic, and test control stream remain alive. The scenario requires
+a fresh lookup generation within five seconds, an unchanged healthy announce
+generation, an exact immutable get through the replacement, and successful
+suspend/resume and teardown. Elapsed detection time uses a monotonic clock.
+Every selectable middle can receive the fault, including `announce-middle`;
+role labels do not determine which branch uses a relay.
 
-| case                                   | destroy consumed | channel depth |
+Scope: this proves complete bidirectional route-cell silence in the local
+eleven-role topology. It does not prove loss tolerance under arbitrary delay,
+a remote-network latency bound, or detection of a malicious relay that answers
+heartbeats while discarding application cells. L0 still bounds an outstanding
+operation. The existing heartbeat also reveals idle adjacency activity; fixed
+cell size is not traffic-analysis resistance.
+
+#### Historical diagnosis — before 2026-08-30, superseded
+
+The original pump fault stopped `pumpM3RouteTransport` whenever
+`record.received` held an unread frame. A `BRANCH_DESTROY` behind that frame was
+never consumed because neither recursion nor the re-pump path restarted the
+reader. The original measurement compared two cases:
+
+| Historical case                        | Destroy consumed | Channel depth |
 | -------------------------------------- | ---------------- | ------------- |
-| branch destroy alone                   | true             | 0             |
-| branch destroy behind one unread frame | false            | 1             |
+| Branch destroy alone                   | true             | 0             |
+| Branch destroy behind one unread frame | false            | 1             |
 
-In the second case the destroy is still in the channel and the transport is still live.
+Cancelled operations could leave a late reply without a reader. The same pump
+served endpoint requests, DHT exits, and final-exit activation, so the KI-8 pump
+fix addressed all three consumers. This table records the pre-fix failure, not
+current behavior.
 
-An endpoint acquires an unread frame in ordinary operation.
-`lib/private/live-route-authority.js:715` reads the route transport in a
-`while (operationState.live)` loop, one loop per operation; on cancel, `:798-803` clears
-`live` and calls `cancelM3RouteFrameReservation`, removing the waiter. From then until a
-new operation starts, nothing reads that transport. A reply to a cancelled operation
-therefore arrives with no reader, queues, and halts the pump. An endpoint between
-operations is the normal idle state, so the window is not exotic.
+An early rehearsal reported a route change only after 9,656ms, at lease
+rotation. The original diagnosis incorrectly concluded that no keepalive or
+adjacency timeout existed. A later blackhole probe contradicted that premise:
+it observed detection in about 1.48–1.52 seconds while idle and 1.30–1.34 seconds
+with a get outstanding, versus about 14.7 seconds of no-fault silence.
+Disabling the L0 operation deadline did not materially change those results.
+At that point the detector had not been identified.
 
-The fault was never endpoint-specific, and neither is the fix. Every route transport in the
-codebase is minted in one place, `m3-adjacency-runtime.js:785` via `takeM3RouteTransport`,
-called only from `tail-control.js:2079`: one object shape, one `record.received`, one pump,
-one wedge. It has three consumers, and all three have the same reader gap:
+Commits `d00ecef` and `6468028` replaced that uncertainty with the production
+`LinkControlSession` path and the native eleven-process blackhole gate described
+above. The earlier claims of lease-only discovery, an unknown detector, and
+unfixed idle pump blocking are withdrawn. They must not be used as reasons to
+implement the unratified L1/L2 proposal.
 
-- the endpoint's `binding.transport`, `live-route-authority.js:715`, which reserves per
-  operation;
-- an exit's `service.transport`, `dht-exit-io.js:765-823`, whose loop registers a waiter,
-  then runs `codec.open`, the class checks and `pushAuthenticated` with NO waiter registered
-  before reserving again - and whose four `continue` paths all return to the top the same
-  way, so every iteration has such a window;
-- `state.activationTransport`, `final-exit-activation.js:2220-2286`.
-
-So the precondition is structurally available on an exit and on the activation path, not only
-on the endpoint, and because the pump is shared the fix covers all three at once.
-
-SECOND, STILL OPEN: no guaranteed branch-liveness mechanism is specified. If the
-in-band notification is lost, the remaining specified path to discovery is
-`BRANCH_ROTATION_LEAD_MS`, `route-manager.js:36`, a timer scheduled 5s before the branch
-material expires. That is a lease running down, not liveness detection. There is no
-keepalive or adjacency timeout in the private-routing design. In an instrumented
-rehearsal where the in-band notification never arrived and no lower-layer loss signal
-was observed, the endpoint learned nothing for 9656ms and then rotated on that timer,
-which would have fired at the same moment had nothing been faulted at all.
-
-The lease-only premise was falsified by a separate blackhole probe on the same
-eleven-role topology. With `lookup-middle-a` route cells dropped in both
-directions, the endpoint reported a route change after about 1.48-1.52 seconds
-when idle, and about 1.30-1.34 seconds with an immutable get outstanding. The
-no-fault control remained silent for about 14.7 seconds before the lease. Reverting
-the L0 deadline arm made no material difference. This proves that the blackhole
-was detected before lease expiry; it does **not** identify the detector. The
-current evidence points at the physical-loss sink or UDX link progress, but that
-attribution remains unverified. The probe is deliberately not a gate because
-asserting the observed latency would pin an unexplained implementation detail.
-
-This changes the open question from "does anything detect a silent branch?" to
-"which native layer detects this failure, and is that mechanism guaranteed for
-healthy-but-silent links?" No liveness feature is claimed or shipped from this
-measurement.
-
-Stated precisely: in-band branch-loss notification is best-effort and silently
-lossy while an endpoint is idle, and it is unreliable by the design of the reader
-rather than by anything the network does. The only reliable **specified** discovery
-mechanism is the branch lease running down; the blackhole result proves an additional
-native mechanism exists in at least one failure mode, but its contract is unknown.
-
-Together these mean a middle relay that dies without warning - power cut, host gone,
-process killed - **may** leave an endpoint routing into a black hole until branch
-material expires when no lower-layer loss signal arrives. The blackhole measurement
-shows that a lower-layer signal can arrive in at least one such failure mode, but
-does not establish coverage or a bound for healthy-but-silent links. An endpoint
-holding one unread datagram can still discard the in-band notification even when
-the dying peer does send it. The two faults are separable and should be fixed
-separately: the pump must not let one unread frame block control frames, and branch
-liveness needs a bound that does not depend on either an in-band message or the
-expiry lease.
-
-Relationship to KI-8: this mechanism produces KI-8's Fault A exactly, but attribution is
-not established. It requires the stale frame to reach the endpoint before the destroy,
-and in identical mode the destroy is consumed 2.8ms after the fault while a routed get
-takes about 70ms end to end, so the destroy would normally win - which is consistent
-with identical addressing passing 28 of 28. Whether a failing divergent run actually has
-a queued unread frame at the moment of the fault is a single line of a single capture and
-is not yet answered.
+The historical KI-8 field attribution remained uncertain: the proposed stale
+frame had to arrive before the destroy, while one identical-addressing run
+consumed the destroy after 2.8ms and took about 70ms for a routed get. That
+uncertainty concerns the cause of a past field occurrence, not the current
+native detector or the fixed pump.
 
 ### KI-11: a teardown phase mismatch, window found and closed
 
@@ -1387,13 +1465,13 @@ dispatch reports a partial punch matrix, that is the first place to look.
 
 ### KI-14: a rotation re-qualifies the hop it just rotated away from
 
-**Status: FIXED on the ROTATION path for pools larger than three-plus-three. NO
-OBSERVABLE EFFECT in the three-plus-three shape the eleven-role scenario runs, and NOT
-applied to the two-pair build at all — so the attack remains fully open for that
-topology, and this entry must not be read as "the eleven-role scenario is now
-protected".** Distinct from KI-6, and was never going to be fixed by fixing KI-6 — but
-it turns out to be BLOCKED BY the same coupling KI-6 describes, which is recorded below
-and is the most consequential thing in this entry.
+**Status: preferred-tier fault demotion is implemented for initial, reconnect,
+and replacement selection.** The all-candidate tier remains available when no
+preferred combination is possible; demotion is not hard exclusion. A minimal
+three-plus-three pool can still require a previously faulted pair. KI-6 now
+selects uniformly within the chosen tier and its harness coupling is fixed.
+The rotation-only scope and harness blocker described below are historical;
+the small-pool exposure remains current.
 
 The honest cost first, because it is the part a later reader most needs and least wants.
 At three middles and three exits, `reserveReplacement` already excludes the live opposite
@@ -2296,15 +2374,15 @@ surface:
 native UDX loopback. It is test infrastructure, not a public API, and carries no
 anonymity claim.
 
-On Linux the scenario passes all 132 assertions deterministically with both Node
+On Linux the scenario passes all 136 assertions with both Node
 and Bare role children. It proves,
 live and cross-process: ordered DHT role bind and the audited setup store;
 endpoint bootstrap, guard pinning, and separate lookup/announce branches built
 through authenticated adjacent links; an exact immutable get retrieved through
 the three-position route either directly from the configured DHT path or after
 the exit admits an isolated learned closer under a signed Task 12 grant;
-delayed-lookup cancellation; a physical lookup-A link fault that propagates
-`BRANCH_DESTROY` upstream and rotates the endpoint onto lookup B,
+delayed-lookup cancellation; a silent native lookup-middle route-cell blackhole
+that triggers link-loss propagation and rotates the endpoint onto a fresh pair,
 followed by a second exact immutable get; exit accounting for referral probes and
 ordinary requests; endpoint suspend and resume, including a third exact immutable
 get over the rebuilt route; a terminal network change that leaves no endpoint
@@ -2337,27 +2415,28 @@ while `test/private-routing.js` stays green everywhere:
 Counts below are a MEASUREMENT taken at one commit, not a contract. Every added test
 moves them, and a stale total quoted as current has already caused four false findings
 in this document's history - so re-measure rather than cite, and if you change a suite,
-change this table in the same pass. Measured after the remote optional-grant accounting
-fix and KI-4 three-bound deadline split. Where a row claims two platforms, both were run:
-the two aggregates were measured in the Linux container AND on the macOS host, and agreed
-exactly. The Linux-only rows were measured only in the container, which is the only place
-they can run at all (KI-2, KI-3).
+change this table in the same pass. Measured on 2026-09-05 after the native
+blackhole and local-matrix hardening. All rows below were run in the Linux
+container; Darwin aggregates and remote dispatches were not re-measured in this
+checkpoint.
 
-| Suite                            | Command                                    | Result                                                       |
-| -------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
-| Private aggregate, Node          | `npx brittle-node test/private-routing.js` | 925/925 tests, 18,818/18,818 assertions, on Linux and Darwin |
-| Private aggregate, Bare          | `bare test/private-routing.js`             | 904/904 tests, 18,759/18,759 assertions, on Linux and Darwin |
-| Eleven-role scenario, Node roles | `npm run test:private:process:node`        | 132/132 assertions, Linux                                    |
-| Eleven-role scenario, Bare roles | `npm run test:private:process:bare`        | 132/132 assertions, Linux                                    |
-| Namespace projection enforcement | `npm run test:private:namespace`           | 27/27 assertions, privileged Linux                           |
-| Namespace live route and oracles | `npm run test:private:namespace:live`      | 142/142 assertions, privileged Linux                         |
+| Suite                              | Command                                            | Result                                         |
+| ---------------------------------- | -------------------------------------------------- | ---------------------------------------------- |
+| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 925/925 tests, 18,820/18,820 assertions, Linux |
+| Private aggregate, Bare            | `bare test/private-routing.js`                     | 904/904 tests, 18,761/18,761 assertions, Linux |
+| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 136/136 assertions, Linux                      |
+| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 136/136 assertions, Linux                      |
+| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 136/136 assertions, Linux                      |
+| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 136/136 assertions, Linux                      |
+| Namespace projection enforcement   | `npm run test:private:namespace`                   | 27/27 assertions, privileged Linux             |
+| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 146/146 assertions, privileged Linux           |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
 `test/private/live-namespace-node.js` runs the same eleven-process scenario with
 every role in its own Linux network namespace, captures every packet on every
 veth, and decides the result from the captured bytes rather than from the
-implementation's own accounting. It passes `142/142` assertions on Linux.
+implementation's own accounting. It passes `146/146` assertions on Linux.
 
 Isolation is structural, not asserted. Each role holds routes only to the peers
 named by `ALLOW_EDGES`, and the root namespace forwards under a dedicated

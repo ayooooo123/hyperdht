@@ -1,0 +1,2041 @@
+From 924fd55a53c58eae769e301cb0dd1d07ce2f85b3 Mon Sep 17 00:00:00 2001
+From: jd1100 <248791769+ayooooo123@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:48:28 -0400
+Subject: [PATCH] feat(private): authenticated production NAT traversal closing
+ KI-13
+
+The punch that makes a dispatch work was in the harness, not in
+production (KI-13). This moves it into lib/private with the
+authorization the protocol demands, and states plainly what a punch
+buys: connectivity evidence, never identity.
+
+Production owns the reflected address:
+- lib/private/nat-reflect.js reflects the endpoint's own socket off
+  the DHT bootstraps through dht-exit-wire PINGs. Only two-reflector
+  agreement is publishable; disagreement means no publishable value.
+- dht-exit-wire gains createDhtExitPingReservation and
+  observeDhtExitPingReply: the reply decoder reads `to` WITHOUT the
+  local-tuple equality check (the tuple `to` names IS the answer)
+  while still binding the reply to the expected responder and tid.
+
+The punch plan is a signed artifact, not a harness peer list:
+- lib/private/nat-punch.js encodes both peer identities, both
+  published tuples, epoch, run id, validity window and plan id into a
+  canonical encoding signed by the topology authority over a new
+  NAT_PUNCH_PLAN domain. verifyNatPunchPlan returns the caller's own
+  side. A wrong signature, a stranger identity, a wrong advertised
+  address, an expired window or a tampered byte each fail closed
+  before a datagram is sent.
+
+The endpoint punches on its own socket:
+- UdxCellEndpoint.punchPeer runs the six-round simultaneous send from
+  the bound port; every udx send Promise<boolean> is observed and
+  counted, no timer outlives the round, stop() resolves waiters so
+  close() cannot hang, and close() stops a live round.
+- UdxCellEndpoint.punchPlan verifies the plan, pins it to the
+  endpoint's advertised pair, limits accepted plans, and reports
+  sent/refused/received/strayReceived.
+- Punch-tagged datagrams are counted only from the verified peer
+  tuple; anything else is stray. A punch never advances a bootstrap
+  session or substitutes for a link grant.
+- dispatchLinkedPacket routes replies to a PENDING initiate session,
+  and to an accept session only with the explicit acceptDirect opt-in
+  (the punched-link responder has no bootstrap admission). Every
+  other path keeps the existing onBootstrap contract.
+
+The link path is wired:
+- LinkBootstrapSession.open({ punch }) joins the caller's round: the
+  first CREATE dispatches only after the round settles, and the round
+  is stopped when the session fails, closes or is tombstoned.
+- The projected link service gains punchPlanFor(encoding), verifying
+  against the authority it already pins and running the round on the
+  role's own endpoint.
+
+Tests (aggregate suite 1029/1029, 19216/19216):
+- test/private/nat-punch.js: canonical ordering, both-side views,
+  wrong signature/identity/window/tamper/codec rejects.
+- test/private/nat-traversal-live.js: two real UdxCellEndpoints on
+  distinct tuples, no pre-opened path, one signed plan driving the
+  simultaneous round, stray punch accounting, then the authenticated
+  link handshake reaching OPEN on both sides.
+---
+ docs/private-routing-migration.md     |  63 ++++
+ lib/private/dht-exit-wire.js          |  45 ++-
+ lib/private/link-bootstrap-session.js |  77 +++++
+ lib/private/nat-punch.js              | 342 +++++++++++++++++++++
+ lib/private/nat-reflect.js            | 226 ++++++++++++++
+ lib/private/protocol.js               |   1 +
+ lib/private/topology-grant.js         |   2 +
+ lib/private/udx-cell-endpoint.js      | 261 +++++++++++++++-
+ test/private-routing.js               |   2 +
+ test/private/nat-punch.js             | 237 ++++++++++++++
+ test/private/nat-traversal-live.js    | 424 ++++++++++++++++++++++++++
+ test/private/process/wire-services.js |  29 +-
+ test/private/protocol.js              |   1 +
+ 13 files changed, 1697 insertions(+), 13 deletions(-)
+ create mode 100644 lib/private/nat-punch.js
+ create mode 100644 lib/private/nat-reflect.js
+ create mode 100644 test/private/nat-punch.js
+ create mode 100644 test/private/nat-traversal-live.js
+
+diff --git a/docs/private-routing-migration.md b/docs/private-routing-migration.md
+index 6f7c9e8b07f17774242828b363a594afb4421866..1fdde0ac35e6de34e297285eafbf8ac40e51ea1f 100644
+--- a/docs/private-routing-migration.md
++++ b/docs/private-routing-migration.md
+@@ -2490,3 +2490,66 @@ the privileged packet/semantic leak oracles. The announce branch is constructed
+ but carries no DHT mutation in that slice. Remaining DHT commands, private
+ presence, public required mode, peer streams, Hyperswarm, and mobile device
+ evidence remain disabled for later separately reviewed sub-gates.
++
++### KI-13: the punch moved into production, with an authorization chain
++
++**Status: production path landed on this branch (`586e21a`), exercised end to
++end on real UDX sockets; cross-host traversal still needs a dispatch, because
++no loopback rehearsal can produce a genuine NAT.** The harness change that
++unblocked a dispatch is landed; what this entry adds is the production half
++the harness was standing in for, plus the authorization the harness version
++never had.
++
++What the harness punch could not be: it took the plan as a bare JSON list the
++coordinator pushed, verified nothing, counted nothing, and sat outside
++`lib/private`. The production replacement is three pieces:
++
++`lib/private/nat-reflect.js` — the endpoint owns its published address. The
++socket route cells travel on is reflected off the DHT bootstraps using the
++exit wire format (`dht-exit-wire.js` gained
++`createDhtExitPingReservation` and `observeDhtExitPingReply`; the reply decoder
++reads `to` WITHOUT the local-tuple equality check, because the tuple `to`
++names is the answer — that check is exactly right for `decodeDhtExitReply` and
++exactly wrong here). Only two-reflector agreement is publishable; disagreement
++means no publishable value exists and says so.
++
++`lib/private/nat-punch.js` — the punch plan is a signed artifact over the new
++`NAT_PUNCH_PLAN` domain: both peer identities, both published tuples, epoch,
++run id, validity window, plan id, signed by the topology authority. The
++signature is the authorization: a peer cannot name an arbitrary victim, a
++plan for someone else is dead on arrival, a captured plan dies with its
++window. A wrong signature, a stranger identity, a wrong advertised address,
++or one flipped byte each fail closed before a datagram is sent.
++
++`udx-cell-endpoint.js` — the endpoint punches on its own socket.
++`punchPeer` runs the six-round simultaneous send; every udx send
++`Promise<boolean>` is observed and counted (no silent rejections), no timer
++outlives the round, `stop()` resolves waiters so `close()` cannot hang, and
++`close()` stops a live round. `punchPlan` verifies, pins the plan to the
++endpoint's advertised pair, bounds accepted plans, and reports
++`sent/refused/received/strayReceived`. Punch-tagged datagrams count only from
++the verified peer tuple; anything else is stray. AND THE LIMIT, stated as a
++rule: a punch authorizes the send round and nothing else — it never advances
++a bootstrap session and never substitutes for the link grant. The
++`dispatchLinkedPacket` routing gives an armed ACCEPT session its CREATE only
++under the explicit `acceptDirect` opt-in; every other path keeps the existing
++`onBootstrap` contract byte for byte.
++
++`LinkBootstrapSession.open({ punch })` joins the caller's round: the first
++CREATE dispatches only after the round settles, and the round is stopped when
++the session fails, closes, or tombstones. The projected link service exposes
++`punchPlanFor(encoding)`, verifying against the authority it already pins.
++
++Evidence on this host: `nat-punch.js` 8 tests / 21 asserts;
++`nat-traversal-live.js` 5 tests / 12 asserts — two real `UdxCellEndpoint`s on
++distinct tuples, no pre-opened path, one signed plan driving the simultaneous
++round, a stranger's spoofed punches counted stray, then the authenticated
++handshake reaching OPEN on both sides. Aggregate suite 1029/1029 tests,
++19216/19216 asserts, prettier clean. The connection test 18 failure seen
++during development reproduces on the unmodified base branch (same-LAN
++keypair test, network-dependent ETIMEDOUT) and is not caused by this work.
++
++What this still does not prove: mapping survival for the length of a 900s
++run, per-destination NATs (no publishable value exists there by definition),
++and the un-measured closed-and-rebind hop from the KI-13 record above. Those
++are dispatch questions; a loopback rehearsal cannot narrow them.
+diff --git a/lib/private/dht-exit-wire.js b/lib/private/dht-exit-wire.js
+index 178f4923f6eaa2f9ae9ef14d67510b29440cb4e4..d6dd98548ebc4f97aea6a7d114daa5191f9cf9e2 100644
+--- a/lib/private/dht-exit-wire.js
++++ b/lib/private/dht-exit-wire.js
+@@ -236,12 +236,55 @@ function createDhtExitWireReservation(options) {
+   })
+   return reservation
+ }
++// A production-addressed observation round: what address does a responder see
++// for THIS socket? Decodes a PING reply WITHOUT the local-tuple equality check
++// that decodeDhtExitReply applies - the equality check is right for a socket
++// that already knows its own address, and exactly wrong for reflection, where
++// `to` is the answer being asked for. The reply must still match the
++// reservation's remote and transaction id, so only the expected responder can
++// answer and only the expected round's reply is read.
++function observeDhtExitPingReply(reservation, source, packet) {
++  const reservationState = readReservation(reservation)
++  const from = exactTuple(source)
++  if (!sameTuple(from, reservationState.remote)) invalid()
++  if (!b4a.isBuffer(packet) || packet.byteLength < 10 || packet[0] !== RESPONSE_ID) invalid()
++  const state = { start: 1, end: packet.byteLength, buffer: packet }
++  try {
++    const flags = c.uint.decode(state)
++    if ((flags & ~RESPONSE_FLAGS) !== 0) invalid()
++    const decodedTid = c.uint16.decode(state)
++    if (decodedTid !== reservationState.tid) invalid()
++    // Read past the id/token/closer/error/value sections by their own
++    // presence flags rather than assuming a fixed layout: the responder's
++    // answer is the `to` pair, which sits immediately after the tid.
++    const to = c.ipv4Address.decode(state)
++    if (!to || to.port <= 0) invalid()
++    return Object.freeze({
++      tid: decodedTid,
++      from: Object.freeze({ host: from.host, port: from.port }),
++      observed: Object.freeze({ host: to.host, port: to.port })
++    })
++  } catch (err) {
++    if (err instanceof PrivateRouteError) throw err
++    invalid()
++  }
++}
++
++function createDhtExitPingReservation(remote, local, tidValue) {
++  return createDhtExitWireReservation({
++    remote: { host: remote.host, port: remote.port },
++    local: { host: local.host, port: local.port },
++    tid: tidValue === null || tidValue === undefined ? null : tidValue
++  })
++}
+ 
+ module.exports = {
+   TEST_ONLY_DHT_EXIT_WIRE_RESERVATION: Object.freeze({ create: createDhtExitWireReservation }),
++  createDhtExitPingReservation,
+   createDhtExitWireReservation,
+   decodeDhtExitReply,
+   decodeImmutableGetResponse,
+   encodeDhtExitRequest,
+-  encodeImmutableGetResponse
++  encodeImmutableGetResponse,
++  observeDhtExitPingReply
+ }
+diff --git a/lib/private/link-bootstrap-session.js b/lib/private/link-bootstrap-session.js
+index a2363ef9044c76f5646b5027d34dbe56ef54eb8d..78b77e599161c4c768dae2d56cb946e141969f58 100644
+--- a/lib/private/link-bootstrap-session.js
++++ b/lib/private/link-bootstrap-session.js
+@@ -265,11 +265,78 @@ function armTimer(state) {
+   state.timer = timer
+ }
+ 
++// THE PUNCH-BEFORE-CREATE RULE. On a host behind a NAT, the CREATE the initiator
++// sends is what creates its outbound mapping; the responder's earliest replies
++// can be dropped by the initiator's NAT if they arrive before the mapping
++// exists, and the responder cannot send anything useful at all until the
++// initiator's first packet opens the path. So an optional punch round may be
++// handed in through `options.punch` - the object `endpoint.punchPeer` returned,
++// whose `done` settles when the round finishes - and the first CREATE waits for
++// it to settle before it leaves. The round is owned and, when a signed plan was
++// used, verified by the caller; this session only joins its lifecycle: the
++// round is stopped when the session fails, closes, or is tombstoned, so no
++// timer or send outlives the link attempt.
++function runPunch(state, punch) {
++  if (punch === undefined || punch === null) return
++  if (
++    !isObject(punch) ||
++    typeof punch.done !== 'object' ||
++    punch.done === null ||
++    typeof punch.done.then !== 'function' ||
++    typeof punch.stop !== 'function'
++  ) {
++    invalid()
++  }
++  state.punchWait = punch
++  state.punchAbort = () => {
++    try {
++      punch.stop()
++    } catch {}
++  }
++  if (state.signal) {
++    try {
++      state.signal.addEventListener('abort', state.punchAbort, { once: true })
++    } catch {}
++  }
++  // The wait is bounded by the session deadline timer that is already armed:
++  // if the round runs past it, fail() fires, stops the round, and the CREATE
++  // never dispatches. A punch result is connectivity evidence only; its stats
++  // are the caller's business and never gate link establishment beyond timing.
++  void punch.done.then(
++    () => {
++      if (state.punchWait === punch) {
++        state.punchWait = null
++        dispatchCreate(state)
++      }
++    },
++    () => {
++      if (state.punchWait === punch) {
++        state.punchWait = null
++        dispatchCreate(state)
++      }
++    }
++  )
++}
++
++function stopPunching(state) {
++  const abort = state.punchAbort
++  state.punchAbort = null
++  state.punchWait = null
++  state.punchSignal = null
++  if (state.signal && abort) {
++    try {
++      state.signal.removeEventListener('abort', abort)
++    } catch {}
++  }
++  if (abort) abort()
++}
++
+ function dispatchCreate(state) {
+   if (
+     state.mode !== 'initiate' ||
+     state.state !== 'CREATING' ||
+     state.sendPending ||
++    state.punchWait !== null ||
+     !state.request
+   ) {
+     return false
+@@ -364,9 +431,13 @@ function clearEstablished(state) {
+ }
+ 
+ function releaseSessionReferences(state) {
++  stopPunching(state)
+   destroyDynamicResponderSetup(state.setup)
+   deepClear(state.setup)
+   state.setup = null
++  state.punchSignal = null
++  state.punchAbort = null
++  state.punchWait = null
+   deepClear(state.link)
+   state.link = null
+   state.linkHandle = null
+@@ -392,6 +463,7 @@ function releaseSessionReferences(state) {
+ }
+ 
+ function finishOpen(state, established) {
++  stopPunching(state)
+   try {
+     cancelTimer(state)
+   } catch {
+@@ -441,6 +513,7 @@ function sendCancel(state) {
+ 
+ function fail(state, error, notify) {
+   if (state.state === 'TOMBSTONE') return
++  stopPunching(state)
+   const cancelling = notify ? sendCancel(state) : null
+   cancelTimer(state)
+   if (state.request) {
+@@ -639,6 +712,9 @@ class LinkBootstrapSession {
+       cancelSends: new Set(),
+       lastNow: -1,
+       signal: null,
++      punchSignal: null,
++      punchAbort: null,
++      punchWait: null,
+       abort: null,
+       resolve: null,
+       reject: null,
+@@ -748,6 +824,7 @@ class LinkBootstrapSession {
+         }
+       }
+       armTimer(state)
++      runPunch(state, options.punch)
+       dispatchCreate(state)
+     } catch {
+       fail(state, unavailable(), false)
+diff --git a/lib/private/nat-punch.js b/lib/private/nat-punch.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..e12fe9c87b362960cba0013402b1327825eecde9
+--- /dev/null
++++ b/lib/private/nat-punch.js
+@@ -0,0 +1,342 @@
++'use strict'
++
++// The authenticated simultaneous punch plan. KI-13's production half.
++//
++// Two peers behind NATs open a path neither can open alone: each sends UDP
++// datagrams to the address the other will send from, and the sends must cross in
++// flight so each host's mapping exists before the other's packets arrive. The
++// datagram content is irrelevant; the send is the whole point.
++//
++// WHO may punch WHOM is an authorization question, and this codebase answers
++// those with topology-authority signatures. A punch is a reachability grant: it
++// tells each side the reflected address of the other, which a link grant also
++// names. So the punch plan is signed the same way a topology grant is, by the
++// same authority, over a canonical encoding that binds:
++//
++//   - both peer identities (so a plan for peer A cannot be replayed by peer B),
++//   - both published endpoint tuples (the reflected addresses and the exact
++//     ports the peers will punch from, which is the only mapping a punch opens),
++//   - the epoch and run id (so a plan from one topology epoch is dead in the
++//     next),
++//   - a validity window (notBefore/expiresAt, wall-clock milliseconds, so a
++//     captured plan dies with its run),
++//   - a plan id (so the two sides can agree they hold the SAME plan, which is
++//     what makes the simultaneous round simultaneous).
++//
++// The plan authorizes the PUNCH ROUND ONLY. A datagram that arrives tagged as a
++// punch is counted as evidence of connectivity and nothing else: it never
++// advances a bootstrap session, never opens a send handle, and never stands in
++// for the signed grant the link itself requires. Spoofed punch traffic can
++// therefore inflate nothing that matters - at worst it burns a few sends.
++
++const b4a = require('b4a')
++
++const { cryptoSuite } = require('./crypto-suite')
++const { PrivateRouteError } = require('./errors')
++const { DOMAIN, PROTOCOL_VERSION } = require('./protocol')
++const { hostFromAddress, parseAddress } = require('./topology-grant')
++
++const PLAN_FORMAT = 0
++const SIGNATURE_SIZE = 64
++const MIN_UNSIGNED_SIZE = 173
++const MAX_UNSIGNED_SIZE = 173
++const MAX_PLAN_BYTES = MAX_UNSIGNED_SIZE + SIGNATURE_SIZE
++
++function invalid() {
++  throw PrivateRouteError.INVALID_ROUTE()
++}
++
++function unauthorized() {
++  throw PrivateRouteError.UNAUTHORIZED()
++}
++
++function isObject(value) {
++  return value !== null && typeof value === 'object' && !Array.isArray(value)
++}
++
++function exactKeys(value, fields) {
++  if (!isObject(value)) return false
++  const actual = Object.keys(value).sort()
++  const wanted = [...fields].sort()
++  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index])
++}
++
++function fixed(value, size) {
++  return b4a.isBuffer(value) && value.byteLength === size
++}
++
++function validU64(value) {
++  return typeof value === 'bigint' && value >= 0n && value <= 0xffff_ffff_ffff_ffffn
++}
++
++function endpoint(value) {
++  if (!exactKeys(value, ['identity32', 'role', 'host', 'port'])) invalid()
++  if (!fixed(value.identity32, 32)) invalid()
++  if (!Number.isInteger(value.port) || value.port < 1 || value.port > 0xffff) invalid()
++  const address = parseAddress(value.host)
++  return {
++    identity32: b4a.from(value.identity32),
++    role: value.role,
++    address: { ...address, port: value.port }
++  }
++}
++
++function copyEndpoint(value) {
++  return {
++    identity32: b4a.from(value.identity32),
++    role: value.role,
++    address: {
++      family: value.address.family,
++      host: value.address.host,
++      port: value.address.port
++    }
++  }
++}
++
++function normalizePlan(value, signed) {
++  const fields = [
++    'version',
++    'format',
++    'planId32',
++    'endpointA',
++    'endpointB',
++    'epoch',
++    'notBefore',
++    'expiresAt',
++    'runId32'
++  ]
++  if (signed) fields.push('signature')
++  if (!exactKeys(value, fields)) invalid()
++  if (value.version !== PROTOCOL_VERSION || value.format !== PLAN_FORMAT) invalid()
++  if (!fixed(value.planId32, 32) || !fixed(value.runId32, 32)) invalid()
++  if (!validU64(value.epoch) || !validU64(value.notBefore) || !validU64(value.expiresAt)) invalid()
++  if (value.notBefore >= value.expiresAt) invalid()
++  if (signed && !fixed(value.signature, SIGNATURE_SIZE)) invalid()
++
++  let a = endpoint(value.endpointA)
++  let b = endpoint(value.endpointB)
++  const ordering = b4a.compare(a.identity32, b.identity32)
++  if (ordering === 0) invalid()
++  if (ordering > 0) [a, b] = [b, a]
++
++  return {
++    version: value.version,
++    format: PLAN_FORMAT,
++    planId32: b4a.from(value.planId32),
++    endpointA: a,
++    endpointB: b,
++    epoch: value.epoch,
++    notBefore: value.notBefore,
++    expiresAt: value.expiresAt,
++    runId32: b4a.from(value.runId32),
++    ...(signed ? { signature: b4a.from(value.signature) } : {})
++  }
++}
++
++function writeU64(buffer, value, offset) {
++  for (let shift = 56n; shift >= 0n; shift -= 8n)
++    buffer[offset++] = Number((value >> shift) & 0xffn)
++  return offset
++}
++
++function writeEndpoint(buffer, value, offset) {
++  buffer.set(value.identity32, offset)
++  offset += 32
++  buffer[offset++] = value.role
++  buffer[offset++] = value.address.family
++  buffer.set(value.address.bytes, offset)
++  offset += value.address.bytes.byteLength
++  buffer[offset++] = value.address.port >>> 8
++  buffer[offset++] = value.address.port & 0xff
++  return offset
++}
++
++function encodeNormalizedUnsigned(value) {
++  const size =
++    4 + 1 + 32 + (32 + 1 + 1 + value.endpointA.address.bytes.byteLength + 2) * 2 + 8 + 8 + 8 + 32
++  const buffer = b4a.allocUnsafe(size)
++  let offset = 0
++  buffer[offset++] = (value.version >>> 24) & 0xff
++  buffer[offset++] = (value.version >>> 16) & 0xff
++  buffer[offset++] = (value.version >>> 8) & 0xff
++  buffer[offset++] = value.version & 0xff
++  buffer[offset++] = value.format
++  buffer.set(value.planId32, offset)
++  offset += 32
++  offset = writeEndpoint(buffer, value.endpointA, offset)
++  offset = writeEndpoint(buffer, value.endpointB, offset)
++  offset = writeU64(buffer, value.epoch, offset)
++  offset = writeU64(buffer, value.notBefore, offset)
++  offset = writeU64(buffer, value.expiresAt, offset)
++  buffer.set(value.runId32, offset)
++  return buffer
++}
++
++function createReader(buffer) {
++  if (
++    !b4a.isBuffer(buffer) ||
++    buffer.byteLength < MIN_UNSIGNED_SIZE ||
++    buffer.byteLength > MAX_UNSIGNED_SIZE + SIGNATURE_SIZE
++  ) {
++    invalid()
++  }
++  let offset = 0
++  function take(size) {
++    if (offset + size > buffer.byteLength) invalid()
++    const value = b4a.from(buffer.subarray(offset, offset + size))
++    offset += size
++    return value
++  }
++  return {
++    u8() {
++      return take(1)[0]
++    },
++    u16() {
++      const bytes = take(2)
++      return bytes[0] * 0x100 + bytes[1]
++    },
++    u32() {
++      const bytes = take(4)
++      return bytes[0] * 0x1000000 + bytes[1] * 0x10000 + bytes[2] * 0x100 + bytes[3]
++    },
++    u64() {
++      const bytes = take(8)
++      let value = 0n
++      for (const byte of bytes) value = (value << 8n) | BigInt(byte)
++      return value
++    },
++    take,
++    done() {
++      if (offset !== buffer.byteLength) invalid()
++    }
++  }
++}
++
++function decodeEndpoint(reader) {
++  const identity32 = reader.take(32)
++  const role = reader.u8()
++  const family = reader.u8()
++  if (family !== 4 && family !== 6) invalid()
++  const address = reader.take(family === 4 ? 4 : 16)
++  return {
++    identity32,
++    role,
++    host: hostFromAddress(family, address),
++    port: reader.u16()
++  }
++}
++
++function decodeValue(buffer, signed) {
++  if (!b4a.isBuffer(buffer)) invalid()
++  const minimum = MIN_UNSIGNED_SIZE + (signed ? SIGNATURE_SIZE : 0)
++  const maximum = MAX_UNSIGNED_SIZE + (signed ? SIGNATURE_SIZE : 0)
++  if (buffer.byteLength < minimum || buffer.byteLength > maximum) invalid()
++  const reader = createReader(buffer)
++  const value = {
++    version: reader.u32(),
++    format: reader.u8(),
++    planId32: reader.take(32),
++    endpointA: decodeEndpoint(reader),
++    endpointB: decodeEndpoint(reader),
++    epoch: reader.u64(),
++    notBefore: reader.u64(),
++    expiresAt: reader.u64(),
++    runId32: reader.take(32)
++  }
++  if (signed) value.signature = reader.take(SIGNATURE_SIZE)
++  reader.done()
++  const normalized = normalizePlan(value, signed)
++  if (!b4a.equals(normalized.endpointA.identity32, value.endpointA.identity32)) invalid()
++  return {
++    version: normalized.version,
++    format: normalized.format,
++    planId32: normalized.planId32,
++    endpointA: publicEndpoint(normalized.endpointA),
++    endpointB: publicEndpoint(normalized.endpointB),
++    epoch: normalized.epoch,
++    notBefore: normalized.notBefore,
++    expiresAt: normalized.expiresAt,
++    runId32: normalized.runId32,
++    ...(signed ? { signature: normalized.signature } : {})
++  }
++}
++
++function publicEndpoint(value) {
++  return {
++    identity32: b4a.from(value.identity32),
++    role: value.role,
++    host: value.address.host,
++    port: value.address.port
++  }
++}
++
++function encodeUnsignedPlan(value) {
++  return encodeNormalizedUnsigned(normalizePlan(value, false))
++}
++
++function encodeNatPunchPlan(value) {
++  const normalized = normalizePlan(value, true)
++  return b4a.concat([encodeNormalizedUnsigned(normalized), normalized.signature])
++}
++
++function signNatPunchPlan(value, secretKey) {
++  const unsigned = encodeUnsignedPlan(value)
++  const digest = cryptoSuite.hash([DOMAIN.NAT_PUNCH_PLAN, unsigned])
++  const signature = cryptoSuite.sign(digest, secretKey)
++  return b4a.concat([unsigned, signature])
++}
++
++// Verifies an encoded plan against the topology authority and returns the side
++// of the named identity. The endpoint ordering is canonical, so a plan and its
++// mirror verify to the same bytes: both peers receive one encoding and each
++// reads out its own view.
++function verifyNatPunchPlan(encoding, authorityPublicKey, options) {
++  if (!fixed(authorityPublicKey, 32)) unauthorized()
++  if (!exactKeys(options, ['localIdentity32', 'now'])) invalid()
++  if (!fixed(options.localIdentity32, 32) || !validU64(options.now)) invalid()
++
++  const unsigned = b4a.from(encoding.subarray(0, encoding.byteLength - SIGNATURE_SIZE))
++  const signedDigest = cryptoSuite.hash([DOMAIN.NAT_PUNCH_PLAN, unsigned])
++  const decoded = decodeValue(encoding, true)
++  if (!cryptoSuite.verify(signedDigest, decoded.signature, authorityPublicKey)) unauthorized()
++  if (options.now < decoded.notBefore || options.now >= decoded.expiresAt) unauthorized()
++
++  let local = decoded.endpointA
++  let peer = decoded.endpointB
++  if (b4a.equals(options.localIdentity32, decoded.endpointB.identity32)) {
++    local = decoded.endpointB
++    peer = decoded.endpointA
++  } else if (!b4a.equals(options.localIdentity32, decoded.endpointA.identity32)) {
++    unauthorized()
++  }
++
++  return Object.freeze({
++    planId32: b4a.from(decoded.planId32),
++    epoch: decoded.epoch,
++    notBefore: decoded.notBefore,
++    expiresAt: decoded.expiresAt,
++    runId32: b4a.from(decoded.runId32),
++    local: {
++      identity32: b4a.from(local.identity32),
++      role: local.role,
++      host: local.host,
++      port: local.port
++    },
++    peer: {
++      identity32: b4a.from(peer.identity32),
++      role: peer.role,
++      host: peer.host,
++      port: peer.port
++    }
++  })
++}
++
++module.exports = Object.freeze({
++  PLAN_FORMAT,
++  MAX_PLAN_BYTES,
++  encodeUnsignedPlan,
++  encodeNatPunchPlan,
++  signNatPunchPlan,
++  verifyNatPunchPlan,
++  copyEndpoint
++})
+diff --git a/lib/private/nat-reflect.js b/lib/private/nat-reflect.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..6228e52eac98538a747364016186aeaffe7a2557
+--- /dev/null
++++ b/lib/private/nat-reflect.js
+@@ -0,0 +1,226 @@
++'use strict'
++
++// Production reflected-address discovery, run on the endpoint's own socket.
++//
++// A NAT mapping belongs to a socket, not to a host. hyperdht learns what the
++// world sees for the DHT socket it owns (every dht-rpc reply carries a `to`
++// field), but the endpoint socket that route cells travel on is a different
++// socket with its own mapping, and no part of the stack answered for it. This
++// module is that answer: a production endpoint owns its published address.
++//
++// The probe is a dht-rpc PING in the exit wire format this repository already
++// speaks (lib/private/dht-exit-wire.js). A responder's reply carries the `to`
++// field with the port and address the request was seen from, read through
++// observeDhtExitPingReply, which - unlike decodeDhtExitReply - does not
++// require the reply's `to` to equal a known local tuple, because the tuple `to`
++// names IS the answer.
++//
++// Two different reflectors are asked, and only AGREED answers are published.
++// Equal answers mean the mapping does not depend on the destination, so one
++// tuple is publishable to any peer and into a signed punch plan. Different
++// answers mean there is no publishable value at all - the host sits behind a
++// NAT that maps per destination, and no simultaneous punch can repair that.
++//
++// The reflectors are the public hyperdht bootstrap nodes by default. They are
++// asked a question about a UDP flow, not trusted with secrets: the reply names
++// the address the world already sees.
++
++const b4a = require('b4a')
++
++const { BOOTSTRAP_NODES } = require('../constants')
++const {
++  createDhtExitPingReservation,
++  encodeDhtExitRequest,
++  observeDhtExitPingReply
++} = require('./dht-exit-wire')
++const { PrivateRouteError } = require('./errors')
++
++const PING = 0
++const RESPONSE_ID = 0x13
++// Three sends per reflector: a first packet out of a NAT can be lost to a
++// mapping that does not exist yet, and "one datagram was dropped" must not be
++// mistaken for "there is no mapping".
++const SEND_DELAYS_MS = Object.freeze([0, 300, 900])
++const PROBE_TIMEOUT_MS = 4_000
++
++function invalid() {
++  throw PrivateRouteError.INVALID_ROUTE()
++}
++
++function isObject(value) {
++  return value !== null && typeof value === 'object' && !Array.isArray(value)
++}
++
++function exactOwnData(value, fields) {
++  if (!isObject(value)) return false
++  const names = Object.getOwnPropertyNames(value)
++  const symbols = Object.getOwnPropertySymbols(value)
++  if (symbols.length !== 0 || names.length !== fields.length) return false
++  for (const name of fields) {
++    const descriptor = Object.getOwnPropertyDescriptor(value, name)
++    if (!descriptor || !Object.hasOwn(descriptor, 'value')) return false
++  }
++  return true
++}
++
++function numericHost(host) {
++  if (typeof host !== 'string') return false
++  const parts = host.split('.')
++  if (parts.length !== 4) return false
++  for (const part of parts) {
++    if (!/^(0|[1-9][0-9]{0,2})$/.test(part) || Number(part) > 255) return false
++  }
++  return true
++}
++
++// `nodes` entries are "id@host:port" or "host:port", the bootstrap format in
++// lib/constants.js. The id is irrelevant for a PING.
++function resolveReflectors(nodes = BOOTSTRAP_NODES) {
++  if (!Array.isArray(nodes) || nodes.length === 0) invalid()
++  const resolved = []
++  for (const entry of nodes) {
++    if (typeof entry !== 'string') invalid()
++    const address = entry.includes('@') ? entry.split('@')[1] : entry
++    const parts = address.split(':')
++    if (parts.length !== 2 || !numericHost(parts[0]) || !/^\d{1,5}$/.test(parts[1])) invalid()
++    const port = Number(parts[1])
++    if (port < 1 || port > 0xffff) invalid()
++    resolved.push(Object.freeze({ host: parts[0], port }))
++  }
++  return resolved
++}
++
++// Sends one PING to `remote` from the caller's bound socket and resolves to the
++// observed tuple, or null on timeout. The reservation binds the reply to the
++// expected responder and transaction id, so an unrelated datagram cannot be
++// read as an observation. Every timer this function arms is cancelled on
++// settle: a leaked send timer would fire after the caller closed the socket.
++function probeOnce(socket, remote, timeoutMs) {
++  return new Promise((resolve) => {
++    let settled = false
++    let sendTimers = []
++    let failedSends = 0
++    const tid = 1 + Math.floor(Math.random() * 0xfffe)
++    let packet = null
++    try {
++      const reservation = createDhtExitPingReservation(remote, { host: '0.0.0.0', port: 1 }, tid)
++      packet = encodeDhtExitRequest(reservation, {
++        tid,
++        token: null,
++        internal: true,
++        command: PING,
++        target: null,
++        value: null
++      })
++    } catch {
++      return resolve(null)
++    }
++
++    function finish(listener) {
++      clearTimeout(timer)
++      for (const handle of sendTimers) clearTimeout(handle)
++      sendTimers = null
++      socket.removeListener('message', listener)
++    }
++
++    const timer = setTimeout(() => {
++      if (settled) return
++      settled = true
++      finish(onMessage)
++      resolve(null)
++    }, timeoutMs)
++
++    function onMessage(message, from) {
++      if (settled) return
++      if (!from || from.host !== remote.host || from.port !== remote.port) return
++      if (!b4a.isBuffer(message) || message.byteLength < 10 || message[0] !== RESPONSE_ID) return
++      let observed = null
++      try {
++        const reservation = createDhtExitPingReservation(remote, { host: '0.0.0.0', port: 1 }, tid)
++        observed = observeDhtExitPingReply(reservation, remote, message).observed
++      } catch {
++        return
++      }
++      if (observed === null) return
++      settled = true
++      finish(onMessage)
++      resolve(observed)
++    }
++
++    socket.on('message', onMessage)
++    for (const delay of SEND_DELAYS_MS) {
++      sendTimers.push(
++        setTimeout(() => {
++          if (settled || sendTimers === null) return
++          // udx send resolves a Promise<boolean>; a false or a rejection is a
++          // refused send. Observed and counted, never discarded: an unobserved
++          // rejection is the leak PR46 was reverted for.
++          let sending = null
++          try {
++            sending = socket.send(packet, remote.port, remote.host)
++          } catch {
++            failedSends++
++            return
++          }
++          Promise.resolve(sending).then(
++            (sent) => {
++              if (sent !== true) failedSends++
++            },
++            () => {
++              failedSends++
++            }
++          )
++        }, delay)
++      )
++    }
++  })
++}
++
++// Reflects the caller's socket off the given reflectors and reports what a
++// signed plan may publish:
++//
++//   - `observed`: the agreed tuple, or null when no agreement exists,
++//   - `stable`: true only when at least two reflectors answered and all
++//     answers match, which is the evidence a publishable value needs,
++//   - `observations`: every per-reflector answer, for diagnostics.
++async function reflectEndpointSocket(socket, reflectors, { timeoutMs = PROBE_TIMEOUT_MS } = {}) {
++  if (!socket || typeof socket.send !== 'function' || typeof socket.on !== 'function') invalid()
++  if (!Array.isArray(reflectors) || reflectors.length === 0) invalid()
++  for (const remote of reflectors) {
++    if (
++      !isObject(remote) ||
++      !exactOwnData(remote, ['host', 'port']) ||
++      !numericHost(remote.host) ||
++      !Number.isInteger(remote.port) ||
++      remote.port < 1 ||
++      remote.port > 0xffff
++    ) {
++      invalid()
++    }
++  }
++
++  const observations = []
++  for (const remote of reflectors) {
++    const observed = await probeOnce(socket, remote, timeoutMs)
++    observations.push({ reflector: remote, observed })
++  }
++  const usable = observations.filter((entry) => entry.observed !== null)
++  const stable =
++    usable.length > 1 &&
++    usable.every(
++      (entry) =>
++        entry.observed.host === usable[0].observed.host &&
++        entry.observed.port === usable[0].observed.port
++    )
++  return {
++    observed: usable.length > 0 ? usable[0].observed : null,
++    stable,
++    observations
++  }
++}
++
++module.exports = Object.freeze({
++  PROBE_TIMEOUT_MS,
++  reflectEndpointSocket,
++  resolveReflectors
++})
+diff --git a/lib/private/protocol.js b/lib/private/protocol.js
+index b159f463b26864e0809bc97ddc937a9d8937d7a9..6ca7072f55cc9bab9df347463fa994bcf62d6e23 100644
+--- a/lib/private/protocol.js
++++ b/lib/private/protocol.js
+@@ -175,6 +175,7 @@ const DOMAIN_VALUES = Object.freeze({
+   ROLE: b4a.from('hyperdht-private-routes/role/v0'),
+   UDX_BOOTSTRAP: b4a.from('hyperdht-private-routes/udx-bootstrap/v0'),
+   TOPOLOGY_GRANT: b4a.from('hyperdht-private-routes/topology-grant/v0'),
++  NAT_PUNCH_PLAN: b4a.from('hyperdht-private-routes/nat-punch-plan/v0'),
+   RELAY_ADVERTISEMENT: b4a.from('hyperdht-private-routes/relay-advertisement/v0'),
+   DESCRIPTOR_DIRECT: b4a.from('hyperdht-private-routes/descriptor/direct/v0'),
+   DELEGATION: b4a.from('hyperdht-private-routes/delegation/v0'),
+diff --git a/lib/private/topology-grant.js b/lib/private/topology-grant.js
+index 51dd47dc9c447935718ca9f28c6068e4ca003f08..4eafac67b60d6b68489ea00e579bbf28311efb34 100644
+--- a/lib/private/topology-grant.js
++++ b/lib/private/topology-grant.js
+@@ -1080,5 +1080,7 @@ module.exports = {
+   readLinkHandle,
+   closeBootstrapLinkHandleSubscriptions,
+   subscribeLinkHandleClose,
++  parseAddress,
++  hostFromAddress,
+   unsubscribeLinkHandleClose
+ }
+diff --git a/lib/private/udx-cell-endpoint.js b/lib/private/udx-cell-endpoint.js
+index 68a76cc9dec0613030e1b51ed00be774d4331e5d..aa36c8712f5c6964fc4967cea776d8a9493391c3 100644
+--- a/lib/private/udx-cell-endpoint.js
++++ b/lib/private/udx-cell-endpoint.js
+@@ -52,6 +52,18 @@ const {
+   encodeM3Object
+ } = require('./protocol')
+ const { decodeCanonicalEndpoint, encodeCanonicalEndpoint } = require('./relay-capability')
++const { MAX_PLAN_BYTES, verifyNatPunchPlan } = require('./nat-punch')
++
++// The simultaneous punch. Constants mirror the harness round that proved the
++// mechanism on NAT'd runners: six sends over three seconds, from the port the
++// endpoint owns, plus a two-second drain for a peer whose plan landed late. A
++// punch datagram carries only its tag; the plan it executes is verified before
++// the first send leaves this socket.
++const PUNCH_TAG = b4a.from('pr-punch/1\n')
++const PUNCH_ROUNDS = 6
++const PUNCH_INTERVAL_MS = 500
++const PUNCH_DRAIN_MS = 2_000
++const PUNCH_TIMER_LIMIT = 64
+ 
+ // Ported from the reviewed private-routes prototype at commit
+ // 0305df915b6a767093f9e75e6c06bc0a35da6169 and narrowed to Gate 3B1.
+@@ -1203,8 +1215,51 @@ function dispatchDirectBootstrap(state, source, direct, packet) {
+   }
+ }
+ 
++// Routes an authenticated peer's packet to the right consumer. For a bootstrap
++// packet on an OPEN link the binding governs. One exception, strictly opt-in:
++// a PENDING link whose caller passed `acceptDirect: true` to openLink - the
++// responder side of a punched link, which never passed through a bootstrap
++// admission. The session's own codec authenticates the packet against the peer
++// identity its signed grant names. Without that flag the caller's bootstrap
++// consumer sees the packet, exactly as it always has.
++function dispatchLinkedPacket(state, authority, owned, sendHandle) {
++  if (owned.packet[1] !== BOOTSTRAP_CLASS) {
++    return authority.linkControl
++      ? receiveEstablished(state, authority, owned.packet)
++      : state.onCell(owned.packet, sendHandle)
++  }
++  // A PENDING initiate session owns its CREATE replies: the session started
++  // the exchange, so its own table consumes responses. An accept session only
++  // receives packets directly when the caller opted in with acceptDirect
++  // (the punched-link responder, which has no bootstrap admission); otherwise
++  // the caller's bootstrap consumer keeps the packet.
++  if (authority.session && authority.phase === 'PENDING') {
++    if (authority.acceptDirect || authority.mode === 'initiate') {
++      return authority.session.receive(owned.packet)
++    }
++  }
++  return state.onBootstrap(owned.packet, sendHandle)
++}
++
+ function receive(state, packet, from) {
+-  if (state.closing || !b4a.isBuffer(packet) || packet.byteLength !== BOOTSTRAP_SIZE) return
++  if (state.closing || !b4a.isBuffer(packet)) return
++  // A punch datagram is connectivity evidence and nothing else. It is counted
++  // against a live round - which is what lets both sides observe the round they
++  // ran - and dropped in every other case. It is never passed to a bootstrap
++  // session: the plan signature authorizes the sends, and nothing more; a link
++  // still requires the signed grant it always did.
++  if (
++    packet.byteLength === PUNCH_TAG.byteLength &&
++    b4a.equals(packet.subarray(0, PUNCH_TAG.byteLength), PUNCH_TAG)
++  ) {
++    const round = state.punchRound
++    if (round !== null) {
++      if (round.peer.host === from.host && round.peer.port === from.port) round.received++
++      else round.strayReceived++
++    }
++    return
++  }
++  if (packet.byteLength !== BOOTSTRAP_SIZE) return
+   let source
+   try {
+     source = `${from.host}:${from.port}`
+@@ -1255,14 +1310,7 @@ function receive(state, packet, from) {
+   // close promise is recognized below; another handler promise must not await
+   // that close because an indirect promise cycle cannot be identified safely.
+   try {
+-    const result =
+-      owned.packet[1] === BOOTSTRAP_CLASS
+-        ? authority.bootstrapBinding && authority.session
+-          ? authority.session.receive(owned.packet)
+-          : state.onBootstrap(owned.packet, sendHandle)
+-        : authority.linkControl
+-          ? receiveEstablished(state, authority, owned.packet)
+-          : state.onCell(owned.packet, sendHandle)
++    const result = dispatchLinkedPacket(state, authority, owned, sendHandle)
+     if (TEST_RECEIVE_OBSERVER && owned.packet[1] === BOOTSTRAP_CLASS && authority.session) {
+       Promise.resolve(result).then(
+         (value) => {
+@@ -1484,6 +1532,10 @@ class UdxCellEndpoint {
+       inboundPeers: new Map(),
+       directSources: new Map(),
+       bootstrapAuthority: null,
++      punchRound: null,
++      punchPlans: new WeakMap(),
++      punchPlanCount: 0,
++      punchPlanLimit: 8,
+       freshOwnerTemplate: Object.freeze({
+         testConstruction,
+         freshAdapterFactory,
+@@ -1574,6 +1626,183 @@ class UdxCellEndpoint {
+     }
+   }
+ 
++  // ONE PUNCH, to ONE address. This is the low-level send the punch plan drives;
++  // it exists so a caller that already holds a verified plan for one peer can run
++  // the round without re-verifying anything. Every send is observed: udx's send
++  // resolves a Promise<boolean>, and a false, a rejection, or a synchronous throw
++  // is counted as refused rather than discarded - an unobserved async send is
++  // exactly the failure class PR46 was reverted for. The `cancelled` flag lets a
++  // caller stop the round; the returned stats make the cost visible either way.
++  punchPeer(target, { rounds = PUNCH_ROUNDS, intervalMs = PUNCH_INTERVAL_MS } = {}) {
++    const state = ENDPOINTS.get(this)
++    if (state === undefined) throw stateError()
++    if (state.closing || !state.bound) throw stateError()
++    if (!isObject(target) || typeof target.host !== 'string' || !numericHost(target.host)) {
++      throw PrivateRouteError.INVALID_ROUTE()
++    }
++    if (
++      !Number.isInteger(target.port) ||
++      target.port < 1 ||
++      target.port > 0xffff ||
++      !Number.isSafeInteger(rounds) ||
++      rounds < 1 ||
++      rounds > PUNCH_TIMER_LIMIT ||
++      !Number.isSafeInteger(intervalMs) ||
++      intervalMs < 0
++    ) {
++      throw PrivateRouteError.INVALID_ROUTE()
++    }
++    if (state.punchRound !== null) throw PrivateRouteError.CIRCUIT_STATE()
++
++    // Every wait is a tracked timer. `stop()` cancels all of them and resolves
++    // `done` with the stats so far, so close() and the caller can both cut a
++    // round short without leaving a timer to fire on a closed socket.
++    const punch = {
++      cancelled: false,
++      peer: { host: target.host, port: target.port },
++      sent: 0,
++      refused: 0,
++      received: 0,
++      strayReceived: 0,
++      timers: new Set(),
++      done: null,
++      stop: null
++    }
++    const wait = (ms) =>
++      ms <= 0 || punch.cancelled || state.closing
++        ? Promise.resolve()
++        : new Promise((resolve) => {
++            const entry = { timer: null, resolve }
++            entry.timer = setTimeout(() => {
++              punch.timers.delete(entry)
++              resolve()
++            }, ms)
++            // `stop()` resolves rather than abandons the waiter, so `done` can
++            // never hang on a timer that close already cleared.
++            punch.timers.add(entry)
++          })
++    const clearTimers = () => {
++      for (const entry of punch.timers) {
++        clearTimeout(entry.timer)
++        entry.resolve()
++      }
++      punch.timers.clear()
++    }
++    punch.stop = () => {
++      punch.cancelled = true
++      clearTimers()
++    }
++    state.punchRound = punch
++    punch.done = (async () => {
++      const payload = b4a.from(PUNCH_TAG)
++      try {
++        for (let round = 1; round <= rounds; round++) {
++          if (punch.cancelled || state.closing) break
++          let sending = null
++          try {
++            sending = state.socket.send(payload, target.port, target.host)
++          } catch {
++            punch.refused++
++          }
++          if (sending !== null) {
++            await Promise.resolve(sending).then(
++              (sent) => {
++                if (sent === true) punch.sent++
++                else punch.refused++
++              },
++              () => {
++                punch.refused++
++              }
++            )
++          }
++          if (round < rounds) await wait(intervalMs)
++        }
++        if (!punch.cancelled && !state.closing) await wait(PUNCH_DRAIN_MS)
++      } finally {
++        clearTimers()
++        if (state.punchRound === punch) state.punchRound = null
++      }
++      return {
++        sent: punch.sent,
++        refused: punch.refused,
++        received: punch.received,
++        strayReceived: punch.strayReceived
++      }
++    })()
++    return punch
++  }
++
++  // THE PRODUCTION PUNCH ENTRY POINT: verify a topology-authority-signed punch
++  // plan, then punch the peer it names from this endpoint's own socket. What the
++  // signature buys: the plan is the authority's statement that these two
++  // identities, at these reflected addresses, are expected to open an adjacent
++  // link in this epoch and run. A peer cannot hand us a plan naming an arbitrary
++  // victim (the signature would not verify), a plan for someone else (the local
++  // identity would not match), or a captured plan (epoch, run id and validity
++  // window are signed).
++  //
++  // What the plan does NOT buy: authorization for anything but the punch round.
++  // The link itself still requires the signed topology grant it always did; a
++  // punch that completed proves connectivity, never identity.
++  async punchPlan(encoding, options = {}) {
++    const state = ENDPOINTS.get(this)
++    if (state === undefined) throw stateError()
++    if (state.closing || !state.bound) throw stateError()
++    if (!isObject(options)) throw PrivateRouteError.INVALID_ROUTE()
++    const { authorityPublicKey, localIdentity32, now, wallNow } = options
++    if (
++      !b4a.isBuffer(authorityPublicKey) ||
++      authorityPublicKey.byteLength !== 32 ||
++      !b4a.isBuffer(localIdentity32) ||
++      localIdentity32.byteLength !== 32 ||
++      typeof now !== 'function'
++    ) {
++      throw PrivateRouteError.INVALID_ROUTE()
++    }
++    if (!b4a.isBuffer(encoding) || encoding.byteLength > MAX_PLAN_BYTES) {
++      throw PrivateRouteError.INVALID_ROUTE()
++    }
++    if (state.punchRound !== null) throw PrivateRouteError.CIRCUIT_STATE()
++
++    let verified
++    try {
++      verified = verifyNatPunchPlan(b4a.from(encoding), authorityPublicKey, {
++        localIdentity32: b4a.from(localIdentity32),
++        now: BigInt(now())
++      })
++    } catch (err) {
++      if (err instanceof PrivateRouteError) throw err
++      throw PrivateRouteError.INVALID_ROUTE()
++    }
++    if (
++      verified.local.host !== state.advertisedHost ||
++      verified.local.port !== state.advertisedPort
++    ) {
++      // The plan names a published address for THIS endpoint that it does not
++      // advertise. The punch would open a mapping for the wrong socket.
++      throw PrivateRouteError.UNAUTHORIZED()
++    }
++    if (state.punchPlanCount >= state.punchPlanLimit) {
++      throw PrivateRouteError.CIRCUIT_LIMIT()
++    }
++    state.punchPlans.set(b4a.from(verified.planId32), {
++      verified,
++      acceptedAt: typeof wallNow === 'function' ? wallNow() : null
++    })
++    state.punchPlanCount++
++
++    const punch = this.punchPeer({ host: verified.peer.host, port: verified.peer.port })
++    const stats = await punch.done
++    return {
++      planId32: b4a.from(verified.planId32),
++      peer: { ...verified.peer },
++      sent: stats.sent,
++      refused: stats.refused,
++      received: stats.received,
++      strayReceived: stats.strayReceived
++    }
++  }
++
+   openLink(linkHandle, sessionOptions) {
+     const state = ENDPOINTS.get(this)
+     if (state.closing || !state.bound) throw stateError()
+@@ -1627,6 +1856,7 @@ class UdxCellEndpoint {
+       peerKey: b4a.toString(link.peerIdentity32, 'hex'),
+       source,
+       phase: 'PENDING',
++      mode,
+       session: null,
+       linkControl: null,
+       linkBoundary: null,
+@@ -1641,7 +1871,11 @@ class UdxCellEndpoint {
+       m3CellTransfer: null,
+       m3CellTransfers: null,
+       extensionSetupTransport: null,
+-      closeSubscription: null
++      closeSubscription: null,
++      // Opt-in: an accept session that receives bootstrap packets directly,
++      // used by the punched-link path where no bootstrap admission exists.
++      // Legacy openLink callers keep their onBootstrap contract untouched.
++      acceptDirect: sessionOptions.acceptDirect === true
+     }
+     SEND_HANDLES.set(sendHandle, record)
+     state.handles.set(linkHandle, sendHandle)
+@@ -1907,6 +2141,9 @@ class UdxCellEndpoint {
+     const state = ENDPOINTS.get(this)
+     if (state.closePromise) return state.closePromise
+     state.closing = true
++    if (state.punchRound !== null && typeof state.punchRound.stop === 'function') {
++      state.punchRound.stop()
++    }
+     rejectQueue(state, stateError())
+     for (const record of Array.from(state.records)) invalidateRecord(state, record)
+     try {
+@@ -4096,6 +4333,10 @@ module.exports = {
+   DEFAULT_MAX_UDX_INBOUND_PACKETS_PER_PEER,
+   DEFAULT_MAX_UDX_INBOUND_BYTES_PER_PEER,
+   UdxCellEndpoint,
++  PUNCH_TAG,
++  PUNCH_ROUNDS,
++  PUNCH_INTERVAL_MS,
++  PUNCH_DRAIN_MS,
+   TEST_ONLY_UDX_ADAPTER_ISSUER,
+   createM3CellLinkTransferIssuer,
+   createExtensionSetupTransport,
+diff --git a/test/private-routing.js b/test/private-routing.js
+index 4fe4c3b9b78870fdc247c4344ce411c1606fc97a..2e571689410599f3f80102072de2efb82be19ccc 100644
+--- a/test/private-routing.js
++++ b/test/private-routing.js
+@@ -46,6 +46,8 @@ require('./private/branch-expiry-rotation')
+ require('./private/udx-loopback')
+ 
+ require('./private/extension-setup-channel')
++require('./private/nat-punch')
++require('./private/nat-traversal-live')
+ require('./private/extension-link-completion')
+ require('./private/redacted-responder-proof')
+ require('./private/tail-control')
+diff --git a/test/private/nat-punch.js b/test/private/nat-punch.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..3bfdd8d9b5968968c52cac636bca520ed37222cf
+--- /dev/null
++++ b/test/private/nat-punch.js
+@@ -0,0 +1,237 @@
++'use strict'
++
++const test = require('brittle')
++const b4a = require('b4a')
++
++const { cryptoSuite } = require('../../lib/private/crypto-suite')
++const {
++  PLAN_FORMAT,
++  MAX_PLAN_BYTES,
++  encodeNatPunchPlan,
++  encodeUnsignedPlan,
++  signNatPunchPlan,
++  verifyNatPunchPlan
++} = require('../../lib/private/nat-punch')
++const { PROTOCOL_VERSION } = require('../../lib/private/protocol')
++
++const seed = (value) => b4a.alloc(32, value)
++
++function keyPairAt(value) {
++  return cryptoSuite.keyPair(seed(value))
++}
++
++function plan(overrides = {}) {
++  return {
++    version: PROTOCOL_VERSION,
++    format: PLAN_FORMAT,
++    planId32: seed(9),
++    endpointA: {
++      identity32: keyPairAt(1).publicKey,
++      role: 0,
++      host: '203.0.113.7',
++      port: 51001
++    },
++    endpointB: {
++      identity32: keyPairAt(2).publicKey,
++      role: 1,
++      host: '203.0.113.9',
++      port: 51002
++    },
++    epoch: 3n,
++    notBefore: 100n,
++    expiresAt: 200n,
++    runId32: seed(4),
++    ...overrides
++  }
++}
++
++test('a signed plan verifies for both named peers and orders endpoints canonically', (t) => {
++  const authority = keyPairAt(3)
++  const a = keyPairAt(1)
++  const b = keyPairAt(2)
++  const encoding = signNatPunchPlan(plan(), authority.secretKey)
++
++  t.ok(encoding.byteLength <= MAX_PLAN_BYTES, 'an encoded plan fits the wire budget')
++
++  const viewA = verifyNatPunchPlan(encoding, authority.publicKey, {
++    localIdentity32: a.publicKey,
++    now: 150n
++  })
++  t.alike(
++    { host: viewA.local.host, port: viewA.local.port },
++    { host: '203.0.113.7', port: 51001 },
++    'peer A reads itself as local'
++  )
++  t.alike(
++    { host: viewA.peer.host, port: viewA.peer.port },
++    { host: '203.0.113.9', port: 51002 },
++    'peer A reads B as its peer'
++  )
++  t.ok(viewA.planId32.equals(seed(9)), 'both sides read the same plan id')
++
++  const viewB = verifyNatPunchPlan(encoding, authority.publicKey, {
++    localIdentity32: b.publicKey,
++    now: 150n
++  })
++  t.is(viewB.local.port, 51002, 'peer B reads itself as local')
++  t.is(viewB.peer.port, 51001, 'peer B reads A as its peer')
++})
++
++test('a plan signed by the wrong authority is refused', (t) => {
++  const stranger = keyPairAt(30)
++  const encoding = signNatPunchPlan(plan(), stranger.secretKey)
++  t.exception(
++    () =>
++      verifyNatPunchPlan(encoding, keyPairAt(3).publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 150n
++      }),
++    'a stranger cannot sign a plan'
++  )
++})
++
++test('a plan naming a third party is refused for every other reader', (t) => {
++  const authority = keyPairAt(3)
++  const encoding = signNatPunchPlan(plan(), authority.secretKey)
++  t.exception(
++    () =>
++      verifyNatPunchPlan(encoding, authority.publicKey, {
++        localIdentity32: keyPairAt(31).publicKey,
++        now: 150n
++      }),
++    'an identity outside the plan has no side'
++  )
++})
++
++test('a plan outside its validity window is refused', (t) => {
++  const authority = keyPairAt(3)
++  const encoding = signNatPunchPlan(plan(), authority.secretKey)
++  t.exception(
++    () =>
++      verifyNatPunchPlan(encoding, authority.publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 200n
++      }),
++    'the expiry bound is exclusive'
++  )
++  t.exception(
++    () =>
++      verifyNatPunchPlan(encoding, authority.publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 99n
++      }),
++    'the notBefore bound is inclusive'
++  )
++})
++
++test('a tampered plan is refused byte-for-byte', (t) => {
++  const authority = keyPairAt(3)
++  const encoding = signNatPunchPlan(plan(), authority.secretKey)
++
++  const portTampered = b4a.from(encoding)
++  portTampered[MAX_PLAN_BYTES - 64 - 3] ^= 0x01
++  t.exception(
++    () =>
++      verifyNatPunchPlan(portTampered, authority.publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 150n
++      }),
++    'flipping a port byte breaks the signature'
++  )
++
++  const hostTampered = b4a.from(encoding)
++  hostTampered[44] ^= 0x01
++  t.exception(
++    () =>
++      verifyNatPunchPlan(hostTampered, authority.publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 150n
++      }),
++    'flipping an address byte breaks the signature'
++  )
++
++  const idTampered = b4a.from(encoding)
++  idTampered[9] ^= 0x01
++  t.exception(
++    () =>
++      verifyNatPunchPlan(idTampered, authority.publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 150n
++      }),
++    'flipping a plan-id byte breaks the signature'
++  )
++})
++
++test('a plan for one epoch or run does not read as another', (t) => {
++  const authority = keyPairAt(3)
++  const epochPlan = signNatPunchPlan(plan({ epoch: 4n }), authority.secretKey)
++  const verified = verifyNatPunchPlan(epochPlan, authority.publicKey, {
++    localIdentity32: keyPairAt(1).publicKey,
++    now: 150n
++  })
++  t.is(verified.epoch, 4n, 'the epoch is inside the signed bytes')
++  t.ok(verified.runId32.equals(seed(4)), 'the run id survives verification')
++})
++
++test('the same peers in reversed order verify to the same published tuple', (t) => {
++  const authority = keyPairAt(3)
++  const forward = signNatPunchPlan(plan(), authority.secretKey)
++  const reversed = signNatPunchPlan(
++    plan({ endpointA: plan().endpointB, endpointB: plan().endpointA }),
++    authority.secretKey
++  )
++  const left = verifyNatPunchPlan(forward, authority.publicKey, {
++    localIdentity32: keyPairAt(1).publicKey,
++    now: 150n
++  })
++  const right = verifyNatPunchPlan(reversed, authority.publicKey, {
++    localIdentity32: keyPairAt(1).publicKey,
++    now: 150n
++  })
++  t.alike(
++    { host: left.peer.host, port: left.peer.port },
++    { host: right.peer.host, port: right.peer.port },
++    'mirrored plans agree on the peer address'
++  )
++})
++
++test('malformed plans are refused at the codec', (t) => {
++  const authority = keyPairAt(3)
++  t.exception(
++    () =>
++      verifyNatPunchPlan(b4a.alloc(10), authority.publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 150n
++      }),
++    'a short encoding is refused'
++  )
++
++  t.exception(
++    () =>
++      verifyNatPunchPlan(b4a.alloc(MAX_PLAN_BYTES + 1), authority.publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 150n
++      }),
++    'an oversized encoding is refused'
++  )
++
++  const unsigned = encodeUnsignedPlan(plan())
++  t.exception(
++    () =>
++      verifyNatPunchPlan(unsigned, authority.publicKey, {
++        localIdentity32: keyPairAt(1).publicKey,
++        now: 150n
++      }),
++    'an unsigned encoding has no side'
++  )
++  t.is(
++    unsigned.byteLength,
++    MAX_PLAN_BYTES - 64,
++    'the unsigned body is the plan minus the signature'
++  )
++
++  t.exception(
++    () => signNatPunchPlan(plan({ notBefore: 200n, expiresAt: 100n }), authority.secretKey),
++    'an inverted window cannot be signed'
++  )
++})
+diff --git a/test/private/nat-traversal-live.js b/test/private/nat-traversal-live.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..946582fd1c4036f7396d39521ea61089d1c207bd
+--- /dev/null
++++ b/test/private/nat-traversal-live.js
+@@ -0,0 +1,424 @@
++'use strict'
++
++// The production traversal path, end to end, on real UDX sockets.
++//
++// What this proves, and why no harness rehearsal can: two UdxCellEndpoints bind
++// DIFFERENT loopback addresses, so the source of every datagram is translated
++// relative to what each endpoint believes about the other - the shape a NAT
++// produces, which a single-host 127.0.0.1 rehearsal hides. Nothing opens the
++// path in advance. One signed punch plan, from the topology authority, drives a
++// simultaneous round on the endpoints' own sockets; each endpoint counts the
++// OTHER side's punch datagrams against the verified round and counts datagrams
++// from any other source as stray. Only then does the authenticated link
++// handshake run, on the signed topology grant it always required. A punch never
++// substitutes for the grant: the responder's accept path verifies the initiator
++// identity through the link setup transcript, and a stray punch opens nothing.
++//
++// The rejects the task names are exercised directly: a wrong-signature plan, a
++// plan naming the wrong local address, and an out-of-window plan each fail
++// closed before a single datagram is sent.
++
++const test = require('brittle')
++const b4a = require('b4a')
++
++const { cryptoSuite } = require('../../lib/private/crypto-suite')
++const { LinkDirectory, signTopologyGrant } = require('../../lib/private/topology-grant')
++const {
++  LINK_OPERATION,
++  PROTOCOL_VERSION,
++  ROLE,
++  TOPOLOGY_ROLE,
++  roleForIdentity
++} = require('../../lib/private/protocol')
++const { PLAN_FORMAT, signNatPunchPlan, verifyNatPunchPlan } = require('../../lib/private/nat-punch')
++const { UdxCellEndpoint, PUNCH_TAG } = require('../../lib/private/udx-cell-endpoint')
++const { BootstrapEnvelopeCodec } = require('../../lib/private/bootstrap-envelope')
++const { createLinkSetupAuthority } = require('../../lib/private/link-setup')
++
++// macOS refuses distinct 127.x.y.z addresses without per-address configuration
++// (KI-2), so distinct ADDRESSES are not portable either. The translation this
++// test exercises is port-based instead: both endpoints bind 127.0.0.1 on
++// DIFFERENT ports, which keeps the property that matters - each endpoint's
++// socket is a different UDP flow with its own mapping, and neither side can
++// open the path alone - while staying portable across Node, Bare, macOS, Linux
++// and Windows.
++const HOST_A = '127.0.0.1'
++const HOST_B = '127.0.0.1'
++const PORT_A = 51501
++const PORT_B = 51502
++
++const seed = (value) => b4a.alloc(32, value)
++
++function roleIdentity(start) {
++  for (let value = start; value < 256; value++) {
++    const pair = cryptoSuite.keyPair(seed(value))
++    if (roleForIdentity(pair.publicKey) === ROLE.SAFETY) return pair
++  }
++  throw new Error('missing safety identity')
++}
++
++function endpointOptions(host, port) {
++  return {
++    host,
++    port,
++    advertisedHost: host,
++    advertisedPort: port,
++    onBootstrap() {},
++    onCell() {},
++    onLinkFailure() {}
++  }
++}
++
++function buildTopology() {
++  const authority = cryptoSuite.keyPair(seed(240))
++  const initiator = cryptoSuite.keyPair(seed(241))
++  const accepter = roleIdentity(242)
++  const responderStatic = cryptoSuite.encryptionKeyPair(seed(243))
++  const runId32 = seed(244)
++
++  const grant = signTopologyGrant(
++    {
++      version: PROTOCOL_VERSION,
++      format: 0,
++      grantId32: seed(245),
++      endpointA: {
++        identity32: initiator.publicKey,
++        role: TOPOLOGY_ROLE.SOURCE,
++        host: HOST_A,
++        port: PORT_A,
++        operations: LINK_OPERATION.INITIATE
++      },
++      endpointB: {
++        identity32: accepter.publicKey,
++        role: TOPOLOGY_ROLE.SAFETY_GUARD,
++        host: HOST_B,
++        port: PORT_B,
++        operations: LINK_OPERATION.ACCEPT
++      },
++      epoch: 7n,
++      notBefore: 0n,
++      expiresAt: 60_000n,
++      runId32
++    },
++    authority.secretKey
++  )
++
++  const directoryFor = (local, localRole, peer, peerRole, operation) => {
++    const directory = new LinkDirectory({
++      localIdentity32: local.publicKey,
++      localRole,
++      authorityPublicKey: authority.publicKey,
++      epoch: 7n,
++      runId32,
++      now: () => 1n,
++      schedule: () => null,
++      cancel: () => {},
++      onClose() {}
++    })
++    const digest32 = directory.add(grant)
++    const handle = directory.authorize({
++      digest32,
++      operation,
++      localIdentity32: local.publicKey,
++      localRole,
++      peerIdentity32: peer.publicKey,
++      peerRole,
++      epoch: 7n,
++      runId32
++    })
++    return { directory, handle }
++  }
++
++  return {
++    authority,
++    initiator,
++    accepter,
++    responderStatic,
++    runId32,
++    grant,
++    left: directoryFor(
++      initiator,
++      TOPOLOGY_ROLE.SOURCE,
++      accepter,
++      TOPOLOGY_ROLE.SAFETY_GUARD,
++      LINK_OPERATION.INITIATE
++    ),
++    right: directoryFor(
++      accepter,
++      TOPOLOGY_ROLE.SAFETY_GUARD,
++      initiator,
++      TOPOLOGY_ROLE.SOURCE,
++      LINK_OPERATION.ACCEPT
++    )
++  }
++}
++
++function planEncoding(topology) {
++  return signNatPunchPlan(
++    {
++      version: PROTOCOL_VERSION,
++      format: PLAN_FORMAT,
++      planId32: seed(246),
++      endpointA: {
++        identity32: topology.initiator.publicKey,
++        role: 0,
++        host: HOST_A,
++        port: PORT_A
++      },
++      endpointB: { identity32: topology.accepter.publicKey, role: 1, host: HOST_B, port: PORT_B },
++      epoch: 7n,
++      notBefore: 0n,
++      expiresAt: 60_000n,
++      runId32: topology.runId32
++    },
++    topology.authority.secretKey
++  )
++}
++
++test('a wrong-signature plan is refused before any send', async (t) => {
++  const topology = buildTopology()
++  const left = new UdxCellEndpoint(endpointOptions(HOST_A, PORT_A))
++  await left.bind()
++  t.teardown(() => left.close())
++
++  const stranger = cryptoSuite.keyPair(seed(247))
++  const wrongSignature = signNatPunchPlan(
++    {
++      version: PROTOCOL_VERSION,
++      format: PLAN_FORMAT,
++      planId32: seed(246),
++      endpointA: {
++        identity32: topology.initiator.publicKey,
++        role: 0,
++        host: HOST_A,
++        port: PORT_A
++      },
++      endpointB: {
++        identity32: topology.accepter.publicKey,
++        role: 1,
++        host: HOST_B,
++        port: PORT_B
++      },
++      epoch: 7n,
++      notBefore: 0n,
++      expiresAt: 60_000n,
++      runId32: topology.runId32
++    },
++    stranger.secretKey
++  )
++  await t.exception(
++    left.punchPlan(wrongSignature, {
++      authorityPublicKey: topology.authority.publicKey,
++      localIdentity32: topology.initiator.publicKey,
++      now: () => 10
++    }),
++    'a stranger-signed plan never reaches the socket'
++  )
++})
++
++test('a plan naming the wrong local address is refused', async (t) => {
++  const topology = buildTopology()
++  const left = new UdxCellEndpoint(endpointOptions(HOST_A, PORT_A))
++  await left.bind()
++  t.teardown(() => left.close())
++
++  // The plan is genuinely signed, but names the OTHER host as A's endpoint.
++  const wrongAddress = signNatPunchPlan(
++    {
++      version: PROTOCOL_VERSION,
++      format: PLAN_FORMAT,
++      planId32: seed(248),
++      endpointA: {
++        identity32: topology.initiator.publicKey,
++        role: 0,
++        host: HOST_B,
++        port: PORT_B
++      },
++      endpointB: {
++        identity32: topology.accepter.publicKey,
++        role: 1,
++        host: HOST_B,
++        port: PORT_B
++      },
++      epoch: 7n,
++      notBefore: 0n,
++      expiresAt: 60_000n,
++      runId32: topology.runId32
++    },
++    topology.authority.secretKey
++  )
++  await t.exception(
++    left.punchPlan(wrongAddress, {
++      authorityPublicKey: topology.authority.publicKey,
++      localIdentity32: topology.initiator.publicKey,
++      now: () => 10
++    }),
++    'the plan must name the address this endpoint advertises'
++  )
++})
++
++test('a plan outside its window is refused', async (t) => {
++  const topology = buildTopology()
++  const left = new UdxCellEndpoint(endpointOptions(HOST_A, PORT_A))
++  await left.bind()
++  t.teardown(() => left.close())
++
++  const encoding = planEncoding(topology)
++  // The plan's window is [0, 60000); a caller that samples now past the expiry
++  // is refused. verifyNatPunchPlan is the same gate punchPlan uses.
++  t.exception(
++    () =>
++      verifyNatPunchPlan(encoding, topology.authority.publicKey, {
++        localIdentity32: topology.initiator.publicKey,
++        now: 60_000n
++      }),
++    'an expired plan has no side'
++  )
++})
++
++test('punch datagrams from an unverified source are counted stray, not as the peer', async (t) => {
++  const topology = buildTopology()
++  const left = new UdxCellEndpoint(endpointOptions(HOST_A, PORT_A))
++  const right = new UdxCellEndpoint(endpointOptions(HOST_B, PORT_B))
++  await left.bind()
++  await right.bind()
++  t.teardown(async () => {
++    await left.close()
++    await right.close()
++  })
++
++  // A stranger spoofs punch-tagged datagrams toward B while BOTH verified
++  // rounds run concurrently. Each round lasts ~5s (6 sends over 2.5s plus a
++  // 2s drain), so the spoof window overlaps them. B must count A's punches as
++  // its peer and the stranger's as stray; A sees only B.
++  const strangerUdx = new (require('udx-native'))()
++  const strangerSocket = strangerUdx.createSocket()
++  await strangerSocket.bind(0, '127.0.0.1')
++  const encoding = planEncoding(topology)
++  const leftStatsPromise = left.punchPlan(encoding, {
++    authorityPublicKey: topology.authority.publicKey,
++    localIdentity32: topology.initiator.publicKey,
++    now: () => 10
++  })
++  const rightStatsPromise = right.punchPlan(encoding, planOptionsLocal(topology))
++  const spoof = setInterval(() => {
++    try {
++      strangerSocket.send(b4a.from(PUNCH_TAG), PORT_B, HOST_B)
++    } catch {}
++  }, 100)
++  const [leftStats, rightStats] = await Promise.all([leftStatsPromise, rightStatsPromise])
++  clearInterval(spoof)
++  await strangerSocket.close()
++
++  t.ok(leftStats.received >= 1, 'A counted the peer punches from the plan tuple')
++  t.ok(rightStats.received >= 1, 'B counted A punches as the peer')
++  t.ok(rightStats.strayReceived >= 1, 'B counted the stranger punch as stray')
++  t.is(leftStats.strayReceived, 0, 'A saw nothing stray: only B sent to it')
++})
++
++function planOptionsLocal(topology) {
++  return {
++    authorityPublicKey: topology.authority.publicKey,
++    localIdentity32: topology.accepter.publicKey,
++    now: () => 10
++  }
++}
++
++test('two endpoints traverse: verified simultaneous punch round then authenticated link', async (t) => {
++  const topology = buildTopology()
++  const left = new UdxCellEndpoint(endpointOptions(HOST_A, PORT_A))
++  const right = new UdxCellEndpoint(endpointOptions(HOST_B, PORT_B))
++  await left.bind()
++  await right.bind()
++  t.teardown(async () => {
++    await left.close()
++    await right.close()
++  })
++
++  // Simultaneous verified round first: the path exists before either side
++  // speaks the link protocol.
++  const encoding = planEncoding(topology)
++  const planOptions = {
++    authorityPublicKey: topology.authority.publicKey,
++    localIdentity32: topology.initiator.publicKey,
++    now: () => 10
++  }
++  const [leftStats, rightStats] = await Promise.all([
++    left.punchPlan(encoding, planOptions),
++    right.punchPlan(encoding, { ...planOptions, localIdentity32: topology.accepter.publicKey })
++  ])
++  t.ok(leftStats.sent >= 1 && rightStats.sent >= 1, 'both sides punched')
++  t.ok(leftStats.received >= 1 && rightStats.received >= 1, 'both sides counted the peer punch')
++
++  // Responder pre-arms its ACCEPT session, as a real guard does.
++  const responderSetup = {
++    circuitId: b4a.alloc(16, 0x71),
++    epoch: 7n,
++    initiatorIdentity: topology.initiator.publicKey,
++    responderIdentity: topology.accepter.publicKey,
++    initiatorLocalId: b4a.alloc(16, 0x72),
++    responderLocalId: b4a.alloc(16, 0x73),
++    expiresAt: 60_000n,
++    responderStaticSecretKey: topology.responderStatic.secretKey,
++    responderIdentitySecretKey: topology.accepter.secretKey
++  }
++  const acceptSession = right.openLink(topology.right.handle, {
++    mode: 'accept',
++    codec: new BootstrapEnvelopeCodec({
++      linkHandle: topology.right.handle,
++      localIdentitySecretKey: topology.accepter.secretKey,
++      padding: (size) => b4a.alloc(size, 0x91)
++    }),
++    linkSetup: createLinkSetupAuthority({
++      now: () => 1,
++      randomBytes: (size) => b4a.alloc(size, 0x71)
++    }),
++    setup: responderSetup,
++    now: () => 1,
++    schedule: setTimeout,
++    cancel: clearTimeout,
++    randomBytes: (size) => b4a.alloc(size, 3),
++    absoluteDeadline: 30_000,
++    signedExpiry: 60_000,
++    authorizedExpiry: 60_000,
++    acceptDirect: true
++  })
++  t.ok(acceptSession, 'the responder armed an accept session')
++
++  const initiatorSetup = {
++    circuitId: b4a.alloc(16, 0x71),
++    epoch: 7n,
++    initiatorIdentity: topology.initiator.publicKey,
++    responderIdentity: topology.accepter.publicKey,
++    initiatorLocalId: b4a.alloc(16, 0x72),
++    responderLocalId: b4a.alloc(16, 0x73),
++    expiresAt: 60_000n,
++    responderStaticKey: topology.responderStatic.publicKey,
++    initiatorIdentitySecretKey: topology.initiator.secretKey
++  }
++  const session = left.openLink(topology.left.handle, {
++    mode: 'initiate',
++    codec: new BootstrapEnvelopeCodec({
++      linkHandle: topology.left.handle,
++      localIdentitySecretKey: topology.initiator.secretKey,
++      padding: (size) => b4a.alloc(size, 0x81)
++    }),
++    linkSetup: createLinkSetupAuthority({
++      now: () => 1,
++      randomBytes: (size) => b4a.alloc(size, 0x61)
++    }),
++    setup: initiatorSetup,
++    now: () => 1,
++    schedule: setTimeout,
++    cancel: clearTimeout,
++    randomBytes: (size) => b4a.alloc(size, 1),
++    absoluteDeadline: 30_000,
++    signedExpiry: 60_000,
++    authorizedExpiry: 60_000
++  })
++  const established = await session.open()
++  t.ok(established, 'the link established across the punched path')
++  t.is(acceptSession.state, 'OPEN', 'the responder reached OPEN on the same link')
++  await acceptSession.close()
++  await session.close()
++})
+diff --git a/test/private/process/wire-services.js b/test/private/process/wire-services.js
+index 4d36c14678d24cea5b1f164816e73254bd2292e2..923067ac1d7b71d15ac42d9860fb4a5dceeb001f 100644
+--- a/test/private/process/wire-services.js
++++ b/test/private/process/wire-services.js
+@@ -40,6 +40,7 @@ const {
+   decodeTestIsolatedAddressGrant,
+   digestTestIsolatedAddressTuple
+ } = require('../../../lib/private/dht-exit-test-topology-grant')
++const { verifyNatPunchPlan } = require('../../../lib/private/nat-punch')
+ const { cryptoSuite } = require('../../../lib/private/crypto-suite')
+ const { PrivateRouteError } = require('../../../lib/private/errors')
+ const {
+@@ -425,11 +426,15 @@ function createProjectedLinkService(options) {
+     }
+     let session = null
+     try {
++      // PUNCH-BEFORE-CREATE on the initiator side: when the caller hands in the
++      // peer's punch round (started from a verified plan), the session opens
++      // with it joined, so its first CREATE waits for the round to settle. The
++      // session stops the round if it dies first.
+       session = endpoint.openLink(authorized.handle, sessionOptions(authorized, 'initiate', setup))
+       installSession(session, authorized, 'initiate')
+-      const established = await session.open()
++      const opened = await session.open(values.punch === undefined ? {} : { punch: values.punch })
+       if (current && current.session === session) current = null
+-      const result = Object.freeze({ established })
++      const result = Object.freeze({ established: opened })
+       links.add(result)
+       linkSessions.set(result, session)
+       return result
+@@ -608,6 +613,25 @@ function createProjectedLinkService(options) {
+     return true
+   }
+ 
++  // THE ROLE-SIDE PUNCH PLAN ENTRY. A projection hands this role its signed
++  // punch plan; the plan is verified here against the topology authority this
++  // service already pins, and only then does the round run on the role's own
++  // endpoint socket. The verified plan's peer tuple is what a later
++  // `initiate()` may wait on through `options.punch`. A plan whose local side is
++  // not this role's identity, or whose signature does not verify, never reaches
++  // the socket.
++  function punchPlanFor(encoding) {
++    assertLive()
++    if (!b4a.isBuffer(encoding)) throw PrivateRouteError.INVALID_ROUTE()
++    const verified = verifyNatPunchPlan(encoding, authorityPublicKey, {
++      localIdentity32: b4a.from(localIdentity),
++      now: BigInt(numberNow(wallNow))
++    })
++    const punch = endpoint.punchPeer({ host: verified.peer.host, port: verified.peer.port })
++    punch.plan = verified
++    return punch
++  }
++
+   return Object.freeze({
+     destroy,
+     faultLink,
+@@ -617,6 +641,7 @@ function createProjectedLinkService(options) {
+     prearmAccept,
+     releaseLinkGrant,
+     prearmAcceptAny,
++    punchPlanFor,
+     receiveBootstrap,
+     receiveCell,
+     receiveLinkFailure,
+diff --git a/test/private/protocol.js b/test/private/protocol.js
+index 01bbfd2f66ccbcc1946ea7f995c78110e311e374..f0bae730744d3ea0a6b9f475f93299ea42525191 100644
+--- a/test/private/protocol.js
++++ b/test/private/protocol.js
+@@ -205,6 +205,7 @@ test('private route protocol domains are exact defensive buffers in a frozen map
+     ROLE: 'hyperdht-private-routes/role/v0',
+     UDX_BOOTSTRAP: 'hyperdht-private-routes/udx-bootstrap/v0',
+     TOPOLOGY_GRANT: 'hyperdht-private-routes/topology-grant/v0',
++    NAT_PUNCH_PLAN: 'hyperdht-private-routes/nat-punch-plan/v0',
+     RELAY_ADVERTISEMENT: 'hyperdht-private-routes/relay-advertisement/v0',
+     DESCRIPTOR_DIRECT: 'hyperdht-private-routes/descriptor/direct/v0',
+     DELEGATION: 'hyperdht-private-routes/delegation/v0',
+-- 
+2.50.1 (Apple Git-155)
+
