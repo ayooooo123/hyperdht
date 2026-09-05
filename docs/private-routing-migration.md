@@ -1,5 +1,15 @@
 # Private Routing Gate 3A / Gate 3B1 Migration Record
 
+## Preservation status — 2026-09-05
+
+This branch preserves the unaccepted `924fd55` NAT rework. Its commit title
+and historical delivery text do not establish that KI-13 is closed. Prior
+review rejected missing production ownership and real NAT evidence; the
+subsequent rework has not received acceptance on the canonical branch.
+Run/topology binding, replay-budget behavior, address-family bounds,
+same-socket production startup, and mapping lifetime require review and
+real-network proof before merge. This publication preserves work only.
+
 ## Status and scope
 
 This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
