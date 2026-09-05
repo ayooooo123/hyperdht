@@ -1,5 +1,15 @@
 # Private Routing Gate 3A / Gate 3B1 Migration Record
 
+## Preservation status — 2026-09-05
+
+This branch preserves an incomplete, rejected Gate C experiment. It is not a
+merge candidate. The SURB rewrite and ad hoc `check_vectors.js` are research
+source, not an approved wire format or integrated DATAGRAM reply path.
+The checker needs an absent `/tmp/surb_vectors.txt` and reads relay `sec`
+fields that its key records do not define. No successful vector run, external
+cryptographic review, or production integration is claimed by this snapshot.
+The historical records below do not override this status.
+
 ## Status and scope
 
 This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
