@@ -289,7 +289,7 @@ function actorFailure(err) {
     scheduleIncomingRearm()
     return
   }
-  void fatal(Object.assign(new Error(), { code }))
+  void fatal(Object.assign(new Error(err && err.stack ? err.stack : String(err)), { code }))
 }
 
 // A rebuilt branch opens a new adjacent link, so a relay that lost its circuit must

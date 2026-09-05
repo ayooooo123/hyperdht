@@ -1,5 +1,12 @@
 # Private Routing Gate 3A / Gate 3B1 Migration Record
 
+## Preservation status — 2026-09-05
+
+This is an incomplete historical candidate-demotion comparison based on
+`ab818f9`, with a role-runner diagnostic change. It differs from the
+blackhole-isolation experiment and the accepted implementation. It is
+preserved as research source only, not as a merge-ready or production feature.
+
 ## Status and scope
 
 This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
