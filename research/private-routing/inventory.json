@@ -238,6 +238,17 @@
   ],
   "detached_archives": ["blackhole-isolation", "baseline"],
   "external_archive": "handoff",
+  "external_histories": [
+    {
+      "source_checkout": "source-hyperdht",
+      "branch": "claude/hyperdht-hyperswarm-transports-71d7fn",
+      "commit": "b329b8b417183ac2e9438cfb2a3da1be561f40db",
+      "status": "historical",
+      "already_on_origin": true,
+      "reachable_from_accepted_before_collection": false,
+      "preservation": "Archive-only merge parent; four legacy Tor transport commits are retained without activating their code."
+    }
+  ],
   "excluded_generated_files": [
     "hyperdht-blackhole-isolation/choose.log",
     "hyperdht-blackhole-isolation/hook.log"

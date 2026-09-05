@@ -81,7 +81,8 @@ All related work is centralized on `private-routing-v1` in
 unaccepted implementations are preserved under `research/private-routing/`,
 not merged into `lib/private`. Preservation does not close their review gates.
 The complete inventory covers all 33 local branch refs found at collection
-time, both detached experiments, and external handoff/workflow notes.
+time, both detached experiments, external handoff/workflow notes, and the
+legacy Tor-transport history from the separate `source-hyperdht` checkout.
 Original worktree commits are also retained as parents of an explicitly
 archive-only merge. That merge keeps the accepted tree unchanged: it preserves
 Git history without installing rejected implementations. Thus the one pushed
@@ -127,8 +128,13 @@ The temporary verification worktrees were removed.
 its location on the fork or in these archives. Other local routing branches
 already match their fork refs. The second `projects/Hyperdht-private-routing`
 checkout has no unique edits or commits. The clean `source-hyperdht` reference
-tip `b329b8b` is already on the fork. The clean DHT-RPC dependency tip
-`fe04496` is already on its own `ayooooo123/dht-rpc` fork and is not copied here.
+tip `b329b8b` was already on the fork, but its four Tor-transport commits were
+not reachable from the collected branch. A further archive-only merge retains
+that tip without installing its files. The source checkout's disabled push
+configuration is unchanged. This history is listed in `external_histories` in
+the inventory and can be inspected directly with `git worktree add --detach`
+at `b329b8b`; no duplicate patch archive is needed. The clean DHT-RPC dependency
+tip `fe04496` is already on its own `ayooooo123/dht-rpc` fork and is not copied here.
 The stale `/private/tmp` baseline worktree entry points to a missing directory;
 the live detached experiments are preserved without pruning that entry.
 
@@ -1730,8 +1736,8 @@ passed all three private-routing jobs on the same commit; the
 [build matrix](https://github.com/ayooooo123/hyperdht/actions/runs/33992419669)
 also passed on Linux, macOS, and Windows. These results do not clear the failure.
 
-The recorded stack starts at `actorFailure` in `role-runner.js`, which replaces
-the original error with a new one before logging it. The guard's
+The recorded stack starts at `actorFailure` in `role-runner.js`, which replaced
+the original error with a new one before logging it in that run. The guard's
 `createTailRelayActor().serve()` rejection reaches that boundary, but the
 originating authentication check is not recorded. Its cause is not established
 as a wall-clock defect or as either earlier signature. No authentication check
@@ -1740,8 +1746,23 @@ has been weakened, no retry added, and no runtime fix is claimed.
 An isolated copy retained the original actor error stack for diagnosis and ran
 eight Node plus eight Bare live process scenarios in the local Linux container.
 All 16 passed 136 assertions each; the CI failure did not recur. This is a
-non-reproduction, not a fix. The diagnostic copy was removed; the accepted
-runtime and failure handling are unchanged.
+non-reproduction, not a fix. The diagnostic copy was removed. The same
+one-line stack-preservation change is now retained in the role harness:
+actual `Error` objects reach the existing opt-in fatal log unchanged; a
+non-Error value still gets a normalized fallback error. The control channel
+still sends only `sanitizeCode(err)`. No protocol or routing behavior changed,
+and the authentication failure remains unresolved.
+
+A deterministic fault-path smoke injected a marked authentication error in a
+temporary relay actor. Before the fix, Node logged a replacement stack and
+Bare wrote no diagnostic file: the shared `require('fs')` lacked a Bare module
+mapping. The package now maps `fs` to the pinned `bare-fs` development dependency
+under Bare, following the existing cross-runtime import pattern.
+After the fix, both runtimes logged the original marker and `Object.serve`
+source stack; both control failures still contained only
+`PROCESS_FAILURE (guard/CONTROL): ERR_AUTHENTICATION`. The injected fault and
+temporary worktree were removed. This proves diagnostic preservation, not a
+fix for the intermittent CI rejection.
 
 Historical evidence for the two established causes follows.
 
