@@ -95,6 +95,8 @@ function validCommand(type) {
       return { ...base(type), operationSequence: 2n }
     case 'rotate':
       return { ...base(type, 'lookup-middle-a', 3), nextGeneration: 8n }
+    case 'blackhole':
+      return base(type, 'lookup-middle-a', 3)
     case 'guard-loss':
       return base(type, 'guard', 2)
     case 'phase-ack':
@@ -145,7 +147,10 @@ function validEvent(type) {
         type
       }
     case 'ready':
-      return { ...base(type), state: 'READY' }
+      // base() builds an endpoint event, and the endpoint owns no DHT node, so
+      // zero is the honest count here as well as the only one the codec accepts
+      // from a non-DHT role.
+      return { ...base(type), answeredRequestCount: 0, state: 'READY' }
     case 'value':
       return { ...base(type), target: b4a.alloc(32, 6), value: b4a.from('value') }
     case 'cancelled':
@@ -538,6 +543,15 @@ test('physical lifecycle commands are bound only to their failing link owners', 
   throwsCode(t, () =>
     validateControlMessage(endpointRotate, messageContext('command', endpointRotate))
   )
+  const middleBlackhole = base('blackhole', 'lookup-middle-a', 3)
+  t.alike(
+    validateControlMessage(middleBlackhole, messageContext('command', middleBlackhole)),
+    middleBlackhole
+  )
+  const wrongBlackhole = base('blackhole', 'lookup-middle-b', 5)
+  throwsCode(t, () =>
+    validateControlMessage(wrongBlackhole, messageContext('command', wrongBlackhole))
+  )
 
   const guardLoss = base('guard-loss', 'guard', 2)
   t.alike(validateControlMessage(guardLoss, messageContext('command', guardLoss)), guardLoss)
@@ -559,6 +573,7 @@ test('exact command and event registries are frozen and all schemas reject extra
     'immutable-get',
     'cancel',
     'rotate',
+    'blackhole',
     'suspend',
     'resume',
     'network-change',

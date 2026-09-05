@@ -15,7 +15,6 @@ const {
 const { RelayService } = require('../../../lib/private/relay-service')
 const { ROLE } = require('../../../lib/private/protocol')
 const { encodeCanonicalEndpoint } = require('../../../lib/private/relay-capability')
-const { UdxCellEndpoint } = require('../../../lib/private/udx-cell-endpoint')
 const { AUDIT_CLASSES, AUDIT_PHASES, TEST_ONLY_AUDIT_CONTEXT_ISSUER } = require('./audit-event')
 const {
   ControlFrameDecoder,
@@ -35,7 +34,9 @@ const { PROCESS_PLANS } = require('./topology-fixture')
 const {
   acceptProjectedExtension,
   activateFinalExitActor,
+  blackholeRouteCells,
   createGuardProcessService,
+  createProjectedCellEndpoint,
   createProjectedLinkService
 } = require('./wire-services')
 
@@ -447,7 +448,7 @@ function startIncomingExtension() {
 }
 
 async function createCellOwner() {
-  cellEndpoint = new UdxCellEndpoint({
+  cellEndpoint = createProjectedCellEndpoint({
     host: projection.bind.host,
     // On separate hosts the socket is bound locally and reached at a translated
     // address, which is the one the role's capability names.
@@ -616,6 +617,18 @@ async function activate() {
     if (projection.role !== 'guard') startIncomingExtension()
     state = 'READY'
   }
+}
+
+// dht.stats.requests is dht-rpc's live io counter (dht-rpc/lib/io.js, the
+// `stats.requests` object built in the IO constructor). `responses` increments
+// in exactly one place, io.js's RESPONSE_ID branch, and only after a reply
+// datagram has matched an inflight request - so it counts requests that were
+// ANSWERED. `total` counts requests SENT and `timeouts` counts the ones that
+// were not, and neither distinguishes a live peer from a deaf one. Roles that
+// own no DHT node report 0, which is the only value the control codec accepts
+// from them.
+function answeredRequestCount() {
+  return dht === null ? 0 : dht.stats.requests.responses
 }
 
 function auditSpec(auditClass, command, target, value) {
@@ -962,7 +975,7 @@ async function handle(message) {
     ) {
       throw Object.assign(new Error(), { code: 'PROCESS_LINK_SESSION_UNAVAILABLE' })
     }
-    await emit('ready', { state })
+    await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
     return
   }
   phaseSequence = message.phaseSequence
@@ -998,7 +1011,7 @@ async function handle(message) {
       return
     case 'activate':
       await activate()
-      await emit('ready', { state })
+      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
       return
     case 'store-immutable':
       await storeImmutable(message.value)
@@ -1045,7 +1058,18 @@ async function handle(message) {
       ) {
         throw Object.assign(new Error(), { code: 'PROCESS_LINK_SESSION_UNAVAILABLE' })
       }
-      await emit('ready', { state })
+      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+      return
+    // Silent death, and the only fault verb that destroys nothing. The route cells this
+    // role would relay are dropped in both directions at its UDX adapter, every local
+    // object stays alive and the socket stays bound, so no party anywhere forms the intent
+    // to notify - which is the one condition the two link-fault verbs cannot produce,
+    // because both make this relay emit BRANCH_DESTROY.
+    case 'blackhole':
+      if (projection.role !== 'lookup-middle-a' || !blackholeRouteCells()) {
+        throw Object.assign(new Error(), { code: 'PROCESS_BLACKHOLE_UNAVAILABLE' })
+      }
+      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
       return
     case 'snapshot':
       await emit('snapshot', snapshotFields())
