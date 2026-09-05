@@ -23,6 +23,10 @@
       "bare": "bare-events",
       "default": "events"
     },
+    "fs": {
+      "bare": "bare-fs",
+      "default": "fs"
+    },
     "child_process": {
       "bare": "bare-node-child-process",
       "default": "child_process"
@@ -51,6 +55,7 @@
     "xache": "^1.1.0"
   },
   "devDependencies": {
+    "bare-fs": "4.7.4",
     "bare-node-child-process": "^1.0.1",
     "bare-process": "4.5.1",
     "bare-runtime": "1.30.3",
