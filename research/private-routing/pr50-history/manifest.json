@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "id": "pr50-history",
+  "source_worktree": "hyperdht-private-routing",
+  "base_commit": "2b5f0ab09750f4e53e31ce696be41ae8051cd1cf",
+  "source_head": "ba1f87e4a79ba9417c2da38547fead2de5f67d8d",
+  "source_branch": "pr50-reviewed-continuation",
+  "status": "already-integrated",
+  "notes": [
+    "Original history preserved; source tip tree equals accepted c035cf8. Do not re-apply to current runtime."
+  ],
+  "history_patch": "history.patch",
+  "working_patch": null,
+  "files": [
+    {
+      "path": ".github/workflows/live-route.yml",
+      "sha256": "1e289907ce8269c3c9c416edfbceef116c9d174f26db36535f1bd18625491d3f"
+    },
+    {
+      "path": "docs/private-routing-migration.md",
+      "sha256": "8803f8889050d3c12b32287081151ae7d6c059af1a1be5b7247484eb6d9adb87"
+    },
+    {
+      "path": "lib/private/m3-adjacency-runtime.js",
+      "sha256": "2ab38c9598375f1d503033cd0dee767be0226b7974aaed2ad79d3185ee8be10f"
+    },
+    {
+      "path": "lib/private/tail-control.js",
+      "sha256": "c309bf0b9be214230e2eecb7ba1808dad3f5d26a538d691b3e228f07b68a07eb"
+    },
+    {
+      "path": "scripts/live-route.sh",
+      "sha256": "26c18bccc50a7cc6bfdb6a485428eb7a9c46d6f70a3900ddb59d9724a8d3a9fb"
+    },
+    {
+      "path": "test/private/live-process-suite.js",
+      "sha256": "be3943bdd9ae07e339264b09155e1f6a3cb395cb56935ffa977f2ebc49bc15a6"
+    },
+    {
+      "path": "test/private/m3-adjacency-runtime.js",
+      "sha256": "cbce8236194a746fc782d04c195122b05bcccffcad1152ce55d0ce8212d876fc"
+    },
+    {
+      "path": "test/private/process-codec.js",
+      "sha256": "36fabf3ac3b231498442cff7575d803eb2dd1f108f5844b0ab5db3a6b34e0420"
+    },
+    {
+      "path": "test/private/process-config-auditor.js",
+      "sha256": "5226c9c1613cdf73dcda1be4f63efc5ff1bc1b0c25695593b0a2dcf4e5ac8685"
+    },
+    {
+      "path": "test/private/process/config-auditor.js",
+      "sha256": "a641ab2e17e9c7561a3733b18652d67415cf3aa7a88d86e2de6e08e48c16a9d1"
+    },
+    {
+      "path": "test/private/process/control-channel.js",
+      "sha256": "9f66a7c919e116b66a8b82a3bce60a55ef48f40011b474e9a312079f77d6a651"
+    },
+    {
+      "path": "test/private/process/role-runner.js",
+      "sha256": "531a60a9a69931b8a61bf7724112c945b20bded391c9341acec277e9cd37ca2f"
+    },
+    {
+      "path": "test/private/process/teardown-phase-window-probe.js",
+      "sha256": "36af410bbb662af14fe3860a13bb66114f67198935d221a60cfbe8d1c0b19242"
+    },
+    {
+      "path": "test/private/tail-control.js",
+      "sha256": "5be1873fc5346c30ef9585058ff1284b0bdd15a6ab8d876c6a9a04127e795f3e"
+    }
+  ]
+}

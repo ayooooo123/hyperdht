@@ -16,8 +16,8 @@ const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
 // the taken issuer with its own transfer object, so a flag on the pre-install physical
 // channel is bypassed - the same reason destroying the issuer is a no-op in
 // `faultOutgoingPhysicalLink`. The lowest seam a test may hold is the UDX adapter, which is
-// consulted once at endpoint construction, so the adapter is installed for every role from
-// start and carries a flag that is read per datagram when the verb arrives later.
+// consulted once at endpoint construction, so the adapter is installed for every eligible
+// middle role from start and reads a per-datagram flag when the verb arrives later.
 
 // Classification needs no key material, because the two byte positions that separate a
 // route cell from everything else on this socket are cleartext framing. A cell writes

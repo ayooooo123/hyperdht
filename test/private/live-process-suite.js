@@ -1,6 +1,7 @@
 'use strict'
 
 const test = require('brittle')
+const { hrtime } = require('process')
 const b4a = require('b4a')
 const { digestTestIsolatedAddressTuple } = require('../../lib/private/dht-exit-test-topology-grant')
 const { deriveDhtExitPeerId } = require('../../lib/private/dht-exit-destination-table')
@@ -465,12 +466,17 @@ function registerLiveProcessSuite(launch) {
         healthyGeneration,
         'healthy silent lookup branch survives the native detector window'
       )
+      t.is(
+        healthySnapshot.announceGeneration,
+        readyEndpointSnapshot.announceGeneration,
+        'healthy silent announce branch survives the native detector window'
+      )
 
       const rotatePhase = nextPhase('endpoint')
       phases.set('endpoint', rotatePhase)
       generations.set('endpoint', 2n)
       const rotationEvent = control.expectEvent('endpoint', 'rotated', 2n, rotatePhase)
-      const blackholeStartedAt = Date.now()
+      const blackholeStartedAt = hrtime.bigint()
       const faultAcknowledged = await sendAndWait(
         initialRouting.lookupPair.middleRole,
         'blackhole',
@@ -484,7 +490,7 @@ function registerLiveProcessSuite(launch) {
       const rotated = await rotationEvent
       t.is(rotated.previousGeneration, endpointGeneration)
       t.ok(
-        Date.now() - blackholeStartedAt <= BLACKHOLE_ROTATION_BOUND_MS,
+        hrtime.bigint() - blackholeStartedAt <= BigInt(BLACKHOLE_ROTATION_BOUND_MS) * 1_000_000n,
         'native detector rotates the blackholed branch within the process deadline'
       )
       const secondValueWaiting = control.expect('endpoint', 'value', 2n)
@@ -538,6 +544,11 @@ function registerLiveProcessSuite(launch) {
       t.ok(
         rotatedEndpointSnapshot.lookupGeneration > readyEndpointSnapshot.lookupGeneration,
         `physical ${initialRouting.lookupPair.middleRole} fault publishes a fresh lookup generation`
+      )
+      t.is(
+        rotatedEndpointSnapshot.announceGeneration,
+        healthySnapshot.announceGeneration,
+        'blackholed lookup replacement preserves the healthy announce generation'
       )
 
       const suspended = await sendAndWait('endpoint', 'suspend', 'suspended')

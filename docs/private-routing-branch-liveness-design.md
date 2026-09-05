@@ -1,8 +1,24 @@
 # Branch liveness: design for KI-10's second half
 
-**Status: design, not ratified. No production code in this pass.** Written against
-919f822 with KI-10's first half (pump halt) taken as fixed, so in-band `BRANCH_DESTROY`
-is reliably consumed when it is sent.
+**Status: historical proposal; its lease-only premise is superseded.** Written
+against 919f822, with the KI-10 pump-halt fix already present. L0 landed; L1/L2
+were not ratified and are not authorized by this document.
+
+The accepted native blackhole gate now identifies an existing
+`LinkControlSession`: authenticated hop-local PING/PONG every 500ms and closure
+after 1,500ms without accepted activity. `UdxCellEndpoint.installLinkControl`
+already installs it on live adjacencies. The eleven-process scenario exercises
+the native socket → M3 → controller → RouteManager loss path without calling a
+synthetic destroy. Both healthy branches survive application silence; a
+blackholed lookup branch is replaced while its healthy sibling is preserved.
+See [current KI-10 status](private-routing-migration.md#ki-10-native-blackhole-detection-and-refused-loss-redelivery).
+
+The measurements and proposed alternatives below remain historical evidence,
+not a current implementation plan. In particular, the missing-trigger claim in
+§1 and the missing-blackhole-harness claim in §6 are no longer true. A new
+keepalive would duplicate existing traffic rather than fill an absent detector.
+Changing that traffic or adding reliable branch-loss delivery still requires
+its own protocol and privacy review.
 
 ## 1. A premise in the brief is false, and it removes the "free half"
 
