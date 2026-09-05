@@ -1489,100 +1489,128 @@ test('extension adjacent open consumes honest admission before dialing canonical
   t.is(factoryDestroyed, 1, 'eventual factory destroy spends the factory owner once')
 })
 
-test('extension adjacent factory completes production responder proof over native UDX ownership', async (t) => {
-  const currentIdentity = identityForRole(ROLE.SAFETY, 50)
-  const nextIdentity = identityForRole(ROLE.PRIVATE, 80)
-  const native = await nativeAdjacentPair(currentIdentity, nextIdentity)
-  const x = await admittedExtensionFixture({ nextEndpoint: native.endpoint })
-  const currentSignerOwner = createRelayIdentitySigningAuthority({
-    identitySecretKey: x.currentIdentity.secretKey
-  })
-  const nextSignerOwner = createRelayIdentitySigningAuthority({
-    identitySecretKey: x.nextIdentity.secretKey
-  })
-  const linkOfferSigner = createLinkOfferSigner(currentSignerOwner)
-  const proofAuthority = createRedactedResponderProofAuthority({ now: x.clock.wallNow })
-  const responderAuthority = tailAuthority(x.clock)
-  let extensionResponder = null
-  let dialFailure = null
-  const socketOwner = Object.freeze({})
-  const dialAuthority = createRelayAdjacentDialAuthority({
-    socketOwner,
-    allowedRole: ROLE.PRIVATE,
-    async dial(owner, endpoint) {
-      try {
-        const offer = extensionGuardLinks[TAKE_STAGED_RELAY_ADJACENT_OFFER](owner, endpoint)
-        const channels = await native.open({
-          circuitId: b4a.alloc(16, 0x42),
-          generation: 7n
-        })
-        const responses = []
-        const inbound = [offer, null]
-        const offerReceiver = createExtensionOfferReceiver({
-          observedPredecessorEndpoint: encodeCanonicalEndpoint({
-            addressFamily: 4,
-            addressBytes: b4a.from([127, 0, 0, 1]),
-            port: 49_299
-          }),
-          receiveObject: () => inbound.shift(),
-          takePhysicalChannel: () => channels.responder,
-          sendObject: (value) => responses.push(b4a.from(value)),
-          finish: () => responses.push(null),
-          destroy() {}
-        })
-        extensionResponder = createExtensionLinkResponder({
-          advertisement: x.nextAdvertisement,
-          adjacencyAdopter: responderAuthority.responderAdopter(),
-          extensionResponderSigner: createExtensionResponderSigner(nextSignerOwner),
-          responderRouteEncryptionSecretKey: x.nextRoute.secretKey,
-          wallNow: x.clock.wallNow,
-          monotonicNow: x.clock.monotonicNow,
-          schedule: x.clock.schedule,
-          cancelScheduled: x.clock.cancelScheduled,
-          offerReceiver,
-          randomBytes: (size) => b4a.alloc(size, 0xe1)
-        })
-        const accepted = extensionResponder.accept()
-        t.ok(accepted.accepted, 'production responder adopts the native adjacent link')
-        return createExtensionResponseReceiver({
-          receiveObject: () => responses.shift(),
-          takePhysicalChannel: () => channels.initiator,
-          destroy() {}
-        })
-      } catch (err) {
-        dialFailure = err
-        throw err
-      }
-    },
-    destroy() {}
-  })
-  const factory = createExtensionAdjacentLinkFactory({
-    dialAuthority,
-    linkOfferSigner,
-    proofVerifier: proofAuthority.verifier,
-    proofConsumer: proofAuthority.consumer,
-    wallNow: x.clock.wallNow,
-    monotonicNow: x.clock.monotonicNow,
-    randomBytes: (size) => b4a.alloc(size, 0xe2),
-    schedule: x.clock.schedule,
-    cancelScheduled: x.clock.cancelScheduled,
-    destroy() {}
-  })
-  try {
-    let completion = null
+test('extension adjacent completion accepts signed peer clock skew over native UDX', async (t) => {
+  const cases = [
+    { name: 'responder behind', skew: -1n },
+    { name: 'responder ahead', skew: 1n },
+    { name: 'accepted at expiry', acceptedAt: 5_000n, error: 'ERR_AUTHENTICATION' },
+    { name: 'accepted past window', acceptedAt: 5_001n, error: 'ERR_AUTHENTICATION' },
+    { name: 'forged signature', acceptedAt: NOW + 1n, forge: true, error: 'ERR_AUTHENTICATION' }
+  ]
+  for (const scenario of cases) {
+    const skew = scenario.skew || 0n
+    const currentIdentity = identityForRole(ROLE.SAFETY, 50)
+    const nextIdentity = identityForRole(ROLE.PRIVATE, 80)
+    const native = await nativeAdjacentPair(currentIdentity, nextIdentity)
+    const x = await admittedExtensionFixture({ nextEndpoint: native.endpoint })
+    const responderClock = { ...x.clock, wallNow: () => x.clock.wallNow() + skew }
+    const currentSignerOwner = createRelayIdentitySigningAuthority({
+      identitySecretKey: x.currentIdentity.secretKey
+    })
+    const nextSignerOwner = createRelayIdentitySigningAuthority({
+      identitySecretKey: x.nextIdentity.secretKey
+    })
+    const linkOfferSigner = createLinkOfferSigner(currentSignerOwner)
+    const proofAuthority = createRedactedResponderProofAuthority({ now: x.clock.wallNow })
+    const responderAuthority = tailAuthority(responderClock)
+    let extensionResponder = null
+    let dialFailure = null
+    const socketOwner = Object.freeze({})
+    const dialAuthority = createRelayAdjacentDialAuthority({
+      socketOwner,
+      allowedRole: ROLE.PRIVATE,
+      async dial(owner, endpoint) {
+        try {
+          const offer = extensionGuardLinks[TAKE_STAGED_RELAY_ADJACENT_OFFER](owner, endpoint)
+          const channels = await native.open({
+            circuitId: b4a.alloc(16, 0x42),
+            generation: 7n
+          })
+          const responses = []
+          const inbound = [offer, null]
+          const offerReceiver = createExtensionOfferReceiver({
+            observedPredecessorEndpoint: encodeCanonicalEndpoint({
+              addressFamily: 4,
+              addressBytes: b4a.from([127, 0, 0, 1]),
+              port: 49_299
+            }),
+            receiveObject: () => inbound.shift(),
+            takePhysicalChannel: () => channels.responder,
+            sendObject: (value) => responses.push(b4a.from(value)),
+            finish: () => responses.push(null),
+            destroy() {}
+          })
+          extensionResponder = createExtensionLinkResponder({
+            advertisement: x.nextAdvertisement,
+            adjacencyAdopter: responderAuthority.responderAdopter(),
+            extensionResponderSigner: createExtensionResponderSigner(nextSignerOwner),
+            responderRouteEncryptionSecretKey: x.nextRoute.secretKey,
+            wallNow: responderClock.wallNow,
+            monotonicNow: x.clock.monotonicNow,
+            schedule: x.clock.schedule,
+            cancelScheduled: x.clock.cancelScheduled,
+            offerReceiver,
+            randomBytes: (size) => b4a.alloc(size, 0xe1)
+          })
+          const accepted = extensionResponder.accept()
+          t.ok(accepted.accepted, 'production responder adopts the native adjacent link')
+          if (scenario.acceptedAt !== undefined) {
+            responses[0] = resign(
+              responses[0],
+              M3_MESSAGE_ID.LINK_ACCEPT_V1,
+              ACCEPT_DOMAIN,
+              x.nextIdentity.secretKey,
+              (body) => body.writeBigUInt64BE(scenario.acceptedAt, 173)
+            )
+            if (scenario.forge) responses[0][responses[0].byteLength - 1] ^= 1
+          }
+          return createExtensionResponseReceiver({
+            receiveObject: () => responses.shift(),
+            takePhysicalChannel: () => channels.initiator,
+            destroy() {}
+          })
+        } catch (err) {
+          dialFailure = err
+          throw err
+        }
+      },
+      destroy() {}
+    })
+    const factory = createExtensionAdjacentLinkFactory({
+      dialAuthority,
+      linkOfferSigner,
+      proofVerifier: proofAuthority.verifier,
+      proofConsumer: proofAuthority.consumer,
+      wallNow: x.clock.wallNow,
+      monotonicNow: x.clock.monotonicNow,
+      randomBytes: (size) => b4a.alloc(size, 0xe2),
+      schedule: x.clock.schedule,
+      cancelScheduled: x.clock.cancelScheduled,
+      destroy() {}
+    })
     try {
-      completion = await openExtensionAdjacentLink(factory, x.admitted)
-    } catch (err) {
-      throw dialFailure || err
+      let completion = null
+      let failure = null
+      try {
+        completion = await openExtensionAdjacentLink(factory, x.admitted)
+      } catch (err) {
+        failure = dialFailure || err
+      }
+      if (scenario.error) {
+        if (completion) abortExtensionLinkCompletion(completion)
+        t.is(failure && failure.code, scenario.error, scenario.name)
+      } else {
+        if (failure) throw failure
+        t.is(abortExtensionLinkCompletion(completion), true, scenario.name)
+      }
+    } finally {
+      destroyExtensionAdjacentLinkFactory(factory)
+      if (extensionResponder) extensionResponder.destroy()
+      destroyRelayIdentitySigningAuthority(currentSignerOwner)
+      destroyRelayIdentitySigningAuthority(nextSignerOwner)
+      x.cleanup()
+      await native.destroy()
     }
-    t.is(abortExtensionLinkCompletion(completion), true, 'verified native completion is owned')
-  } finally {
-    destroyExtensionAdjacentLinkFactory(factory)
-    if (extensionResponder) extensionResponder.destroy()
-    destroyRelayIdentitySigningAuthority(currentSignerOwner)
-    destroyRelayIdentitySigningAuthority(nextSignerOwner)
-    x.cleanup()
-    await native.destroy()
   }
 })
 
@@ -2951,6 +2979,59 @@ test('index-zero offer and accept are exact fixed signed messages with mutual li
   t.exception(() => readM3EstablishedLink(established))
 })
 
+test('index-zero completion accepts signed peer clock skew within the offered window', (t) => {
+  for (const now of [NOW - 1n, NOW + 1n]) {
+    const x = exchange({ now: NOW - 10n })
+    let established = null
+    try {
+      established = completeIndexZeroGuardLink(x.initiated.pending, x.accepted.accept, {
+        advertisement: x.f.advertisement,
+        physicalChannel: Object.freeze({ destroy() {} }),
+        now
+      })
+      const left = readM3EstablishedLink(established)
+      const right = readM3EstablishedLink(x.accepted.established)
+      t.alike(left.contexts[0].tx.key, right.contexts[0].rx.key)
+      t.alike(left.contexts[0].rx.key, right.contexts[0].tx.key)
+    } finally {
+      if (established) destroyM3EstablishedLink(established)
+      destroyM3EstablishedLink(x.accepted.established)
+      x.responder.destroy()
+    }
+  }
+})
+
+test('index-zero signed accept includes the offer boundary without shortening link lifetime', (t) => {
+  const x = exchange({
+    requestedLimits: { ...setup().requestedLimits, expiresAtMs: 20_000n }
+  })
+  const deadline = decodeM3Object(x.initiated.offer).body.readBigUInt64BE(294)
+  const accept = resign(
+    x.accepted.accept,
+    M3_MESSAGE_ID.LINK_ACCEPT_V1,
+    ACCEPT_DOMAIN,
+    x.f.guard.secretKey,
+    (body) => body.writeBigUInt64BE(deadline, 173)
+  )
+  let established = null
+  try {
+    established = completeIndexZeroGuardLink(x.initiated.pending, accept, {
+      advertisement: x.f.advertisement,
+      physicalChannel: Object.freeze({ destroy() {} }),
+      now: NOW
+    })
+    t.is(
+      readM3EstablishedLink(established).expiresAt,
+      20_000n,
+      'accepted timestamp may equal the handshake deadline without clipping signed link lifetime'
+    )
+  } finally {
+    if (established) destroyM3EstablishedLink(established)
+    destroyM3EstablishedLink(x.accepted.established)
+    x.responder.destroy()
+  }
+})
+
 test('index-zero accept rejects replay, late completion, and M2 handles', (t) => {
   const x = exchange()
   const complete = (pending = x.initiated.pending, accept = x.accepted.accept) =>
@@ -3280,18 +3361,27 @@ test('initiator rejects every invalid accept binding and cross-offer substitutio
       }
     ],
     ['over-limit cells', (body) => body.fill(0xff, 149, 153)],
-    ['late accepted time', (body) => body.fill(0xff, 173, 181)],
+    ['accepted at admitted expiry', (body) => body.writeBigUInt64BE(5_000n, 173)],
+    [
+      'accepted time beyond offered deadline',
+      (body, x) =>
+        body.writeBigUInt64BE(
+          decodeM3Object(x.initiated.offer).body.readBigUInt64BE(294) + 1n,
+          173
+        ),
+      { requestedLimits: { ...setup().requestedLimits, expiresAtMs: 20_000n } }
+    ],
     ['zero accept nonce', (body) => body.fill(0, 181, 213)]
   ]
-  for (const [name, mutate] of mutations) {
-    const x = exchange()
+  for (const [name, mutate, overrides] of mutations) {
+    const x = exchange(overrides)
     let closes = 0
     const accept = resign(
       x.accepted.accept,
       M3_MESSAGE_ID.LINK_ACCEPT_V1,
       ACCEPT_DOMAIN,
       x.f.guard.secretKey,
-      mutate
+      (body) => mutate(body, x)
     )
     t.exception(
       () =>

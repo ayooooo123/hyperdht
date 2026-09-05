@@ -40,16 +40,12 @@ hardening, not a new public routing feature:
 - KI-10 and the historical branch-liveness proposal now name the existing
   detector. KI-14's headline now reflects preferred-tier selection on all three
   construction paths, without implying hard exclusion in small pools.
-- Fork CI on collection commit `efb5051` is mixed: one live Linux run failed
-  with guard `ERR_AUTHENTICATION` at resume, while a second run on the same
-  commit passed. KI-4 below records the failure; the passing run does not
-  establish a fix.
+- Fork CI exposed a guard authentication failure at resume. Preserved source
+  stacks and deterministic signed-message regressions identified a clock-skew
+  rejection in both handshake completion paths. KI-4 below records the fix:
+  order peer timestamps against signed bounds, not another host's wall clock.
 
 Remaining work, in dependency order:
-
-The immediate verification issue is the unresolved KI-4 guard rejection at
-resume. Its originating error stack is missing from the CI log. Resolve that
-failure before treating the live CI gate as reliable.
 
 1. **KI-10 refused-loss redelivery:** a loss report refused during rotation
    still falls back to expiry. Design and verify generation-bound redelivery
@@ -1719,8 +1715,8 @@ revisited before landing it.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
-**Status: both established causes below are fixed; a guard authentication
-rejection at resume remains unresolved.**
+**Status: the earlier two causes and the reproduced signed clock-skew rejection
+are fixed. Signature, local expiry, and replay checks remain enforced.**
 
 On 2026-09-05, collection commit `efb5051` produced:
 
@@ -1736,12 +1732,10 @@ passed all three private-routing jobs on the same commit; the
 [build matrix](https://github.com/ayooooo123/hyperdht/actions/runs/33992419669)
 also passed on Linux, macOS, and Windows. These results do not clear the failure.
 
-The recorded stack starts at `actorFailure` in `role-runner.js`, which replaced
-the original error with a new one before logging it in that run. The guard's
-`createTailRelayActor().serve()` rejection reaches that boundary, but the
-originating authentication check is not recorded. Its cause is not established
-as a wall-clock defect or as either earlier signature. No authentication check
-has been weakened, no retry added, and no runtime fix is claimed.
+The first recorded stack started at `actorFailure` in `role-runner.js`, which
+replaced the original error before logging it. It therefore did not identify
+the originating authentication check. At that checkpoint, the cause was not
+established and no runtime fix was claimed.
 
 An isolated copy retained the original actor error stack for diagnosis and ran
 eight Node plus eight Bare live process scenarios in the local Linux container.
@@ -1750,8 +1744,8 @@ non-reproduction, not a fix. The diagnostic copy was removed. The same
 one-line stack-preservation change is now retained in the role harness:
 actual `Error` objects reach the existing opt-in fatal log unchanged; a
 non-Error value still gets a normalized fallback error. The control channel
-still sends only `sanitizeCode(err)`. No protocol or routing behavior changed,
-and the authentication failure remains unresolved.
+still sends only `sanitizeCode(err)`. That diagnostic commit did not change
+protocol acceptance and did not itself fix the authentication rejection.
 
 A deterministic fault-path smoke injected a marked authentication error in a
 temporary relay actor. Before the fix, Node logged a replacement stack and
@@ -1763,6 +1757,42 @@ source stack; both control failures still contained only
 `PROCESS_FAILURE (guard/CONTROL): ERR_AUTHENTICATION`. The injected fault and
 temporary worktree were removed. This proves diagnostic preservation, not a
 fix for the intermittent CI rejection.
+
+#### Signed clock-skew rejection reproduced and fixed
+
+The [next failing Bare CI run](https://github.com/ayooooo123/hyperdht/actions/runs/33993769484)
+on `3c8e48f` preserved the originating stack at `completeExtensionLink`'s
+ACCEPT validation. A deterministic valid signed reply with the responder
+1 ms ahead of the initiator failed at `acceptedAtMs > current`.
+The equivalent index-zero case failed too. An independent clock experiment
+also showed how the role clock's fractional start phase can produce a signed
+timestamp of `1600000001002` followed by a receiver reading `1600000001001`.
+Separate real hosts can have clock skew as well; synchronizing the fixture
+would hide rather than fix that protocol assumption.
+
+Both completion paths now require the authenticated ordering
+`acceptedAtMs < admittedLimits.expiresAtMs`, while retaining
+`acceptedAtMs <= offerDeadlineMs`. They no longer compare the peer's accepted
+time with the receiver's current time. The receiver still rejects completion
+at or after its offered deadline and rejects already expired admitted limits.
+Signatures, exact offer/identity bindings, nonces, one-shot pending ownership,
+and proof verification are unchanged.
+
+For extension links, admitted expiry must also remain at or before the
+offered deadline. Index-zero link lifetime remains bounded by its authenticated
+requested/admitted limits; the handshake deadline does not shorten that lifetime.
+No clock-skew allowance constant, retry, or shared-clock fixture was added.
+
+Both positive-skew regressions fail before the fix. After it, the focused
+guard-link suite passes 51 tests and 1,059 assertions, including both skew
+directions, a signed accepted time at admitted expiry, a signed time beyond
+the offered window, forged signatures, late completion, cross-offer
+substitution, and replay rejection. The extension cases use native UDX
+ownership and production responder proofs.
+The index-zero inclusive boundary is also pinned: a signed accepted timestamp
+equal to the offered deadline can complete before that deadline while retaining
+the longer authenticated link lifetime. Changing the rejection from `>` to
+`>=` in an isolated module-loading mutation makes that regression fail.
 
 Historical evidence for the two established causes follows.
 
@@ -2474,14 +2504,14 @@ Counts below are a MEASUREMENT taken at one commit, not a contract. Every added 
 moves them, and a stale total quoted as current has already caused four false findings
 in this document's history - so re-measure rather than cite, and if you change a suite,
 change this table in the same pass. Measured on 2026-09-05 after the native
-blackhole and local-matrix hardening. All rows below were run in the Linux
+blackhole, local-matrix, and signed clock-skew corrections. All rows below were run in the Linux
 container; Darwin aggregates and remote dispatches were not re-measured in this
 checkpoint.
 
 | Suite                              | Command                                            | Result                                         |
 | ---------------------------------- | -------------------------------------------------- | ---------------------------------------------- |
-| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 925/925 tests, 18,820/18,820 assertions, Linux |
-| Private aggregate, Bare            | `bare test/private-routing.js`                     | 904/904 tests, 18,761/18,761 assertions, Linux |
+| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 927/927 tests, 18,835/18,835 assertions, Linux |
+| Private aggregate, Bare            | `bare test/private-routing.js`                     | 906/906 tests, 18,776/18,776 assertions, Linux |
 | Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 136/136 assertions, Linux                      |
 | Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 136/136 assertions, Linux                      |
 | Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 136/136 assertions, Linux                      |
