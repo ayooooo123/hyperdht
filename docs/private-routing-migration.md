@@ -40,8 +40,16 @@ hardening, not a new public routing feature:
 - KI-10 and the historical branch-liveness proposal now name the existing
   detector. KI-14's headline now reflects preferred-tier selection on all three
   construction paths, without implying hard exclusion in small pools.
+- Fork CI on collection commit `efb5051` is mixed: one live Linux run failed
+  with guard `ERR_AUTHENTICATION` at resume, while a second run on the same
+  commit passed. KI-4 below records the failure; the passing run does not
+  establish a fix.
 
 Remaining work, in dependency order:
+
+The immediate verification issue is the unresolved KI-4 guard rejection at
+resume. Its originating error stack is missing from the CI log. Resolve that
+failure before treating the live CI gate as reliable.
 
 1. **KI-10 refused-loss redelivery:** a loss report refused during rotation
    still falls back to expiry. Design and verify generation-bound redelivery
@@ -1705,8 +1713,37 @@ revisited before landing it.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
-**Status: FIXED for both established causes. Never reproduced locally except by the
-deterministic Signature-B characterization added after the field failures.**
+**Status: both established causes below are fixed; a guard authentication
+rejection at resume remains unresolved.**
+
+On 2026-09-05, collection commit `efb5051` produced:
+
+```
+not ok 73 - PROCESS_FAILURE (guard/CONTROL): ERR_AUTHENTICATION
+```
+
+The [push run](https://github.com/ayooooo123/hyperdht/actions/runs/33992418356)
+passed both deterministic jobs but failed the Node process scenario immediately
+after `suspend has no send-capable guard edge`. The
+[companion run](https://github.com/ayooooo123/hyperdht/actions/runs/33992419663)
+passed all three private-routing jobs on the same commit; the
+[build matrix](https://github.com/ayooooo123/hyperdht/actions/runs/33992419669)
+also passed on Linux, macOS, and Windows. These results do not clear the failure.
+
+The recorded stack starts at `actorFailure` in `role-runner.js`, which replaces
+the original error with a new one before logging it. The guard's
+`createTailRelayActor().serve()` rejection reaches that boundary, but the
+originating authentication check is not recorded. Its cause is not established
+as a wall-clock defect or as either earlier signature. No authentication check
+has been weakened, no retry added, and no runtime fix is claimed.
+
+An isolated copy retained the original actor error stack for diagnosis and ran
+eight Node plus eight Bare live process scenarios in the local Linux container.
+All 16 passed 136 assertions each; the CI failure did not recur. This is a
+non-reproduction, not a fix. The diagnostic copy was removed; the accepted
+runtime and failure handling are unchanged.
+
+Historical evidence for the two established causes follows.
 
 Three fail-closed rejections on the GitHub `ubuntu-latest` runner, in three of
 the twelve `live-linux` executions observed before the fix below, all tied to a
@@ -2386,11 +2423,11 @@ that triggers link-loss propagation and rotates the endpoint onto a fresh pair,
 followed by a second exact immutable get; exit accounting for referral probes and
 ordinary requests; endpoint suspend and resume, including a third exact immutable
 get over the rebuilt route; a terminal network change that leaves no endpoint
-socket and installs no fallback edge; an acknowledged guard physical link fault;
-and ordered teardown with zero residual operations, resources, and queued bytes in
+socket and installs no fallback edge; and ordered teardown with zero residual
+operations, resources, and queued bytes in
 every role.
 
-Reaching resume, rotation, network-change, and guard-loss required four fixture
+Reaching resume, rotation, and network-change required four fixture
 and owner corrections, each of which is now part of the proof:
 
 - The fixture issues a per-generation pool of one-shot topology grants
@@ -2445,9 +2482,9 @@ contains exactly one destination, its guard, and no default route, so a datagram
 addressed anywhere else has no path rather than an unenforced prohibition.
 
 The scenario is the full lifecycle, including the failure paths: bootstrap,
-guard pinning, two branches, three exact immutable gets, a physical link fault
-with rotation, suspend and resume, a terminal network change, a guard fault, and
-ordered teardown. What the capture shows across all of it:
+guard pinning, two branches, three exact immutable gets, a silent route-cell
+blackhole with lookup rotation, suspend and resume, a terminal network change,
+and ordered teardown. What the capture shows across all of it:
 
 | Observed on the wire                                                      | Assertion                                                         |
 | ------------------------------------------------------------------------- | ----------------------------------------------------------------- |
