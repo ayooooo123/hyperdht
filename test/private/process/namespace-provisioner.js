@@ -333,7 +333,7 @@ function provisionNamespaceProjection(namespace, options = {}) {
           // current so an interrupted run still yields complete records.
           // stdio must be detached: execFileSync waits for the inherited pipes
           // to close, and a backgrounded tcpdump never closes them.
-          `tcpdump -i ${endpoint.rootDevice} -s 0 -U -n -w ${file} udp </dev/null >/dev/null 2>&1 & echo $! > ${pidFile}`
+          `tcpdump -i ${endpoint.rootDevice} -s 0 -U -n -w ${file} ip </dev/null >/dev/null 2>&1 & echo $! > ${pidFile}`
         ])
         captures.set(endpoint.key, {
           file,

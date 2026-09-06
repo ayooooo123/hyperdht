@@ -54,6 +54,9 @@ let phaseSequence = 0n
 let state = 'NEW'
 let commandQueue = Promise.resolve()
 let stopped = false
+const finishSocketCloseObservation = runtime.socketCloseLog
+  ? require('./socket-close-observer')(UDX, () => stopped, runtime.socketCloseLog)
+  : null
 let cellEndpoint = null
 let relayService = null
 let endpointController = null
@@ -1123,6 +1126,7 @@ async function handle(message) {
     case 'stop':
       stopped = true
       await stopOwners()
+      if (finishSocketCloseObservation) finishSocketCloseObservation()
       await emit('snapshot', snapshotFields(true))
       await emit('closed')
       runtime.exit(0)

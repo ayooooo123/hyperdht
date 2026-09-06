@@ -31,7 +31,11 @@ const {
   PRIVATE_ROUTING_STATE,
   TEST_ONLY_PRIVATE_ROUTING_CONTROLLER_ISSUER: controllerIssuer
 } = require('../../lib/private/private-routing-controller')
-const { TEST_ONLY_ROUTE_MANAGER_OBSERVER } = require('../../lib/private/route-manager')
+const {
+  TEST_ONLY_ROUTE_MANAGER_OBSERVER,
+  createRouteManagerBranchLossRegistration,
+  issueRouteManagerBranchPhysicalLoss
+} = require('../../lib/private/route-manager')
 const { bindOpenRouteTransport } = require('../../lib/private/live-route-authority')
 const finalExitActivation = require('../../lib/private/final-exit-activation')
 const opaqueDestination = require('../../lib/private/opaque-destination')
@@ -116,7 +120,10 @@ async function waitForReady(routing) {
     const state = routing.snapshot().state
     if (state === PRIVATE_ROUTING_STATE.READY) return
     if (state === PRIVATE_ROUTING_STATE.UNAVAILABLE) {
-      throw new Error('controller entered UNAVAILABLE before READY')
+      throw (
+        controllerIssuer.buildFailure(routing) ||
+        new Error('controller entered UNAVAILABLE before READY')
+      )
     }
     await new Promise((resolve) => setTimeout(resolve, 1))
   }
@@ -294,4 +301,165 @@ test('a branch expiry refused during a rotation still rotates that branch', asyn
       }
     }
   }
+})
+
+async function lossHarness(t, value, port) {
+  let routing = null
+  const harness = await liveAuthorityHarness(
+    (manager, topology) => {
+      routing = controller(value, port, topology.clock)
+      const builder = controllerIssuer.registerManager(routing, manager)
+      return {
+        publishInitialPair: (handoffs) =>
+          controllerIssuer.publishInitialPair(routing, builder, handoffs),
+        createDhtSeedAdmission: (branchClass, owner) =>
+          controllerIssuer.createDhtSeedAdmission(routing, builder, branchClass, owner),
+        publishInitialSeedPair: (readiness) =>
+          controllerIssuer.publishInitialSeedPair(routing, builder, readiness)
+      }
+    },
+    null,
+    { records: spareRecords() }
+  )
+  const replacements = []
+  t.teardown(async () => {
+    await routing.destroy()
+    await closeLiveAuthorityHarness(harness)
+    for (const replacement of replacements) {
+      for (const forwarder of replacement.network.forwarders) forwarder.destroy()
+    }
+  })
+  await waitForReady(routing)
+  return { harness, routing, replacements }
+}
+
+for (const duringRotation of [false, true]) {
+  test(`branch loss survives ${duringRotation ? 'manager rotation' : 'controller refusal'}`, async (t) => {
+    const { harness, routing, replacements } = await lossHarness(
+      t,
+      duringRotation ? 163 : 159,
+      duringRotation ? 48963 : 48959
+    )
+    const digestSeed = duringRotation ? 0x91 : 0xc1
+    const manager = harness.manager
+    const observe = () => manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]()
+    const lookup = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.LOOKUP)
+    const announce = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.ANNOUNCE)
+    const stale = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.LOOKUP)
+
+    t.is(issueRouteManagerBranchPhysicalLoss(lookup), true)
+    if (duringRotation) await settle()
+    t.is(issueRouteManagerBranchPhysicalLoss(announce), true, 'sibling loss is retained')
+    await settle()
+    t.is(observe().rotations.lookup.branch.generation, 2n)
+    t.is(observe().rotations.announce, undefined)
+
+    replacements.push(
+      publishReplacementBranch(harness, BRANCH_CLASS.LOOKUP, digestSeed, digestSeed + 1)
+    )
+    await settle()
+    const pending = observe().rotations.announce
+    t.is(pending ? pending.branch.generation : null, 2n, 'loss starts replacement without expiry')
+    t.is(routing.snapshot().lookupGeneration, 2n)
+    t.is(
+      issueRouteManagerBranchPhysicalLoss(stale),
+      false,
+      'retired registration cannot lose replacement'
+    )
+    if (pending) {
+      replacements.push(
+        publishReplacementBranch(harness, BRANCH_CLASS.ANNOUNCE, digestSeed + 16, digestSeed + 17)
+      )
+      await waitForReady(routing)
+    }
+    await settle()
+    t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.READY)
+    t.is(routing.snapshot().lookupGeneration, 2n)
+    t.is(routing.snapshot().announceGeneration, 2n)
+    t.is(harness.topology.clock.wallNow(), NOW, 'neither recovery waited for lease expiry')
+  })
+}
+
+test('loss of a retiring branch does not rotate its replacement', async (t) => {
+  const { harness, routing, replacements } = await lossHarness(t, 161, 48961)
+  const manager = harness.manager
+  const loss = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.LOOKUP)
+  controllerIssuer.issue(routing, controllerIssuer.sinks(routing).lookupBranchExpiry)
+  await settle()
+  t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING)
+  issueRouteManagerBranchPhysicalLoss(loss)
+  await settle()
+  replacements.push(publishReplacementBranch(harness, BRANCH_CLASS.LOOKUP, 0xa1, 0xa2))
+  await waitForReady(routing)
+  await settle()
+  t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.READY)
+  t.is(routing.snapshot().lookupGeneration, 2n)
+  t.is(routing.snapshot().announceGeneration, 1n)
+  t.ok(manager.branchCapability(BRANCH_CLASS.LOOKUP), 'replacement remains usable')
+  const replacementLoss = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.LOOKUP)
+  t.is(issueRouteManagerBranchPhysicalLoss(replacementLoss), true)
+  await settle()
+  t.is(
+    manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().rotations.lookup.branch.generation,
+    3n,
+    'retiring loss did not consume the replacement loss sink'
+  )
+})
+
+test('network change clears loss waiting behind a rotation', async (t) => {
+  const { harness, routing } = await lossHarness(t, 165, 48965)
+  const manager = harness.manager
+  const lookup = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.LOOKUP)
+  const announce = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.ANNOUNCE)
+  issueRouteManagerBranchPhysicalLoss(lookup)
+  await settle()
+  issueRouteManagerBranchPhysicalLoss(announce)
+  await settle()
+  await routing.networkChanged()
+  await runClock(harness.topology.clock, harness.topology.clock.pendingTimers())
+  const snapshot = routing.snapshot()
+  t.is(snapshot.state, PRIVATE_ROUTING_STATE.UNAVAILABLE)
+  t.is(snapshot.routeManager, false)
+  t.is(snapshot.endpointSockets, 0)
+  t.is(snapshot.queues, 0)
+  t.is(
+    await routing.immutableGet(seed(0x61)).then(
+      () => null,
+      (err) => err.code
+    ),
+    'ERR_PRIVACY_UNAVAILABLE',
+    'pending recovery cannot restore request authority after network change'
+  )
+})
+
+test('rotation failure after same-branch loss does not restore ready state', async (t) => {
+  const { harness, routing } = await lossHarness(t, 167, 48967)
+  const manager = harness.manager
+  const lookup = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.LOOKUP)
+
+  controllerIssuer.issue(routing, controllerIssuer.sinks(routing).lookupBranchExpiry)
+  await settle()
+  t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING)
+  t.is(
+    issueRouteManagerBranchPhysicalLoss(lookup),
+    true,
+    'loss is retained during same-branch rotation'
+  )
+  await settle()
+
+  t.exception(
+    () => manager.publishRotation(BRANCH_CLASS.LOOKUP, {}),
+    'fails replacement before publication'
+  )
+  await settle()
+
+  t.is(manager.ready(), false, 'failed replacement cannot restore a lost branch to READY')
+  let code = null
+  try {
+    manager.branchCapability(BRANCH_CLASS.LOOKUP)
+  } catch (err) {
+    code = err.code
+  }
+  t.is(code, 'ERR_PRIVACY_UNAVAILABLE', 'lost branch cannot regain request authority')
+  t.is(harness.topology.clock.wallNow(), NOW, 'failure does not depend on lease expiry')
 })
