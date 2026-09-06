@@ -329,7 +329,29 @@ never reached the production steps: the runners' harness punch matrix arrived
 on 10 of 117 pairs, as in the third run, and DHT setup failed. The remote
 lifecycle after readiness — rotation under a blackhole across runners — is
 therefore still unmeasured with the punched edge; it is a harness-deadline
-question, not a NAT one. Dispatching stopped after the fifth run.
+question, not a NAT one.
+
+After the KI-17 fixes (`7017cda`), two more guard-on-operator-host runs. Run
+[34062727729](https://github.com/ayooooo123/hyperdht/actions/runs/34062727729):
+matrix 117/117, reflection equal on both sides, exchange 648.9 ms, both first
+sends, then the endpoint's `activate` missed the coordinator's 5 s command
+deadline. Run
+[34062848870](https://github.com/ayooooo123/hyperdht/actions/runs/34062848870),
+identical except for the coordinator's documented diagnostic overrides
+(`PR_COMMAND_TIMEOUT_MS=20000`, `PR_SCENARIO_TIMEOUT_MS=120000`): **141/141.**
+Matrix 117/117; reflection equal on both sides; exchange 672.7 ms; punch
+counters guard sent 6 / received 2, endpoint sent 2 / received 1, so both
+directions crossed; the endpoint bootstrapped through the punched pair; exact
+routed gets before and after rotation; the native detector rotated the
+blackholed branch inside its own 5 s bound (assertion 53); suspend, resume,
+network change and teardown all passed. That is the full eleven-role lifecycle
+on real NAT with the production-punched endpoint↔guard edge, and the first
+remote run to finish since the blackhole scenario was added. What the raised
+override changed is only the coordinator's per-command wait: the protocol
+bounds inside the run (bootstrap budget, rotation bound) were met unchanged.
+The 5 s `COMMAND_TIMEOUT_MS` is therefore a loopback constant for remote runs
+of the `activate` step; whether to give the remote driver its own value is a
+harness decision, not a protocol one. Dispatching stopped after this run.
 
 Two contract notes. The reflectors observe the endpoint's socket before guard
 pinning; that is within the pre-guard exposure the security contract allows
@@ -1887,19 +1909,22 @@ value today, so nothing on the wire or in the live path changes.
 
 ### KI-13: the punch that makes a dispatch work is in the harness, not in production
 
-**Status: endpoint↔guard edge proven on real NAT (fourth `-p` dispatch,
-run 34061028552: same-socket reflection, bilateral plan over the topology
-owner's channel, punch from the production socket, authenticated bootstrap and
-an exact routed get with no harness punch on that edge). Open residuals: the
-remote lifecycle after readiness is unmeasured with the punched edge because
-the scenario's 5 s command and rotation deadlines are loopback constants;
-relay pairs still depend on the harness pre-punch; the second dispatch measured
-a runner NAT that did not preserve the mapping across close-and-rebind
-(production failed closed). NAT'd middles and exits remain unsupported by
-decision D7: they are dialed cold at rotation time and have no pre-link
-channel, so the harness pre-punch below still opens those pairs and is test
-topology plumbing, not production. The paragraphs below describe the harness
-and remain accurate for the relay pairs.**
+**Status: endpoint↔guard edge proven on real NAT, including the full
+eleven-role lifecycle. Run 34061028552 (fourth `-p` dispatch) showed
+same-socket reflection, a bilateral plan over the topology owner's channel, a
+punch from the production socket, authenticated bootstrap and an exact routed
+get with no harness punch on that edge; run 34062848870, after the KI-17
+fixes, passed 141/141 with both punch directions crossing, rotation under a
+blackhole inside its 5 s bound, suspend, resume and network change. Open
+residuals: the coordinator's 5 s per-command wait is a loopback constant for
+the remote `activate` step (the passing run raised it through the documented
+diagnostic override); relay pairs still depend on the harness pre-punch; the
+second dispatch measured a runner NAT that did not preserve the mapping across
+close-and-rebind (production failed closed). NAT'd middles and exits remain
+unsupported by decision D7: they are dialed cold at rotation time and have no
+pre-link channel, so the harness pre-punch below still opens those pairs and
+is test topology plumbing, not production. The paragraphs below describe the
+harness and remain accurate for the relay pairs.**
 
 The eleven-role dispatch now opens role-to-role NAT mappings before any role starts:
 the coordinator distributes all eleven addresses over a fourth bridge mode byte, and
