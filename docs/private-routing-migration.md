@@ -295,10 +295,15 @@ the harness could never measure, measured: on that runner's NAT the mapping
 did not survive the rebind, or the NAT allocates per socket. Production
 behaved as designed — the guard's claim did not match its grant tuple, no plan
 was offered, no punch byte was sent, and the run stopped at the reflection
-assertion. Two runs, two different runners whose NAT admits no unsolicited
-peer; which runner draws such a NAT is not under the harness's control, so a
-green `-p` run is a lottery over runner placement until the guard is placed on
-a host with a known cone NAT.
+assertion. Third dispatch, run
+[34060254019](https://github.com/ayooooo123/hyperdht/actions/runs/34060254019):
+the harness punch matrix arrived on 8 of 117 pairs and the run died in DHT
+setup, before any production step. Three runs, three different outcomes from
+runner placement alone; which runner draws a NAT that admits unsolicited peers
+is not under the harness's control. A green `-p` run therefore needs the guard
+(and ideally the endpoint) on a host with a known cone NAT — `-l 2` on the
+operator's machine or a VPS — which is an owner decision because it puts that
+host's reflected address in the run. Dispatching was stopped after the third run.
 
 Two contract notes. The reflectors observe the endpoint's socket before guard
 pinning; that is within the pre-guard exposure the security contract allows
