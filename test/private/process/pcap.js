@@ -1,8 +1,8 @@
 'use strict'
 
-// Minimal reader for the classic pcap savefiles that `tcpdump -w` produces on
-// the namespace veths. The oracles only need Ethernet/IPv4/UDP, so this decodes
-// exactly that and counts everything else rather than guessing at it.
+// Classic pcap readers for namespace veth captures. The UDP oracles retain
+// their existing decoder; the teardown audit uses the strict IPv4 record reader
+// so malformed or non-UDP traffic cannot disappear from reconciliation.
 
 const fs = require('fs')
 const b4a = require('b4a')
@@ -81,6 +81,166 @@ function decodeIpv4Udp(frame, linkType) {
   })
 }
 
+function computeIpv4Checksum(buffer, offset, headerBytes) {
+  let sum = 0
+  for (let i = 0; i < headerBytes; i += 2) {
+    sum += buffer.readUInt16BE(offset + i)
+  }
+  while (sum >> 16) {
+    sum = (sum & 0xffff) + (sum >> 16)
+  }
+  return ~sum & 0xffff
+}
+
+/**
+ * Strict classic-pcap IPv4 reader.
+ *
+ * Returns a frozen array of frozen `{ packet, timestampMicros }` records.
+ */
+function readPcapPackets(file) {
+  const buffer = b4a.isBuffer(file) ? file : fs.readFileSync(file)
+  if (buffer.byteLength < GLOBAL_HEADER_BYTES) {
+    throw new PcapError('PCAP_TRUNCATED', 'global header')
+  }
+  const header = readGlobalHeader(buffer)
+  const u16 = (offset) =>
+    header.littleEndian ? buffer.readUInt16LE(offset) : buffer.readUInt16BE(offset)
+  const u32 = (offset) =>
+    header.littleEndian ? buffer.readUInt32LE(offset) : buffer.readUInt32BE(offset)
+
+  const versionMajor = u16(4)
+  const versionMinor = u16(6)
+  if (versionMajor !== 2 || versionMinor !== 4) {
+    throw new PcapError('PCAP_VERSION_UNSUPPORTED', `${versionMajor}.${versionMinor}`)
+  }
+  const snaplen = u32(16)
+  if (snaplen === 0) {
+    throw new PcapError('PCAP_SNAPLEN_INVALID', String(snaplen))
+  }
+  const records = []
+  let offset = GLOBAL_HEADER_BYTES
+
+  while (offset < buffer.byteLength) {
+    if (offset + RECORD_HEADER_BYTES > buffer.byteLength) {
+      throw new PcapError('PCAP_TRUNCATED', 'record header')
+    }
+    const seconds = u32(offset)
+    const fraction = u32(offset + 4)
+    const captured = u32(offset + 8)
+    const original = u32(offset + 12)
+    offset += RECORD_HEADER_BYTES
+
+    if (header.nanos) {
+      if (fraction >= 1000000000) {
+        throw new PcapError('PCAP_TIME_FRACTION_INVALID', String(fraction))
+      }
+    } else {
+      if (fraction >= 1000000) {
+        throw new PcapError('PCAP_TIME_FRACTION_INVALID', String(fraction))
+      }
+    }
+
+    if (captured > snaplen) {
+      throw new PcapError('PCAP_RECORD_SNAPLEN_EXCEEDED', `${captured} > ${snaplen}`)
+    }
+
+    if (captured !== original) {
+      throw new PcapError('PCAP_CAPTURE_TRUNCATED', `${captured} != ${original}`)
+    }
+
+    if (offset + captured > buffer.byteLength) {
+      throw new PcapError('PCAP_TRUNCATED', 'record body')
+    }
+
+    const frame = buffer.subarray(offset, offset + captured)
+    offset += captured
+
+    let ipOffset = 0
+    if (header.linkType === LINKTYPE_ETHERNET) {
+      if (frame.byteLength < ETHERNET_HEADER_BYTES) {
+        throw new PcapError('PCAP_FRAME_TRUNCATED', 'ethernet header')
+      }
+      const ethertype = frame.readUInt16BE(12)
+      if (ethertype !== ETHERTYPE_IPV4) {
+        throw new PcapError(
+          'PCAP_NON_IPV4',
+          `ethertype 0x${ethertype.toString(16).padStart(4, '0')}`
+        )
+      }
+      ipOffset = ETHERNET_HEADER_BYTES
+    } else if (header.linkType === LINKTYPE_RAW) {
+      ipOffset = 0
+    }
+
+    const networkBytes = frame.byteLength - ipOffset
+    if (networkBytes < 20) {
+      throw new PcapError('PCAP_IPV4_INVALID', 'header too short')
+    }
+
+    const versionAndIhl = frame[ipOffset]
+    const version = versionAndIhl >> 4
+    if (version !== 4) {
+      throw new PcapError('PCAP_NON_IPV4', `version ${version}`)
+    }
+    const ihl = versionAndIhl & 0x0f
+    const headerBytes = ihl * 4
+    if (headerBytes < 20 || headerBytes > networkBytes) {
+      throw new PcapError('PCAP_IPV4_INVALID', `invalid ihl ${ihl}`)
+    }
+
+    const totalLength = frame.readUInt16BE(ipOffset + 2)
+    if (totalLength < headerBytes) {
+      throw new PcapError(
+        'PCAP_IPV4_INVALID',
+        `total length ${totalLength} < header length ${headerBytes}`
+      )
+    }
+    if (totalLength > networkBytes) {
+      throw new PcapError(
+        'PCAP_IPV4_TRUNCATED',
+        `total length ${totalLength} > captured network bytes ${networkBytes}`
+      )
+    }
+    const padding = frame.subarray(ipOffset + totalLength)
+    const maxPadding = header.linkType === LINKTYPE_ETHERNET ? Math.max(0, 46 - totalLength) : 0
+    if (padding.byteLength > maxPadding || padding.some((byte) => byte !== 0)) {
+      throw new PcapError('PCAP_IPV4_TRAILING_BYTES')
+    }
+
+    const flagsAndFragment = frame.readUInt16BE(ipOffset + 6)
+    if ((flagsAndFragment & 0x8000) !== 0) {
+      throw new PcapError('PCAP_IPV4_FRAGMENTED', 'reserved bit set')
+    }
+    if ((flagsAndFragment & 0x2000) !== 0) {
+      throw new PcapError('PCAP_IPV4_FRAGMENTED', 'more fragments (MF) set')
+    }
+    if ((flagsAndFragment & 0x1fff) !== 0) {
+      throw new PcapError('PCAP_IPV4_FRAGMENTED', `fragment offset ${flagsAndFragment & 0x1fff}`)
+    }
+
+    if (computeIpv4Checksum(frame, ipOffset, headerBytes) !== 0) {
+      throw new PcapError('PCAP_IPV4_CHECKSUM_INVALID')
+    }
+
+    const packet = frame.subarray(ipOffset, ipOffset + totalLength)
+
+    const fractionMicros = header.nanos ? Math.floor(fraction / 1000) : fraction
+    const timestampMicros = seconds * 1000000 + fractionMicros
+    if (!Number.isSafeInteger(timestampMicros)) {
+      throw new PcapError('PCAP_TIMESTAMP_OVERFLOW', String(timestampMicros))
+    }
+
+    records.push(
+      Object.freeze({
+        packet,
+        timestampMicros
+      })
+    )
+  }
+
+  return Object.freeze(records)
+}
+
 /**
  * Read one savefile into its UDP/IPv4 datagrams.
  *
@@ -144,5 +304,6 @@ module.exports = Object.freeze({
   PcapError,
   contains,
   datagramEdges,
-  readPcap
+  readPcap,
+  readPcapPackets
 })

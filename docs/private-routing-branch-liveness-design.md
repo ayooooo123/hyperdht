@@ -17,8 +17,10 @@ The measurements and proposed alternatives below remain historical evidence,
 not a current implementation plan. In particular, the missing-trigger claim in
 §1 and the missing-blackhole-harness claim in §6 are no longer true. A new
 keepalive would duplicate existing traffic rather than fill an absent detector.
-Changing that traffic or adding reliable branch-loss delivery still requires
-its own protocol and privacy review.
+Changing that traffic or adding wire-level reliable branch-loss delivery still
+requires its own protocol and privacy review. KI-10 now retains already-received
+local loss reports on their published branch generation and redelivers them
+after rotation. That local recovery adds no protocol traffic or heartbeat.
 
 ## 1. A premise in the brief is false, and it removes the "free half"
 
