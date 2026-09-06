@@ -141,6 +141,7 @@ function candidate(role, ordinal, index, overrides = {}) {
     identity: b4a.from(value.relayIdentity),
     canonicalEndpointBytes: b4a.from(value.reachableEndpoint),
     routePublicKey: b4a.from(value.routeEncryptionPublicKey),
+    routeSecretKey: b4a.from(route.secretKey),
     role,
     capabilityMask,
     epoch: value.epoch,
