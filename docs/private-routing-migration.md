@@ -361,6 +361,181 @@ reflector `identity32` is a label bound into the claim, not an authenticated
 identity: dht-rpc pings are unauthenticated, and the claim's authority comes
 from the socket owner observing agreement between two reflectors.
 
+### Continuation checkpoint — 2026-09-06, Gate D records, exposure accounting, live put coverage
+
+**Gate D dependency pinned.** The CI prebuilds of the sodium-native fork at
+`5c10460` (run 34056613931, all fourteen targets) are committed on
+`ayooooo123/sodium-native` branch `private-routing/scalar-mul-prebuilds` at
+`562d642`, and `package.json` now carries an npm `overrides` entry pinning
+`sodium-native` to that commit, so `sodium-universal` resolves the fork under
+Node and Bare without a toolchain. The Linux gate image is keyed on
+`package.json`, so it rebuilt; `crypto_core_ed25519_scalar_mul` is a function
+inside it under both runtimes. No JavaScript scalar arithmetic exists in the
+tree.
+
+**Gate D records implemented on the approved transcript.**
+`lib/private/blinded-presence.js` derives, natively only, the blinding scalar
+$h = \text{reduce}(\text{SHA-512}(\text{domain} \| A \| \text{period} \| \text{length}))$,
+the blinded key $A' = h\cdot A$ (`crypto_scalarmult_ed25519_noclamp`, point
+validity checked) and, for the owner, $a' = h \cdot a \bmod L$
+(`crypto_core_ed25519_scalar_mul` over the clamped expanded seed), with the
+owner-side check $a' \cdot B = A'$. Signing under $a'$ is standard Ed25519
+assembled from `scalar_reduce`, `scalarmult_ed25519_base_noclamp`,
+`scalar_mul` and `scalar_add`, so any storage node verifies it with plain
+`crypto_sign_verify_detached` under $A'$. Seat decisions recorded in the
+module: the storage key is the DHT's own `generichash(A')` (the mutable
+contract enforces `target = hash(publicKey)`, so a separate `k_e` domain is
+not available); the owner signature over the complete record is the DHT
+mutable signature itself (`mutableSignable{seq, value}` signed with the
+blinded signer through `mutablePut`'s `signMutable` option); periods are one
+day with a one-hour overlap (`publishPeriods` adds the next period inside the
+last hour, `lookupPeriods` keeps the previous one for the first hour, exact
+boundary milliseconds tested). The record is exactly 895 bytes (the mutable
+cap): clear `version u8 || revision u32 || noncePrefix[16]`, then an
+XChaCha20-Poly1305 body under a per-record reader key
+$H(\text{domain} \| \text{readerSecret} \| A' \| \text{period})$ with associated
+data $\text{domain} \| A' \| \text{version} \| \text{period} \| \text{revision}$,
+carrying `type u8 || period u64 || tombstoneScope u8 || tombstoneTarget[32] ||
+descriptorLength u16 || descriptor[814]` zero-padded and checked for zero
+padding on open. Type, period, scope, target and length are therefore under
+both the AEAD and the owner signature, which closes the rejected branch's three
+faults: a reader-credential holder cannot flip descriptor↔tombstone without
+$a'$, trailing zero bytes survive because the length is explicit, and the
+overlap is executable. Verification derives $A'$ from the caller's identity and
+period, never from the record; the header revision must equal the DHT `seq`;
+rollback is `resolvePresenceState`: a revision at or below the retained one is
+`REPLAY`, a `PERIOD` tombstone clears presence, a `RECORD` tombstone clears it
+only when its target equals the retained record digest and is otherwise
+ignored, and the highest revision wins, so an owner may re-enable after a
+tombstone. `lib/private/presence-client.js` is the production caller over
+`controller.mutablePut` / `mutableGet` (publish, revoke, resolve across the
+period lists; the reader credential is the client's configured secret and the
+per-record key is derived and erased inside the codec). Fixed vectors: identity
+seed `0x11`×32 gives $A'$ `fda0443b…3cb94d64` for period 0 and
+`00584423…b57bf49d` for period 1. Suites: `blinded-presence` 9/58,
+`presence-client` 6/25, `live-presence` 6/43 (a real signed record fetched
+over the lookup branch and opened; the announce-branch put through a READY
+controller is not exercised in-process, see the process gate below for the
+controller's `mutablePut` with a caller `seq`). Not done: the required-mode
+`lookup`/`announce` mapping onto these records (Gate 3B remainder), any
+external cryptographic review, and the presence client on the eleven-role gate.
+
+**Reflector sends now in the exposure report.** `BootstrapIO` mints its
+redaction key at construction instead of at `start()`, and
+`recordPreGuardContact({ host, port, outcome })` records a `reflect` /
+`reflector` entry through the same `expose` path. The reflected claim now
+retains which reflectors answered (`readReflectedEndpointClaimReflectors`),
+so `prepareEndpointNatTraversal` records one entry per configured reflector:
+`observed` when its reply reached the socket, `silent` otherwise, `rejected`
+for all when reflection threw (the original error is rethrown unchanged). The
+worker's first version matched a field the opaque claim does not expose and
+would have recorded every reflector as silent; caught on diff review and
+replaced. `endpoint-bootstrap-authority` 7/46, `bootstrap-io` 33/347.
+
+**Remote driver command wait.** The coordinator now takes the topology plan and
+ships `REMOTE_ACTIVATE_TIMEOUT_MS = 20_000` for the `ready` reply on the
+`dht-mesh` plan only (`PLAN_EVENT_TIMEOUTS`); every other event and every
+loopback plan keeps the 5 s `COMMAND_TIMEOUT_MS`, callers still cannot pass
+deadlines, and the loud environment override can only lengthen a step. This is
+the harness decision the previous checkpoint left open; run 34062727729 failed
+at exactly that step and run 34062848870 passed with the override. A `-l 2 -p`
+dispatch without overrides is the check, after this tree is pushed (the runner
+roles execute the default branch and the role runner changed below).
+
+**Live announce-branch put coverage.** The eleven-role scenario now, after the
+resumed get, issues a routed `immutable-put`, reads the value back exact over
+the lookup branch, then a routed `mutable-put` (`seq` 1) and a `mutable-get`
+that returns it at sequence 1 — all through `PrivateRoutingController`'s
+production announce-branch path, which the in-process harness cannot deliver.
+That required the DHT-tier storage oracle to become exact instead of
+"dht-value holds one value": every DHT role now reports
+`storedValueCount`, `storedValueDigests` (sorted, unique) and
+`mutableRecordTargets` (sorted, unique; the persistent mutable cache is keyed
+by the record target), the control channel validates the lists, and the
+config auditor admits only the setup value on dht-value plus records the
+scenario announced beforehand through `auditor.expectRoutedRecords`; the setup
+value may never appear on seed or referral and may not vanish from dht-value
+before close. The steps sit after every routing derivation because a put grows
+the announce exit's ordinary request count, which is how the lookup pair is
+told apart. Process gates now pass **148 assertions** each (was 136), Node and
+Bare, with a DHT role reporting each routed record.
+
+**Gate C integration, experimental and off by default.** The owner-approved
+wire is implemented; the approval is owner approval, external cryptographic
+review is still open, and no anonymity claim follows from any of this.
+`ROUTED_REQUEST_V2` (`0x0103`, `REPLY_MODE` `1 = CORRELATED`,
+`2 = SURB_REQUIRED`) wraps a complete V1 request:
+`replyMode u8 || batchId[16] || surbCount u8 || reserved u16 = 0 ||
+requestBytes u16 || surbBytes u16 || request || descriptors[surbCount × 436]`;
+V1 is untouched and its fixtures are pinned. `fragments.js` gained
+`createFragmentProfile` and the 492-byte / eight-fragment
+`SURB_REPLY_FRAGMENT_PROFILE`, so a required reply is at most **3,936**
+application bytes (`RESPONSE_TOO_LARGE` above that, no correlated send). The
+initiator (`RoutedDHTIO` → `LiveRouteAuthority.request`) builds eight
+independent SURBs against the route's own relays in reverse order, one open
+authority and one terminal handle each, bound by the operation deadline and
+revoked on cancellation and teardown, and sends the V2 request as one logical
+forward message; the exit (`dht-exit-io.js`) validates the complete batch
+before any DHT request, and its only SURB output is the sealed first-hop cell
+onto its reverse link (`routeSurbHop`); `SURB_REQUIRED` never reaches the
+correlated authority or `onRoutedReply`, and a middle given a hop cell with a
+flipped MAC drops it without forwarding. Relay peeling is
+`processRelaySurbHop` (`relay-service.js`), reachable from the M3 forwarding
+facade through an opt-in `surbHopPeel` capability whose absence leaves every
+reverse cell byte-identical (`m3-adjacency-runtime` 48/48 unchanged). The
+endpoint admits terminal cells by handle, opens with the one-use authority,
+reassembles under the 492 profile and resolves the same promise the
+correlated path would. The controller exposes `immutableGet(target,
+{ replyMode })` / `mutableGet(publicKey, { replyMode })`; `SURB_REQUIRED`
+throws `ERR_PRIVACY_UNAVAILABLE` unless the controller was created with
+`experimentalSurbReplies: true`. Suites: `surb-integration` 19/65 (the
+review's scenarios 1–20 mapped to named tests), `live-surb-required` 7/43
+(exact value back with zero correlated frames and exit hop cells counted;
+flipped-MAC drop; 4,000-byte refusal with no hop cell; option gate), plus the
+touched suites unchanged in count. A first LEAD version had the exit peel
+every layer itself with the relays' authorities ("local peel"); that was
+rejected on diff review as the shim the packet forbids and deleted, and the
+exit no longer accepts relay authorities at all.
+
+What is still not proven, stated plainly: (1) the in-process live topology
+forwards reverse cells through opaque forwarders, not the M3 facade, so
+`live-surb-required` feeds each exit hop cell through `processRelaySurbHop`
+with that relay's own authorities from the test (the relay code path is real,
+the link between relays is simulated), and terminal delivery to the endpoint
+uses the test issuer's `deliverSurbTerminal`; (2) no fixture or production
+owner passes `surbHopPeel` to a facade yet, and the return-path relay
+capabilities are bound by the test issuer (`bindSurbReturnPath`), not by the
+route builder; (3) packed SURB frames on the reverse link carry a fixed magic
+and are not sealed by the per-link route codec, which classifies them to a
+link observer as SURB traffic (not a cross-link tag, but a visible kind);
+(4) the eleven-role gate does not exercise required mode. Those four are the
+remaining Gate C work before the wire can be called proven on live links, and
+they are recorded rather than papered over.
+
+**Measurements.** All ten local Linux gates pass on the combined tree
+(image rebuilt on the pinned dependency). Node aggregate **1,075 tests /
+19,601 assertions**; Bare **1,031 / 19,468**; the four normal/reverse process
+legs 148 each; both production-punch legs 153; namespace projection 27; live
+namespace capture 158 with raw DROP zero. Whole-repository Prettier passes.
+The one aggregate failure on the first run was the protocol registry test,
+which pins the exact sorted message-ID set and had to learn
+`ROUTED_REQUEST_V2` (63 IDs now). Presence message IDs `0x0280–0x02a3`
+remain reserved and unused: Gate D records ride the mutable-record commands
+by seat decision; the routed presence commands belong to the Gate 3B
+remainder.
+
+Remaining work, in dependency order: (1) Gate C on live links — bind the
+return path in the route builder, pass `surbHopPeel` from the fixtures that
+construct relay facades (`wire-services.js`, `hosted-tail-fixture.js`), seal
+SURB frames under the per-link codec, and put required mode on the
+eleven-role gate; (2) the `-l 2 -p` dispatch without overrides as the check on
+the plan-scoped `ready` bound, after this tree is pushed; (3) Gate 3B
+remainder — routed `findPeer`, `lookup`, `announce`, `unannounce`, raw
+`query`, the required-mode `lookup`/`announce` mapping onto presence records,
+peer streams, the public required-mode gate; (4) external cryptographic
+review of Gate C and Gate D, and consumer integration, which also brings the
+production topology owner that D7 waits on.
+
 ### Subagent design handoff — 2026-09-05
 
 These are review requirements, not accepted replacement protocols:
@@ -3000,22 +3175,24 @@ while `test/private-routing.js` stays green everywhere:
 Counts below are a MEASUREMENT taken at one commit, not a contract. Every added test
 moves them, and a stale total quoted as current has already caused four false findings
 in this document's history - so re-measure rather than cite, and if you change a suite,
-change this table in the same pass. Measured on 2026-09-05 after the native
-blackhole, local-matrix, signed clock-skew, generation-bound refused-loss, and
-SURB advisory corrections. The namespace row records the failed full run,
-not a later passing rerun. Darwin aggregates and remote dispatches were not
-re-measured in this checkpoint.
+change this table in the same pass. Measured on 2026-09-06 on the tree that
+adds the pinned sodium-native fork, Gate D records, the experimental Gate C
+integration, reflector exposure accounting, the plan-scoped remote `ready`
+bound, and the routed put steps with the exact DHT storage oracle. Darwin
+aggregates and remote dispatches were not re-measured in this checkpoint.
 
-| Suite                              | Command                                            | Result                                            |
-| ---------------------------------- | -------------------------------------------------- | ------------------------------------------------- |
-| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 975/975 tests, 19,051/19,051 assertions, Linux    |
-| Private aggregate, Bare            | `bare test/private-routing.js`                     | 932/932 tests, 18,923/18,923 assertions, Linux    |
-| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 136/136 assertions, Linux                         |
-| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 136/136 assertions, Linux                         |
-| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 136/136 assertions, Linux                         |
-| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 136/136 assertions, Linux                         |
-| Namespace projection enforcement   | `npm run test:private:namespace`                   | 27/27 assertions, privileged Linux                |
-| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 146/146 assertions; raw DROP 0, classified ICMP 0 |
+| Suite                              | Command                                            | Result                                             |
+| ---------------------------------- | -------------------------------------------------- | -------------------------------------------------- |
+| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 1,075/1,075 tests, 19,601/19,601 assertions, Linux |
+| Private aggregate, Bare            | `bare test/private-routing.js`                     | 1,031/1,031 tests, 19,468/19,468 assertions, Linux |
+| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 148/148 assertions, Linux                          |
+| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 148/148 assertions, Linux                          |
+| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 148/148 assertions, Linux                          |
+| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 148/148 assertions, Linux                          |
+| Eleven-role scenario, punch Node   | `bash scripts/linux-gates.sh process:node:punch`   | 153/153 assertions, Linux                          |
+| Eleven-role scenario, punch Bare   | `bash scripts/linux-gates.sh process:bare:punch`   | 153/153 assertions, Linux                          |
+| Namespace projection enforcement   | `npm run test:private:namespace`                   | 27/27 assertions, privileged Linux                 |
+| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 158/158 assertions; raw DROP 0, classified ICMP 0  |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
