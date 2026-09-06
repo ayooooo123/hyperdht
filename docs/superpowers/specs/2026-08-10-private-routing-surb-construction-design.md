@@ -286,3 +286,18 @@ are no other callers. Still not implemented and still human-gated: reply-mode
 selection inside the authenticated routed request, the SURB batch framing, a
 492-byte fragment profile, exit and initiator integration, and any wire
 ratification or anonymity claim.
+
+## Integration — 2026-09-06 (experimental, off by default)
+
+Owner-approved wire, external cryptographic review still open. `ROUTED_REQUEST_V2`
+(`0x0103`) carries `replyMode`, a batch id and up to eight 436-byte descriptors around
+an unchanged V1 request; replies are fragmented under the 492-byte / eight-fragment
+`SURB_REPLY_FRAGMENT_PROFILE` (3,936-byte ceiling, `RESPONSE_TOO_LARGE` above), one
+independent SURB, reply key pair, open authority and terminal handle per fragment. The
+exit's only SURB output is the sealed first-hop cell on its reverse link; relays peel
+with `processRelaySurbHop` through the M3 facade's opt-in `surbHopPeel`; the endpoint
+admits by terminal handle. `SURB_REQUIRED` never falls back to the correlated path and
+is refused unless the controller was created with `experimentalSurbReplies: true`.
+What is proven, what is simulated in the live test, and the four open items are recorded
+in `docs/private-routing-migration.md`, "Continuation checkpoint — 2026-09-06, Gate D
+records, exposure accounting, live put coverage".
