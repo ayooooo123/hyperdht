@@ -281,8 +281,24 @@ reads them at the scenario tail. The blackhole rotation then missed the process
 deadline; the only replacement middle was the role whose NAT admitted nobody,
 which is consistent with the punch matrix but was not proven to be the cause.
 The first `-p` drive also exposed a `live-route.sh` bug: an expanded word is
-never an assignment prefix, so the flag is now exported. A second dispatch on
-the corrected tree is recorded below when it completes.
+never an assignment prefix, so the flag is now exported.
+
+Second dispatch, run
+[34059905384](https://github.com/ayooooo123/hyperdht/actions/runs/34059905384),
+on the corrected tree: this time the guard's runner and lookup-middle-b's
+runner admitted nobody (punch matrix 77/117, every silent pair involving role 2
+or role 5). The endpoint's production reflection again equalled its minted
+tuple (`52.161.51.65:20489`), but the guard's did not: the probe socket had
+been reflected at `48.217.251.100:10265` and the final socket, bound to the
+same local port, was reflected at `:10267`. That is the close-and-rebind hop
+the harness could never measure, measured: on that runner's NAT the mapping
+did not survive the rebind, or the NAT allocates per socket. Production
+behaved as designed — the guard's claim did not match its grant tuple, no plan
+was offered, no punch byte was sent, and the run stopped at the reflection
+assertion. Two runs, two different runners whose NAT admits no unsolicited
+peer; which runner draws such a NAT is not under the harness's control, so a
+green `-p` run is a lottery over runner placement until the guard is placed on
+a host with a known cone NAT.
 
 Two contract notes. The reflectors observe the endpoint's socket before guard
 pinning; that is within the pre-guard exposure the security contract allows
