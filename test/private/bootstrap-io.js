@@ -373,7 +373,7 @@ function fixture(options = {}) {
       options.reconnectDeadline === undefined ? 10_000 : Number(options.reconnectDeadline)
   })
   const randomBytes = (size) => {
-    if (options.onRandomBytes) options.onRandomBytes({ io, clock, size })
+    if (options.onRandomBytes && io) options.onRandomBytes({ io, clock, size })
     return b4a.alloc(size, 0x44)
   }
   const sink = createRelayCandidateDirectorySink({
@@ -451,6 +451,7 @@ test('BootstrapIO exposes only the narrowed cold-start lifecycle', (t) => {
     'cancel',
     'constructor',
     'destroy',
+    'recordPreGuardContact',
     'start'
   ])
 })
@@ -1218,4 +1219,77 @@ test('reentrant directory sealing cancels IO and publishes neither guard resourc
   t.is(f.physicalDestroys, 1, 'established guard is destroyed after sealing loses authority')
   t.is(f.io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER]().candidateCount, 0)
   f.cleanup()
+})
+
+test('BootstrapIO recordPreGuardContact records reflector exposure and enforces boundaries', async (t) => {
+  const f = fixture()
+  f.io.recordPreGuardContact({ host: '198.51.100.99', port: 49737, outcome: 'observed' })
+
+  const preObserver = f.io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER]()
+  t.is(preObserver.exposureReport.length, 1)
+  const preEntry = preObserver.exposureReport[0]
+  t.is(preEntry.phase, 'reflect')
+  t.is(preEntry.contactCategory, 'reflector')
+  t.is(preEntry.outcome, 'observed')
+  t.is(preEntry.attemptCount, 1)
+  t.is(preEntry.redactedEndpoint.length, 24)
+  t.is(/^[0-9a-f]{24}$/.test(preEntry.redactedEndpoint), true)
+  t.is(preEntry.redactedEndpoint.includes('198.51.100.99'), false)
+  t.is(preEntry.redactedEndpoint.includes('49737'), false)
+
+  // The same reflector recorded twice increments attemptCount and keeps one entry
+  f.io.recordPreGuardContact({ host: '198.51.100.99', port: 49737, outcome: 'silent' })
+  const updatedObserver = f.io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER]()
+  t.is(updatedObserver.exposureReport.length, 1)
+  const updatedEntry = updatedObserver.exposureReport[0]
+  t.is(updatedEntry.phase, 'reflect')
+  t.is(updatedEntry.contactCategory, 'reflector')
+  t.is(updatedEntry.outcome, 'silent')
+  t.is(updatedEntry.attemptCount, 2)
+  t.is(updatedEntry.redactedEndpoint, preEntry.redactedEndpoint)
+
+  // Normal run carries the reflector entry in the published readiness exposure report
+  const transfer = await f.io.start()
+  const result = consumeBootstrapGuardPin(transfer)
+  t.ok(result.exposureReport.length > 1)
+  const publishedReflector = result.exposureReport.find(
+    (entry) => entry.phase === 'reflect' && entry.contactCategory === 'reflector'
+  )
+  t.ok(publishedReflector)
+  t.is(publishedReflector.outcome, 'silent')
+  t.is(publishedReflector.attemptCount, 2)
+  t.is(publishedReflector.redactedEndpoint, preEntry.redactedEndpoint)
+  t.is(publishedReflector.redactedEndpoint.includes('198.51.100.99'), false)
+  f.cleanup()
+
+  // Entry limit holds (MAX_EXPOSURE_ENTRIES = 6)
+  const f2 = fixture()
+  for (let i = 1; i <= 20; i++) {
+    f2.io.recordPreGuardContact({
+      host: `198.51.100.${i}`,
+      port: 49800 + i,
+      outcome: 'observed'
+    })
+  }
+  const limitObserver = f2.io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER]()
+  t.is(limitObserver.exposureReport.length, 6)
+  f2.cleanup()
+
+  // Destroyed IO ignores the call
+  const f3 = fixture()
+  f3.io.destroy()
+  t.is(
+    f3.io.recordPreGuardContact({ host: '198.51.100.99', port: 49737, outcome: 'observed' }),
+    undefined
+  )
+  f3.cleanup()
+
+  // Invalid host is rejected with the same error the constructor uses (INVALID_ROUTE)
+  const f4 = fixture()
+  expectCode(
+    t,
+    () => f4.io.recordPreGuardContact({ host: 'invalid-host', port: 49737, outcome: 'observed' }),
+    'INVALID_ROUTE'
+  )
+  f4.cleanup()
 })
