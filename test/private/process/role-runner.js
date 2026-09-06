@@ -796,14 +796,28 @@ async function handleNatStart() {
   }
   const first = startNatPunchAttempt(natAttempt)
   if (first && typeof first.then === 'function') await first
+  await emit('nat-started', natAttemptStats())
+}
+
+function natAttemptStats() {
   const stats = readNatPunchAttemptStats(natAttempt)
-  await emit('nat-started', {
+  return {
     firstOwnedSend: stats.firstOwnedSend === true,
     received: stats.received,
     refused: stats.refused,
     sent: stats.sent,
     strayReceived: stats.strayReceived
-  })
+  }
+}
+
+// `nat-started` answers right after the first owned send so the coordinator can
+// sequence the peer; the peer's packets have not crossed yet. `nat-stats` reports
+// the counters as they stand, without waiting, so the coordinator decides when.
+async function handleNatStats() {
+  if (natAttempt === null || typeof readNatPunchAttemptStats !== 'function') {
+    throw Object.assign(new Error(), { code: 'PROCESS_NAT_PUNCH_UNAVAILABLE' })
+  }
+  await emit('nat-stats', natAttemptStats())
 }
 
 async function prepare() {
@@ -1320,6 +1334,9 @@ async function handle(message) {
       return
     case 'nat-start':
       await handleNatStart()
+      return
+    case 'nat-stats':
+      await handleNatStats()
       return
     case 'store-immutable':
       await storeImmutable(message.value)
