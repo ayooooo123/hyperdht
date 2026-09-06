@@ -316,10 +316,12 @@ was exact; the initial routes, cancel, and healthy-silence checks all passed.
 **That is the KI-13 real-NAT proof for the endpoint↔guard edge: bind once,
 reflect the same socket, bilateral plan, punch from that socket, authenticated
 link, no harness punch on that edge and no close-and-rebind after reflection.**
-The run then failed at the blackhole rotation with `PROCESS_COMMAND_DEADLINE`:
-the coordinator's 5 s command deadline and the 5 s rotation bound are loopback
-constants, and a three-hop rebuild across runners after a 1.5 s detector window
-did not fit. The same step failed the same way in the first dispatch. A fifth
+The run then failed at the blackhole rotation with `PROCESS_COMMAND_DEADLINE`,
+as the first dispatch had. That was first read as loopback-tuned deadlines; the
+later KI-17 diagnosis gives the likelier cause: the harness link service killed
+every pre-armed standby accept five seconds after activation, and on runners
+the punch exchange and real latency pushed the rotation past that. Fixed under
+KI-17; not yet re-run remotely. A fifth
 run with the coordinator's documented diagnostic overrides
 (`PR_COMMAND_TIMEOUT_MS=20000`, `PR_SCENARIO_TIMEOUT_MS=120000`), run
 [34061182110](https://github.com/ayooooo123/hyperdht/actions/runs/34061182110),
@@ -511,25 +513,53 @@ Observed locally on macOS 25.5.0 arm64 with Docker 29.5.2 over Colima
 
 ### KI-17: a routed get fails after a short idle following readiness
 
-**Status: open. Found while placing the punch counters, on the unmodified
-scenario; not caused by NAT work.**
+**Status: FIXED, two causes — one production, one harness. Found on the
+unmodified scenario while placing the punch counters; not caused by NAT work.
+The eleven-process gates now idle two seconds between readiness and the first
+routed get, so the fix is defended by every process leg.**
 
-On the portable loopback `process:node` gate, inserting a coordinator wait
-between the endpoint's `ready` and the first `immutable-get` changes the
-result: 1,000 ms passes 136/136; 2,000 ms and 3,000 ms fail the first get with
-`ERR_PRIVACY_UNAVAILABLE` from `PrivateRoutingController.immutableGet`, which
-means the routed query returned no value. The endpoint snapshot taken after the
-wait still reports both generations and a guard-only edge. Candidates worth
-checking first: `EXIT_DHT_REFERRAL_MS = 1000n` in `routed-dht-io.js` and
-`PROBE_DEADLINE_MS = 1_000n` in `dht-exit-destination-table.js`. A pause of
-about 2.5 s after the first get also moves the later blackhole rotation past
-`COMMAND_TIMEOUT_MS`, so the scenario is phase-sensitive in two places. A real
-client waits arbitrarily long between readiness and its first request, so this
-needs a production explanation before Gate 3B, not a harness adjustment.
+Symptom. On the portable loopback `process:node` gate, a coordinator wait
+between the endpoint's `ready` and the first `immutable-get` changed the
+result: 1,000 ms passed; 2,000 ms failed the first get with
+`ERR_PRIVACY_UNAVAILABLE`, meaning the routed query returned no value. A
+pause of about 2.5 s after that get instead failed the blackhole rotation.
 
-Reproduction: add `await new Promise((r) => setTimeout(r, 2000))` after the
-endpoint's `activate` in `test/private/live-process-suite.js` and run
-`scripts/linux-gates.sh process:node`.
+Production cause. `buildDhtExitOpenAuthorityMaterial` in
+`final-exit-activation.js` set the DHT-exit open authority's
+`absoluteDeadline` to `min(graceDeadline, localDeadline)`. The grace deadline
+is OPEN + `FINALIZATION_TIMEOUT_MS` (5 s): it bounds finalization
+retransmits, not the open route. That value flowed through
+`dht-exit-reservation.js` into the exit's destination table, where every
+admitted destination expires at `min(now + 300 s, expiresAt,
+absoluteDeadline)` and `verifyDhtExitRoutedDestination` refuses a request
+whose deadline exceeds the entry's expiry. A routed get carries a 3 s budget,
+so any request issued more than about 2 s after OPEN was refused by the exit
+and the endpoint's query drained empty. The same class of fault as the
+extension-budget shortening recorded under the KI-4 history: an operation
+budget carried as a route lifetime. Fix: the open authority is bounded by the
+route's `localDeadline` only. Both the exit-side and endpoint-side authorities
+come from the same builder, so both are corrected.
+
+Harness cause. `test/private/process/wire-services.js` gave every
+`LinkBootstrapSession` `absoluteDeadline = now + LINK_DEADLINE_MS` (5 s).
+That is right for an initiate, which starts now, and wrong for a pre-armed
+accept, which waits for a peer that dials whenever the route owner decides.
+`receive()` computes `min(start + 5 s, absoluteDeadline, signedExpiry)` when
+the first LINK CREATE arrives and fails closed when that is already past, so
+every standby middle and exit arm died five seconds after activation. The
+scenario's blackhole rotation normally lands at about 3.7 s and passed; two
+seconds later it dialed dead arms and the endpoint reported `unavailable`.
+Fix: accept-mode sessions are bounded by the grant's remaining lifetime
+projected onto the monotonic clock; initiates keep the operation budget.
+Production relays do not use this test link service, so this half is
+harness-only, but the consumer integration that replaces it must not repeat
+it.
+
+Evidence. With the 2 s idle in place: unfixed tree fails assertion 35
+(`ERR_PRIVACY_UNAVAILABLE`); production fix alone reaches assertion 48 and
+fails the rotation (`unavailable`, generation 1, instead of `rotated`); both
+fixes pass 136/136. Debug instrumentation used to identify the rejected event
+was removed.
 
 ### KI-16: ordered UDP shutdown can produce kernel ICMP drops
 

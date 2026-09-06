@@ -281,6 +281,14 @@ function createProjectedLinkService(options) {
     }
     const signedExpiry = Number(authorized.decoded.expiresAt)
     if (!Number.isSafeInteger(signedExpiry)) throw PrivateRouteError.INVALID_ROUTE()
+    // LINK_DEADLINE_MS is an operation budget and bounds an initiate, which starts
+    // now. A pre-armed accept waits for a peer that dials whenever the route owner
+    // decides to, so its only bound is the grant it was authorized from; five
+    // seconds here silently killed every standby arm before a rotation that came
+    // two seconds late (KI-17).
+    const wall = numberNow(wallNow)
+    const absoluteDeadline =
+      mode === 'accept' ? now + Math.max(0, signedExpiry - wall) : now + LINK_DEADLINE_MS
     return {
       mode,
       codec: new BootstrapEnvelopeCodec({
@@ -294,7 +302,7 @@ function createProjectedLinkService(options) {
       schedule,
       cancel: cancelScheduled,
       randomBytes,
-      absoluteDeadline: now + LINK_DEADLINE_MS,
+      absoluteDeadline,
       signedExpiry,
       authorizedExpiry: signedExpiry
     }
