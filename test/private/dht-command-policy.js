@@ -42,7 +42,13 @@ test('query capabilities bind exact immutable-get policies', (t) => {
   t.is(lookupPolicy.encode, encodeDHTRequest)
   t.is(announcePolicy.encode, encodeDHTRequest)
 
-  t.alike(Object.keys(contexts), ['immutableGet', 'classify'])
+  t.alike(Object.keys(contexts), [
+    'immutableGet',
+    'immutablePut',
+    'mutableGet',
+    'mutablePut',
+    'classify'
+  ])
   t.alike(Object.keys(contexts.immutableGet), ['lookup', 'announce'])
   t.alike(Object.keys(lookup), [])
   t.alike(Object.keys(announce), [])
@@ -502,4 +508,113 @@ test('query context operations capture mutable WeakMap and freeze intrinsics', (
   t.is(policy, IMMUTABLE_GET_POLICIES.lookup)
   t.ok(Object.isFrozen(contexts))
   t.ok(Object.isFrozen(contexts.immutableGet.lookup))
+})
+
+test('mutable get and put policies encode fixed-width bodies', (t) => {
+  const c = require('compact-encoding')
+  const m = require('../../lib/messages')
+  const sodium = require('sodium-universal')
+  const {
+    MUTABLE_GET_POLICIES,
+    MUTABLE_PUT_POLICIES,
+    IMMUTABLE_PUT_POLICIES,
+    IMMUTABLE_GET_MAX_VALUE,
+    MUTABLE_PUT_MAX_VALUE
+  } = require('../../lib/private/dht-command-policy')
+  const contexts = createQueryContexts()
+
+  t.is(contexts.classify(contexts.mutableGet.lookup), MUTABLE_GET_POLICIES.lookup)
+  t.is(contexts.classify(contexts.mutableGet.announce), MUTABLE_GET_POLICIES.announce)
+  t.is(contexts.classify(contexts.immutablePut.announce), IMMUTABLE_PUT_POLICIES.announce)
+  t.is(contexts.classify(contexts.mutablePut.announce), MUTABLE_PUT_POLICIES.announce)
+  t.is(IMMUTABLE_GET_MAX_VALUE, 1023)
+  t.is(MUTABLE_PUT_MAX_VALUE, 895)
+
+  const target = b4a.alloc(32, 9)
+  const seqBody = c.encode(c.uint, 7)
+  const encodedGet = MUTABLE_GET_POLICIES.lookup.encode(MUTABLE_GET_POLICIES.lookup, {
+    command: COMMANDS.MUTABLE_GET,
+    target,
+    value: seqBody
+  })
+  t.is(encodedGet.byteLength, 40)
+  t.alike(encodedGet.subarray(0, 32), target)
+
+  const token = b4a.alloc(32, 3)
+  const putValue = b4a.alloc(4, 0xab)
+  const immutablePut = IMMUTABLE_PUT_POLICIES.announce.encode(IMMUTABLE_PUT_POLICIES.announce, {
+    command: COMMANDS.IMMUTABLE_PUT,
+    target,
+    token,
+    value: putValue
+  })
+  t.is(immutablePut.byteLength, 71)
+  t.is(immutablePut[64], 1)
+  t.is((immutablePut[65] << 8) | immutablePut[66], 4)
+
+  const publicKey = b4a.alloc(32, 5)
+  const signature = b4a.alloc(64, 6)
+  sodium.crypto_generichash(target, publicKey)
+  const signed = c.encode(m.mutablePutRequest, {
+    publicKey,
+    seq: 1,
+    value: putValue,
+    signature
+  })
+  const mutablePut = MUTABLE_PUT_POLICIES.announce.encode(MUTABLE_PUT_POLICIES.announce, {
+    command: COMMANDS.MUTABLE_PUT,
+    target,
+    token,
+    value: signed
+  })
+  t.is(mutablePut.byteLength, 175)
+
+  expectUnsupported(t, () =>
+    IMMUTABLE_PUT_POLICIES.announce.encode(IMMUTABLE_PUT_POLICIES.announce, {
+      command: COMMANDS.IMMUTABLE_PUT,
+      target,
+      token,
+      value: b4a.alloc(1024)
+    })
+  )
+  expectUnsupported(t, () =>
+    MUTABLE_PUT_POLICIES.announce.encode(MUTABLE_PUT_POLICIES.announce, {
+      command: COMMANDS.MUTABLE_PUT,
+      target,
+      token,
+      value: c.encode(m.mutablePutRequest, {
+        publicKey,
+        seq: 1,
+        value: b4a.alloc(896),
+        signature
+      })
+    })
+  )
+})
+
+test('findPeer lookup announce and raw query contexts stay fail-closed', (t) => {
+  const contexts = createQueryContexts()
+  expectUnsupported(t, () => contexts.classify({}))
+  expectUnsupported(t, () => contexts.classify(null))
+  expectUnsupported(t, () =>
+    encodeDHTRequest(IMMUTABLE_GET_POLICIES.lookup, {
+      command: COMMANDS.FIND_PEER,
+      target: b4a.alloc(32),
+      value: null
+    })
+  )
+  expectUnsupported(t, () =>
+    encodeDHTRequest(IMMUTABLE_GET_POLICIES.lookup, {
+      command: COMMANDS.LOOKUP,
+      target: b4a.alloc(32),
+      value: null
+    })
+  )
+  expectUnsupported(t, () =>
+    encodeDHTRequest(IMMUTABLE_GET_POLICIES.lookup, {
+      command: COMMANDS.ANNOUNCE,
+      target: b4a.alloc(32),
+      value: null
+    })
+  )
 })

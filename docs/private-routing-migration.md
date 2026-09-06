@@ -45,30 +45,190 @@ hardening, not a new public routing feature:
   rejection in both handshake completion paths. KI-4 below records the fix:
   order peer timestamps against signed bounds, not another host's wall clock.
 
+KI-10 refused-loss redelivery is now implemented: loss stays on its published
+branch, physical and live-IO reports carry that generation, and a refused
+controller wakeup is restored for delivery after the active rotation completes.
+The focused regression proves both refusal paths without advancing the lease
+clock, plus rejection of retired registrations and retiring-branch safety.
+
+The active, experimental SURB reference now has wire-compatible key cleanup,
+payload bounds, canonical X25519 public-key validation, and aggregate test
+registration. A direct probe reproduced high-bit encoding malleability before
+the fix and rejects it afterward. A four-hop fault probe also checks key
+erasure across 115 injected native-hash failures. The deterministic fixture
+still passes. This hardening does not activate Gate C: one-use ownership,
+authenticated epoch and reply-mode binding, and production DATAGRAM integration
+remain separate design/review work. See the
+[reference hardening record](superpowers/specs/2026-08-10-private-routing-surb-construction-design.md#reference-hardening--2026-09-05).
+
+After the advisory fixes and approved teardown classification, all eight local
+Linux gates pass. Node passes **975 tests / 19,051 assertions**; Bare passes
+**932 / 18,923**. All four normal/reverse process legs pass 136 assertions;
+namespace projection passes 27; live namespace capture passes 146 with raw
+DROP zero and classified ICMP zero. A delayed-close probe passes with three
+raw drops and three classified replies. An injected ICMP echo fails as required.
+See [KI-16](#ki-16-ordered-udp-shutdown-can-produce-kernel-icmp-drops).
+These local container results do not replace fork-native CI or real NAT-host
+evidence.
+
 Remaining work, in dependency order:
 
-1. **KI-10 refused-loss redelivery:** a loss report refused during rotation
-   still falls back to expiry. Design and verify generation-bound redelivery
-   without applying a retired branch's loss to its replacement.
-2. **KI-13 production NAT traversal:** design and review the production owner
+1. **KI-13 production NAT traversal:** design and review the production owner
    path for same-socket reflection, signed plan creation/distribution, topology
    and run binding, replay limits, and mapping lifetime. Then prove authenticated
    route startup across real NAT'd hosts without harness pre-punching. The
    isolated NAT branch's positive worker report is not acceptance evidence.
-3. **Gate C and private-presence/Gate D:** meet their protocol and cryptographic
+2. **Gate C and private-presence/Gate D:** meet their protocol and cryptographic
    review gates, then integrate the actual reply and record paths. The reverted
    and rejected branches are not completed implementations. Gate D still needs
    a vetted native scalar multiplication path for full blinded-key signing.
-4. **Complete Gate 3B:** remaining DHT commands, private presence, and peer
+3. **Complete Gate 3B:** remaining DHT commands, private presence, and peer
    streams need reviewed end-to-end implementations. Public required mode must
    remain disabled until all aggregate criteria below pass together in CI.
-5. **Consumer integration:** Hyperswarm, mobile, and PearTube follow the public
+4. **Consumer integration:** Hyperswarm, mobile, and PearTube follow the public
    controller gate. Real-device and real-network evidence cannot be replaced by
    the local container gates.
 
 KI-1 timing/volume correlation and KI-5 operator diversity remain explicit
 limits. This checkpoint adds no production constructor, protocol, or anonymity
 claim. Current local measurements are in the Task 17 table below.
+
+### Continuation checkpoint — 2026-09-06
+
+Two internal architecture reviews (KI-13 production NAT ownership; Gate C SURB
+lifecycle) and one dependency build were completed, and the two reviewed
+experimental slices were implemented. Neither review is external
+cryptographic review, and nothing here enables public required mode.
+
+**KI-13 production NAT ownership.** The review found that active production
+code creates no topology grants (`signTopologyGrant` is only called by the
+process fixture), that the archived `924fd55` proposal inherits a test trust
+root and reflects through a raw socket that is closed and rebound, and that a
+general plan signer accepting caller tuples would be a UDP redirection
+service. Seat decisions, recorded here for owner review: (D1) a plan is signed
+by both adjacent identities over one canonical body, with no central signer;
+(D2) plans travel only over an existing authenticated pre-link control path,
+otherwise the adjacency fails closed; (D3) IPv4 and IPv6 through the topology
+address codec; (D4) a successful punch never authorizes a link or readiness;
+(D5) plan validity is bounded by the link deadline and both reflection claims,
+at most 15 s; (D6) test topology grants stay test-only. Implemented:
+`lib/private/nat-reflect.js` (probe/observation codec and endpoint-bound
+reflection claims; two distinct identity-pinned reflectors must agree; never
+holds a socket), `lib/private/nat-punch-plan.js` (canonical plan codec,
+bilateral sign/verify, fixed punch-profile registry), a shared strict parser
+in `dht-exit-wire.js`, and package-private
+`createNatTraversalAuthority`/`reflectNatEndpoint`/`armNatPunch` on
+`UdxCellEndpoint`. `armNatPunch` compares the plan against the live link
+handle (grant digest, epoch, run, identities, roles, both tuples, expiry), the
+live reflection claim for this socket generation, and a plan-ID tombstone
+before charging or allocating a packet. Punch bytes are demultiplexed before
+bootstrap parsing and never reach `BootstrapRequestTable`. Guard pinning and
+endpoint close destroy all NAT state. `LinkBootstrapSession` consumes one
+opaque attempt, arms its deadline first, starts LINK CREATE after the first
+owned send, and cancels the attempt on OPEN, failure, close, and invalidation.
+Focused tests: `nat-reflect` 9/17, `nat-punch-plan` 7/25, `nat-traversal`
+6/33; the owned-file suites are unchanged. Review scenarios 19 and 27–29 need
+live processes and are not covered locally. Not implemented: the production
+plan producer/distributor over a pre-link channel, and the real-NAT run with
+the harness punch disabled. KI-13 therefore remains open.
+
+**Gate C SURB amendment.** Implemented in `lib/private/surb.js` as recorded in
+the [design spec](superpowers/specs/2026-08-10-private-routing-surb-construction-design.md#ownership-amendment--2026-09-06):
+per-hop context-bound key schedule with no context bytes on the wire, owned
+one-use authorities, atomic in-hop replay admission, and an authenticated inner
+reply envelope. 31 tests / 115 assertions. Reply-mode selection in the routed
+request, batch framing, the 492-byte fragment profile, and exit/initiator
+integration remain unimplemented and human-gated.
+
+**Gate D dependency.** `crypto_core_ed25519_scalar_mul` was added to a local
+checkout of `holepunchto/sodium-native` at `f566427` (npm 5.1.0) as a direct
+libsodium binding with the upstream wrapper conventions (local commit
+`5c10460`, patch at `/tmp/hyperdht-sodium-scalar-mul.patch`). Built with
+`bare-make` for darwin-arm64; the full upstream suite passes under Node
+(6,292 assertions) and Bare (6,282), plus independent checks
+$(L-1)^2 \equiv 1$ and $(L-1)\cdot 2 \equiv L-2 \pmod L$. Not yet done: a
+fork commit or release, prebuilds for the Linux gate image, the
+`sodium-universal` override, and the record-transcript approval that the
+design handoff below still requires. No JavaScript scalar arithmetic was
+introduced.
+
+**Routed immutable-put and mutable get/put (Gate 3B criterion 4, partial).**
+An internal review (`glm-5.3`, full text at
+`/tmp/hyperdht-routed-dht-commands-review.md`) confirmed that the frozen
+`COMMANDS` ranges in `routed-dht.js` fit only fixed-width bodies:
+`MUTABLE_GET_V1` is `target[32] || seq u64`; `IMMUTABLE_PUT_V1` is
+`token[32] || target[32] || version u8 || len u16 || value[0..1023]`;
+`MUTABLE_PUT_V1` adds `publicKey[32] || seq u64` before the value and a
+64-byte signature after it, so the required-mode mutable value cap is
+**895 bytes** (direct mode allows more; this asymmetry is now the contract).
+Seat decisions taken as the review defaults: put replies are bare one-byte
+acks with no token or closer nodes (209-byte reply, amplification 0); the exit
+maps upstream `SEQ_REUSED`/`SEQ_TOO_LOW` to `ROUTED_ERROR.RECORD_CONFLICT` and
+the controller surfaces `ERR_RECORD_CONFLICT`; no exit-side token state or
+hash checks (the upstream node verifies signatures and hashes); a
+refresh-capable `mutableGet` queries on the announce branch so its commit token
+comes from the exit that will send the put; pure reads stay on the lookup
+branch. Implemented across `dht-command-policy.js`, `query-context.js`,
+`routed-dht.js` (per-command reply profiles and `targetOf`),
+`opaque-destination.js` (announce referrals), `routed-dht-io.js`,
+`live-route-authority.js`, `dht-exit-wire.js`, `dht-exit-destination-table.js`,
+`dht-exit-io.js`, and `PrivateRoutingController.immutablePut/mutableGet/
+mutablePut` with generation pinning and one restart on rotation. `findPeer`,
+`lookup`, `announce`, `unannounce`, and raw `query` still fail closed. New
+suites: `dht-exit-put` 3/24, `dht-exit-mutable-get` 3/18,
+`live-mutable-and-put` 3/16. Not covered: a live announce-branch put end to
+end (the in-process harness does not deliver announce seed frames), and the
+lying-exit limitation stays a documented v1 limit.
+
+After formatting, the eight local Linux gates were run on the combined tree.
+Node aggregate passes **1,019 tests / 19,244 assertions**; Bare passes
+**976 / 19,116**. Process legs pass 136 assertions each; namespace projection
+27; live namespace capture 146 with raw DROP zero. One earlier
+`process:bare:reverse` run failed with `ERR_PRIVATE_GUARD_UNAVAILABLE` from
+the bootstrap deadline at 6.1 s while the container was also finishing the
+aggregate; five immediate reruns of that gate, one of `process:bare`, and the
+final full pass all succeeded. The no-punch bootstrap path is unchanged by
+this checkpoint, so the failure is recorded as a load-related deadline expiry,
+not explained. It should be watched in fork CI.
+
+Remaining work is unchanged in shape: KI-13 plan distribution and real-NAT
+proof; Gate C integration and human review; Gate D transcript approval,
+dependency pin, and implementation; remaining DHT commands, presence, peer
+streams; consumer integration.
+
+### Subagent design handoff — 2026-09-05
+
+These are review requirements, not accepted replacement protocols:
+
+- **Gate C:** make initiator ownership one-use and expiry-bound. Relay replay
+  admission must be atomic, after header authentication and before wrapping.
+  Remove manual replay-cache reset from the production contract. A local
+  `{run, epoch}` label alone is not cryptographic binding: an old header must
+  also fail under a new run or epoch. Bind that context through the accepted
+  key/header contract; do not call a cache-only change sufficient.
+- Authenticate the reply mode inside the inner request AEAD. A required SURB
+  reply must never fall back to the correlated path. Each reply fragment needs
+  an independent SURB; counter-based reuse is not the single-use construction.
+  At the current 512-byte reference cap, a 20-byte fragment header leaves
+  492 data bytes. The existing fragment encoder uses 1,053 data bytes, so it
+  cannot be reused unchanged. A three-SURB request also needs a reviewed batch
+  format and multi-cell carriage. Full-header reply overhead is 468 bytes;
+  the 1,073-byte route payload leaves 605 bytes before any new envelope fields.
+  This arithmetic does not approve a production cap.
+- **Gate D:** the current native dependency lacks
+  `crypto_core_ed25519_scalar_mul`. The
+  [current npm release](https://registry.npmjs.org/sodium-native/latest) is
+  `sodium-native@5.1.0`, which supports Node and Bare. The proposed dependency
+  path is an upstream native binding to libsodium's scalar multiply, followed
+  by a released version or approved commit and an explicit dependency pin.
+  No JavaScript scalar arithmetic, substitute signer, codec shell, or
+  permanently disabled implementation is an accepted substitute.
+- Before Gate D implementation, approve the complete signed record transcript:
+  version, type, epoch, revision, descriptor length, and tombstone scope/target.
+  Verification must use the caller-derived expected blinded key, epoch, and
+  storage key, not authority taken from the record itself. Overlap and rollback
+  rules must be executable. The advisor's proposed schema and hash choices are
+  not ratified, and external cryptographic review remains a human gate.
 
 ### Single-branch work collection — 2026-09-05
 
@@ -207,6 +367,90 @@ Observed locally on macOS 25.5.0 arm64 with Docker 29.5.2 over Colima
 - `namespace`: 1/1 test, 27/27 assertions.
 - `namespace:live`: 1/1 test, 135/135 assertions, marker datagrams 0,
   undecodable frames 0.
+
+### KI-16: ordered UDP shutdown can produce kernel ICMP drops
+
+**Status: classification approved, implemented, and verified on native Linux.**
+
+The 2026-09-05 advisory verification passed seven Linux gates. The live
+namespace gate reported one firewall drop, despite passing every UDP graph,
+marker, and payload oracle. The original UDP-only capture could not identify
+the dropped packet.
+
+The capture now includes IPv4 traffic, and an audit with drops prints non-UDP
+frames as well as the unchanged raw counter. A throwaway 750 ms pause
+after the guard's stop command reproduced five dropped ICMP destination/port
+unreachable replies. They quoted 1,200-byte route datagrams sent on allowed
+adjacencies after the receiving endpoint or guard socket had closed. The
+coordinator stops roles in sequence while later roles can still send link
+heartbeats. This explains a real failure mechanism; the uncaptured packet in
+the first run cannot be identified retroactively.
+
+Six instrumented reruns and one ordinary run passed 146/146 without a drop.
+Those passes do not resolve the shutdown race. A separate six-container
+concurrency experiment hit command deadlines before its first lifecycle
+assertion; it is not evidence about the original dropped packet.
+
+No firewall exception, counter reset, skipped UDP assertion, delayed production
+close, or packet-suppressing adapter was added. JD approved a narrow teardown
+classification instead of a new acknowledged shutdown protocol.
+
+The two read-only reviews found no existing peer-acknowledged shutdown barrier.
+`LinkControlSession.destroy()` waits for local send completion, not peer
+receipt; the receiver closes without an acknowledgement. A bounded delay
+cannot prove that all peer datagrams have stopped.
+
+Main rejected the first ICMP classification proposal: these kernel replies
+contain only a prefix of the original datagram, so a full-cell comparison
+cannot succeed. The original one-drop failure remains unattributed.
+
+The replacement audit reads all eleven role captures and both marker captures.
+It requires complete, checksummed, unfragmented IPv4; marker non-UDP traffic
+never qualifies. Only ICMP type 3/code 3 with zero reserved bytes, a valid
+checksum, and an exact quoted-prefix match to earlier allowed UDP traffic on
+the same destination root-veth can qualify. The outer addresses must reverse
+that exact firewall tuple. Duplicate records, missing provenance, other
+protocols, malformed packets, and unmatched counters fail the gate.
+
+Namespace-only instrumentation observes each real native UDP socket's close
+call and successful completion without changing its returned promise or
+shutdown order. Sidecars identify the exact host and port. Eligibility starts
+three milliseconds after the sampled close-call time: one millisecond for
+resolution plus two for observed clock uncertainty. This is a close-call
+bound, not an exact kernel-unbind timestamp. Packets near that boundary remain
+unmatched; uncertainty never backdates eligibility. Completion must precede
+the audit, and observed realtime/monotonic drift over two milliseconds fails.
+Coordinator receipt of the later `closed` event is not used as a close time.
+
+The raw DROP counter is printed and checked before and after capture stops.
+It must exactly equal the independently classified ICMP count in both
+directions. No counter is decremented and ICMP remains blocked by the firewall.
+Every existing UDP privacy assertion still runs over the full capture.
+
+One follow-up run failed a new file-order assertion with raw DROP zero.
+[Libpcap documents that packet queues can produce non-increasing timestamps](https://www.tcpdump.org/manpages/pcap-tstamp.7.html).
+The audit no longer assumes global timestamp order. Quote proof still needs
+both an earlier file record and an earlier timestamp. A later matching UDP
+record cannot supply missing earlier evidence. Duplicate detection covers
+records separated by different timestamps.
+
+The native-close observer also had an error path that could throw before
+calling native close. It now records the audit error and still closes the
+socket. A real-socket regression injects a clock error, rebinds the same port,
+and requires the audit to refuse the bad clock. Restoring the throw makes
+that regression fail. Restoring the global file-order assertion fails the
+valid reordered-traffic case; removing the file-index check fails the later
+matching-record refusal case. The final focused checks pass 31 tests and
+79 assertions.
+
+The final full Linux matrix passes all eight gates: Node 975 tests / 19,051
+assertions; Bare 932 / 18,923; four process legs at 136 assertions each;
+namespace projection 27; live namespace 146 with raw DROP zero and classified
+ICMP zero. On the same source, a throwaway 750 ms guard-stop pause produces
+three raw drops and three classified replies, with all 146 assertions passing.
+A separate injected ICMP echo produces one raw drop and fails assertion 146
+with `ERR_TEARDOWN_ICMP: unmatched non-UDP packet`, as required. The native
+firewall remains strict; the original uncaptured packet remains unattributed.
 
 ### Remote peer timing harness
 
@@ -824,20 +1068,48 @@ replacement sink for the emptied slot, `private-routing-controller.js:298-302`, 
 own clock at `BRANCH_EXPIRY_RETRY_MS` of 250ms - well inside
 `BRANCH_ROTATION_LEAD_MS` - so redelivery does not depend on the controller reaching
 any particular state. Only an empty slot can be filled, so a live sink is never
-displaced. A branch LOSS is deliberately not renewed this way: it is a past event with
-no timer behind it, its expiry timer remains the backstop, and that residual gap is
-a separate refused-loss delivery limit, not an absent native detector. Regression coverage is
+displaced. KI-10 now retains a refused branch loss separately on the published
+branch and redelivers it after READY; expiry is no longer its recovery backstop.
+Regression coverage for expiry remains
 `test/private/branch-expiry-rotation.js:271`, which refuses an announce expiry during a
 lookup rotation and asserts the redelivered signal rotates the announce branch.
 
 ### KI-10: native blackhole detection and refused-loss redelivery
 
-**Status: native blackhole detection fixed; refused-loss redelivery remains open.**
-A branch-loss report refused during rotation is not redelivered; expiry remains
-its backstop. This is separate from the verified silent-link detector. The
-head-of-line blocking fault was closed with KI-8. Commits `d00ecef` and `6468028`
-then added an eleven-process proof of the existing native link detector; they
-did not introduce a new heartbeat protocol.
+**Status: native blackhole detection and refused-loss redelivery fixed.**
+Loss reports now name the generation owned by the physical registration or live
+route IO owner. RouteManager rejects a retired generation before changing
+capabilities or recording fault demotion. A matching loss received during either
+branch's rotation remains on the current published branch object.
+
+The controller treats a loss signal as a wakeup, not as authority to lose an
+arbitrary current branch. It checks the current manager-owned loss, restores a
+refused one-shot sink, and redelivers standing losses in the `pairReady`
+handler after `await installReadyGeneration(state)` completes, including old
+transport teardown. No additional `dht.ready()` wait changes controller startup.
+Replacement discards the old branch's lost flag; loss during that branch's own
+build does not spend the replacement's lifecycle sink. Teardown destroys the
+pending branch state. No loss retry queue, retry timer, or direct fallback is added.
+
+`test/private/branch-expiry-rotation.js` reproduces both refusal windows: two
+reports queued before the first controller transition, and a sibling report
+issued after RouteManager enters ROTATING. Recovery completes with the lease
+clock unchanged. It also checks delayed retired registrations and loss of a
+branch already being replaced.
+The retiring-branch regression also faults its replacement to prove that the
+new loss sink remains usable. A network change with pending sibling loss
+removes request authority and prevents recovery from restoring it. The shared
+test harness now encodes its complete deterministic counter instead of
+wrapping a byte-fill sequence into an invalid all-zero route identifier.
+Failed replacement publication also requires the old branch to be both unexpired
+and not lost before READY can be restored. A same-branch-loss regression fails
+when `!current.lost` is removed: the old code reports ready and returns the
+rotating error instead of `ERR_PRIVACY_UNAVAILABLE`.
+
+This is separate from the verified silent-link detector. The head-of-line
+blocking fault was closed with KI-8. Commits `d00ecef` and `6468028` added an
+eleven-process proof of the existing detector; they did not introduce a new
+heartbeat protocol.
 
 `installLinkControl` in `lib/private/udx-cell-endpoint.js` installs a production
 `LinkControlSession` on each authenticated adjacency. Its `runLiveness` sends
@@ -1422,9 +1694,12 @@ value today, so nothing on the wire or in the live path changes.
 
 ### KI-13: the punch that makes a dispatch work is in the harness, not in production
 
-**Status: open, and it is the largest single item between this fork and production
-readiness. The harness change that unblocks a dispatch is landed; the production gap it
-exposes is not addressed.**
+**Status: open. The harness change that unblocks a dispatch is landed. As of
+2026-09-06 the production endpoint also owns same-socket reflection and a
+bounded, plan-gated punch attempt (see the checkpoint above), but no production
+path yet produces or distributes a signed plan to both sides, and no real-NAT
+run has used the production path. The paragraphs below describe the state
+before that change and remain accurate for the harness.**
 
 The eleven-role dispatch now opens role-to-role NAT mappings before any role starts:
 the coordinator distributes all eleven addresses over a fourth bridge mode byte, and
@@ -1691,27 +1966,23 @@ strategy. That precondition is now met **only for pools larger than three-plus-t
 the minimal shape a relay that fails is still handed the sibling branch, so L1 remains
 blocked there, and the blocker is pool size rather than a missing mechanism.
 
-#### Stale loss registration: investigated, not reachable
+#### Generation binding after refused-loss redelivery
 
-`createRouteManagerBranchLossRegistration` binds `{ manager, state, branchClass }`
-without a generation, which initially looked able to target whichever pair later
-occupied that class. The suspected window does not exist in the production event
-model.
+Before redelivery, the no-yield publish/swap/revoke sequence prevented an old
+physical registration from reaching a new pair through native I/O interleaving.
+That argument depended on refusing and spending every report during ROTATING.
+It is not sufficient once losses can survive a rotation.
 
-`receiveRotationSeed` awaits network input **before** calling
-`publishRotationSeed`. Publication then commits the new pair synchronously. The
-controller's `await` continuation is a microtask and, once resumed, executes
-`commitBranchConnection`, swaps the connection, and destroys/revokes the previous
-registration with no intervening `await`. A UDX physical-loss I/O event cannot
-interleave inside that synchronous continuation. If the old loss fires during the
-earlier network await, RouteManager is `ROTATING`, so the report returns false
-against the old state and spends that registration before publication; it cannot
-demote or rotate the new pair.
+`createRouteManagerBranchLossRegistration` now captures the published material's
+generation. Live route IO passes its owner generation through the same
+`reportRouteManagerBranchLoss` boundary. A mismatched generation is rejected
+before marking the branch lost or demoting its selected pair.
 
-Generation binding would therefore add state and migration surface without closing
-a reachable path. The relevant invariant is the no-yield publish/swap/revoke
-sequence; if a future change inserts an await there, this conclusion must be
-revisited before landing it.
+Pending loss belongs to the published branch object, not to a branch-class-only
+event queue. Publishing its replacement removes that standing loss. A queued
+controller wakeup must still find a current manager-owned loss to start rotation.
+The regression deliberately retains a physical registration across publication
+and proves that issuing it cannot lose the replacement.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
@@ -2504,27 +2775,31 @@ Counts below are a MEASUREMENT taken at one commit, not a contract. Every added 
 moves them, and a stale total quoted as current has already caused four false findings
 in this document's history - so re-measure rather than cite, and if you change a suite,
 change this table in the same pass. Measured on 2026-09-05 after the native
-blackhole, local-matrix, and signed clock-skew corrections. All rows below were run in the Linux
-container; Darwin aggregates and remote dispatches were not re-measured in this
-checkpoint.
+blackhole, local-matrix, signed clock-skew, generation-bound refused-loss, and
+SURB advisory corrections. The namespace row records the failed full run,
+not a later passing rerun. Darwin aggregates and remote dispatches were not
+re-measured in this checkpoint.
 
-| Suite                              | Command                                            | Result                                         |
-| ---------------------------------- | -------------------------------------------------- | ---------------------------------------------- |
-| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 927/927 tests, 18,835/18,835 assertions, Linux |
-| Private aggregate, Bare            | `bare test/private-routing.js`                     | 906/906 tests, 18,776/18,776 assertions, Linux |
-| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 136/136 assertions, Linux                      |
-| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 136/136 assertions, Linux                      |
-| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 136/136 assertions, Linux                      |
-| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 136/136 assertions, Linux                      |
-| Namespace projection enforcement   | `npm run test:private:namespace`                   | 27/27 assertions, privileged Linux             |
-| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 146/146 assertions, privileged Linux           |
+| Suite                              | Command                                            | Result                                            |
+| ---------------------------------- | -------------------------------------------------- | ------------------------------------------------- |
+| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 975/975 tests, 19,051/19,051 assertions, Linux    |
+| Private aggregate, Bare            | `bare test/private-routing.js`                     | 932/932 tests, 18,923/18,923 assertions, Linux    |
+| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 136/136 assertions, Linux                         |
+| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 136/136 assertions, Linux                         |
+| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 136/136 assertions, Linux                         |
+| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 136/136 assertions, Linux                         |
+| Namespace projection enforcement   | `npm run test:private:namespace`                   | 27/27 assertions, privileged Linux                |
+| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 146/146 assertions; raw DROP 0, classified ICMP 0 |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
 `test/private/live-namespace-node.js` runs the same eleven-process scenario with
-every role in its own Linux network namespace, captures every packet on every
-veth, and decides the result from the captured bytes rather than from the
-implementation's own accounting. It passes `146/146` assertions on Linux.
+every role in its own Linux network namespace, captures IPv4 traffic on every
+veth, and checks the captured UDP bytes plus the independent kernel-drop
+counter. The final full run passes `146/146` with raw DROP zero. KI-16 records
+the approved narrow teardown classification, its three-drop native positive
+probe, and the injected ICMP echo that the gate rejects. Every UDP-specific
+assertion still covers the full capture.
 
 Isolation is structural, not asserted. Each role holds routes only to the peers
 named by `ALLOW_EDGES`, and the root namespace forwards under a dedicated

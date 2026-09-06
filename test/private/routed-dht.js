@@ -1508,3 +1508,71 @@ test('routed reply rejects accessor-backed value and exact validation options be
   )
   destroyLiveOpaqueDestinations(live.owner)
 })
+
+test('put replies require bare ack and reject tokens or closers', (t) => {
+  const from = expectedDestination()
+  const ack = b4a.from([0x00])
+  const good = encodeRoutedReply({
+    requestId: b4a.alloc(16, 1),
+    commandId: M3_MESSAGE_ID.IMMUTABLE_PUT_V1,
+    commandVersion: 1,
+    operationClass: BRANCH_CLASS.ANNOUNCE,
+    from,
+    errorCode: 0,
+    token: b4a.alloc(0),
+    closerNodes: [],
+    encodedResponse: ack
+  })
+  const decoded = decodeRoutedReply(good)
+  t.is(decoded.commandId, M3_MESSAGE_ID.IMMUTABLE_PUT_V1)
+  t.alike(decoded.encodedResponse, ack)
+
+  expectCode(
+    t,
+    () =>
+      encodeRoutedReply({
+        requestId: b4a.alloc(16, 1),
+        commandId: M3_MESSAGE_ID.IMMUTABLE_PUT_V1,
+        commandVersion: 1,
+        operationClass: BRANCH_CLASS.ANNOUNCE,
+        from,
+        errorCode: 0,
+        token: b4a.alloc(32, 2),
+        closerNodes: [],
+        encodedResponse: ack
+      }),
+    'INVALID_ROUTE'
+  )
+  expectCode(
+    t,
+    () =>
+      encodeRoutedReply({
+        requestId: b4a.alloc(16, 1),
+        commandId: M3_MESSAGE_ID.MUTABLE_PUT_V1,
+        commandVersion: 1,
+        operationClass: BRANCH_CLASS.ANNOUNCE,
+        from,
+        errorCode: 0,
+        token: b4a.alloc(0),
+        closerNodes: [],
+        encodedResponse: b4a.from([0x01])
+      }),
+    'INVALID_ROUTE'
+  )
+  expectCode(
+    t,
+    () =>
+      encodeRoutedReply({
+        requestId: b4a.alloc(16, 1),
+        commandId: M3_MESSAGE_ID.IMMUTABLE_PUT_V1,
+        commandVersion: 1,
+        operationClass: BRANCH_CLASS.LOOKUP,
+        from,
+        errorCode: 0,
+        token: b4a.alloc(0),
+        closerNodes: [],
+        encodedResponse: ack
+      }),
+    'INVALID_ROUTE'
+  )
+})
