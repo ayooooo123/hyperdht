@@ -114,7 +114,7 @@ test('private route protocol versions and core enums are exact and frozen', (t) 
   }
 })
 
-test('private route message and routed-error IDs form the exact sorted 62-ID registry', (t) => {
+test('private route message and routed-error IDs form the exact sorted 63-ID registry', (t) => {
   const messages = {
     CAPABILITY_ADVERTISEMENT_V1: 0x0001,
     CAPS_QUERY_V1: 0x0002,
@@ -148,6 +148,7 @@ test('private route message and routed-error IDs form the exact sorted 62-ID reg
     DESTINATION_REF_V1: 0x0100,
     ROUTED_REQUEST_V1: 0x0101,
     ROUTED_REPLY_V1: 0x0102,
+    ROUTED_REQUEST_V2: 0x0103,
     IMMUTABLE_GET_V1: 0x0120,
     IMMUTABLE_PUT_V1: 0x0121,
     MUTABLE_GET_V1: 0x0122,
@@ -191,8 +192,8 @@ test('private route message and routed-error IDs form the exact sorted 62-ID reg
   t.is(M3_MESSAGE_ID.DHT_EXIT_SEEDS_V1, 0x0044)
   t.is(M3_MESSAGE_ID.DHT_EXIT_DHT_SEEDS_V1, 0x0045)
   t.is(M3_ID_REGISTRY.filter((id) => id === 0x0045).length, 1)
-  t.is(assigned.length, 62)
-  t.is(new Set(assigned).size, 62)
+  t.is(assigned.length, 63)
+  t.is(new Set(assigned).size, 63)
   t.alike(
     M3_ID_REGISTRY,
     assigned.slice().sort((left, right) => left - right)
