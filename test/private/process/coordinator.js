@@ -617,6 +617,49 @@ function createProcessControl(options) {
     await shutdown()
   }
 
+  function commandBase(role, type, fields = {}) {
+    const record = records.get(role)
+    if (!record) throw new ProcessControlError('PROCESS_CONTROL_INVALID')
+    return {
+      generation: record.generation,
+      phaseSequence: record.phaseSequence,
+      role: record.role,
+      roleIndex: record.roleIndex,
+      type,
+      ...fields
+    }
+  }
+
+  async function sendAndExpect(role, type, eventType, fields = {}) {
+    const waiting = expect(role, eventType, records.get(role).generation)
+    await send(role, commandBase(role, type, fields))
+    return waiting
+  }
+
+  function natReflect(role) {
+    return sendAndExpect(role, 'nat-reflect', 'nat-reflected')
+  }
+
+  function natOffer(role) {
+    return sendAndExpect(role, 'nat-offer', 'nat-offer')
+  }
+
+  function natCounter(role, offer) {
+    return sendAndExpect(role, 'nat-counter', 'nat-counter', { offer })
+  }
+
+  function natPlan(role, counter) {
+    return sendAndExpect(role, 'nat-plan', 'nat-plan', { counter })
+  }
+
+  function natArm(role, plan) {
+    return sendAndExpect(role, 'nat-arm', 'nat-armed', { plan })
+  }
+
+  function natStart(role) {
+    return sendAndExpect(role, 'nat-start', 'nat-started')
+  }
+
   return Object.freeze({
     cancel,
     close: shutdown,
@@ -631,6 +674,12 @@ function createProcessControl(options) {
     get closed() {
       return closed
     },
+    natArm,
+    natCounter,
+    natOffer,
+    natPlan,
+    natReflect,
+    natStart,
     respondIsolatedGrant,
     send,
     setPhase

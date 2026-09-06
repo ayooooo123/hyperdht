@@ -3,8 +3,8 @@
 # Dispatches role bridges to runners and drives the eleven-role live route from
 # this machine.
 #
-#   scripts/live-route.sh up [-s 900] [-w 600] [-l 1,3,9]
-#   scripts/live-route.sh drive <run-id> [-w 600] [-l 1,3,9]
+#   scripts/live-route.sh up [-s 900] [-w 600] [-l 1,3,9] [-p]
+#   scripts/live-route.sh drive <run-id> [-w 600] [-l 1,3,9] [-p]
 #
 # Needs both local secrets; run scripts/remote-peer.sh secret --push once. Nothing
 # else has to be set up, and no repository secret beyond REMOTE_PEER_SECRET is ever
@@ -78,6 +78,7 @@ roles=11
 seconds=900
 wait_seconds=600
 local_roles=""
+production_endpoint_punch=0
 # The guard plus the six relay candidates: the roles validatePathDiversity compares
 # by subnet. Padded with spaces so a membership test cannot match a substring.
 diverse_roles=" 2 3 4 5 6 7 8 "
@@ -86,6 +87,7 @@ diverse_roles=" 2 3 4 5 6 7 8 "
 required_edges=" 1:2 2:3 2:5 2:7 3:4 5:6 7:8 4:9 4:10 4:11 6:9 6:10 6:11 8:9 8:10 8:11 9:10 9:11 10:11 "
 
 parse_flags() {
+  production_endpoint_punch=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       -s | --seconds)
@@ -99,6 +101,10 @@ parse_flags() {
       -l | --local)
         local_roles="$2"
         shift 2
+        ;;
+      -p | --production-endpoint-punch)
+        production_endpoint_punch=1
+        shift
         ;;
       *)
         echo "unknown flag: $1" >&2
@@ -302,6 +308,7 @@ drive() {
     REMOTE_PEER_COORDINATOR_SECRET="$coordinator_secret" \
     REMOTE_PEER_RUN_ID="$run_id" \
     REMOTE_PEER_WAIT_SECONDS="$wait_seconds" \
+    ${production_endpoint_punch:+REMOTE_PEER_PRODUCTION_ENDPOINT_PUNCH=1} \
     "$repo/node_modules/.bin/brittle-node" test/remote-peer/live-route.js
 }
 

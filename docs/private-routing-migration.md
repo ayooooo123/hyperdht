@@ -196,6 +196,83 @@ proof; Gate C integration and human review; Gate D transcript approval,
 dependency pin, and implementation; remaining DHT commands, presence, peer
 streams; consumer integration.
 
+### Continuation checkpoint — 2026-09-06, KI-13 plan distribution
+
+The production plan producer and distributor were implemented after mapping the
+real link lifecycle rather than the review packet's assumed one. Three facts
+decided the shape. Topology grants are minted only by the process fixture and
+reach roles over the coordinator control channel; no production owner mints
+them yet. The endpoint opens its guard link inside `bootstrap-io.js` only after
+a direct CAPS_QUERY / ACTIVE_CHALLENGE exchange with the guard, so any punch
+for that edge must precede the FIRST bootstrap contact, not LINK CREATE.
+Guard→middle and middle→exit links are dialed cold from
+`wire-services.dial()` at route build and at every rotation, and a plan is
+valid for at most 15 s, so no pre-negotiated plan can serve them.
+
+Seat decisions, recorded for owner review beside D1–D6:
+
+- **D7.** Endpoint↔guard is the only production-punched edge. Its plan
+  travels over the topology owner's channel, the same authenticated channel
+  that carries the topology grant; in the harness that is the coordinator,
+  which relays opaque bytes and never signs. Relay↔relay cold dials have no
+  pre-link channel, so under D2 a NAT'd middle or exit stays unsupported and
+  fails closed. The harness keeps its own pre-punch for relay pairs and labels
+  it test topology plumbing.
+- **D8.** The endpoint's punch precedes its first bootstrap contact. The
+  attempt is armed against a link handle the role authorizes from the same
+  grant in its own `LinkDirectory`, runs standalone, and the controller starts
+  only after the first owned punch send. OPEN transfers nothing from the punch.
+- **D9.** Four-step bilateral exchange: `offerNatPunch` (initiator: header,
+  its side, responder claim digest and nonce zero) → `counterNatPunch`
+  (responder fills its claim digest and nonce, may only LOWER `expiresAt`,
+  signs) → `completeNatPunch` (initiator checks the counter differs from its
+  offer in exactly those fields, verifies the responder signature, signs, arms
+  through `armNatPunch`) → `acceptNatPunch` (responder checks the plan's
+  unsigned bytes and its own signature byte-for-byte, arms through
+  `armNatPunch`, which verifies the initiator signature and every binding).
+
+Implemented in `lib/private`: strict offer/counter codecs and the
+allowed-difference comparator in `nat-punch-plan.js`; the four functions above
+plus single-use pending tokens (bounded by `DEFAULT_MAX_NAT_PLANS`, expiring at
+the offer window, revoked on guard pin, endpoint close, authority destroy and
+link-handle close) in `udx-cell-endpoint.js`; the NAT authority now retains an
+owned copy of the identity secret key and clears it on every revocation path;
+`bindReflectedEndpointClaim` requires explicit reflectors (the hard-coded
+`203.0.113.x` defaults were a production bypass and are gone); and
+`prepareEndpointNatTraversal` in `endpoint-bootstrap-authority.js`, which binds
+the endpoint's own socket before the controller starts, creates the NAT
+authority on it from a second identity secret capability, and reflects.
+
+Harness: optional `natTraversal.reflectors` projection field, guard
+`endpointGrant`, control-channel commands `nat-reflect|offer|counter|plan|arm|start`
+and events `nat-reflected|offer|counter|plan|armed|started`, coordinator
+helpers, role-runner handlers, and the suite sequence guard reflect → endpoint
+reflect → offer → counter → plan → arm → guard start → endpoint start →
+endpoint activate. `nat-reflected` carries one `observed` string because the
+leak oracle refuses any event field named `host` or `port`. `scripts/live-route.sh -p`
+(`REMOTE_PEER_PRODUCTION_ENDPOINT_PUNCH=1`) removes the endpoint from the
+harness punch cross-product and passes the two public bootstrap reflectors,
+labelled by `hash(host:port)`. New local gates `process:node:punch` and
+`process:bare:punch` run the portable loopback scenario with dht-seed and
+dht-value as reflectors. Default runs send no NAT command and mint no NAT
+projection field.
+
+Evidence: `nat-negotiation` 11/19, `nat-traversal` 6/33, `process-codec`
+21/416, `nat-control-messages` 2/49. `process:node:punch` passes 141/141: both
+production reflections equal the minted tuples, the whole exchange took 33.7 ms
+on loopback, both sides report a first owned punch send, at least one direction
+crossed, and the endpoint then bootstrapped and completed the full lifecycle.
+Loopback proves the frame path only; the real-NAT proof is a `live-route.sh -p`
+dispatch and has not been run.
+
+Two contract notes. The reflectors observe the endpoint's socket before guard
+pinning; that is within the pre-guard exposure the security contract allows
+for configured bootstrap contacts, but those sends bypass the bootstrap
+exposure accounting, so the readiness report does not yet list them. The
+reflector `identity32` is a label bound into the claim, not an authenticated
+identity: dht-rpc pings are unauthenticated, and the claim's authority comes
+from the socket owner observing agreement between two reflectors.
+
 ### Subagent design handoff — 2026-09-05
 
 These are review requirements, not accepted replacement protocols:
@@ -1694,12 +1771,16 @@ value today, so nothing on the wire or in the live path changes.
 
 ### KI-13: the punch that makes a dispatch work is in the harness, not in production
 
-**Status: open. The harness change that unblocks a dispatch is landed. As of
-2026-09-06 the production endpoint also owns same-socket reflection and a
-bounded, plan-gated punch attempt (see the checkpoint above), but no production
-path yet produces or distributes a signed plan to both sides, and no real-NAT
-run has used the production path. The paragraphs below describe the state
-before that change and remain accurate for the harness.**
+**Status: open on real-NAT evidence only. As of 2026-09-06 the production
+endpoint owns same-socket reflection, a bilateral signed plan exchanged over
+the topology owner's channel, and a bounded punch from the socket it then
+bootstraps with (see "Continuation checkpoint — 2026-09-06, KI-13 plan
+distribution"). The loopback `process:*:punch` gates prove the frame path; a
+`live-route.sh -p` dispatch has not been run. NAT'd middles and exits remain
+unsupported by decision D7: they are dialed cold at rotation time and have no
+pre-link channel, so the harness pre-punch below still opens those pairs and
+is test topology plumbing, not production. The paragraphs below describe the
+harness and remain accurate for the relay pairs.**
 
 The eleven-role dispatch now opens role-to-role NAT mappings before any role starts:
 the coordinator distributes all eleven addresses over a fourth bridge mode byte, and
@@ -1721,8 +1802,9 @@ it is:
 > the one-tick plan distribution and that the probes release the role's ports. Only a
 > dispatch tests traversal.
 
-`udx-cell-endpoint.js:1427-1428` owns its socket with no injection point, so there is no
-seam where a production punch could currently be introduced.
+When this was written, `udx-cell-endpoint.js` owned its socket with no injection
+point. That seam now exists for the endpoint↔guard edge only:
+`prepareEndpointNatTraversal` and `armNatPunch` punch from the production socket.
 
 Three limits belong beside it, and together they mean a green store assertion says the
 pair was open at that moment rather than that the topology is durably connected:

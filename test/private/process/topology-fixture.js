@@ -765,18 +765,41 @@ function dhtOptions(tuple, nodes, bootstrap = []) {
 function createLiveProcessTopology(options) {
   if (options === null || typeof options !== 'object') invalid()
   // endpoints belongs to the discovered plan only, and candidateOrder is a
-  // test-only mutation. Their presence is part of the exact shape.
+  // test-only mutation. natTraversal is optional production endpoint punch wiring.
+  // Their presence is part of the exact shape.
   const supplied = Object.prototype.hasOwnProperty.call(options, 'endpoints')
   const ordered = Object.prototype.hasOwnProperty.call(options, 'candidateOrder')
+  const natTraversalSupplied = Object.prototype.hasOwnProperty.call(options, 'natTraversal')
   exactObject(options, [
     'clocks',
     ...(supplied ? ['endpoints'] : []),
     'entropy',
     ...(ordered ? ['candidateOrder'] : []),
+    ...(natTraversalSupplied ? ['natTraversal'] : []),
     'plan'
   ])
   const candidateOrder = ordered ? options.candidateOrder : 'normal'
   if (candidateOrder !== 'normal' && candidateOrder !== 'reverse') invalid()
+  let natTraversalSource = null
+  if (natTraversalSupplied) {
+    exactObject(options.natTraversal, ['reflectors'])
+    const reflectors = options.natTraversal.reflectors
+    if (!Array.isArray(reflectors) || reflectors.length < 2 || reflectors.length > 3) invalid()
+    for (const reflector of reflectors) {
+      exactObject(reflector, ['host', 'identity32', 'port'])
+      if (
+        typeof reflector.host !== 'string' ||
+        reflector.host.length === 0 ||
+        reflector.host.length > 64 ||
+        !Number.isSafeInteger(reflector.port) ||
+        reflector.port < 1 ||
+        reflector.port > 0xffff ||
+        length(reflector.identity32) !== 32
+      )
+        invalid()
+    }
+    natTraversalSource = reflectors
+  }
   const clocks = CLOCK_CAPABILITIES.get(options.clocks)
   const entropy = ENTROPY_CAPABILITIES.get(options.entropy)
   if (
@@ -810,7 +833,18 @@ function createLiveProcessTopology(options) {
     secrets.push(value)
     return value
   }
+  let natTraversalProjection = null
   try {
+    if (natTraversalSource !== null) {
+      const copied = natTraversalSource.map((reflector) =>
+        Object.freeze({
+          host: reflector.host,
+          identity32: track(copy(reflector.identity32, 32)),
+          port: reflector.port
+        })
+      )
+      natTraversalProjection = Object.freeze({ reflectors: Object.freeze(copied) })
+    }
     // Reachable addresses drive every published value: advertisements, adjacency
     // contacts, link specs, DHT peers and the firewall map. Only the bind tuple is
     // local to the host that owns the socket.
@@ -937,6 +971,7 @@ function createLiveProcessTopology(options) {
         identityPublicKey: copy(identities[0].publicKey, 32),
         leakSentinel: copy(leakSentinel, 32),
         localIdentitySecretKey: identities[0].secretKey,
+        ...(natTraversalProjection === null ? {} : { natTraversal: natTraversalProjection }),
         targetHash: copy(targetHash, 32)
       })
     )
@@ -957,6 +992,12 @@ function createLiveProcessTopology(options) {
           roleIndex: index + 1
         })),
         endpointAdjacentBinding: { ...tuples[0] },
+        ...(natTraversalProjection === null
+          ? {}
+          : {
+              endpointGrant: copy(grantFor(1, 2)),
+              natTraversal: natTraversalProjection
+            }),
         identityPublicKey: copy(identities[1].publicKey, 32),
         identitySecretKey: identities[1].secretKey,
         middleAdjacencies: [2, 4, 6].map((index) =>
