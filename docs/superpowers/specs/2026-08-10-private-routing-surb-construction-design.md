@@ -202,3 +202,87 @@ conformance fixture** over all deterministic wire fields; payload-budget enforce
 remaining: a **deterministic-seal payload vector** (box_seal is randomized), statistical
 review of filler indistinguishability, DHT wiring into the DATAGRAM reply path, and external
 cryptographic review.
+
+## Reference hardening — 2026-09-05
+
+The active reference implementation now rejects noncanonical X25519 public
+encodings: the little-endian coordinate must be less than `2^255 - 19`, with
+bit 255 clear. This check applies to public keys, not secret scalars. A direct
+probe first showed that toggling bit 255 in `message.ephem` still opened the
+original reply; the same probe now fails with `INVALID_ROUTE`. Valid generated
+keys and the deterministic wire fixture are unchanged.
+
+Temporary DH secrets, derived keys, PRG buffers, and decrypted routing buffers
+are erased on success and failure. Returned plaintext and caller-owned
+`openKeys` remain intact. An executable fault probe checked temporary-buffer
+erasure at all 115 native-hash failure points of a four-hop build, and completed
+a four-hop reply at the 512-byte limit.
+
+The relay input is bounded to 608 payload bytes; the initiator input is bounded
+to 624. Open-key arrays must contain one through four valid wrap-key pairs.
+The suite is now in `test/private-routing.js`. Seeded choices replace
+`Math.random`, the tamper loop requires rejection, and the weak filler
+non-degeneracy check is removed.
+
+These changes do **not** implement the ownership part of invariant 5:
+`processSurbHop` does not admit the replay token, `openSurbPayload` does not
+consume caller keys, and `createNullifierGuard.reset()` is not an authenticated
+epoch transition. Production ownership, epoch binding, reply-mode
+authentication, fragmentation, and DATAGRAM integration still need an accepted
+design. Owner approval and external cryptographic review remain open.
+
+The initial hardening suite passed **21 tests / 100 assertions** under both
+Linux Node and Bare, with a separate internal review. The advisory follow-up
+adds low-order reply-public-key rejection: `sealReply` maps only the native
+`Error('status: -1')` outcome to `INVALID_ROUTE`. Canonical encoding alone does
+not exclude low-order curve points. Unknown native errors still propagate.
+Node and Bare smoke checks verify that distinction, failed sealed-output
+erasure, and invalid-MAC nullifier erasure. External cryptographic review is
+still required.
+
+## Ownership amendment — 2026-09-06
+
+An internal architecture review (not external cryptographic review) found
+that the 2026-09-05 reference still had reusable initiator secrets, optional
+and late replay admission, and no cryptographic run or epoch binding. The
+active reference now implements the reviewed amendment. It remains
+experimental, off by default, and not wire-stable.
+
+- **Per-hop context binding.** Each hop derives
+  `hopRoot = BLAKE2b-256(key = X25519 shared, input = u16be(len) ||
+"hyperdht-private-routes/surb-hop/v1" || u16be(58) || HopContext)` with
+  `HopContext = u16be(1) || routeKey[32] || u64be(capabilityEpoch) ||
+u64be(issuedAtMs) || u64be(expiresAtMs)` taken from the relay's signed
+  capability. `rho`, `mu`, `wrap-key`, `wrap-nonce`, and `nullifier` keys are
+  derived from `hopRoot`. The MAC covers `E_i || beta_i`. No context byte is
+  on the return wire; the test asserts that for every leg. A header from another
+  epoch or another route key derives a different MAC key and fails before any
+  replay-store change. The advertised route key is therefore the run boundary:
+  a relay must use a fresh route key pair per run and drain old keys only for
+  the exact signed capability window. If route keys can be reused across runs,
+  this contract is insufficient and a signed key-generation identifier must be
+  added to the capability schema under human ratification.
+- **Authorities, not buffers.** `buildSurb` returns `{ descriptor,
+openAuthority }`; `createSurbCapabilityAuthority` recomputes the public key
+  from the secret and rejects mismatch or expiry; `createSurbReplayAuthority`
+  has no manual reset. `processSurbHop({ message, capabilityAuthority,
+replayAuthority })` verifies the MAC, validates the hop block, admits the
+  nullifier atomically, then wraps, and returns a one-use forwarding authority.
+  `openSurbReply` consumes the open authority on the first attempt whether it
+  succeeds or fails. Every authority is a frozen handle over private WeakMap
+  state with erasure on consume, revoke, or expiry.
+- **Inner reply.** `crypto_box_seal` is replaced by a fresh X25519 ephemeral
+  plus XChaCha20-Poly1305 with associated data `"SURB-REPLY-V1" ||
+replyBinding`; the builder and sealer must bind identical bytes. Overhead is
+  unchanged at 48 bytes.
+- **Sizes.** A 512-byte reply produces relay inputs of 932, 948, 964, and 980
+  bytes and a 624-byte terminal payload, all within the 1,073-byte route
+  payload. A 513-byte plaintext is rejected before encryption.
+
+`node test/private/surb.js` passes **31 tests / 115 assertions**. The
+conformance fixture was regenerated for the new key schedule. Removed exports:
+`sealReply`, `openSurbPayload`, `nullifierOf`, `createNullifierGuard`; there
+are no other callers. Still not implemented and still human-gated: reply-mode
+selection inside the authenticated routed request, the SURB batch framing, a
+492-byte fragment profile, exit and initiator integration, and any wire
+ratification or anonymity claim.
