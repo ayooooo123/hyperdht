@@ -660,6 +660,10 @@ function createProcessControl(options) {
     return sendAndExpect(role, 'nat-start', 'nat-started')
   }
 
+  function natStats(role) {
+    return sendAndExpect(role, 'nat-stats', 'nat-stats')
+  }
+
   return Object.freeze({
     cancel,
     close: shutdown,
@@ -680,6 +684,7 @@ function createProcessControl(options) {
     natPlan,
     natReflect,
     natStart,
+    natStats,
     respondIsolatedGrant,
     send,
     setPhase

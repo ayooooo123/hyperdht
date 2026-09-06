@@ -460,10 +460,6 @@ function registerLiveProcessSuite(launch) {
         t.comment(`production endpoint punch elapsed ${punchElapsedMs.toFixed(1)}ms`)
         t.is(guardStarted.firstOwnedSend, true, 'guard first owned punch send')
         t.is(endpointStarted.firstOwnedSend, true, 'endpoint first owned punch send')
-        t.ok(
-          guardStarted.received > 0 || endpointStarted.received > 0,
-          'at least one punch direction crossed'
-        )
       }
 
       {
@@ -648,6 +644,25 @@ function registerLiveProcessSuite(launch) {
         })
       )
       t.ok((await resumedValueWaiting).value.equals(topology.oracle.immutableValue))
+
+      if (productionEndpointPunch) {
+        // The first-send replies were taken before the peer's packets could have
+        // crossed a real NAT, and the rounds ran on for three seconds. Asked only
+        // here: an idle of two seconds before the first routed get fails the
+        // unmodified scenario (KI-17), and a pause after it moves the blackhole
+        // rotation past its process deadline, so nothing above may wait on this.
+        const guardStats = await control.natStats('guard')
+        const endpointStats = await control.natStats('endpoint')
+        t.comment(
+          `production punch guard sent=${guardStats.sent} received=${guardStats.received} ` +
+            `stray=${guardStats.strayReceived}; endpoint sent=${endpointStats.sent} ` +
+            `received=${endpointStats.received} stray=${endpointStats.strayReceived}`
+        )
+        t.ok(
+          guardStats.received > 0 || endpointStats.received > 0,
+          'at least one punch direction crossed'
+        )
+      }
 
       const unavailable = await sendAndWait('endpoint', 'network-change', 'unavailable')
       t.is(unavailable.reason, 'NETWORK_CHANGE')

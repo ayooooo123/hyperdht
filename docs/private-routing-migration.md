@@ -262,8 +262,27 @@ Evidence: `nat-negotiation` 11/19, `nat-traversal` 6/33, `process-codec`
 production reflections equal the minted tuples, the whole exchange took 33.7 ms
 on loopback, both sides report a first owned punch send, at least one direction
 crossed, and the endpoint then bootstrapped and completed the full lifecycle.
-Loopback proves the frame path only; the real-NAT proof is a `live-route.sh -p`
-dispatch and has not been run.
+Loopback proves the frame path only.
+
+First real-NAT dispatch, run
+[34059354417](https://github.com/ayooooo123/hyperdht/actions/runs/34059354417),
+all eleven roles on runners, `-p`: the harness punch matrix arrived on 96 of
+117 directed pairs and every one of the 21 silent pairs involved
+lookup-middle-b, which heard nothing from any role. Production reflection on
+the final socket equalled the minted tuple on both NAT'd hosts (endpoint
+`74.235.70.229:23569`, guard `135.119.236.51:32793`), so the close-and-rebind
+hop preserved both mappings on those runners. The four-step exchange took
+799.6 ms over the DHT control streams; both sides reported a first owned punch
+send; the endpoint then bootstrapped to the guard, pinned it, and the first
+routed immutable get was exact — with no harness punch on the endpoint's edge.
+Two assertions failed. The crossing check read the counters immediately after
+the first send, before the peer's packets could have crossed a real NAT; it now
+reads them at the scenario tail. The blackhole rotation then missed the process
+deadline; the only replacement middle was the role whose NAT admitted nobody,
+which is consistent with the punch matrix but was not proven to be the cause.
+The first `-p` drive also exposed a `live-route.sh` bug: an expanded word is
+never an assignment prefix, so the flag is now exported. A second dispatch on
+the corrected tree is recorded below when it completes.
 
 Two contract notes. The reflectors observe the endpoint's socket before guard
 pinning; that is within the pre-guard exposure the security contract allows
@@ -444,6 +463,28 @@ Observed locally on macOS 25.5.0 arm64 with Docker 29.5.2 over Colima
 - `namespace`: 1/1 test, 27/27 assertions.
 - `namespace:live`: 1/1 test, 135/135 assertions, marker datagrams 0,
   undecodable frames 0.
+
+### KI-17: a routed get fails after a short idle following readiness
+
+**Status: open. Found while placing the punch counters, on the unmodified
+scenario; not caused by NAT work.**
+
+On the portable loopback `process:node` gate, inserting a coordinator wait
+between the endpoint's `ready` and the first `immutable-get` changes the
+result: 1,000 ms passes 136/136; 2,000 ms and 3,000 ms fail the first get with
+`ERR_PRIVACY_UNAVAILABLE` from `PrivateRoutingController.immutableGet`, which
+means the routed query returned no value. The endpoint snapshot taken after the
+wait still reports both generations and a guard-only edge. Candidates worth
+checking first: `EXIT_DHT_REFERRAL_MS = 1000n` in `routed-dht-io.js` and
+`PROBE_DEADLINE_MS = 1_000n` in `dht-exit-destination-table.js`. A pause of
+about 2.5 s after the first get also moves the later blackhole rotation past
+`COMMAND_TIMEOUT_MS`, so the scenario is phase-sensitive in two places. A real
+client waits arbitrarily long between readiness and its first request, so this
+needs a production explanation before Gate 3B, not a harness adjustment.
+
+Reproduction: add `await new Promise((r) => setTimeout(r, 2000))` after the
+endpoint's `activate` in `test/private/live-process-suite.js` and run
+`scripts/linux-gates.sh process:node`.
 
 ### KI-16: ordered UDP shutdown can produce kernel ICMP drops
 

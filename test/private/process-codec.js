@@ -104,6 +104,7 @@ function validCommand(type) {
     case 'nat-reflect':
     case 'nat-offer':
     case 'nat-start':
+    case 'nat-stats':
       return base(type, 'endpoint', 1)
     case 'nat-counter':
       return { ...base(type, 'guard', 2), offer: b4a.alloc(334, 7) }
@@ -211,6 +212,7 @@ function validEvent(type) {
     case 'nat-armed':
       return base(type, 'guard', 2)
     case 'nat-started':
+    case 'nat-stats':
       return {
         ...base(type, 'endpoint', 1),
         firstOwnedSend: true,
@@ -672,7 +674,8 @@ test('exact command and event registries are frozen and all schemas reject extra
     'nat-counter',
     'nat-plan',
     'nat-arm',
-    'nat-start'
+    'nat-start',
+    'nat-stats'
   ])
   t.alike(EVENTS, [
     'configured',
@@ -698,7 +701,8 @@ test('exact command and event registries are frozen and all schemas reject extra
     'nat-counter',
     'nat-plan',
     'nat-armed',
-    'nat-started'
+    'nat-started',
+    'nat-stats'
   ])
   t.ok(Object.isFrozen(COMMANDS))
   t.ok(Object.isFrozen(EVENTS))

@@ -304,11 +304,17 @@ drive() {
   coordinator_secret="$(read_coordinator_secret)"
   trap cleanup EXIT
   start_local_bridges "$secret" "$(derive_coordinator_key "$coordinator_secret")" "$run_id"
+  # A word produced by expansion is never parsed as an assignment prefix, so the
+  # optional flag is exported instead of prefixed.
+  if [ "$production_endpoint_punch" = 1 ]; then
+    export REMOTE_PEER_PRODUCTION_ENDPOINT_PUNCH=1
+  else
+    unset REMOTE_PEER_PRODUCTION_ENDPOINT_PUNCH
+  fi
   REMOTE_PEER_SECRET="$secret" \
     REMOTE_PEER_COORDINATOR_SECRET="$coordinator_secret" \
     REMOTE_PEER_RUN_ID="$run_id" \
     REMOTE_PEER_WAIT_SECONDS="$wait_seconds" \
-    ${production_endpoint_punch:+REMOTE_PEER_PRODUCTION_ENDPOINT_PUNCH=1} \
     "$repo/node_modules/.bin/brittle-node" test/remote-peer/live-route.js
 }
 

@@ -41,7 +41,8 @@ const COMMANDS = Object.freeze([
   'nat-counter',
   'nat-plan',
   'nat-arm',
-  'nat-start'
+  'nat-start',
+  'nat-stats'
 ])
 
 const EVENTS = Object.freeze([
@@ -68,7 +69,8 @@ const EVENTS = Object.freeze([
   'nat-counter',
   'nat-plan',
   'nat-armed',
-  'nat-started'
+  'nat-started',
+  'nat-stats'
 ])
 
 const ROLES = Object.freeze([
@@ -789,7 +791,8 @@ const COMMAND_FIELDS = Object.freeze({
   'nat-counter': Object.freeze([...BASE_FIELDS, 'offer']),
   'nat-plan': Object.freeze([...BASE_FIELDS, 'counter']),
   'nat-arm': Object.freeze([...BASE_FIELDS, 'plan']),
-  'nat-start': BASE_FIELDS
+  'nat-start': BASE_FIELDS,
+  'nat-stats': BASE_FIELDS
 })
 const EVENT_FIELDS = Object.freeze({
   configured: BASE_FIELDS,
@@ -870,6 +873,14 @@ const EVENT_FIELDS = Object.freeze({
   'nat-plan': Object.freeze([...BASE_FIELDS, 'plan']),
   'nat-armed': BASE_FIELDS,
   'nat-started': Object.freeze([
+    ...BASE_FIELDS,
+    'firstOwnedSend',
+    'received',
+    'refused',
+    'sent',
+    'strayReceived'
+  ]),
+  'nat-stats': Object.freeze([
     ...BASE_FIELDS,
     'firstOwnedSend',
     'received',
@@ -1074,6 +1085,7 @@ function validateCommand(message, context) {
     case 'nat-reflect':
     case 'nat-offer':
     case 'nat-start':
+    case 'nat-stats':
       if (!NAT_ROLES.has(common.role)) invalid()
       break
     case 'nat-counter':
@@ -1329,6 +1341,7 @@ function validateEvent(message, context) {
       if (!NAT_ROLES.has(common.role)) invalid()
       break
     case 'nat-started':
+    case 'nat-stats':
       if (
         !NAT_ROLES.has(common.role) ||
         !Number.isSafeInteger(message.sent) ||
