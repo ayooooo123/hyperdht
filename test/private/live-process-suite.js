@@ -21,6 +21,7 @@ const {
 
 const HEALTHY_SILENCE_MS = LINK_UNRESPONSIVE_AFTER + 500
 const BLACKHOLE_ROTATION_BOUND_MS = LINK_UNRESPONSIVE_AFTER + 3_500
+const READY_IDLE_MS = 2_000
 
 function capabilities(seed) {
   return {
@@ -466,6 +467,12 @@ function registerLiveProcessSuite(launch) {
         const ready = await sendAndWait('endpoint', 'activate', 'ready')
         t.is(ready.state, 'READY', 'endpoint activates after DHT setup')
       }
+      // KI-17 regression. A client waits as long as it likes between readiness and
+      // its first request; the exit's open authority once inherited the five-second
+      // finalization grace as its absolute deadline, so a request budget reaching
+      // past that window was refused. Two seconds here is the shortest wait that
+      // failed; the gate must not depend on the coordinator being fast.
+      await new Promise((resolve) => setTimeout(resolve, READY_IDLE_MS))
       const readyEndpointSnapshot = await sendAndWait('endpoint', 'snapshot', 'snapshot')
       t.is(readyEndpointSnapshot.guardOnly, true, 'endpoint semantic edge is guard-only')
       t.is(
