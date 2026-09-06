@@ -302,6 +302,51 @@ function zeroBytes(value) {
   return true
 }
 
+function digestList(value) {
+  if (!Array.isArray(value) || safeProxy(value)) invalid()
+  const list = []
+  for (let index = 0; index < value.length; index++) {
+    const digest = own(value, String(index))
+    if (length(digest) !== 32) invalid()
+    list.push(digest)
+  }
+  return list
+}
+
+function includes(list, digest) {
+  return list.some((entry) => b4a.equals(entry, digest))
+}
+
+// The storage oracle: a DHT role holds exactly the records the scenario put there.
+// The setup value lives on dht-value alone and never leaves it; routed puts land
+// wherever the DHT places them, but only records the coordinator announced through
+// `expectRoutedRecords` are admissible anywhere.
+function checkDhtStorage(role, event, state, closedSnapshot) {
+  const count = own(event, 'storedValueCount')
+  const digests = digestList(own(event, 'storedValueDigests'))
+  const targets = digestList(own(event, 'mutableRecordTargets'))
+  if (count !== digests.length) invalid()
+  if (closedSnapshot) {
+    if (digests.length !== 0 || targets.length !== 0) invalid()
+    return
+  }
+  const holdsSetupValue = includes(digests, state.targetHash)
+  if (role === 'dht-value') {
+    if (holdsSetupValue) state.dhtValueStored = true
+    else if (state.dhtValueStored) invalid()
+  } else if (holdsSetupValue) {
+    invalid()
+  }
+  for (const digest of digests) {
+    if (b4a.equals(digest, state.targetHash)) continue
+    if (!includes(state.routedValueDigests, digest)) invalid()
+  }
+  for (const target of targets) {
+    if (!includes(state.routedMutableTargets, target)) invalid()
+  }
+  if (role === 'dht-referral' && own(event, 'transientValueBytes') !== 0) invalid()
+}
+
 function validateDhtSnapshot(role, event, state) {
   const type = objectGetOwnPropertyDescriptor(event, 'type')
   if (!DHT_ROLES.has(role) || !type || !('value' in type) || type.value !== 'snapshot') return
@@ -310,23 +355,7 @@ function validateDhtSnapshot(role, event, state) {
   if (own(event, 'guardOnly') !== false) invalid()
   const closedSnapshot = own(event, 'state') === 'CLOSED'
   if (own(event, 'openResources') !== (closedSnapshot ? 0 : 1)) invalid()
-  if (role === 'dht-value') {
-    const count = own(event, 'storedValueCount')
-    const digest = own(event, 'storedValueDigest')
-    if (closedSnapshot) {
-      if (count !== 0 || !zeroBytes(digest)) invalid()
-    } else if (count === 0 && zeroBytes(digest) && !state.dhtValueStored) {
-      return
-    } else if (count === 1 && length(digest) === 32 && b4a.equals(digest, state.targetHash)) {
-      state.dhtValueStored = true
-    } else {
-      invalid()
-    }
-  } else if (role === 'dht-referral') {
-    if (own(event, 'storedValueCount') !== 0 || own(event, 'transientValueBytes') !== 0) invalid()
-  } else if (own(event, 'storedValueCount') !== 0) {
-    invalid()
-  }
+  checkDhtStorage(role, event, state, closedSnapshot)
 }
 
 const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
@@ -350,6 +379,8 @@ function validateRelationshipSnapshot(role, event) {
   if (selectedExit !== null || selectedMiddle !== null) invalid()
 }
 
+// A non-snapshot event that claims storage state is held to the same oracle as a
+// snapshot; only DHT roles may make the claim, and only with the full field set.
 function validatePostSetupState(role, event, state) {
   if (
     event === null ||
@@ -360,43 +391,16 @@ function validatePostSetupState(role, event, state) {
     return
   const type = objectGetOwnPropertyDescriptor(event, 'type')
   if (type && 'value' in type && type.value === 'snapshot') return
-  const count = objectGetOwnPropertyDescriptor(event, 'storedValueCount')
-  const digest = objectGetOwnPropertyDescriptor(event, 'storedValueDigest')
-  const transient = objectGetOwnPropertyDescriptor(event, 'transientValueBytes')
-  if (!count && !digest && !transient) return
-  if (
-    role === 'dht-value' &&
-    count &&
-    digest &&
-    !transient &&
-    'value' in count &&
-    'value' in digest &&
-    count.value === 1 &&
-    length(digest.value) === 32 &&
-    b4a.equals(digest.value, state.targetHash)
-  )
-    return
-  if (
-    role === 'dht-referral' &&
-    count &&
-    !digest &&
-    transient &&
-    'value' in count &&
-    'value' in transient &&
-    count.value === 0 &&
-    transient.value === 0
-  )
-    return
-  if (
-    role === 'dht-seed' &&
-    count &&
-    !digest &&
-    !transient &&
-    'value' in count &&
-    count.value === 0
-  )
-    return
-  invalid()
+  const claims = [
+    'storedValueCount',
+    'storedValueDigests',
+    'mutableRecordTargets',
+    'transientValueBytes'
+  ].filter((field) => objectGetOwnPropertyDescriptor(event, field))
+  if (claims.length === 0) return
+  if (!DHT_ROLES.has(role)) invalid()
+  if (claims.includes('transientValueBytes') !== (role === 'dht-referral')) invalid()
+  checkDhtStorage(role, event, state, false)
 }
 
 function createProcessConfigAuditor(oracle) {
@@ -440,7 +444,9 @@ function createProcessConfigAuditor(oracle) {
     targetHash: copy(oracle.targetHash, 32),
     plan: oracle.plan,
     projectionBytes: oracle.projectionBytes.map((value) => copy(value)),
-    projectionDigests: oracle.projectionDigests.map((value) => copy(value, 32))
+    projectionDigests: oracle.projectionDigests.map((value) => copy(value, 32)),
+    routedValueDigests: [],
+    routedMutableTargets: []
   }
   return Object.freeze({
     auditProjection(projection) {
@@ -493,6 +499,21 @@ function createProcessConfigAuditor(oracle) {
       validateRelationshipSnapshot(role, event)
       return true
     },
+    // The scenario announces a routed put before it issues it; only then may a DHT
+    // role report holding that record. Digests are copied, so a caller cannot
+    // widen the set later by mutating what it passed.
+    expectRoutedRecords(records) {
+      if (state.closed) closed()
+      exactObject(records, ['mutableTargets', 'valueDigests'])
+      for (const digest of digestList(own(records, 'valueDigests'))) {
+        if (b4a.equals(digest, state.targetHash)) invalid()
+        state.routedValueDigests.push(copy(digest, 32))
+      }
+      for (const target of digestList(own(records, 'mutableTargets'))) {
+        state.routedMutableTargets.push(copy(target, 32))
+      }
+      return true
+    },
     destroy() {
       if (state.closed) return
       state.closed = true
@@ -502,9 +523,13 @@ function createProcessConfigAuditor(oracle) {
       for (const value of state.forbiddenBytes) clear(value)
       for (const value of state.projectionBytes) clear(value)
       for (const value of state.projectionDigests) clear(value)
+      for (const value of state.routedValueDigests) clear(value)
+      for (const value of state.routedMutableTargets) clear(value)
       state.forbiddenBytes.length = 0
       state.projectionBytes.length = 0
       state.projectionDigests.length = 0
+      state.routedValueDigests.length = 0
+      state.routedMutableTargets.length = 0
     }
   })
 }

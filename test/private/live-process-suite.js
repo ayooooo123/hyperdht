@@ -116,7 +116,7 @@ function registerLiveProcessSuite(launch) {
             enter: placement ? placement.enter : undefined,
             nodePath: launch.nodePath
           })
-    const control = createProcessControl({ auditor, children })
+    const control = createProcessControl({ auditor, children, plan })
     const phases = new Map(ROLES.map((role) => [role, 1n]))
     const generations = new Map(
       topology.projections.map((projection) => [projection.role, projection.generation])
@@ -264,9 +264,10 @@ function registerLiveProcessSuite(launch) {
         const snapshot = await sendAndWait(role, 'snapshot', 'snapshot')
         preStoreSnapshots.push(snapshot)
         t.is(snapshot.storedValueCount, 0, `${role} has no value before setup store`)
+        t.alike(snapshot.storedValueDigests, [], `${role} holds no immutable record`)
+        t.alike(snapshot.mutableRecordTargets, [], `${role} holds no mutable record`)
       }
       t.is(preStoreSnapshots[1].transientValueBytes, 0)
-      t.ok(preStoreSnapshots[2].storedValueDigest.equals(b4a.alloc(32)))
 
       const referral = projectionFor('dht-referral')
       const referralGeneration = generations.get('dht-referral')
@@ -309,7 +310,7 @@ function registerLiveProcessSuite(launch) {
       t.is(afterStore[1].storedValueCount, 0, 'referral stores no value')
       t.is(afterStore[1].transientValueBytes, 0, 'referral clears transient value bytes')
       t.is(afterStore[2].storedValueCount, 1, 'value role stores exactly one value')
-      t.ok(afterStore[2].storedValueDigest.equals(topology.oracle.targetHash))
+      t.alike(afterStore[2].storedValueDigests, [topology.oracle.targetHash])
 
       // An exit MAY ask for a learned-closer grant when discovery returns an isolated
       // candidate. Real DHT ordering can also return the value directly, in which case
@@ -651,6 +652,63 @@ function registerLiveProcessSuite(launch) {
         })
       )
       t.ok((await resumedValueWaiting).value.equals(topology.oracle.immutableValue))
+
+      // Live announce-branch coverage. The in-process harness delivers no announce
+      // seed frames, so a routed put is exercised only here: an immutable put and a
+      // mutable put travel the announce branch to the exit that answered the
+      // announce-context query, land on the DHT roles, and read back exact over the
+      // lookup branch. Placed after every routing derivation above, because a put
+      // grows the announce exit's ordinary request count and `deriveRoutingState`
+      // tells the lookup pair apart by exactly that growth.
+      const routedValue = b4a.from(`announce-branch immutable put (${launch.runtime})`)
+      const routedTarget = cryptoSuite.hash([routedValue])
+      const mutableSeed = b4a.alloc(32, 0x5a)
+      const mutableKeyPair = cryptoSuite.keyPair(mutableSeed)
+      const mutableTarget = cryptoSuite.hash([mutableKeyPair.publicKey])
+      // The storage oracle admits exactly these two records on the DHT roles from
+      // here on; anything else a DHT role reports holding still fails the audit.
+      auditor.expectRoutedRecords({ mutableTargets: [mutableTarget], valueDigests: [routedTarget] })
+      const storedRouted = await sendAndWait('endpoint', 'immutable-put', 'stored-routed', {
+        value: routedValue
+      })
+      t.ok(storedRouted.target.equals(routedTarget), 'routed immutable put reports the value hash')
+      const routedBack = await sendAndWait('endpoint', 'immutable-get', 'value', {
+        target: storedRouted.target
+      })
+      t.ok(routedBack.value.equals(routedValue), 'announce-branch immutable put reads back exact')
+      const mutableValue = b4a.from(`announce-branch mutable put (${launch.runtime})`)
+      const storedMutable = await sendAndWait('endpoint', 'mutable-put', 'stored-routed', {
+        seed: mutableSeed,
+        seq: 1n,
+        value: mutableValue
+      })
+      t.ok(
+        storedMutable.target.equals(mutableTarget),
+        'routed mutable put reports the record target'
+      )
+      const mutableBack = await sendAndWait('endpoint', 'mutable-get', 'mutable-value', {
+        publicKey: mutableKeyPair.publicKey
+      })
+      t.is(mutableBack.seq, 1n, 'announce-branch mutable put reads back at its sequence')
+      t.ok(mutableBack.value.equals(mutableValue), 'announce-branch mutable put reads back exact')
+      // Which DHT role holds the records is the DHT's placement, not the harness's;
+      // that at least one of them reports each record is what proves the put landed.
+      const recordHolders = []
+      for (const role of ['dht-seed', 'dht-referral', 'dht-value']) {
+        recordHolders.push(await sendAndWait(role, 'snapshot', 'snapshot'))
+      }
+      t.ok(
+        recordHolders.some((snapshot) =>
+          snapshot.storedValueDigests.some((d) => d.equals(routedTarget))
+        ),
+        'a DHT role holds the routed immutable value'
+      )
+      t.ok(
+        recordHolders.some((snapshot) =>
+          snapshot.mutableRecordTargets.some((d) => d.equals(mutableTarget))
+        ),
+        'a DHT role holds the routed mutable record'
+      )
 
       if (productionEndpointPunch) {
         // The first-send replies were taken before the peer's packets could have
