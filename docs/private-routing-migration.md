@@ -300,10 +300,34 @@ assertion. Third dispatch, run
 the harness punch matrix arrived on 8 of 117 pairs and the run died in DHT
 setup, before any production step. Three runs, three different outcomes from
 runner placement alone; which runner draws a NAT that admits unsolicited peers
-is not under the harness's control. A green `-p` run therefore needs the guard
-(and ideally the endpoint) on a host with a known cone NAT — `-l 2` on the
-operator's machine or a VPS — which is an owner decision because it puts that
-host's reflected address in the run. Dispatching was stopped after the third run.
+is not under the harness's control. The owner approved placing the guard on
+the operator's machine (`-l 2`) on condition that its address never enters
+this repository; the records below therefore name that host only as "the
+operator host".
+
+Fourth dispatch, run
+[34061028552](https://github.com/ayooooo123/hyperdht/actions/runs/34061028552),
+ten roles on runners and the guard on the operator host: harness punch matrix
+117/117; production reflection equalled the minted tuple on the endpoint's
+runner and on the operator host; the four-step exchange took 738.1 ms; both
+sides made a first owned punch send; the endpoint bootstrapped through the
+production-punched pair, pinned the guard, and the first routed immutable get
+was exact; the initial routes, cancel, and healthy-silence checks all passed.
+**That is the KI-13 real-NAT proof for the endpoint↔guard edge: bind once,
+reflect the same socket, bilateral plan, punch from that socket, authenticated
+link, no harness punch on that edge and no close-and-rebind after reflection.**
+The run then failed at the blackhole rotation with `PROCESS_COMMAND_DEADLINE`:
+the coordinator's 5 s command deadline and the 5 s rotation bound are loopback
+constants, and a three-hop rebuild across runners after a 1.5 s detector window
+did not fit. The same step failed the same way in the first dispatch. A fifth
+run with the coordinator's documented diagnostic overrides
+(`PR_COMMAND_TIMEOUT_MS=20000`, `PR_SCENARIO_TIMEOUT_MS=120000`), run
+[34061182110](https://github.com/ayooooo123/hyperdht/actions/runs/34061182110),
+never reached the production steps: the runners' harness punch matrix arrived
+on 10 of 117 pairs, as in the third run, and DHT setup failed. The remote
+lifecycle after readiness — rotation under a blackhole across runners — is
+therefore still unmeasured with the punched edge; it is a harness-deadline
+question, not a NAT one. Dispatching stopped after the fifth run.
 
 Two contract notes. The reflectors observe the endpoint's socket before guard
 pinning; that is within the pre-guard exposure the security contract allows
@@ -1833,16 +1857,19 @@ value today, so nothing on the wire or in the live path changes.
 
 ### KI-13: the punch that makes a dispatch work is in the harness, not in production
 
-**Status: open on real-NAT evidence only. As of 2026-09-06 the production
-endpoint owns same-socket reflection, a bilateral signed plan exchanged over
-the topology owner's channel, and a bounded punch from the socket it then
-bootstraps with (see "Continuation checkpoint — 2026-09-06, KI-13 plan
-distribution"). The loopback `process:*:punch` gates prove the frame path; a
-`live-route.sh -p` dispatch has not been run. NAT'd middles and exits remain
-unsupported by decision D7: they are dialed cold at rotation time and have no
-pre-link channel, so the harness pre-punch below still opens those pairs and
-is test topology plumbing, not production. The paragraphs below describe the
-harness and remain accurate for the relay pairs.**
+**Status: endpoint↔guard edge proven on real NAT (fourth `-p` dispatch,
+run 34061028552: same-socket reflection, bilateral plan over the topology
+owner's channel, punch from the production socket, authenticated bootstrap and
+an exact routed get with no harness punch on that edge). Open residuals: the
+remote lifecycle after readiness is unmeasured with the punched edge because
+the scenario's 5 s command and rotation deadlines are loopback constants;
+relay pairs still depend on the harness pre-punch; the second dispatch measured
+a runner NAT that did not preserve the mapping across close-and-rebind
+(production failed closed). NAT'd middles and exits remain unsupported by
+decision D7: they are dialed cold at rotation time and have no pre-link
+channel, so the harness pre-punch below still opens those pairs and is test
+topology plumbing, not production. The paragraphs below describe the harness
+and remain accurate for the relay pairs.**
 
 The eleven-role dispatch now opens role-to-role NAT mappings before any role starts:
 the coordinator distributes all eleven addresses over a fourth bridge mode byte, and
