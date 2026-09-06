@@ -7,6 +7,7 @@ const { PassThrough } = require('stream')
 const { encodeControlFrame } = require('./process/control-channel')
 const {
   COMMAND_TIMEOUT_MS,
+  REMOTE_ACTIVATE_TIMEOUT_MS,
   SCENARIO_TIMEOUT_MS,
   STDERR_LIMIT_BYTES,
   TERMINATION_GRACE_MS,
@@ -14,6 +15,7 @@ const {
   resolveRuntimeLaunch,
   spawnRuntimeProcess
 } = require('./process/coordinator')
+const { PROCESS_PLANS } = require('./process/topology-fixture')
 
 class FakeChild extends EventEmitter {
   constructor() {
@@ -178,6 +180,60 @@ test('process control keeps scenario command and termination deadlines reference
     global.setTimeout = originalSetTimeout
     if (control !== null) await control.close()
   }
+})
+
+// The dht-mesh plan ships its own bound for the `ready` reply to `activate`; every
+// other event keeps the loopback command wait, and loopback plans are untouched.
+test('process control binds the remote activate reply by plan, other steps by the command wait', async (t) => {
+  const originalSetTimeout = global.setTimeout
+  const delays = []
+  global.setTimeout = (callback, delay, ...args) => {
+    delays.push(delay)
+    return originalSetTimeout(callback, delay, ...args)
+  }
+  let control = null
+  try {
+    const child = new FakeChild()
+    control = createProcessControl({
+      plan: PROCESS_PLANS.DHT_MESH,
+      children: [{ child, generation: 1n, phaseSequence: 1n, role: 'endpoint', roleIndex: 1 }]
+    })
+    delays.length = 0
+    control.expect('endpoint', 'ready', 1n).catch(() => {})
+    t.alike(delays, [REMOTE_ACTIVATE_TIMEOUT_MS], 'remote ready waits the plan bound')
+    delays.length = 0
+    control.expect('endpoint', 'snapshot', 1n).catch(() => {})
+    t.alike(delays, [COMMAND_TIMEOUT_MS], 'other remote steps keep the command wait')
+    await control.close()
+
+    const loopback = new FakeChild()
+    control = createProcessControl({
+      children: [
+        { child: loopback, generation: 1n, phaseSequence: 1n, role: 'endpoint', roleIndex: 1 }
+      ]
+    })
+    delays.length = 0
+    control.expect('endpoint', 'ready', 1n).catch(() => {})
+    t.alike(delays, [COMMAND_TIMEOUT_MS], 'loopback ready keeps the command wait')
+  } finally {
+    global.setTimeout = originalSetTimeout
+    if (control !== null) await control.close()
+  }
+  t.ok(REMOTE_ACTIVATE_TIMEOUT_MS > COMMAND_TIMEOUT_MS)
+  rejectsControlCode(t, () =>
+    createProcessControl({
+      plan: { name: 'dht-mesh' },
+      children: [
+        {
+          child: new FakeChild(),
+          generation: 1n,
+          phaseSequence: 1n,
+          role: 'endpoint',
+          roleIndex: 1
+        }
+      ]
+    })
+  )
 })
 
 test('process control preserves a sanitized configuration audit failure', async (t) => {

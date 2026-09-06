@@ -42,7 +42,10 @@ const COMMANDS = Object.freeze([
   'nat-plan',
   'nat-arm',
   'nat-start',
-  'nat-stats'
+  'nat-stats',
+  'immutable-put',
+  'mutable-put',
+  'mutable-get'
 ])
 
 const EVENTS = Object.freeze([
@@ -70,7 +73,9 @@ const EVENTS = Object.freeze([
   'nat-plan',
   'nat-armed',
   'nat-started',
-  'nat-stats'
+  'nat-stats',
+  'stored-routed',
+  'mutable-value'
 ])
 
 const ROLES = Object.freeze([
@@ -792,7 +797,10 @@ const COMMAND_FIELDS = Object.freeze({
   'nat-plan': Object.freeze([...BASE_FIELDS, 'counter']),
   'nat-arm': Object.freeze([...BASE_FIELDS, 'plan']),
   'nat-start': BASE_FIELDS,
-  'nat-stats': BASE_FIELDS
+  'nat-stats': BASE_FIELDS,
+  'immutable-put': Object.freeze([...BASE_FIELDS, 'value']),
+  'mutable-put': Object.freeze([...BASE_FIELDS, 'seed', 'seq', 'value']),
+  'mutable-get': Object.freeze([...BASE_FIELDS, 'publicKey'])
 })
 const EVENT_FIELDS = Object.freeze({
   configured: BASE_FIELDS,
@@ -887,17 +895,25 @@ const EVENT_FIELDS = Object.freeze({
     'refused',
     'sent',
     'strayReceived'
-  ])
+  ]),
+  'stored-routed': Object.freeze([...BASE_FIELDS, 'target']),
+  'mutable-value': Object.freeze([...BASE_FIELDS, 'publicKey', 'seq', 'value'])
 })
-const DHT_SEED_SNAPSHOT_FIELDS = Object.freeze([...EVENT_FIELDS.snapshot, 'storedValueCount'])
-const DHT_VALUE_SNAPSHOT_FIELDS = Object.freeze([
-  ...EVENT_FIELDS.snapshot,
+// Every DHT role reports exactly which records it holds: the digests of its stored
+// immutable values and the targets of its stored mutable records, sorted and unique,
+// so the coordinator's oracle can require the set to be precisely the setup value
+// plus the routed puts it commanded, and nothing else.
+const MAX_STORED_RECORDS = 8
+const DHT_STORAGE_FIELDS = Object.freeze([
   'storedValueCount',
-  'storedValueDigest'
+  'storedValueDigests',
+  'mutableRecordTargets'
 ])
+const DHT_SEED_SNAPSHOT_FIELDS = Object.freeze([...EVENT_FIELDS.snapshot, ...DHT_STORAGE_FIELDS])
+const DHT_VALUE_SNAPSHOT_FIELDS = DHT_SEED_SNAPSHOT_FIELDS
 const DHT_REFERRAL_SNAPSHOT_FIELDS = Object.freeze([
   ...EVENT_FIELDS.snapshot,
-  'storedValueCount',
+  ...DHT_STORAGE_FIELDS,
   'transientValueBytes'
 ])
 
@@ -1100,6 +1116,21 @@ function validateCommand(message, context) {
       if (!NAT_ROLES.has(common.role) || !boundedBytes(message.plan, MAX_NAT_PLAN_BYTES, true))
         invalid()
       break
+    case 'immutable-put':
+      if (common.role !== 'endpoint' || !boundedBytes(message.value, 1023, true)) invalid()
+      break
+    case 'mutable-put':
+      if (
+        common.role !== 'endpoint' ||
+        !fixed(message.seed, 32) ||
+        !uint64(message.seq, true) ||
+        !boundedBytes(message.value, 895, true)
+      )
+        invalid()
+      break
+    case 'mutable-get':
+      if (common.role !== 'endpoint' || !fixed(message.publicKey, 32)) invalid()
+      break
   }
   return message
 }
@@ -1134,6 +1165,32 @@ function arrayValues3(value) {
 function digestArray(value) {
   const values = arrayValues3(value)
   return values !== null && fixed(values[0], 32) && fixed(values[1], 32) && fixed(values[2], 32)
+}
+
+// A sorted, duplicate-free list of at most MAX_STORED_RECORDS 32-byte digests, read
+// through own data descriptors only, like arrayValues3.
+function sortedDigestArray(value) {
+  try {
+    if (!Array.isArray(value) || safeProxy(value)) return false
+    const lengthDescriptor = objectGetOwnPropertyDescriptor(value, 'length')
+    if (!lengthDescriptor || !('value' in lengthDescriptor)) return false
+    const length = lengthDescriptor.value
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_STORED_RECORDS) return false
+    const keys = reflectOwnKeys(value)
+    if (keys.length !== length + 1) return false
+    let previous = null
+    for (let index = 0; index < length; index++) {
+      const descriptor = objectGetOwnPropertyDescriptor(value, String(index))
+      if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) return false
+      const digest = descriptor.value
+      if (!fixed(digest, 32)) return false
+      if (previous !== null && b4a.compare(previous, digest) >= 0) return false
+      previous = digest
+    }
+    return true
+  } catch {
+    return false
+  }
 }
 
 function sequenceArray(value) {
@@ -1290,21 +1347,13 @@ function validateEvent(message, context) {
       )
         invalid()
       if (
-        common.role === 'dht-value' &&
-        (!Number.isSafeInteger(message.storedValueCount) ||
-          message.storedValueCount < 0 ||
-          message.storedValueCount > 1 ||
-          !fixed(message.storedValueDigest, 32) ||
-          (message.storedValueCount === 0 && !zeroBytes(message.storedValueDigest, 32)) ||
-          (message.storedValueCount === 1 && zeroBytes(message.storedValueDigest, 32)))
+        DHT_ROLES.has(common.role) &&
+        (!sortedDigestArray(message.storedValueDigests) ||
+          !sortedDigestArray(message.mutableRecordTargets) ||
+          message.storedValueCount !== message.storedValueDigests.length)
       )
         invalid()
-      if (
-        common.role === 'dht-referral' &&
-        (message.storedValueCount !== 0 || message.transientValueBytes !== 0)
-      )
-        invalid()
-      if (common.role === 'dht-seed' && message.storedValueCount !== 0) invalid()
+      if (common.role === 'dht-referral' && message.transientValueBytes !== 0) invalid()
       break
     }
     case 'error':
@@ -1331,6 +1380,18 @@ function validateEvent(message, context) {
       break
     case 'nat-counter':
       if (!NAT_ROLES.has(common.role) || !boundedBytes(message.counter, MAX_NAT_PLAN_BYTES, true))
+        invalid()
+      break
+    case 'stored-routed':
+      if (common.role !== 'endpoint' || !fixed(message.target, 32)) invalid()
+      break
+    case 'mutable-value':
+      if (
+        common.role !== 'endpoint' ||
+        !fixed(message.publicKey, 32) ||
+        !uint64(message.seq, true) ||
+        !boundedBytes(message.value, 895, true)
+      )
         invalid()
       break
     case 'nat-plan':

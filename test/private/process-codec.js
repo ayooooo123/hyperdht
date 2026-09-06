@@ -112,6 +112,12 @@ function validCommand(type) {
       return { ...base(type, 'endpoint', 1), counter: b4a.alloc(398, 8) }
     case 'nat-arm':
       return { ...base(type, 'guard', 2), plan: b4a.alloc(462, 9) }
+    case 'immutable-put':
+      return { ...base(type), value: b4a.from('routed immutable') }
+    case 'mutable-put':
+      return { ...base(type), seed: b4a.alloc(32, 10), seq: 1n, value: b4a.from('routed mutable') }
+    case 'mutable-get':
+      return { ...base(type), publicKey: b4a.alloc(32, 11) }
     default:
       return base(type)
   }
@@ -209,6 +215,15 @@ function validEvent(type) {
       return { ...base(type, 'guard', 2), counter: b4a.alloc(398, 8) }
     case 'nat-plan':
       return { ...base(type, 'endpoint', 1), plan: b4a.alloc(462, 9) }
+    case 'stored-routed':
+      return { ...base(type), target: b4a.alloc(32, 12) }
+    case 'mutable-value':
+      return {
+        ...base(type),
+        publicKey: b4a.alloc(32, 11),
+        seq: 1n,
+        value: b4a.from('routed mutable')
+      }
     case 'nat-armed':
       return base(type, 'guard', 2)
     case 'nat-started':
@@ -675,7 +690,10 @@ test('exact command and event registries are frozen and all schemas reject extra
     'nat-plan',
     'nat-arm',
     'nat-start',
-    'nat-stats'
+    'nat-stats',
+    'immutable-put',
+    'mutable-put',
+    'mutable-get'
   ])
   t.alike(EVENTS, [
     'configured',
@@ -702,7 +720,9 @@ test('exact command and event registries are frozen and all schemas reject extra
     'nat-plan',
     'nat-armed',
     'nat-started',
-    'nat-stats'
+    'nat-stats',
+    'stored-routed',
+    'mutable-value'
   ])
   t.ok(Object.isFrozen(COMMANDS))
   t.ok(Object.isFrozen(EVENTS))
@@ -880,13 +900,14 @@ test('control validation binds exact role index generation phase and special aut
   pendingTopology.stop()
 })
 
-test('snapshot state exposes only sanitized post-setup DHT value state', (t) => {
+test('snapshot state exposes only exact sorted DHT record sets', (t) => {
   const value = {
     ...validEvent('snapshot'),
     role: 'dht-value',
     roleIndex: 11,
-    storedValueCount: 1,
-    storedValueDigest: b4a.alloc(32, 8)
+    storedValueCount: 2,
+    storedValueDigests: [b4a.alloc(32, 8), b4a.alloc(32, 9)],
+    mutableRecordTargets: [b4a.alloc(32, 3)]
   }
   t.alike(validateControlMessage(value, messageContext('event', value)), value)
   const exit = {
@@ -915,6 +936,8 @@ test('snapshot state exposes only sanitized post-setup DHT value state', (t) => 
     role: 'dht-referral',
     roleIndex: 10,
     storedValueCount: 0,
+    storedValueDigests: [],
+    mutableRecordTargets: [],
     transientValueBytes: 0
   }
   t.alike(validateControlMessage(referral, messageContext('event', referral)), referral)
@@ -924,26 +947,36 @@ test('snapshot state exposes only sanitized post-setup DHT value state', (t) => 
       messageContext('event', referral)
     )
   )
-  throwsCode(t, () =>
-    validateControlMessage({ ...referral, storedValueCount: 1 }, messageContext('event', referral))
-  )
 
   const seed = {
     ...validEvent('snapshot'),
     role: 'dht-seed',
     roleIndex: 9,
-    storedValueCount: 0
+    storedValueCount: 0,
+    storedValueDigests: [],
+    mutableRecordTargets: []
   }
   t.alike(validateControlMessage(seed, messageContext('event', seed)), seed)
-  throwsCode(t, () =>
-    validateControlMessage({ ...seed, storedValueCount: 1 }, messageContext('event', seed))
-  )
-  throwsCode(t, () =>
-    validateControlMessage(
-      { ...value, value: b4a.from('raw immutable') },
-      messageContext('event', value)
-    )
-  )
+  for (const mutation of [
+    // count must equal the list length
+    { storedValueCount: 1 },
+    // unsorted, duplicate, wrong width, over the record bound
+    { storedValueCount: 2, storedValueDigests: [b4a.alloc(32, 9), b4a.alloc(32, 8)] },
+    { storedValueCount: 2, storedValueDigests: [b4a.alloc(32, 8), b4a.alloc(32, 8)] },
+    { storedValueCount: 1, storedValueDigests: [b4a.alloc(31, 8)] },
+    {
+      storedValueCount: 9,
+      storedValueDigests: Array.from({ length: 9 }, (_, index) => b4a.alloc(32, index + 1))
+    },
+    { mutableRecordTargets: [b4a.alloc(32, 2), b4a.alloc(32, 1)] },
+    { mutableRecordTargets: b4a.alloc(32) },
+    // the legacy single-digest field is gone
+    { storedValueDigest: b4a.alloc(32) },
+    { value: b4a.from('raw immutable') }
+  ]) {
+    const invalid = { ...seed, ...mutation }
+    throwsCode(t, () => validateControlMessage(invalid, messageContext('event', invalid)))
+  }
 })
 
 test('ready answered-request count is bounded and denied to roles that own no DHT', (t) => {

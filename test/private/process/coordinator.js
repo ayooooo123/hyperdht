@@ -12,9 +12,20 @@ const {
   TEST_ONLY_CONTROL_AUTHORITY_ISSUER,
   validateControlMessage
 } = require('./control-channel')
+const { PROCESS_PLANS } = require('./topology-fixture')
 
 const COMMAND_TIMEOUT_MS = 5_000
 const SCENARIO_TIMEOUT_MS = 30_000
+// A remote role's `activate` is not a loopback step: the endpoint reflects off two
+// reflectors (up to 4 s each), exchanges the production punch plan over real NAT, and
+// only then runs the bootstrap contact with its own 6.1 s deadline. Run 34062727729
+// missed the 5 s wait at exactly that step and run 34062848870 passed once the wait was
+// raised, so the dht-mesh plan ships its own bound for the `ready` reply. Loopback plans
+// keep the 5 s wait: their assertion counts stay canonical.
+const REMOTE_ACTIVATE_TIMEOUT_MS = 20_000
+const PLAN_EVENT_TIMEOUTS = new Map([
+  [PROCESS_PLANS.DHT_MESH, Object.freeze({ ready: REMOTE_ACTIVATE_TIMEOUT_MS })]
+])
 
 // Diagnostics only, and deliberately NOT reachable from a caller. A stalled step cannot
 // be watched past the deadline that kills it, so an operator debugging one may raise a
@@ -139,10 +150,12 @@ function createProcessControl(options) {
   const scenarioTimeoutMs = options.scenarioTimeoutMs || SCENARIO_TIMEOUT_MS
   const terminationGraceMs = options.terminationGraceMs || TERMINATION_GRACE_MS
   const auditor = options.auditor || null
+  const plan = options.plan === undefined ? PROCESS_PLANS.PORTABLE_LOOPBACK : options.plan
   if (
     commandTimeoutMs !== COMMAND_TIMEOUT_MS ||
     scenarioTimeoutMs !== SCENARIO_TIMEOUT_MS ||
-    terminationGraceMs !== TERMINATION_GRACE_MS
+    terminationGraceMs !== TERMINATION_GRACE_MS ||
+    !Object.values(PROCESS_PLANS).includes(plan)
   ) {
     throw new ProcessControlError('PROCESS_CONTROL_INVALID')
   }
@@ -150,6 +163,15 @@ function createProcessControl(options) {
   // so the caller-facing invariant is untouched by the diagnostic path.
   const effectiveCommandTimeoutMs = overriddenDeadline('PR_COMMAND_TIMEOUT_MS', commandTimeoutMs)
   const effectiveScenarioTimeoutMs = overriddenDeadline('PR_SCENARIO_TIMEOUT_MS', scenarioTimeoutMs)
+  // The plan's own step bounds are shipped literals, not caller input; the diagnostic
+  // override can only lengthen them.
+  const planEventTimeouts = PLAN_EVENT_TIMEOUTS.get(plan) || null
+  function commandDeadlineFor(event) {
+    const stepMs = planEventTimeouts === null ? undefined : planEventTimeouts[event]
+    return stepMs === undefined
+      ? effectiveCommandTimeoutMs
+      : Math.max(stepMs, effectiveCommandTimeoutMs)
+  }
 
   const records = new Map()
   const waiters = new Map()
@@ -403,7 +425,7 @@ function createProcessControl(options) {
       waiters.delete(waiterKey)
       pending.reject(new ProcessControlError('PROCESS_COMMAND_DEADLINE'))
       fail(role, 'COMMAND', 'PROCESS_COMMAND_DEADLINE')
-    }, effectiveCommandTimeoutMs)
+    }, commandDeadlineFor(event))
     waiters.set(waiterKey, {
       ...pending,
       many,
@@ -776,6 +798,7 @@ function spawnRoleProcesses(runtime, projections, options = {}) {
 module.exports = Object.freeze({
   COMMAND_TIMEOUT_MS,
   HARD_KILL,
+  REMOTE_ACTIVATE_TIMEOUT_MS,
   SCENARIO_TIMEOUT_MS,
   STDERR_LIMIT_BYTES,
   TERMINATION_GRACE_MS,

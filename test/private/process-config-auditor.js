@@ -761,8 +761,17 @@ test('auditor binds sanitized post-setup DHT value state to the topology oracle'
     type: 'snapshot',
     ...storage
   })
-  const seedSnapshot = snapshot('dht-seed', 9, { storedValueCount: 0 })
+  const empty = { storedValueCount: 0, storedValueDigests: [], mutableRecordTargets: [] }
+  const seedSnapshot = snapshot('dht-seed', 9, empty)
   t.is(auditor.auditEvent('dht-seed', seedSnapshot), true)
+  const target = b4a.from(fixture.oracle.targetHash)
+  const routedDigest = b4a.alloc(32, 0xaa)
+  const routedMutable = b4a.alloc(32, 0xbb)
+  const holding = (digests, targets = []) => ({
+    storedValueCount: digests.length,
+    storedValueDigests: digests,
+    mutableRecordTargets: targets
+  })
   for (const mutation of [
     { activeOperations: 1 },
     { controllerGeneration: 1n },
@@ -771,54 +780,32 @@ test('auditor binds sanitized post-setup DHT value state to the topology oracle'
     { openLinks: 1 },
     { isolatedGrantRequestCount: 1 },
     { openResources: 0 },
-    { storedValueCount: 1 }
+    // the count must match the list
+    { storedValueCount: 1 },
+    // the setup value never lands on seed or referral
+    holding([target]),
+    // nothing is admissible before it is announced
+    holding([routedDigest]),
+    holding([], [routedMutable])
   ]) {
     throwsCode(t, () => auditor.auditEvent('dht-seed', { ...seedSnapshot, ...mutation }))
   }
-  const emptyValueSnapshot = snapshot('dht-value', 11, {
-    storedValueCount: 0,
-    storedValueDigest: b4a.alloc(32)
-  })
+  const emptyValueSnapshot = snapshot('dht-value', 11, empty)
   t.is(auditor.auditEvent('dht-value', emptyValueSnapshot), true)
   throwsCode(t, () =>
-    auditor.auditEvent('dht-value', {
-      ...emptyValueSnapshot,
-      storedValueDigest: b4a.from(fixture.oracle.targetHash)
-    })
+    auditor.auditEvent('dht-value', snapshot('dht-value', 11, holding([b4a.alloc(32, 0xff)])))
   )
-  t.is(
-    auditor.auditEvent(
-      'dht-value',
-      snapshot('dht-value', 11, {
-        storedValueCount: 1,
-        storedValueDigest: b4a.from(fixture.oracle.targetHash)
-      })
-    ),
-    true
-  )
+  t.is(auditor.auditEvent('dht-value', snapshot('dht-value', 11, holding([target]))), true)
+  // once stored, the setup value may not vanish from dht-value before close
   throwsCode(t, () => auditor.auditEvent('dht-value', emptyValueSnapshot))
-  t.is(
-    auditor.auditEvent(
-      'dht-value',
-      snapshot('dht-value', 11, { storedValueCount: 0, storedValueDigest: b4a.alloc(32) }, 'CLOSED')
-    ),
-    true
+  t.is(auditor.auditEvent('dht-value', snapshot('dht-value', 11, empty, 'CLOSED')), true)
+  throwsCode(t, () =>
+    auditor.auditEvent('dht-value', snapshot('dht-value', 11, holding([target]), 'CLOSED'))
   )
-  t.is(
-    auditor.auditEvent('dht-value', {
-      storedValueCount: 1,
-      storedValueDigest: b4a.from(fixture.oracle.targetHash)
-    }),
-    true
-  )
-  t.is(
-    auditor.auditEvent('dht-referral', {
-      storedValueCount: 0,
-      transientValueBytes: 0
-    }),
-    true
-  )
-  t.is(auditor.auditEvent('dht-seed', { storedValueCount: 0 }), true)
+  // a non-snapshot claim is held to the same oracle
+  t.is(auditor.auditEvent('dht-value', holding([target])), true)
+  t.is(auditor.auditEvent('dht-referral', { ...empty, transientValueBytes: 0 }), true)
+  t.is(auditor.auditEvent('dht-seed', empty), true)
   t.is(
     auditor.auditEvent('endpoint', {
       target: b4a.from(fixture.oracle.targetHash),
@@ -826,37 +813,46 @@ test('auditor binds sanitized post-setup DHT value state to the topology oracle'
     }),
     true
   )
+  throwsCode(t, () => auditor.auditEvent('dht-value', holding([b4a.alloc(32, 0xff)])))
   throwsCode(t, () =>
-    auditor.auditEvent('dht-value', {
-      storedValueCount: 1,
-      storedValueDigest: b4a.alloc(32, 0xff)
-    })
+    auditor.auditEvent('dht-referral', { ...holding([target]), transientValueBytes: 0 })
   )
-  throwsCode(t, () =>
-    auditor.auditEvent('dht-value', {
-      storedValueCount: 0,
-      storedValueDigest: b4a.from(fixture.oracle.targetHash)
-    })
-  )
+  throwsCode(t, () => auditor.auditEvent('dht-referral', { ...empty, transientValueBytes: 1 }))
+  throwsCode(t, () => auditor.auditEvent('dht-referral', empty))
+  throwsCode(t, () => auditor.auditEvent('dht-seed', { ...empty, transientValueBytes: 0 }))
+  throwsCode(t, () => auditor.auditEvent('endpoint', empty))
   throwsCode(t, () =>
     auditor.auditEvent('dht-referral', {
-      storedValueCount: 1,
-      transientValueBytes: 0
-    })
-  )
-  throwsCode(t, () =>
-    auditor.auditEvent('dht-referral', {
-      storedValueCount: 0,
-      transientValueBytes: 1
-    })
-  )
-  throwsCode(t, () => auditor.auditEvent('dht-seed', { storedValueCount: 1 }))
-  throwsCode(t, () =>
-    auditor.auditEvent('dht-referral', {
-      storedValueCount: 0,
+      ...empty,
       transientValueBytes: 0,
       value: b4a.from(fixture.oracle.immutableValue)
     })
+  )
+
+  // Announced routed records become admissible on every DHT role, beside the
+  // setup value on dht-value; the setup target itself cannot be announced.
+  throwsCode(t, () => auditor.expectRoutedRecords({ mutableTargets: [], valueDigests: [target] }))
+  throwsCode(t, () => auditor.expectRoutedRecords({ valueDigests: [routedDigest] }))
+  t.is(
+    auditor.expectRoutedRecords({ mutableTargets: [routedMutable], valueDigests: [routedDigest] }),
+    true
+  )
+  t.is(
+    auditor.auditEvent(
+      'dht-seed',
+      snapshot('dht-seed', 9, holding([routedDigest], [routedMutable]))
+    ),
+    true
+  )
+  t.is(
+    auditor.auditEvent('dht-value', snapshot('dht-value', 11, holding([routedDigest, target]))),
+    true
+  )
+  throwsCode(t, () =>
+    auditor.auditEvent('dht-value', snapshot('dht-value', 11, holding([routedDigest])))
+  )
+  throwsCode(t, () =>
+    auditor.auditEvent('dht-seed', snapshot('dht-seed', 9, holding([], [b4a.alloc(32, 0xcc)])))
   )
   auditor.destroy()
   fixture.stop()

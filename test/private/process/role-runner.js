@@ -1013,6 +1013,68 @@ function immutableGet(target) {
   return sequence
 }
 
+// The three routed write/read operations share the get's one-slot operation model:
+// one owned operation at a time, started after a short schedule so a `cancel` can
+// still race it, and reported through its own event. Puts travel the announce
+// branch in production (`immutablePut`/`mutablePut` query the announce context and
+// commit through the exit that answered), which is exactly what the in-process
+// harness cannot deliver, so this is the live coverage for that path.
+function startEndpointOperation(run) {
+  if (projection.role !== 'endpoint' || (state !== 'READY' && state !== 'BOOTSTRAPPING')) {
+    throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+  }
+  if (activeOperation !== null)
+    throw Object.assign(new Error(), { code: 'PROCESS_OPERATION_ACTIVE' })
+  const sequence = ++operationSequence
+  const timer = schedule(() => {
+    if (activeOperation === null || activeOperation.sequence !== sequence) return
+    activeOperation.timer = null
+    void run(sequence).catch((err) => fatal(err))
+  }, 25)
+  activeOperation = { sequence, target: b4a.alloc(32), timer }
+  return sequence
+}
+
+function immutablePut(value) {
+  const ownedValue = b4a.from(value)
+  return startEndpointOperation(async (sequence) => {
+    const reply = await endpointController.immutablePut(ownedValue)
+    if (activeOperation === null || activeOperation.sequence !== sequence) return
+    if (!reply || !same(reply.hash, cryptoSuite.hash([ownedValue]))) {
+      throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+    }
+    activeOperation = null
+    await emit('stored-routed', { target: reply.hash })
+  })
+}
+
+function mutablePut(seed, seq, value) {
+  const keyPair = cryptoSuite.keyPair(b4a.from(seed))
+  const ownedValue = b4a.from(value)
+  return startEndpointOperation(async (sequence) => {
+    const reply = await endpointController.mutablePut(keyPair, ownedValue, { seq: Number(seq) })
+    if (activeOperation === null || activeOperation.sequence !== sequence) return
+    if (!reply || !same(reply.publicKey, keyPair.publicKey) || reply.seq !== Number(seq)) {
+      throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+    }
+    activeOperation = null
+    await emit('stored-routed', { target: cryptoSuite.hash([keyPair.publicKey]) })
+  })
+}
+
+function mutableGet(publicKey) {
+  const ownedKey = b4a.from(publicKey)
+  return startEndpointOperation(async (sequence) => {
+    const reply = await endpointController.mutableGet(ownedKey)
+    if (activeOperation === null || activeOperation.sequence !== sequence) return
+    if (!reply || !b4a.isBuffer(reply.value) || !Number.isSafeInteger(reply.seq)) {
+      throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+    }
+    activeOperation = null
+    await emit('mutable-value', { publicKey: ownedKey, seq: BigInt(reply.seq), value: reply.value })
+  })
+}
+
 async function cancelOperation(sequence) {
   if (
     projection.role !== 'endpoint' ||
@@ -1034,6 +1096,18 @@ async function cancelOperation(sequence) {
 function storedValues() {
   if (!dht || !dht._persistent || !dht._persistent.immutables) return []
   return Array.from(dht._persistent.immutables.values())
+}
+
+// The persistent mutable cache is keyed by the hex of the record target
+// (generichash of the public key), lib/persistent.js; the record itself carries no
+// key, so the target is what a DHT role can report.
+function storedMutableTargets() {
+  if (!dht || !dht._persistent || !dht._persistent.mutables) return []
+  return Array.from(dht._persistent.mutables.keys()).map((key) => b4a.from(key, 'hex'))
+}
+
+function sortedDigests(digests) {
+  return digests.sort((left, right) => b4a.compare(left, right))
 }
 
 function summaryDigest(summary) {
@@ -1088,14 +1162,12 @@ function snapshotFields(closed = false) {
     ...summary,
     summaryDigest: summaryDigest(summary)
   }
-  if (projection.role === 'dht-value') {
-    fields.storedValueCount = values.length
-    fields.storedValueDigest = values.length === 1 ? cryptoSuite.hash(values[0]) : b4a.alloc(32)
-  } else if (projection.role === 'dht-referral') {
-    fields.storedValueCount = 0
-    fields.transientValueBytes = 0
-  } else if (projection.role === 'dht-seed') {
-    fields.storedValueCount = 0
+  if (DHT_ROLES.has(projection.role)) {
+    const digests = closed ? [] : sortedDigests(values.map((value) => cryptoSuite.hash([value])))
+    fields.storedValueCount = digests.length
+    fields.storedValueDigests = digests
+    fields.mutableRecordTargets = closed ? [] : sortedDigests(storedMutableTargets())
+    if (projection.role === 'dht-referral') fields.transientValueBytes = 0
   }
   return fields
 }
@@ -1343,6 +1415,15 @@ async function handle(message) {
       return
     case 'immutable-get':
       immutableGet(message.target)
+      return
+    case 'immutable-put':
+      immutablePut(message.value)
+      return
+    case 'mutable-put':
+      mutablePut(message.seed, message.seq, message.value)
+      return
+    case 'mutable-get':
+      mutableGet(message.publicKey)
       return
     case 'cancel':
       await cancelOperation(message.operationSequence)
