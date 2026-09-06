@@ -54,6 +54,9 @@
     "udx-native": "1.20.7",
     "xache": "^1.1.0"
   },
+  "overrides": {
+    "sodium-native": "github:ayooooo123/sodium-native#562d642e1a78a8e124cf97bfbda77f01c02d1a7f"
+  },
   "devDependencies": {
     "bare-fs": "4.7.4",
     "bare-node-child-process": "^1.0.1",
