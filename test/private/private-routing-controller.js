@@ -206,6 +206,9 @@ test('private routing controller exposes only the internal lifecycle surface', a
   t.alike(methodNames(controller), [
     'destroy',
     'immutableGet',
+    'immutablePut',
+    'mutableGet',
+    'mutablePut',
     'networkChanged',
     'resume',
     'snapshot',

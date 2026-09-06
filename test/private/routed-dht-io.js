@@ -280,7 +280,7 @@ test('request emits exact immutable-get routed bytes and normalizes logical repl
   t.ok(retained.every((buffer) => buffer.every((byte) => byte === 0)))
 })
 
-test('announce request rejects before route IO', async (t) => {
+test('announce immutable-get request is accepted for prepare-phase destinations', async (t) => {
   const { io, authority, contexts } = fixture()
   authority.announce = [record(0x73)]
   const [to] = await io.bootstrap({
@@ -288,12 +288,14 @@ test('announce request rejects before route IO', async (t) => {
     limit: 1,
     context: contexts.immutableGet.announce
   })
-  expectCode(
-    t,
-    () => io.request(message(to, contexts.immutableGet.announce)),
-    'ERR_PRIVATE_COMMAND_UNSUPPORTED'
-  )
-  t.is(authority.calls.request, 0)
+  t.ok(to)
+  const operation = io.request(message(to, contexts.immutableGet.announce))
+  t.is(typeof operation.cancel, 'function')
+  t.is(authority.calls.request, 1)
+  operation.cancel()
+  try {
+    await operation.promise
+  } catch {}
 })
 
 test('request rejects wrong commands, branches, raw addresses, and stale destinations before authority', (t) => {
@@ -310,7 +312,8 @@ test('request rejects wrong commands, branches, raw addresses, and stale destina
       message(to, first.contexts.immutableGet.lookup, { command: COMMANDS.IMMUTABLE_PUT }),
       'ERR_PRIVATE_COMMAND_UNSUPPORTED'
     ],
-    [message(to, first.contexts.immutableGet.announce), 'ERR_PRIVATE_COMMAND_UNSUPPORTED'],
+    // Announce-context request against a lookup destination fails authentication.
+    [message(to, first.contexts.immutableGet.announce), 'ERR_AUTHENTICATION'],
     [
       message({ host: '127.0.0.1', port: 49737 }, first.contexts.immutableGet.lookup),
       'INVALID_ROUTE'
