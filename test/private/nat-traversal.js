@@ -35,6 +35,23 @@ const {
 const seed = (value) => b4a.alloc(32, value)
 const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
 
+const TEST_REFLECTORS = Object.freeze([
+  Object.freeze({
+    host: '203.0.113.201',
+    port: 1,
+    identity32: cryptoSuite.hash([b4a.from('nat-reflector-a')])
+  }),
+  Object.freeze({
+    host: '203.0.113.202',
+    port: 2,
+    identity32: cryptoSuite.hash([b4a.from('nat-reflector-b')])
+  })
+])
+
+function bindClaim(auth, host, port) {
+  return bindReflectedEndpointClaim(auth, { host, port }, { reflectors: TEST_REFLECTORS })
+}
+
 function expectCode(t, fn, code) {
   try {
     fn()
@@ -280,8 +297,8 @@ test('armNatPunch zero-send refusals cover trust binding (scenarios 1-10)', asyn
     await Promise.all([left.close(), right.close()])
   })
 
-  const claimA = bindReflectedEndpointClaim(leftAuth, { host: fx.hostA, port: fx.portA })
-  const claimB = bindReflectedEndpointClaim(rightAuth, { host: fx.hostB, port: fx.portB })
+  const claimA = bindClaim(leftAuth, fx.hostA, fx.portA)
+  const claimB = bindClaim(rightAuth, fx.hostB, fx.portB)
   const good = signedPlan(fx, claimA, claimB)
   const leftSocket = network.get('127.0.0.1:48301')
   const before = leftSocket.sent.length
@@ -388,8 +405,8 @@ test('armed punch sends and counts peer/stray (scenarios 20-22, 24, 30)', async 
     destroyFixture(fx)
     await Promise.all([left.close(), right.close()])
   })
-  const claimA = bindReflectedEndpointClaim(leftAuth, { host: fx.hostA, port: fx.portA })
-  const claimB = bindReflectedEndpointClaim(rightAuth, { host: fx.hostB, port: fx.portB })
+  const claimA = bindClaim(leftAuth, fx.hostA, fx.portA)
+  const claimB = bindClaim(rightAuth, fx.hostB, fx.portB)
   const encoding = signedPlan(fx, claimA, claimB, { planId32: seed(21) })
   const attempt = armNatPunch(leftAuth, fx.left.handle, encoding, {
     mode: 'initiate',
@@ -424,8 +441,8 @@ test('grant revoke stops attempt (scenario 26)', async (t) => {
     destroyFixture(fx)
     await Promise.all([left.close(), right.close()])
   })
-  const claimA = bindReflectedEndpointClaim(leftAuth, { host: fx.hostA, port: fx.portA })
-  const claimB = bindReflectedEndpointClaim(rightAuth, { host: fx.hostB, port: fx.portB })
+  const claimA = bindClaim(leftAuth, fx.hostA, fx.portA)
+  const claimB = bindClaim(rightAuth, fx.hostB, fx.portB)
   const encoding = signedPlan(fx, claimA, claimB, { planId32: seed(26) })
   const attempt = armNatPunch(leftAuth, fx.left.handle, encoding, {
     mode: 'initiate',

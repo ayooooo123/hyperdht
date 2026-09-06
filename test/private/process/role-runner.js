@@ -7,15 +7,31 @@ const UDX = require('udx-native')
 
 const { cryptoSuite } = require('../../../lib/private/crypto-suite')
 const {
-  createEndpointBootstrapAuthority
+  createEndpointBootstrapAuthority,
+  prepareEndpointNatTraversal
 } = require('../../../lib/private/endpoint-bootstrap-authority')
 const {
   createPrivateRoutingController
 } = require('../../../lib/private/private-routing-controller')
 const { RelayService } = require('../../../lib/private/relay-service')
-const { ROLE } = require('../../../lib/private/protocol')
+const { LINK_OPERATION, ROLE, TOPOLOGY_ROLE } = require('../../../lib/private/protocol')
 const { encodeCanonicalEndpoint } = require('../../../lib/private/relay-capability')
-const { UdxCellEndpoint } = require('../../../lib/private/udx-cell-endpoint')
+const { readReflectedEndpointClaim } = require('../../../lib/private/nat-reflect')
+const { LinkDirectory, decodeTopologyGrant } = require('../../../lib/private/topology-grant')
+const {
+  UdxCellEndpoint,
+  acceptNatPunch,
+  completeNatPunch,
+  counterNatPunch,
+  createLocalIdentitySecretCapability,
+  createNatTraversalAuthority,
+  destroyNatTraversalAuthority,
+  offerNatPunch,
+  readNatPunchAttemptStats,
+  reflectNatEndpoint,
+  startNatPunchAttempt,
+  stopNatPunchAttempt
+} = require('../../../lib/private/udx-cell-endpoint')
 const { AUDIT_CLASSES, AUDIT_PHASES, TEST_ONLY_AUDIT_CONTEXT_ISSUER } = require('./audit-event')
 const {
   ControlFrameDecoder,
@@ -60,7 +76,15 @@ const finishSocketCloseObservation = runtime.socketCloseLog
 let cellEndpoint = null
 let relayService = null
 let endpointController = null
+let endpointBootstrapAuthority = null
+let natAuthority = null
+let natClaim = null
+let natAttempt = null
+let natLinkDirectory = null
+let natLinkHandle = null
 let dht = null
+let natOfferToken = null
+let natCounterToken = null
 let setupAudit = null
 let wireService = null
 let guardProcessService = null
@@ -242,6 +266,7 @@ async function createEndpointOwner() {
     schedule,
     wallNow: runtime.wallNow
   })
+  endpointBootstrapAuthority = authority
   endpointController = createPrivateRoutingController({ endpointBootstrapAuthority: authority })
 }
 
@@ -579,6 +604,208 @@ async function createCellOwner() {
   }
 }
 
+function requireNatApis() {
+  if (
+    typeof prepareEndpointNatTraversal !== 'function' ||
+    typeof offerNatPunch !== 'function' ||
+    typeof counterNatPunch !== 'function' ||
+    typeof completeNatPunch !== 'function' ||
+    typeof acceptNatPunch !== 'function'
+  ) {
+    throw Object.assign(new Error(), { code: 'PROCESS_NAT_PUNCH_UNAVAILABLE' })
+  }
+}
+
+function destroyNatOwners() {
+  if (natAttempt !== null) {
+    try {
+      stopNatPunchAttempt(natAttempt)
+    } catch {}
+    natAttempt = null
+  }
+  if (natLinkDirectory !== null) {
+    try {
+      natLinkDirectory.destroy()
+    } catch {}
+    natLinkDirectory = null
+    natLinkHandle = null
+  }
+  if (natAuthority !== null) {
+    try {
+      destroyNatTraversalAuthority(natAuthority)
+    } catch {}
+    natAuthority = null
+  }
+  natClaim = null
+}
+
+function authorizeNatLink(grant, operation, localRole) {
+  const decoded = decodeTopologyGrant(grant)
+  const localIsA = b4a.equals(decoded.endpointA.identity32, projection.identityPublicKey)
+  const localIsB = b4a.equals(decoded.endpointB.identity32, projection.identityPublicKey)
+  if (!localIsA && !localIsB) {
+    throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
+  }
+  const peer = localIsA ? decoded.endpointB : decoded.endpointA
+  if (natLinkDirectory !== null) {
+    try {
+      natLinkDirectory.destroy()
+    } catch {}
+  }
+  natLinkDirectory = new LinkDirectory({
+    authorityPublicKey: projection.topologyAuthorityPublicKey,
+    cancel: cancelScheduled,
+    epoch: projection.topologyEpoch,
+    localIdentity32: projection.identityPublicKey,
+    localRole,
+    now: () => runtime.wallNow(),
+    onClose() {},
+    runId32: projection.topologyRunId,
+    schedule
+  })
+  const digest32 = natLinkDirectory.add(grant)
+  natLinkHandle = natLinkDirectory.authorize({
+    digest32,
+    epoch: projection.topologyEpoch,
+    localIdentity32: projection.identityPublicKey,
+    localRole,
+    operation,
+    peerIdentity32: peer.identity32,
+    peerRole: peer.role,
+    runId32: projection.topologyRunId
+  })
+}
+
+async function handleNatReflect() {
+  if (!projection.natTraversal || !Array.isArray(projection.natTraversal.reflectors)) {
+    throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
+  }
+  requireNatApis()
+  destroyNatOwners()
+  const reflectors = projection.natTraversal.reflectors
+  if (projection.role === 'endpoint') {
+    if (endpointBootstrapAuthority === null) {
+      throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+    }
+    const prepared = await prepareEndpointNatTraversal(endpointBootstrapAuthority, {
+      epoch: projection.topologyEpoch,
+      reflectors,
+      runId32: projection.topologyRunId,
+      ttlMs: 15_000
+    })
+    natAuthority = prepared.natAuthority
+    natClaim = prepared.claim
+    authorizeNatLink(projection.guardGrant, LINK_OPERATION.INITIATE, TOPOLOGY_ROLE.SOURCE)
+  } else if (projection.role === 'guard') {
+    if (cellEndpoint === null) {
+      throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+    }
+    if (
+      typeof createNatTraversalAuthority !== 'function' ||
+      typeof reflectNatEndpoint !== 'function'
+    ) {
+      throw Object.assign(new Error(), { code: 'PROCESS_NAT_PUNCH_UNAVAILABLE' })
+    }
+    const secret = createLocalIdentitySecretCapability({
+      localIdentity: projection.identityPublicKey,
+      localSecretKey: b4a.from(projection.identitySecretKey)
+    })
+    natAuthority = createNatTraversalAuthority(cellEndpoint, {
+      cancel: cancelScheduled,
+      epoch: projection.topologyEpoch,
+      localSecretCapability: secret,
+      now: () => runtime.wallNow(),
+      randomBytes,
+      runId32: projection.topologyRunId,
+      schedule
+    })
+    natClaim = await reflectNatEndpoint(natAuthority, reflectors, { ttlMs: 15_000 })
+    if (!projection.endpointGrant) {
+      throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
+    }
+    authorizeNatLink(projection.endpointGrant, LINK_OPERATION.ACCEPT, TOPOLOGY_ROLE.SAFETY_GUARD)
+  } else {
+    throw Object.assign(new Error(), { code: 'PROCESS_ROLE_MISMATCH' })
+  }
+  const view = readReflectedEndpointClaim(natClaim, { now: runtime.wallNow() })
+  await emit('nat-reflected', {
+    expiresAt: view.expiresAt,
+    observed: `${view.observed.host}:${view.observed.port}`
+  })
+}
+
+async function handleNatOffer() {
+  if (projection.role !== 'endpoint') {
+    throw Object.assign(new Error(), { code: 'PROCESS_ROLE_MISMATCH' })
+  }
+  requireNatApis()
+  if (natAuthority === null || natClaim === null || natLinkHandle === null) {
+    throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+  }
+  const result = offerNatPunch(natAuthority, natLinkHandle, natClaim)
+  natOfferToken = result.token
+  await emit('nat-offer', { offer: result.offer })
+}
+
+async function handleNatCounter(offer) {
+  if (projection.role !== 'guard') {
+    throw Object.assign(new Error(), { code: 'PROCESS_ROLE_MISMATCH' })
+  }
+  requireNatApis()
+  if (natAuthority === null || natClaim === null || natLinkHandle === null) {
+    throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+  }
+  const result = counterNatPunch(natAuthority, natLinkHandle, natClaim, offer)
+  natCounterToken = result.token
+  await emit('nat-counter', { counter: result.counter })
+}
+
+async function handleNatPlan(counter) {
+  if (projection.role !== 'endpoint') {
+    throw Object.assign(new Error(), { code: 'PROCESS_ROLE_MISMATCH' })
+  }
+  requireNatApis()
+  if (natAuthority === null || natOfferToken === null) {
+    throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+  }
+  const result = completeNatPunch(natAuthority, natOfferToken, counter)
+  natOfferToken = null
+  natAttempt = result.attempt
+  await emit('nat-plan', { plan: result.plan })
+}
+
+async function handleNatArm(plan) {
+  if (projection.role !== 'guard') {
+    throw Object.assign(new Error(), { code: 'PROCESS_ROLE_MISMATCH' })
+  }
+  requireNatApis()
+  if (natAuthority === null || natCounterToken === null) {
+    throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+  }
+  natAttempt = acceptNatPunch(natAuthority, natCounterToken, plan)
+  natCounterToken = null
+  await emit('nat-armed')
+}
+
+async function handleNatStart() {
+  if (projection.role !== 'endpoint' && projection.role !== 'guard') {
+    throw Object.assign(new Error(), { code: 'PROCESS_ROLE_MISMATCH' })
+  }
+  if (natAttempt === null || typeof startNatPunchAttempt !== 'function') {
+    throw Object.assign(new Error(), { code: 'PROCESS_NAT_PUNCH_UNAVAILABLE' })
+  }
+  const first = startNatPunchAttempt(natAttempt)
+  if (first && typeof first.then === 'function') await first
+  const stats = readNatPunchAttemptStats(natAttempt)
+  await emit('nat-started', {
+    firstOwnedSend: stats.firstOwnedSend === true,
+    received: stats.received,
+    refused: stats.refused,
+    sent: stats.sent,
+    strayReceived: stats.strayReceived
+  })
+}
+
 async function prepare() {
   if (state !== 'CONFIGURED') throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
   if (DHT_ROLES.has(projection.role)) {
@@ -656,6 +883,13 @@ async function activate() {
     state = 'DHT_SETUP'
   } else if (projection.role === 'endpoint') {
     state = 'BOOTSTRAPPING'
+    if (natAttempt !== null) {
+      const stats =
+        typeof readNatPunchAttemptStats === 'function' ? readNatPunchAttemptStats(natAttempt) : null
+      if (!stats || stats.firstOwnedSend !== true) {
+        throw Object.assign(new Error(), { code: 'PROCESS_NAT_PUNCH_UNAVAILABLE' })
+      }
+    }
     await endpointController.start()
     if (endpointController.snapshot().state !== 'READY') {
       throw Object.assign(new Error(), { code: 'PROCESS_ENDPOINT_NOT_READY' })
@@ -863,6 +1097,10 @@ async function stopOwners() {
   }
   endpointMonitorSnapshot = null
   endpointMonitorBusy = false
+  destroyNatOwners()
+  natOfferToken = null
+  natCounterToken = null
+  endpointBootstrapAuthority = null
   if (activeOperation !== null) {
     const operation = activeOperation
     activeOperation = null
@@ -1064,6 +1302,24 @@ async function handle(message) {
     case 'activate':
       await activate()
       await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+      return
+    case 'nat-reflect':
+      await handleNatReflect()
+      return
+    case 'nat-offer':
+      await handleNatOffer()
+      return
+    case 'nat-counter':
+      await handleNatCounter(message.offer)
+      return
+    case 'nat-plan':
+      await handleNatPlan(message.counter)
+      return
+    case 'nat-arm':
+      await handleNatArm(message.plan)
+      return
+    case 'nat-start':
+      await handleNatStart()
       return
     case 'store-immutable':
       await storeImmutable(message.value)

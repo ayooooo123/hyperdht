@@ -5,6 +5,7 @@ const { hrtime } = require('process')
 const b4a = require('b4a')
 const { digestTestIsolatedAddressTuple } = require('../../lib/private/dht-exit-test-topology-grant')
 const { deriveDhtExitPeerId } = require('../../lib/private/dht-exit-destination-table')
+const { cryptoSuite } = require('../../lib/private/crypto-suite')
 
 const { createCoherentTestClock } = require('./coherent-clock')
 const { createProcessConfigAuditor } = require('./process/config-auditor')
@@ -26,6 +27,19 @@ function capabilities(seed) {
     clocks: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.clocks(createCoherentTestClock()),
     entropy: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.entropy(b4a.alloc(32, seed))
   }
+}
+
+// Portable loopback has no NAT, so the production endpoint punch there proves only
+// the frame path: same-socket reflection off two live DHT roles, the bilateral plan
+// exchange over the coordinator, and both punch rounds crossing before the endpoint
+// bootstraps. dht-seed and dht-value answer the reflection PING because dht-rpc
+// replies to any source with the tuple it observed. identity32 is a label.
+function loopbackReflectors() {
+  return [9, 11].map((roleIndex) => {
+    const host = `127.64.${roleIndex}.1`
+    const port = 42_000 + roleIndex
+    return { host, port, identity32: cryptoSuite.hash([b4a.from(`${host}:${port}`)]) }
+  })
 }
 
 function base(projection, type, phaseSequence, generation = projection.generation) {
@@ -73,10 +87,22 @@ function registerLiveProcessSuite(launch) {
     // scenario below is identical either way: same protocol, same auditing.
     const prepared = launch.prepare ? await launch.prepare(t) : null
     const candidateOrder = process.env.PR_CANDIDATE_ORDER || 'normal'
+    const localPunch =
+      !launch.productionEndpointPunch &&
+      process.env.PR_PRODUCTION_ENDPOINT_PUNCH === '1' &&
+      plan === PROCESS_PLANS.PORTABLE_LOOPBACK
+    const productionEndpointPunch = launch.productionEndpointPunch === true || localPunch
+    const natTraversal = localPunch
+      ? { reflectors: loopbackReflectors() }
+      : (prepared && prepared.natTraversal) || launch.natTraversal || null
+    if (productionEndpointPunch && natTraversal === null) {
+      throw new Error('production endpoint punch needs reflectors')
+    }
     const topology = createLiveProcessTopology({
       candidateOrder,
       plan,
       ...(prepared && prepared.endpoints ? { endpoints: prepared.endpoints } : {}),
+      ...(productionEndpointPunch ? { natTraversal } : {}),
       ...capabilities(launch.runtime === 'node' ? 0x31 : 0x32)
     })
     const placement = launch.createPlacement ? launch.createPlacement(topology) : null
@@ -402,9 +428,47 @@ function registerLiveProcessSuite(launch) {
         }
       })
 
-      for (const role of ROLES.slice(0, 8).reverse()) {
+      for (const role of ROLES.slice(1, 8).reverse()) {
         const ready = await sendAndWait(role, 'activate', 'ready')
         t.is(ready.state, 'READY', `${role} activates after DHT setup`)
+      }
+
+      if (productionEndpointPunch) {
+        const punchStarted = hrtime.bigint()
+        const guardReflected = await control.natReflect('guard')
+        const endpointReflected = await control.natReflect('endpoint')
+        const endpointTuple = reachableTupleFor(projectionFor('endpoint'))
+        const guardTuple = reachableTupleFor(projectionFor('guard'))
+        const endpointMinted = `${endpointTuple.host}:${endpointTuple.port}`
+        const guardMinted = `${guardTuple.host}:${guardTuple.port}`
+        t.comment(
+          `production reflection endpoint observed=${endpointReflected.observed} minted=${endpointMinted}`
+        )
+        t.comment(
+          `production reflection guard observed=${guardReflected.observed} minted=${guardMinted}`
+        )
+        t.is(endpointReflected.observed, endpointMinted, 'endpoint reflects its minted tuple')
+        t.is(guardReflected.observed, guardMinted, 'guard reflects its minted tuple')
+
+        const offered = await control.natOffer('endpoint')
+        const countered = await control.natCounter('guard', offered.offer)
+        const planned = await control.natPlan('endpoint', countered.counter)
+        await control.natArm('guard', planned.plan)
+        const guardStarted = await control.natStart('guard')
+        const endpointStarted = await control.natStart('endpoint')
+        const punchElapsedMs = Number(hrtime.bigint() - punchStarted) / 1e6
+        t.comment(`production endpoint punch elapsed ${punchElapsedMs.toFixed(1)}ms`)
+        t.is(guardStarted.firstOwnedSend, true, 'guard first owned punch send')
+        t.is(endpointStarted.firstOwnedSend, true, 'endpoint first owned punch send')
+        t.ok(
+          guardStarted.received > 0 || endpointStarted.received > 0,
+          'at least one punch direction crossed'
+        )
+      }
+
+      {
+        const ready = await sendAndWait('endpoint', 'activate', 'ready')
+        t.is(ready.state, 'READY', 'endpoint activates after DHT setup')
       }
       const readyEndpointSnapshot = await sendAndWait('endpoint', 'snapshot', 'snapshot')
       t.is(readyEndpointSnapshot.guardOnly, true, 'endpoint semantic edge is guard-only')

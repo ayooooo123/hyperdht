@@ -28,9 +28,13 @@
 // Skips with a stated reason when no run is configured.
 
 const test = require('brittle')
+const b4a = require('b4a')
 const DHT = require('../..')
+const { cryptoSuite } = require('../../lib/private/crypto-suite')
+const { BOOTSTRAP_NODES } = require('../../lib/constants')
 const registerLiveProcessSuite = require('../private/live-process-suite')
 const { PROCESS_PLANS, ROLES } = require('../private/process/topology-fixture')
+const { resolveReflectors } = require('./dht-reflect')
 const {
   closeRemoteRoleChannels,
   openRemoteRoleChannels,
@@ -102,6 +106,7 @@ function sharedSubnets(endpoints) {
 }
 
 const options = config()
+const productionEndpointPunch = process.env.REMOTE_PEER_PRODUCTION_ENDPOINT_PUNCH === '1'
 
 if (options === null) {
   test('a live private route across eleven hosts', (t) => {
@@ -113,7 +118,10 @@ if (options === null) {
     runtime: 'node',
     runtimeVersion: process.version,
     plan: PROCESS_PLANS.DHT_MESH,
-    label: 'eleven remote hosts',
+    label: productionEndpointPunch
+      ? 'eleven remote hosts with production endpoint punch'
+      : 'eleven remote hosts',
+    productionEndpointPunch,
     async prepare(t) {
       // Roles queue, install and reflect before they answer, so the window is
       // minutes rather than the default thirty seconds.
@@ -159,6 +167,9 @@ if (options === null) {
       // An unanswered pair does NOT fail the run here. It is named instead, on its
       // own comment line, so the scenario's own verdict stands and the cause is in
       // the output above it rather than eight assertions downstream.
+      //
+      // Production endpoint punch owns endpoint<->guard, so the harness punch omits
+      // the endpoint role on both sides of the cross-product.
       const punches = await punchRoleEndpoints({
         node,
         secret: options.secret,
@@ -166,7 +177,8 @@ if (options === null) {
         runId: options.runId,
         endpoints,
         deadline,
-        comment: (message) => t.comment(message)
+        comment: (message) => t.comment(message),
+        ...(productionEndpointPunch ? { excludeIndexes: [1] } : {})
       })
 
       let arrived = 0
@@ -202,8 +214,30 @@ if (options === null) {
       // Nothing refreshes these mappings for the rest of the run: see the limits
       // documented at runPunchPhase in role-bridge.js. A pair the scenario leaves
       // idle past its NAT's UDP timeout loses its mapping with nothing reopening it.
+      let natTraversal = null
+      if (productionEndpointPunch) {
+        // Same two public bootstrap reflectors the bridge uses. identity32 is a
+        // stable label (hash of host:port), not an authenticated identity.
+        const resolved = (await resolveReflectors(BOOTSTRAP_NODES)).slice(0, 2)
+        if (resolved.length < 2) {
+          throw new Error('production endpoint punch needs two bootstrap reflectors')
+        }
+        natTraversal = {
+          reflectors: resolved.map((entry) => ({
+            host: entry.host,
+            identity32: cryptoSuite.hash([b4a.from(`${entry.host}:${entry.port}`)]),
+            port: entry.port
+          }))
+        }
+        t.comment(
+          `production reflectors ${natTraversal.reflectors
+            .map((entry) => `${entry.host}:${entry.port}`)
+            .join(', ')}`
+        )
+      }
       return {
         endpoints,
+        ...(natTraversal === null ? {} : { natTraversal }),
         async openChannels(projections) {
           const entries = await openRemoteRoleChannels({
             node,

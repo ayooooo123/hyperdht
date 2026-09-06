@@ -35,7 +35,13 @@ const COMMANDS = Object.freeze([
   'guard-loss',
   'phase-ack',
   'snapshot',
-  'stop'
+  'stop',
+  'nat-reflect',
+  'nat-offer',
+  'nat-counter',
+  'nat-plan',
+  'nat-arm',
+  'nat-start'
 ])
 
 const EVENTS = Object.freeze([
@@ -56,7 +62,13 @@ const EVENTS = Object.freeze([
   'unavailable',
   'snapshot',
   'closed',
-  'error'
+  'error',
+  'nat-reflected',
+  'nat-offer',
+  'nat-counter',
+  'nat-plan',
+  'nat-armed',
+  'nat-started'
 ])
 
 const ROLES = Object.freeze([
@@ -92,6 +104,9 @@ const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
 const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
 const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
 const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
+const NAT_ROLES = new Set(['endpoint', 'guard'])
+// Offer/counter/plan encodings from lib/private/nat-punch-plan.js (MAX_PLAN_BYTES).
+const MAX_NAT_PLAN_BYTES = 486
 
 const TAG = Object.freeze({
   NULL: 0,
@@ -768,7 +783,13 @@ const COMMAND_FIELDS = Object.freeze({
   'guard-loss': BASE_FIELDS,
   'phase-ack': Object.freeze([...BASE_FIELDS, 'acknowledgedPhaseSequence']),
   snapshot: BASE_FIELDS,
-  stop: BASE_FIELDS
+  stop: BASE_FIELDS,
+  'nat-reflect': BASE_FIELDS,
+  'nat-offer': BASE_FIELDS,
+  'nat-counter': Object.freeze([...BASE_FIELDS, 'offer']),
+  'nat-plan': Object.freeze([...BASE_FIELDS, 'counter']),
+  'nat-arm': Object.freeze([...BASE_FIELDS, 'plan']),
+  'nat-start': BASE_FIELDS
 })
 const EVENT_FIELDS = Object.freeze({
   configured: BASE_FIELDS,
@@ -842,7 +863,20 @@ const EVENT_FIELDS = Object.freeze({
     'summaryDigest'
   ]),
   closed: BASE_FIELDS,
-  error: Object.freeze([...BASE_FIELDS, 'code'])
+  error: Object.freeze([...BASE_FIELDS, 'code']),
+  'nat-reflected': Object.freeze([...BASE_FIELDS, 'expiresAt', 'observed']),
+  'nat-offer': Object.freeze([...BASE_FIELDS, 'offer']),
+  'nat-counter': Object.freeze([...BASE_FIELDS, 'counter']),
+  'nat-plan': Object.freeze([...BASE_FIELDS, 'plan']),
+  'nat-armed': BASE_FIELDS,
+  'nat-started': Object.freeze([
+    ...BASE_FIELDS,
+    'firstOwnedSend',
+    'received',
+    'refused',
+    'sent',
+    'strayReceived'
+  ])
 })
 const DHT_SEED_SNAPSHOT_FIELDS = Object.freeze([...EVENT_FIELDS.snapshot, 'storedValueCount'])
 const DHT_VALUE_SNAPSHOT_FIELDS = Object.freeze([
@@ -1036,6 +1070,23 @@ function validateCommand(message, context) {
     case 'phase-ack':
       if (message.acknowledgedPhaseSequence !== common.phaseSequence) invalid()
       consumePhaseGate(context.phaseGate, common, context)
+      break
+    case 'nat-reflect':
+    case 'nat-offer':
+    case 'nat-start':
+      if (!NAT_ROLES.has(common.role)) invalid()
+      break
+    case 'nat-counter':
+      if (!NAT_ROLES.has(common.role) || !boundedBytes(message.offer, MAX_NAT_PLAN_BYTES, true))
+        invalid()
+      break
+    case 'nat-plan':
+      if (!NAT_ROLES.has(common.role) || !boundedBytes(message.counter, MAX_NAT_PLAN_BYTES, true))
+        invalid()
+      break
+    case 'nat-arm':
+      if (!NAT_ROLES.has(common.role) || !boundedBytes(message.plan, MAX_NAT_PLAN_BYTES, true))
+        invalid()
       break
   }
   return message
@@ -1248,6 +1299,51 @@ function validateEvent(message, context) {
       if (
         typeof message.code !== 'string' ||
         !/^(ERR_[A-Z0-9_]{1,60}|PROCESS_[A-Z0-9_]{1,60})$/.test(message.code)
+      )
+        invalid()
+      break
+    case 'nat-reflected':
+      // `observed` is one `host:port` string: the leak oracle refuses events that
+      // name an address by field, and this one is the role's own reflection.
+      if (
+        !NAT_ROLES.has(common.role) ||
+        !validString(message.observed, 64) ||
+        !/^[0-9a-fA-F.:]+:[1-9][0-9]{0,4}$/.test(message.observed) ||
+        !uint64(message.expiresAt, true)
+      )
+        invalid()
+      break
+    case 'nat-offer':
+      if (!NAT_ROLES.has(common.role) || !boundedBytes(message.offer, MAX_NAT_PLAN_BYTES, true))
+        invalid()
+      break
+    case 'nat-counter':
+      if (!NAT_ROLES.has(common.role) || !boundedBytes(message.counter, MAX_NAT_PLAN_BYTES, true))
+        invalid()
+      break
+    case 'nat-plan':
+      if (!NAT_ROLES.has(common.role) || !boundedBytes(message.plan, MAX_NAT_PLAN_BYTES, true))
+        invalid()
+      break
+    case 'nat-armed':
+      if (!NAT_ROLES.has(common.role)) invalid()
+      break
+    case 'nat-started':
+      if (
+        !NAT_ROLES.has(common.role) ||
+        !Number.isSafeInteger(message.sent) ||
+        message.sent < 0 ||
+        message.sent > 4096 ||
+        !Number.isSafeInteger(message.refused) ||
+        message.refused < 0 ||
+        message.refused > 4096 ||
+        !Number.isSafeInteger(message.received) ||
+        message.received < 0 ||
+        message.received > 4096 ||
+        !Number.isSafeInteger(message.strayReceived) ||
+        message.strayReceived < 0 ||
+        message.strayReceived > 4096 ||
+        typeof message.firstOwnedSend !== 'boolean'
       )
         invalid()
       break

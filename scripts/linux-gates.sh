@@ -14,6 +14,8 @@
 #   process:bare     eleven-role live scenario, Bare roles
 #   process:node:reverse  eleven-role live scenario, reversed candidates, Node roles
 #   process:bare:reverse  eleven-role live scenario, reversed candidates, Bare roles
+#   process:node:punch    eleven-role live scenario with the production endpoint punch, Node roles
+#   process:bare:punch    eleven-role live scenario with the production endpoint punch, Bare roles
 #   namespace        namespace projection enforcement
 #   namespace:live   namespace live route with capture oracles
 #   all              every gate above, in that order (default)
@@ -64,9 +66,9 @@ expanded=()
 for gate in "${gates[@]}"; do
   case "$gate" in
     all)
-      expanded+=(aggregate:node aggregate:bare process:node process:bare process:node:reverse process:bare:reverse namespace namespace:live)
+      expanded+=(aggregate:node aggregate:bare process:node process:bare process:node:reverse process:bare:reverse process:node:punch process:bare:punch namespace namespace:live)
       ;;
-    aggregate:node | aggregate:bare | process:node | process:bare | process:node:reverse | process:bare:reverse | namespace | namespace:live)
+    aggregate:node | aggregate:bare | process:node | process:bare | process:node:reverse | process:bare:reverse | process:node:punch | process:bare:punch | namespace | namespace:live)
       expanded+=("$gate")
       ;;
     *)
@@ -84,6 +86,8 @@ command_for() {
     process:bare) echo 'PR_CANDIDATE_ORDER=normal npm run --silent test:private:process:bare' ;;
     process:node:reverse) echo 'PR_CANDIDATE_ORDER=reverse npm run --silent test:private:process:node' ;;
     process:bare:reverse) echo 'PR_CANDIDATE_ORDER=reverse npm run --silent test:private:process:bare' ;;
+    process:node:punch) echo 'PR_CANDIDATE_ORDER=normal PR_PRODUCTION_ENDPOINT_PUNCH=1 npm run --silent test:private:process:node' ;;
+    process:bare:punch) echo 'PR_CANDIDATE_ORDER=normal PR_PRODUCTION_ENDPOINT_PUNCH=1 npm run --silent test:private:process:bare' ;;
     namespace) echo 'npm run --silent test:private:namespace' ;;
     namespace:live) echo 'npm run --silent test:private:namespace:live' ;;
   esac

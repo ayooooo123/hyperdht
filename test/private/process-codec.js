@@ -101,6 +101,16 @@ function validCommand(type) {
       return base(type, 'guard', 2)
     case 'phase-ack':
       return { ...base(type), acknowledgedPhaseSequence: 11n }
+    case 'nat-reflect':
+    case 'nat-offer':
+    case 'nat-start':
+      return base(type, 'endpoint', 1)
+    case 'nat-counter':
+      return { ...base(type, 'guard', 2), offer: b4a.alloc(334, 7) }
+    case 'nat-plan':
+      return { ...base(type, 'endpoint', 1), counter: b4a.alloc(398, 8) }
+    case 'nat-arm':
+      return { ...base(type, 'guard', 2), plan: b4a.alloc(462, 9) }
     default:
       return base(type)
   }
@@ -186,6 +196,29 @@ function validEvent(type) {
       }
     case 'error':
       return { ...base(type), code: 'ERR_PRIVATE_ROUTE_UNAVAILABLE' }
+    case 'nat-reflected':
+      return {
+        ...base(type, 'endpoint', 1),
+        expiresAt: 15_000n,
+        observed: '203.0.113.10:42001'
+      }
+    case 'nat-offer':
+      return { ...base(type, 'endpoint', 1), offer: b4a.alloc(334, 7) }
+    case 'nat-counter':
+      return { ...base(type, 'guard', 2), counter: b4a.alloc(398, 8) }
+    case 'nat-plan':
+      return { ...base(type, 'endpoint', 1), plan: b4a.alloc(462, 9) }
+    case 'nat-armed':
+      return base(type, 'guard', 2)
+    case 'nat-started':
+      return {
+        ...base(type, 'endpoint', 1),
+        firstOwnedSend: true,
+        received: 1,
+        refused: 0,
+        sent: 3,
+        strayReceived: 0
+      }
     default:
       return base(type)
   }
@@ -633,7 +666,13 @@ test('exact command and event registries are frozen and all schemas reject extra
     'guard-loss',
     'phase-ack',
     'snapshot',
-    'stop'
+    'stop',
+    'nat-reflect',
+    'nat-offer',
+    'nat-counter',
+    'nat-plan',
+    'nat-arm',
+    'nat-start'
   ])
   t.alike(EVENTS, [
     'configured',
@@ -653,7 +692,13 @@ test('exact command and event registries are frozen and all schemas reject extra
     'unavailable',
     'snapshot',
     'closed',
-    'error'
+    'error',
+    'nat-reflected',
+    'nat-offer',
+    'nat-counter',
+    'nat-plan',
+    'nat-armed',
+    'nat-started'
   ])
   t.ok(Object.isFrozen(COMMANDS))
   t.ok(Object.isFrozen(EVENTS))

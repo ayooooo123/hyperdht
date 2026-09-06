@@ -331,24 +331,39 @@ async function requestRoleEndpoints(options) {
 // would replace the run's own verdict with a new failure mode. The reports name every
 // missing directed pair instead, which is what the caller comments.
 async function punchRoleEndpoints(options) {
-  const { node, secret, coordinatorSecret, runId, endpoints, deadline, comment } = options
+  const {
+    node,
+    secret,
+    coordinatorSecret,
+    runId,
+    endpoints,
+    deadline,
+    comment,
+    excludeIndexes = []
+  } = options
   if (!coordinatorSecret) {
     throw new Error('coordinatorSecret is required: roles pin only its public key')
   }
   if (!Array.isArray(endpoints) || endpoints.length === 0) {
     throw new Error('endpoints are required')
   }
+  const excluded = new Set(
+    (Array.isArray(excludeIndexes) ? excludeIndexes : []).map((value) => Number(value))
+  )
   const keyPair = coordinatorKeyPair(coordinatorSecret)
   const say = typeof comment === 'function' ? comment : () => {}
 
   // Every socket a role owns, keyed by role index. The exits' DHT socket is carried
   // separately because it is a second socket with its own mapping, dialled directly
   // by other roles: a plan naming only cell ports would open half the paths and move
-  // the failure rather than fix it.
+  // the failure rather than fix it. Production endpoint punch excludes the endpoint
+  // role (index 1) so the bilateral NAT path owns that edge alone.
   const plan = {}
   for (let offset = 0; offset < endpoints.length; offset++) {
+    const index = offset + 1
+    if (excluded.has(index)) continue
     const entry = endpoints[offset]
-    plan[offset + 1] = {
+    plan[index] = {
       host: entry.reachable.host,
       cellPort: entry.reachable.port,
       ...(entry.dhtExit ? { dhtHost: entry.dhtExit.host, dhtPort: entry.dhtExit.port } : {})
