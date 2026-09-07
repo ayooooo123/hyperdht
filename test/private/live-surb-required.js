@@ -182,6 +182,23 @@ function installHostedSurbReversePath(routing, exitIO, middleAuth, guardAuth) {
   return stats
 }
 
+// Answers exactly the next upstream packet the exit sends with `value`, the way a
+// DHT node would. One reply per request: a flood of duplicate replies to a settled
+// tid is not what a node does and leaves the exit's pending table in a shape no
+// later request on the route can use.
+async function respondOnce(harness, value) {
+  const base = harness.fakeSocket.sends.length
+  for (let attempt = 0; attempt < 5_000 && harness.fakeSocket.sends.length <= base; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  if (harness.fakeSocket.sends.length <= base) throw new Error('exit sent no upstream packet')
+  const sent = harness.fakeSocket.sends[base]
+  harness.fakeSocket.message(
+    dhtResponseFor(sent.packet, 0x10, b4a.concat([b4a.from([value.byteLength]), value])),
+    { host: sent.host || '8.8.8.8', port: sent.port || 49737 }
+  )
+}
+
 test('option gate refuses SURB_REQUIRED without experimentalSurbReplies', async (t) => {
   let routing = null
   let harness = null
@@ -234,25 +251,9 @@ test('SURB_REQUIRED live wire path returns exact value with hop cells and zero c
 
     const value = b4a.from('controller-live-surb-required-value')
     const target = cryptoSuite.hash([value])
-    const upstream = (async () => {
-      await waitFor(() => harness.fakeSocket.sends.length >= 1)
-      for (let i = 0; i < 40; i++) {
-        const n = harness.fakeSocket.sends.length
-        if (!n) {
-          await new Promise((r) => setTimeout(r, 2))
-          continue
-        }
-        const send = harness.fakeSocket.sends[n - 1]
-        harness.fakeSocket.message(
-          dhtResponseFor(send.packet, 0x10, b4a.concat([b4a.from([value.byteLength]), value])),
-          { host: send.host || '8.8.8.8', port: send.port || 49737 }
-        )
-        await new Promise((r) => setTimeout(r, 2))
-      }
-    })()
-
+    const upstream = respondOnce(harness, value)
     const result = await routing.immutableGet(target, { replyMode: REPLY_MODE.SURB_REQUIRED })
-    await upstream.catch(() => {})
+    await upstream
 
     t.alike(result.value, value)
     const snap = TEST_ONLY_DHT_EXIT_IO_STATE.snapshot(harness.exitIO)
@@ -264,6 +265,18 @@ test('SURB_REQUIRED live wire path returns exact value with hop cells and zero c
     t.ok(stats.terminalsDelivered >= 1, 'guard delivered terminal to endpoint')
     t.is(stats.middleDropped, 0)
     t.is(stats.guardDropped, 0)
+
+    // The required mode is a per-query hold, not a switch: a plain get afterwards
+    // is correlated again (a sticky mode once left every later get on the SURB
+    // path, and would have made a later correlated caller's request required).
+    const hopCellsBefore = snap.surbHopCellCount
+    const plainUpstream = respondOnce(harness, value)
+    const plain = await routing.immutableGet(target)
+    await plainUpstream
+    t.alike(plain.value, value)
+    const after = TEST_ONLY_DHT_EXIT_IO_STATE.snapshot(harness.exitIO)
+    t.is(after.correlatedFrameCount, 1, 'the following plain get is correlated')
+    t.is(after.surbHopCellCount, hopCellsBefore, 'no hop cell for the plain get')
   } finally {
     if (routing) await routing.destroy()
     if (harness) await closeLiveAuthorityHarness(harness)

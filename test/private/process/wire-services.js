@@ -41,6 +41,13 @@ const {
   digestTestIsolatedAddressTuple
 } = require('../../../lib/private/dht-exit-test-topology-grant')
 const { cryptoSuite } = require('../../../lib/private/crypto-suite')
+const {
+  createSurbCapabilityAuthority,
+  createSurbReplayAuthority
+} = require('../../../lib/private/surb')
+const { processRelaySurbHop } = require('../../../lib/private/relay-service')
+const { encodeSurbTerminalCell, tryDecodeSurbHopCell } = require('../../../lib/private/surb-batch')
+const { packSurbRouteFrame, unpackSurbRouteFrame } = require('../../../lib/private/surb-path')
 const { PrivateRouteError } = require('../../../lib/private/errors')
 const {
   claimFinalExitActivation,
@@ -663,6 +670,7 @@ function createTailRelayActor(options) {
     advertisement,
     identityPublicKey,
     identitySecretKey,
+    routeSecretKey = null,
     clocks,
     outgoing = null,
     incomingLink: initialIncomingLink = null,
@@ -682,10 +690,12 @@ function createTailRelayActor(options) {
     typeof clocks.schedule !== 'function' ||
     typeof clocks.cancelScheduled !== 'function' ||
     (initialIncomingRelease !== null && typeof initialIncomingRelease !== 'function') ||
-    (initialIncomingLink === null) !== (initialIncomingLinkService === null)
+    (initialIncomingLink === null) !== (initialIncomingLinkService === null) ||
+    (routeSecretKey !== null && (!b4a.isBuffer(routeSecretKey) || routeSecretKey.byteLength !== 32))
   ) {
     throw PrivateRouteError.INVALID_ROUTE()
   }
+  let surbHopsPeeled = 0
   const tail = createTailControlSession(adjacency.tail, {
     wallNow: clocks.wallNow,
     monotonicNow: clocks.monotonicNow,
@@ -841,13 +851,73 @@ function createTailRelayActor(options) {
         sends.push(transport.send(value))
       },
       install(nextRuntime, expiresAt) {
-        forwarding = createM3RelayForwardingFacade(adjacency.runtime, nextRuntime, {
+        const facadeOptions = {
           releaseDownstream: takeOutgoingRelease(),
           releaseUpstream: takeUpstreamRelease(),
           monotonicNow: clocks.monotonicNow,
           schedule: clocks.schedule,
           cancelScheduled: clocks.cancelScheduled
-        })
+        }
+        if (routeSecretKey !== null) {
+          // This relay peels SURB hops with its own capability secret only.
+          let decodedAdv = null
+          try {
+            decodedAdv = decodeRelayCapabilityAdvertisement(advertisement, {
+              now: clocks.wallNow()
+            })
+          } catch {
+            decodedAdv = null
+          }
+          if (decodedAdv) {
+            const capabilityAuthority = createSurbCapabilityAuthority({
+              routeSecretKey: b4a.from(routeSecretKey),
+              routeKey: b4a.from(decodedAdv.routeEncryptionPublicKey),
+              capabilityEpoch: decodedAdv.epoch,
+              issuedAtMs: decodedAdv.issuedAtMs,
+              expiresAtMs: decodedAdv.expiresAtMs,
+              now: clocks.monotonicNow()
+            })
+            const replayAuthority = createSurbReplayAuthority({ maxEntries: 256 })
+            facadeOptions.surbHopPeel = (payload) => {
+              if (!b4a.isBuffer(payload)) return null
+              let cell = unpackSurbRouteFrame(payload)
+              if (cell === null) {
+                // Accept raw hop cells as well as packed frames.
+                cell = tryDecodeSurbHopCell(payload) !== null ? b4a.from(payload) : null
+              }
+              if (cell === null) return null
+              let result = null
+              try {
+                result = processRelaySurbHop({
+                  payload: cell,
+                  capabilityAuthority,
+                  replayAuthority
+                })
+              } catch {
+                if (cell !== payload) cell.fill(0)
+                return null
+              }
+              if (cell !== payload) cell.fill(0)
+              if (result === null) return null
+              surbHopsPeeled++
+              if (result.terminal) {
+                const term = encodeSurbTerminalCell(result.nextHop, result.payload)
+                if (result.payload) result.payload.fill(0)
+                try {
+                  return packSurbRouteFrame(term)
+                } finally {
+                  term.fill(0)
+                }
+              }
+              try {
+                return packSurbRouteFrame(result.payload)
+              } finally {
+                if (result.payload) result.payload.fill(0)
+              }
+            }
+          }
+        }
+        forwarding = createM3RelayForwardingFacade(adjacency.runtime, nextRuntime, facadeOptions)
         const install = beginM3Install(adjacency.runtime, nextRuntime)
         validateM3Install(install, identityPublicKey, 128, clocks.wallNow())
         return commitM3Install(install, expiresAt, forwarding)
@@ -1031,6 +1101,9 @@ function createTailRelayActor(options) {
     get forwarding() {
       return forwarding
     },
+    get surbHopsPeeled() {
+      return surbHopsPeeled
+    },
     importReady,
     serve,
     sendReady,
@@ -1121,6 +1194,7 @@ async function acceptProjectedExtension(options) {
       advertisement,
       identityPublicKey,
       identitySecretKey,
+      routeSecretKey,
       clocks,
       outgoing,
       incomingLink: opened,
@@ -1459,7 +1533,9 @@ async function activateFinalExitActor(options) {
           ordinaryRequestCount: ioState.ordinaryRequestCount,
           pendingPackets: ioState.pendingPackets,
           referralProbeCount: ioState.referralProbeCount,
-          tableEntryCount: tableState.destinationRefs.length
+          tableEntryCount: tableState.destinationRefs.length,
+          surbHopCellCount: ioState.surbHopCellCount || 0,
+          correlatedFrameCount: ioState.correlatedFrameCount || 0
         })
       },
       async destroy() {
@@ -1622,6 +1698,7 @@ function createGuardProcessService(options) {
             advertisement,
             identityPublicKey,
             identitySecretKey,
+            routeSecretKey,
             clocks,
             outgoing: {
               allowedRole: ROLE.SAFETY,
@@ -1759,7 +1836,18 @@ function createGuardProcessService(options) {
     receiveBootstrap,
     receiveCell,
     receiveLinkFailure,
-    start
+    start,
+    snapshot() {
+      let peeled = 0
+      for (const actor of actors) {
+        if (typeof actor.surbHopsPeeled === 'number') peeled += actor.surbHopsPeeled
+      }
+      return Object.freeze({
+        openLinks: 0,
+        pending: 0,
+        surbHopsPeeled: peeled
+      })
+    }
   })
 }
 

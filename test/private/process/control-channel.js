@@ -26,6 +26,7 @@ const COMMANDS = Object.freeze([
   'store-immutable',
   'activate',
   'immutable-get',
+  'surb-get',
   'cancel',
   'rotate',
   'blackhole',
@@ -781,6 +782,7 @@ const COMMAND_FIELDS = Object.freeze({
   'store-immutable': Object.freeze([...BASE_FIELDS, 'value']),
   activate: BASE_FIELDS,
   'immutable-get': Object.freeze([...BASE_FIELDS, 'target']),
+  'surb-get': Object.freeze([...BASE_FIELDS, 'target']),
   cancel: Object.freeze([...BASE_FIELDS, 'operationSequence']),
   rotate: Object.freeze([...BASE_FIELDS, 'nextGeneration']),
   blackhole: BASE_FIELDS,
@@ -871,7 +873,10 @@ const EVENT_FIELDS = Object.freeze({
     'openResources',
     'queuedBytes',
     'state',
-    'summaryDigest'
+    'summaryDigest',
+    'surbHopsPeeled',
+    'surbHopCellCount',
+    'correlatedFrameCount'
   ]),
   closed: BASE_FIELDS,
   error: Object.freeze([...BASE_FIELDS, 'code']),
@@ -929,7 +934,10 @@ const SNAPSHOT_COUNT_FIELDS = Object.freeze([
   'pendingLinks',
   'pendingPackets',
   'referralProbeCount',
-  'tableEntryCount'
+  'tableEntryCount',
+  'surbHopsPeeled',
+  'surbHopCellCount',
+  'correlatedFrameCount'
 ])
 
 function issuePendingGrant(value) {
@@ -1073,6 +1081,9 @@ function validateCommand(message, context) {
       if (common.role !== 'dht-referral' || !boundedBytes(message.value, 4096, true)) invalid()
       break
     case 'immutable-get':
+      if (common.role !== 'endpoint' || !fixed(message.target, 32)) invalid()
+      break
+    case 'surb-get':
       if (common.role !== 'endpoint' || !fixed(message.target, 32)) invalid()
       break
     case 'cancel':

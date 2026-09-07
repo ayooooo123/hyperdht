@@ -198,7 +198,7 @@ function registerLiveProcessSuite(launch) {
       const observed = responder === undefined ? -1 : responder.observedCount()
       const count = snapshot.isolatedGrantRequestCount
       t.ok(
-        Number.isSafeInteger(count) && count === observed && count >= 0 && count <= 18,
+        Number.isSafeInteger(count) && count === observed && count >= 0 && count <= 30,
         `${role} matches coordinator-observed grant requests during ${stage}`
       )
       t.is(snapshot.pendingGrantRequests, 0, `${role} leaves no grant request pending`)
@@ -708,6 +708,46 @@ function registerLiveProcessSuite(launch) {
           snapshot.mutableRecordTargets.some((d) => d.equals(mutableTarget))
         ),
         'a DHT role holds the routed mutable record'
+      )
+
+      // Gate C: required SURB reply path over the live eleven-role mesh.
+      // Exit emits hop cells only; middle and guard peel with their own secrets;
+      // endpoint admits terminals. No correlated reverse frames.
+      const surbRoutingBefore = await routingSnapshots()
+      const surbExitCounts = new Map()
+      for (const role of exitRoles) {
+        surbExitCounts.set(role, surbRoutingBefore.get(role).ordinaryRequestCount)
+      }
+      const correlatedBefore = new Map()
+      for (const role of exitRoles) {
+        correlatedBefore.set(role, surbRoutingBefore.get(role).correlatedFrameCount || 0)
+      }
+      const surbValue = await sendAndWait('endpoint', 'surb-get', 'value', {
+        target: topology.oracle.targetHash
+      })
+      t.ok(
+        surbValue.value.equals(topology.oracle.immutableValue),
+        'surb-get returns the exact oracle value over the SURB path'
+      )
+      const surbRoutingAfter = await routingSnapshots()
+      const surbRouting = deriveRoutingState(surbRoutingAfter, surbExitCounts)
+      const surbMiddle = surbRoutingAfter.get(surbRouting.lookupPair.middleRole)
+      const surbExit = surbRoutingAfter.get(surbRouting.lookupPair.exitRole)
+      // Guard peels on the shared guard role.
+      const surbGuard = await sendAndWait('guard', 'snapshot', 'snapshot')
+      t.ok(
+        surbMiddle.surbHopsPeeled >= 1,
+        'lookup middle peeled at least one SURB hop with its own authority'
+      )
+      t.ok(
+        surbGuard.surbHopsPeeled >= 1,
+        'guard peeled at least one SURB hop with its own authority'
+      )
+      t.ok(surbExit.surbHopCellCount >= 1, 'lookup exit emitted at least one SURB hop cell')
+      t.is(
+        surbExit.correlatedFrameCount,
+        correlatedBefore.get(surbRouting.lookupPair.exitRole) || 0,
+        'SURB path adds no correlated reverse frames on the lookup exit'
       )
 
       if (productionEndpointPunch) {
