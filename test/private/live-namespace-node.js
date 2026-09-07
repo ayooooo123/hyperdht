@@ -96,8 +96,14 @@ if (!namespaceProvisioningAvailable()) {
           )
         },
         enter(roleIndex, command, args) {
+          // sudo drops the environment, so the role's diagnostic file paths ride
+          // on an explicit `env` inside the namespace.
+          const fatalLog = process.env.PR_ROLE_FATAL_LOG
           return provision.enter(roleIndex, 'env', [
             `PR_SOCKET_CLOSE_LOG=${path.join(provision.captureDir, `${roleIndex}.close.json`)}`,
+            ...(typeof fatalLog === 'string' && fatalLog.length > 0
+              ? [`PR_ROLE_FATAL_LOG=${fatalLog}`]
+              : []),
             command,
             ...args
           ])
