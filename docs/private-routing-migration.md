@@ -502,6 +502,8 @@ every layer itself with the relays' authorities ("local peel"); that was
 rejected on diff review as the shim the packet forbids and deleted, and the
 exit no longer accepts relay authorities at all.
 
+The historical item (3) below is corrected by the later link-sealing checkpoint.
+
 What is still not proven, stated plainly, as of commit `4993aae`: (1) the
 in-process live topology forwards reverse cells through opaque forwarders, not
 the M3 facade, so `live-surb-required` feeds each exit hop cell through
@@ -540,8 +542,8 @@ further request (the SURB path never settled it) — `onSurbReplySettled` now
 does; and the endpoint's receive race left the losing transport reservation
 armed after an injected terminal, so it swallowed the next correlated reply
 on the route. `live-surb-required` proves a plain get after a required one is
-correlated again (7/46). Item (3) remains open and is a wire-shape decision
-for review, not an integration gap.
+correlated again (7/46). Item (3)'s wire-layer distinction is corrected in
+the later link-sealing checkpoint below; external cryptographic review remains open.
 
 **Namespace gate and grants.** The routed put/get and required-SURB steps
 each rediscover the learned closers, which on the namespace plan are isolated
@@ -589,9 +591,9 @@ message IDs `0x0280–0x02a3` remain reserved and unused: Gate D records ride
 the mutable-record commands by seat decision; the routed presence commands
 belong to the Gate 3B remainder.
 
-Remaining work, in dependency order: (1) Gate C wire shape — whether SURB
-hop and terminal frames are sealed under the per-link route codec (review
-decision), then external cryptographic review of Gate C and Gate D; (2) the
+Remaining work, in dependency order: (1) external cryptographic review of
+Gate C and Gate D, including the existing link-sealed SURB framing and any
+separately approved wire change; (2) the
 next `-l 2 -p` dispatch as the check on the suspend-after-rotation wait;
 (3) Gate 3B remainder — routed `findPeer`, `lookup`, `announce`,
 `unannounce`, raw `query`, the required-mode `lookup`/`announce` mapping onto
@@ -682,6 +684,139 @@ Four normal/reverse process legs: 155 each; two production-punch legs:
 160 each; namespace: 27; live namespace: 165, raw DROP 0. Complete log:
 `/tmp/hyperdht-gate-d-period-floor-linux-gates.log`. The changed files pass
 Prettier. This run includes the older-period fallback regressions.
+
+### Continuation checkpoint — 2026-09-07, Gate C link sealing and target preflight
+
+The assigned `scary-elephant` worktree starts at `b4bad01`; a fetch found no
+newer commit on `origin/private-routing-v1`. No old worktree or uncommitted
+handoff was used. JD approved verifying the existing link-sealing boundary
+without changing the SURB wire contract.
+
+**Gate C exposure correction.** `routeSurbHop` packs a 1,100-byte frame and
+calls `sendM3RouteFrame`. That function calls `sendM3RuntimePayload`, then
+`sealTail`, which seals a 1,200-byte adjacency `CellCodec` packet. The M3
+relay opens the incoming link cell before `surbHopPeel`, then seals the
+result under the outgoing link context. The fixed `SURB-HOP-V1` and
+`SURB-TERM-V1` tags are visible to authenticated relays after decryption,
+not plaintext to a passive physical-link observer.
+
+`RoutePayloadCodec` is the separate endpoint–exit layer. Applying it to
+these reverse frames would prevent relay-local processing by the middle
+and guard unless distinct hop-owned contexts were designed. No extra
+envelope, exit-side local peel, or correlated fallback was added. Timing,
+volume, visible outer cell metadata, and operator-diversity limits remain.
+
+The namespace capture oracle now searches for both SURB tags using its
+existing leak-marker checks. A live eleven-role namespace run passed with
+the exact required reply, middle and guard peel evidence, no additional
+correlated reply frames, no plaintext SURB tag, fixed 1,200-byte cells,
+and raw DROP zero. A synthetic-capture positive control detects either
+injected tag. A direct `CellCodec` smoke recovers authentic packed frames
+and rejects tampering, wrong keys, wrong epochs, and replay for both tags.
+These checks are not external cryptographic approval or an anonymity claim.
+
+**Gate D review finding and approved repair.** A valid old-period target
+followed by an all-zero new-period target passed the client's length-only
+preflight. The first tombstone was written before the encoder rejected the
+second target. The new two-period regression failed with one write and the
+first stored revision changed from 1 to 2.
+
+`isRecordTombstoneTarget` now owns the 32-byte, nonzero rule in the record
+codec and client preflight. Every required target is checked and copied
+before the first write. The same smoke now returns `INVALID_DESCRIPTOR`
+with zero writes. Node and Bare focused suites pass: blinded presence
+10 tests / 71 assertions, presence client 13 / 66, live presence 6 / 43.
+The record wire, native dependency pin, signature transcript, period floor,
+equal-revision conflict checks, and ignored-tombstone handling are unchanged.
+
+The focused source review covered the SURB context-bound key schedule,
+reply binding, one-use admission, and relay-local processing; Gate D
+blinded signing, mutable signature verification before decryption, AEAD
+period/revision binding, RECORD targets, equal-revision conflicts, overlap,
+and older-period fallback. Existing regressions for both tombstone scopes
+pass. External cryptographic review and approval remain open; neither this
+review nor the previous model reports closes that gate.
+
+**One approved remote run, no overrides.** Ran exactly
+`scripts/live-route.sh up -p -l 2` using the normal runtime credentials.
+Run [34080635056](https://github.com/ayooooo123/hyperdht/actions/runs/34080635056)
+executed `b4bad01aeaa12973b6f657ecc89c07b8dd2c8485`.
+The coordinator exited 1: 38/39 assertions passed, with
+`PROCESS_FAILURE (endpoint/CONTROL): ERR_PRIVACY_UNAVAILABLE` at endpoint
+`activate`. Harness punch matrix was 117/117; both production reflections
+matched the minted tuples; punch exchange took 794.7 ms.
+The endpoint stack identifies the `exchangeSharedGuardBranch` response
+deadline in `lib/private/udx-cell-endpoint.js:4122`, not the later suspend
+path. The missing response's cause is not established. Rotation, suspend,
+resume, and network change were not reached, so the required remote
+lifecycle result remains unproven. No retry was dispatched.
+
+The Actions bridge-host workflow concluded `success`; that is not the
+coordinator scenario result. The bridges ended on their bounded lifetime.
+No operator address or secret is recorded here. No commit, push, public
+required-mode enablement, command-path expansion, or consumer integration
+is part of this checkpoint.
+
+**Final local verification after the preflight repair.**
+`bash scripts/linux-gates.sh all` exited 0, all ten gates passed:
+Node aggregate 1,083 tests / 19,661 assertions; Bare 1,039 / 19,528;
+four normal/reverse process legs 155 each; two production-punch legs 160
+each; namespace projection 27; live namespace 165, raw DROP zero.
+The new SURB marker checks are part of that capture gate. The first
+pre-repair run's tool artifact omitted its middle, so a complete captured
+rerun established the earlier baseline; these final counts are from a
+separate complete captured post-repair run. Synthetic tag-injection and
+direct-codec probes were one-off checks, not permanent test additions.
+
+### Continuation checkpoint — 2026-09-07, exact signing and SURB ownership
+
+JD separately approved two further review repairs, without another remote
+run, commit, push, or wire change.
+
+**Exact-value signing.** A controller could substitute one byte of an
+895-byte presence value and obtain a valid blinded mutable signature for
+those altered bytes. The reader then rejected AEAD authentication. The
+`signMutable` closure now keeps an owned copy of the exact encoded value,
+rejects any unequal candidate with `UNAUTHORIZED`, and hashes the bound
+copy when signing. The hostile-controller regression fails before the
+repair and passes afterward for both a copied substitution and in-place
+mutation of the supplied buffer. A smoke confirms that the unchanged
+record still receives a valid signature. Signed transcript bytes do not change.
+
+**SURB batch ownership.** Injecting failure in the second SURB left the
+first open authority active and its reply secret uncleared. Construction
+now owns each slot as soon as it is allocated and revokes the partial
+batch on failure. The regression injects both an entropy failure and a
+native keypair failure and requires earlier reply secrets and owned
+terminal handles to be erased.
+
+`RoutedDHTIO.request` owns a complete batch until authority admission
+returns a valid operation. Before that handoff, failure revokes the batch
+and clears V1/V2 request and entropy buffers. A rejected-admission
+regression failed with eight live authorities before the repair and now
+finds all eight already revoked. After transfer, the production operation
+revokes the batch on cancellation or settlement. Partial terminal
+registration and reassembler setup are also cleaned if admission throws.
+Successful required replies still pass through relay-local middle and
+guard authorities; no exit-side peel or correlated fallback was added.
+
+The SURB physical-tag positive controls are now permanent tests in
+`test/private/route-oracles.js`, not only one-off probes. Each inserts a
+tag in a 1,200-byte route-edge packet and requires the leak oracle to reject it.
+
+Focused Node and Bare verification passes: blinded presence 10/71,
+presence client 14/70, live presence 6/43, SURB 31/115, SURB integration
+20/71, routed DHT IO 40/274, and live required SURB 7/46.
+External cryptographic review remains open. These are ownership and
+callback-scope repairs, not a replacement for that approval.
+
+Final combined verification after all three review repairs:
+`bash scripts/linux-gates.sh all` exited 0, all ten gates passed.
+Node aggregate 1,087 tests / 19,678 assertions; Bare 1,042 / 19,543;
+four normal/reverse process legs 155 each; two production-punch legs
+160 each; namespace projection 27; live namespace 165, raw DROP zero.
+Changed-file formatting passes. These local results supersede the
+preflight-only counts above; they do not change the failed remote result.
 
 ### Subagent design handoff — 2026-09-05
 

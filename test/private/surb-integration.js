@@ -841,3 +841,51 @@ test('default route fragment profile stays 1053 data bytes', (t) => {
   t.is(MAX_FRAGMENT_DATA, MAX_ROUTE_PAYLOAD - FRAGMENT_HEADER_SIZE)
   t.is(DEFAULT_ROUTE_FRAGMENT_PROFILE.maxDataBytes, 1053)
 })
+
+test('failed SURB batch construction erases keys from completed slots', (t) => {
+  const { buildSurbBatch } = require('../../lib/private/surb-path')
+  for (const failNative of [false, true]) {
+    const r = relay()
+    const keypair = sodium.crypto_box_keypair
+    const secrets = []
+    const handles = []
+    const fault = new Error('second SURB construction failed')
+    let randomCalls = 0
+    sodium.crypto_box_keypair = (publicKey, secretKey) => {
+      keypair(publicKey, secretKey)
+      secrets.push(secretKey)
+      if (failNative && secrets.length === 3) throw fault
+    }
+    try {
+      t.exception(
+        () =>
+          buildSurbBatch({
+            hops: [hopOf(r)],
+            batchId: b4a.alloc(16, 1),
+            requestId: b4a.alloc(16, 2),
+            surbCount: 2,
+            now: NOW,
+            randomBytes(size) {
+              if (++randomCalls === 2 && !failNative) throw fault
+              const handle = b4a.alloc(size, 7)
+              handles.push(handle)
+              return handle
+            }
+          }),
+        fault
+      )
+      t.ok(
+        secrets.every((key) => key.every((byte) => byte === 0)),
+        'no prior reply key survives'
+      )
+      t.ok(
+        handles.every((handle) => handle.every((byte) => byte === 0)),
+        'owned handles are erased'
+      )
+    } finally {
+      sodium.crypto_box_keypair = keypair
+      for (const key of secrets) key.fill(0)
+      r.routeSecretKey.fill(0)
+    }
+  }
+})
