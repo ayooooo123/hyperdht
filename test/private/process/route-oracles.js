@@ -81,7 +81,11 @@ function secretMarkers(oracle) {
   const named = [
     { bytes: oracle.leakSentinel, everywhere: true, name: 'leak sentinel' },
     { bytes: oracle.immutableValue, everywhere: false, name: 'immutable value' },
-    { bytes: oracle.targetHash, everywhere: false, name: 'target hash' }
+    { bytes: oracle.targetHash, everywhere: false, name: 'target hash' },
+    // These tags are visible to authenticated relays after link decryption,
+    // but must not occur in the physical-link capture.
+    { bytes: b4a.from('SURB-HOP-V1'), everywhere: false, name: 'SURB hop tag' },
+    { bytes: b4a.from('SURB-TERM-V1'), everywhere: false, name: 'SURB terminal tag' }
   ]
   const markers = []
   const claimed = new Set()

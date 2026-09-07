@@ -266,6 +266,50 @@ test('missing overlap revocation target fails before publishing either tombstone
   }
 })
 
+test('zero overlap revocation target fails before the first write', async (t) => {
+  const controller = createFakeController()
+  const client = clientFor(controller, Number(PERIOD_MS) - Number(OVERLAP_MS))
+  const published = await client.publishPresence({ descriptor: b4a.from('keep'), revision: 1 })
+  const targets = new Map(published.map(({ period, recordDigest }) => [period, recordDigest]))
+  targets.set(published[1].period, b4a.alloc(32))
+  controller.calls.length = 0
+  try {
+    await client.revokePresence({ revision: 2, scope: TOMBSTONE_SCOPE.RECORD, targets })
+    t.fail('zero target must fail')
+  } catch (err) {
+    t.is(err.code, 'INVALID_DESCRIPTOR')
+  }
+  t.is(controller.calls.length, 0, 'invalid overlap targets cause no mutable writes')
+  for (const { publicKey } of published) {
+    t.is((await controller.mutableGet(publicKey)).seq, 1, 'published descriptor is unchanged')
+  }
+})
+
+test('a controller cannot obtain a presence signature for substituted record bytes', async (t) => {
+  for (const mutateInPlace of [false, true]) {
+    let signatures = 0
+    const controller = {
+      async mutablePut(keyPair, value, options) {
+        const substituted = mutateInPlace ? value : b4a.from(value)
+        substituted[100] ^= 1
+        await options.signMutable(options.seq, substituted, keyPair)
+        signatures++
+      },
+      async mutableGet() {
+        return null
+      }
+    }
+    const client = clientFor(controller, 0)
+    try {
+      await client.publishPresence({ descriptor: b4a.from('original'), revision: 1 })
+      t.fail('substituted bytes must not receive an owner signature')
+    } catch (err) {
+      t.is(err.code, 'UNAUTHORIZED')
+    }
+    t.is(signatures, 0, 'neither copied nor in-place substitutions are signed')
+  }
+})
+
 for (const scope of [TOMBSTONE_SCOPE.PERIOD, TOMBSTONE_SCOPE.RECORD]) {
   test('new-period tombstone blocks stale old-period fallback: ' + scope, async (t) => {
     const controller = createFakeController()

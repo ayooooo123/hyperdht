@@ -212,6 +212,22 @@ test('capture oracles reject a secret inside a route cell', (t) => {
   )
 })
 
+test('capture oracles reject plaintext SURB tags on route edges', (t) => {
+  for (const tag of ['SURB-HOP-V1', 'SURB-TERM-V1']) {
+    const oracle = fakeOracle()
+    const leaked = cell(0x41)
+    b4a.from(tag).copy(leaked, 100)
+    const failures = runOracles(
+      [...cleanRun(oracle), [tupleFor(LOOKUP_EXIT_A), tupleFor(LOOKUP_MIDDLE_A), leaked]],
+      oracle
+    )
+    t.ok(
+      failures.includes('no leak marker appears on any edge that carries route cells'),
+      `${tag} in a 1200-byte physical-link cell is detected`
+    )
+  }
+})
+
 test('capture oracles reject the retrieved value inside a route cell', (t) => {
   const oracle = fakeOracle()
   const leaked = cell(0x42)

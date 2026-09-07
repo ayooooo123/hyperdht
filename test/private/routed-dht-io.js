@@ -1779,3 +1779,48 @@ test('minted budget bytes are identical across clocks with unrelated origins', a
   await low.operation.promise
   await high.operation.promise
 })
+
+test('required reply keys are revoked when authority admission throws', (t) => {
+  const { bindSurbReturnPath } = require('../../lib/private/live-route-authority')
+  const { revokeSurbOpenAuthority } = require('../../lib/private/surb')
+  const authority = new FakeRouteAuthority()
+  let rejectedBatch = null
+  authority.request = (options) => {
+    rejectedBatch = options.surbBatch
+    throw new Error('admission failed')
+  }
+  const current = fixture({ authority })
+  current.authority.lookup = [record(78)]
+  const [to] = current.io.closest({
+    target: bytes(1, 32),
+    limit: 1,
+    context: current.contexts.immutableGet.lookup
+  })
+  const routeKey = b4a.alloc(32)
+  const routeSecret = b4a.alloc(32)
+  sodium.crypto_box_keypair(routeKey, routeSecret)
+  bindSurbReturnPath(current.authority, BRANCH_CLASS.LOOKUP, [
+    { id: bytes(7, 32), routeKey, capabilityEpoch: 1n, issuedAtMs: 0n, expiresAtMs: 10000n }
+  ])
+  try {
+    expectCode(
+      t,
+      () =>
+        current.io.request(
+          message(to, current.contexts.immutableGet.lookup, { replyMode: 'SURB_REQUIRED' })
+        ),
+      'ROUTE_UNAVAILABLE'
+    )
+    t.ok(rejectedBatch, 'failure occurs after the complete batch is built')
+    t.alike(
+      rejectedBatch.openAuthorities.map(revokeSurbOpenAuthority),
+      Array(8).fill(false),
+      'all batch authorities were already revoked'
+    )
+    t.ok(rejectedBatch.terminalHandles.every(allZero), 'abandoned terminal handles are erased')
+    t.ok(current.retained.every(allZero), 'request and batch entropy buffers are erased')
+  } finally {
+    routeSecret.fill(0)
+    current.io.destroy()
+  }
+})
