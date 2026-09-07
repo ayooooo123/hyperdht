@@ -403,11 +403,15 @@ faults: a reader-credential holder cannot flip descriptor↔tombstone without
 $a'$, trailing zero bytes survive because the length is explicit, and the
 overlap is executable. Verification derives $A'$ from the caller's identity and
 period, never from the record; the header revision must equal the DHT `seq`;
-rollback is `resolvePresenceState`: a revision at or below the retained one is
-`REPLAY`, a `PERIOD` tombstone clears presence, a `RECORD` tombstone clears it
-only when its target equals the retained record digest and is otherwise
-ignored, and the highest revision wins, so an owner may re-enable after a
-tombstone. `lib/private/presence-client.js` is the production caller over
+rollback is `resolvePresenceState`: within the same period, a lower revision
+or an equal revision with a different record digest is `REPLAY`. Identical
+records can be polled again. Every returned state retains the period, revision,
+and its own record digest, including tombstones. A `PERIOD` tombstone clears
+presence; a `RECORD` tombstone clears it only when its target matches the
+retained digest in the same period, or when polling that already accepted
+tombstone. A mismatched target stays ignored. A higher revision in that period
+can re-enable presence after a tombstone. Revisions from different periods
+are not compared. `lib/private/presence-client.js` is the production caller over
 `controller.mutablePut` / `mutableGet` (publish, revoke, resolve across the
 period lists; the reader credential is the client's configured secret and the
 per-record key is derived and erased inside the codec). Fixed vectors: identity
@@ -593,6 +597,61 @@ next `-l 2 -p` dispatch as the check on the suspend-after-rotation wait;
 presence records, peer streams, the public required-mode gate; (4) consumer
 integration, which also brings the production topology owner that D7 waits
 on.
+
+### Continuation checkpoint — 2026-09-06, Gate D rollback repair
+
+The session-3 handoff reports independent Fable-5-1 and glm-5.3 findings.
+Both archived reproductions were run against the unchanged implementation:
+the returned PERIOD tombstone state allowed a stale descriptor to restore
+presence; unchanged reads and midnight overlap reads threw `REPLAY`;
+a single RECORD target did not revoke the other period's descriptor.
+
+The state resolver now retains `{ period, revision, recordDigest }` for
+descriptors and tombstones. The digest is a copy of the hash of that record,
+not the tombstone's target. The client computes it for both record types.
+Within a period, lower revisions and equal revisions with different digests
+are rejected; an identical record is idempotent. An accepted RECORD tombstone
+stays absent when polled again, before its target is compared with the previous
+state's now-tombstone digest. Ignored tombstones keep `present: null` and
+`ignoredTombstone: true`, with the same revision metadata.
+
+RECORD revocation now requires `targets: Map<bigint, Buffer>` instead of
+`target`. Build it from the publication results:
+
+```js
+const targets = new Map(published.map(({ period, recordDigest }) => [period, recordDigest]))
+await client.revokePresence({ revision, scope: TOMBSTONE_SCOPE.RECORD, targets })
+```
+
+Every publication period must have a 32-byte target. Targets are checked and
+copied before the first write, so a missing overlap target cannot cause a
+partial revoke and caller mutation during an awaited write cannot change a
+later target. PERIOD revocation needs no target map. Retain each returned
+state unchanged as `previous`; direct helper callers must supply the opened
+record's period and digest. In-tree live callers use this contract.
+
+Scope limits: this is a retained-state, same-period rollback check, not proof
+of freshness for a reader with no history. A caller that needs floors for
+several periods must retain state per period. An unmatched RECORD tombstone
+does not prove absence. No Gate C wire change, remote dispatch, or Gate 3B
+command mapping is part of this repair.
+
+Verification before the full Linux run: the new Node regressions failed on
+the old implementation. Focused Node and Bare suites pass: blinded presence
+10 tests / 70 assertions, presence client 10 / 52, live presence 6 / 43.
+A separate smoke scenario passes on both runtimes: both tombstone scopes,
+both overlap periods, midnight rollover, repeated reads, and stale storage
+rejection using the actual returned tombstone state. The read-only review
+archives remain outside Git and unchanged.
+
+Final verification: `bash scripts/linux-gates.sh all` passes all ten gates
+with exit code 0. Node aggregate: 1,080 tests / 19,646 assertions. Bare
+aggregate: 1,036 / 19,513. All four normal/reverse process legs: 155
+assertions each; both production-punch legs: 160 each; namespace projection:
+27; live namespace: 165, raw DROP 0. Complete local evidence:
+`/tmp/hyperdht-gate-d-linux-gates.log`. The first run's tool artifact omitted
+part of the output; the recorded counts are from a complete captured rerun.
+The temporary smoke script was removed; the regression tests remain.
 
 ### Subagent design handoff — 2026-09-05
 

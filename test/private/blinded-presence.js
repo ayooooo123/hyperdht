@@ -334,7 +334,10 @@ test('tombstone encode/open and resolvePresenceState rules', (t) => {
   })
   t.is(openedPeriod.type, RECORD_TYPE.TOMBSTONE)
   t.is(openedPeriod.tombstone.scope, TOMBSTONE_SCOPE.PERIOD)
-  t.alike(resolvePresenceState({ previous: null, opened: openedPeriod }), { present: false })
+  const periodOpened = { ...openedPeriod, recordDigest: recordDigestOf(periodTomb.encoded.value) }
+  const periodState = resolvePresenceState({ previous: null, opened: periodOpened })
+  t.is(periodState.present, false)
+  t.alike(resolvePresenceState({ previous: periodState, opened: periodOpened }), periodState)
 
   const recordTomb = encodeSigned({
     type: RECORD_TYPE.TOMBSTONE,
@@ -349,20 +352,20 @@ test('tombstone encode/open and resolvePresenceState rules', (t) => {
     value: recordTomb.encoded.value,
     signature: recordTomb.signature
   })
-  t.alike(
-    resolvePresenceState({
-      previous: { revision: 1, recordDigest: digest },
-      opened: openedRecord
-    }),
-    { present: false }
-  )
-  t.alike(
-    resolvePresenceState({
-      previous: { revision: 1, recordDigest: b4a.alloc(32, 9) },
-      opened: openedRecord
-    }),
-    { present: null, ignoredTombstone: true }
-  )
+  const recordOpened = { ...openedRecord, recordDigest: recordDigestOf(recordTomb.encoded.value) }
+  const recordState = resolvePresenceState({
+    previous: { period: 0n, revision: 1, recordDigest: digest },
+    opened: recordOpened
+  })
+  t.is(recordState.present, false)
+  t.alike(resolvePresenceState({ previous: recordState, opened: recordOpened }), recordState)
+  const ignored = resolvePresenceState({
+    previous: { period: 0n, revision: 1, recordDigest: b4a.alloc(32, 9) },
+    opened: recordOpened
+  })
+  t.is(ignored.present, null)
+  t.is(ignored.ignoredTombstone, true)
+  t.alike(resolvePresenceState({ previous: ignored, opened: recordOpened }), ignored)
 
   const openedDesc = openPresenceRecord({
     identityPublicKey: FIXED_IDENTITY.publicKey,
@@ -376,6 +379,7 @@ test('tombstone encode/open and resolvePresenceState rules', (t) => {
   t.alike(resolvePresenceState({ previous: null, opened: withDigest }), {
     present: true,
     descriptor,
+    period: 0n,
     revision: 1,
     recordDigest: digest
   })
@@ -384,7 +388,7 @@ test('tombstone encode/open and resolvePresenceState rules', (t) => {
     t,
     () =>
       resolvePresenceState({
-        previous: { revision: 3, recordDigest: digest },
+        previous: periodState,
         opened: withDigest
       }),
     'REPLAY'
@@ -401,7 +405,7 @@ test('tombstone encode/open and resolvePresenceState rules', (t) => {
     signature: reenable.signature
   })
   const state = resolvePresenceState({
-    previous: { revision: 2, recordDigest: digest },
+    previous: periodState,
     opened: Object.freeze({
       ...openedAgain,
       recordDigest: recordDigestOf(reenable.encoded.value)
@@ -410,4 +414,34 @@ test('tombstone encode/open and resolvePresenceState rules', (t) => {
   t.is(state.present, true)
   t.alike(state.descriptor, b4a.from('again'))
   t.is(state.revision, 3)
+})
+
+test('presence revision floors are period scoped and identical records are idempotent', (t) => {
+  const descriptor = b4a.from('revision-floor')
+  function openedAt(period, revision) {
+    const { encoded, signature } = encodeSigned({ period, revision, descriptor })
+    return {
+      ...openPresenceRecord({
+        identityPublicKey: FIXED_IDENTITY.publicKey,
+        period,
+        revision,
+        readerSecret: READER,
+        value: encoded.value,
+        signature
+      }),
+      recordDigest: recordDigestOf(encoded.value)
+    }
+  }
+  const opened = openedAt(3n, 7)
+  const previous = resolvePresenceState({ opened })
+  t.is(previous.period, 3n)
+  t.alike(resolvePresenceState({ previous, opened }), previous)
+  for (const conflicting of [openedAt(3n, 6), openedAt(3n, 7)]) {
+    expectCode(t, () => resolvePresenceState({ previous, opened: conflicting }), 'REPLAY')
+  }
+  const next = resolvePresenceState({ previous, opened: openedAt(4n, 7) })
+  t.is(next.present, true)
+  t.is(next.period, 4n)
+  t.is(next.revision, 7)
+  t.is(resolvePresenceState({ previous, opened: openedAt(4n, 1) }).revision, 1)
 })
