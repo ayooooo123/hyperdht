@@ -158,23 +158,18 @@ test('revokePresence PERIOD clears presence; higher descriptor re-enables', asyn
   const controller = createFakeController()
   const wallMs = 5_000
   const client = clientFor(controller, wallMs)
-  const published = await client.publishPresence({
+  await client.publishPresence({
     descriptor: b4a.from('before'),
     revision: 1
   })
-  const previous = {
-    revision: 1,
-    recordDigest: published[0].recordDigest
-  }
+  const previous = await client.resolvePresence()
 
   await client.revokePresence({ revision: 2, scope: TOMBSTONE_SCOPE.PERIOD })
   const revoked = await client.resolvePresence({ previous })
   t.is(revoked.present, false)
 
   await client.publishPresence({ descriptor: b4a.from('after'), revision: 3 })
-  const again = await client.resolvePresence({
-    previous: { revision: 2, recordDigest: published[0].recordDigest }
-  })
+  const again = await client.resolvePresence({ previous: revoked })
   t.is(again.present, true)
   t.alike(again.descriptor, b4a.from('after'))
   t.is(again.revision, 3)
@@ -189,5 +184,84 @@ test('ERR_RECORD_CONFLICT surfaces from one period', async (t) => {
     t.fail('expected conflict')
   } catch (err) {
     t.is(err && err.code, 'ERR_RECORD_CONFLICT')
+  }
+})
+
+for (const scope of [TOMBSTONE_SCOPE.PERIOD, TOMBSTONE_SCOPE.RECORD]) {
+  test('retained tombstone blocks stale storage and survives polling: ' + scope, async (t) => {
+    const controller = createFakeController()
+    const client = clientFor(controller, 10_000)
+    const published = await client.publishPresence({ descriptor: b4a.from('live'), revision: 1 })
+    const stale = await controller.mutableGet(published[0].publicKey)
+    const previous = await client.resolvePresence()
+    await client.revokePresence({
+      revision: 2,
+      scope,
+      targets: new Map(published.map(({ period, recordDigest }) => [period, recordDigest]))
+    })
+    const revoked = await client.resolvePresence({ previous })
+    t.is(revoked.present, false)
+    t.is(revoked.revision, 2)
+    t.is(revoked.period, previous.period)
+    t.alike(await client.resolvePresence({ previous: revoked }), revoked)
+    const get = controller.mutableGet.bind(controller)
+    controller.mutableGet = async () => stale
+    try {
+      await client.resolvePresence({ previous: revoked })
+      t.fail('stale descriptor must not restore revoked presence')
+    } catch (err) {
+      t.is(err.code, 'REPLAY')
+    }
+    controller.mutableGet = get
+    await client.publishPresence({ descriptor: b4a.from('restored'), revision: 3 })
+    const restored = await client.resolvePresence({ previous: revoked })
+    t.is(restored.present, true)
+    t.alike(restored.descriptor, b4a.from('restored'))
+  })
+}
+
+test('overlap records can be polled and revoked on both sides of midnight', async (t) => {
+  const controller = createFakeController()
+  const before = clientFor(controller, Number(PERIOD_MS) - Number(OVERLAP_MS))
+  const after = clientFor(controller, Number(PERIOD_MS) + 1_000)
+  const published = await before.publishPresence({ descriptor: b4a.from('overlap'), revision: 7 })
+  const oldState = await before.resolvePresence()
+  t.alike(await before.resolvePresence({ previous: oldState }), oldState)
+  const newState = await after.resolvePresence({ previous: oldState })
+  t.is(newState.period, 1n)
+  t.is(newState.present, true)
+  t.alike(await after.resolvePresence({ previous: newState }), newState)
+  await before.revokePresence({
+    revision: 8,
+    scope: TOMBSTONE_SCOPE.RECORD,
+    targets: new Map(published.map(({ period, recordDigest }) => [period, recordDigest]))
+  })
+  for (const [client, previous] of [
+    [before, oldState],
+    [after, newState]
+  ]) {
+    const revoked = await client.resolvePresence({ previous })
+    t.is(revoked.present, false)
+    t.is(revoked.revision, 8)
+    t.alike(await client.resolvePresence({ previous: revoked }), revoked)
+  }
+})
+
+test('missing overlap revocation target fails before publishing either tombstone', async (t) => {
+  const controller = createFakeController()
+  const client = clientFor(controller, Number(PERIOD_MS) - Number(OVERLAP_MS))
+  const published = await client.publishPresence({ descriptor: b4a.from('keep'), revision: 1 })
+  try {
+    await client.revokePresence({
+      revision: 2,
+      scope: TOMBSTONE_SCOPE.RECORD,
+      targets: new Map([[published[0].period, published[0].recordDigest]])
+    })
+    t.fail('missing target must fail')
+  } catch (err) {
+    t.is(err.code, 'INVALID_DESCRIPTOR')
+  }
+  for (const { publicKey } of published) {
+    t.is((await controller.mutableGet(publicKey)).seq, 1)
   }
 })

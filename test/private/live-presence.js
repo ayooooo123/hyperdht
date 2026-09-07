@@ -104,10 +104,7 @@ test('live client publish then resolve then revoke then resolve', async (t) => {
     scope: TOMBSTONE_SCOPE.PERIOD
   })
   const revoked = await client.resolvePresence({
-    previous: {
-      revision: 1,
-      recordDigest: published[0].recordDigest
-    }
+    previous: resolved
   })
   t.is(revoked.present, false)
 
@@ -116,7 +113,7 @@ test('live client publish then resolve then revoke then resolve', async (t) => {
     revision: 3
   })
   const again = await client.resolvePresence({
-    previous: { revision: 2, recordDigest: published[0].recordDigest }
+    previous: revoked
   })
   t.is(again.present, true)
   t.alike(again.descriptor, b4a.from('reenabled'))
@@ -234,19 +231,16 @@ test('live record-scope tombstone ignores mismatched digest then clears on match
     now: () => 20_000
   })
 
-  const published = await client.publishPresence({
+  await client.publishPresence({
     descriptor: b4a.from('to-tombstone'),
     revision: 1
   })
-  const previous = {
-    revision: 1,
-    recordDigest: published[0].recordDigest
-  }
+  const previous = await client.resolvePresence()
 
   await client.revokePresence({
     revision: 2,
     scope: TOMBSTONE_SCOPE.RECORD,
-    target: b4a.alloc(32, 0xee)
+    targets: new Map([[previous.period, b4a.alloc(32, 0xee)]])
   })
   const ignored = await client.resolvePresence({ previous })
   t.is(ignored.present, null)
@@ -255,7 +249,7 @@ test('live record-scope tombstone ignores mismatched digest then clears on match
   await client.revokePresence({
     revision: 3,
     scope: TOMBSTONE_SCOPE.RECORD,
-    target: previous.recordDigest
+    targets: new Map([[previous.period, previous.recordDigest]])
   })
   const cleared = await client.resolvePresence({ previous })
   t.is(cleared.present, false)
@@ -274,9 +268,10 @@ test('live record-scope tombstone ignores mismatched digest then clears on match
     t.is(recordDigestOf(encoded.value).byteLength, 32)
     t.exception(() =>
       resolvePresenceState({
-        previous: { revision: 3, recordDigest: previous.recordDigest },
+        previous: cleared,
         opened: {
           type: RECORD_TYPE.DESCRIPTOR,
+          period: 0n,
           revision: 1,
           descriptor: b4a.from('to-tombstone'),
           recordDigest: recordDigestOf(encoded.value)
