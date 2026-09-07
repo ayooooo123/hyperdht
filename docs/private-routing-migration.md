@@ -559,8 +559,20 @@ controller was still `ROTATING` when the coordinator's next command arrived,
 which real-link timing can produce after the blackhole rotation and loopback
 never does. The endpoint role now waits out an in-flight rotation (bounded at
 4 s, inside the command wait) before suspending; that is the client contract
-("suspend a READY controller"), not a hidden retry. Not re-dispatched in this
-session; the next `-l 2 -p` run is the check.
+("suspend a READY controller"), not a hidden retry. Two dispatches on the
+pushed tree (`b9686c1`) followed, both lost to runner NAT placement before
+any production step, as runs 3 and 5 were:
+[34070792738](https://github.com/ayooooo123/hyperdht/actions/runs/34070792738)
+had a punch matrix of 18/117 and died in DHT setup (dht-referral and dht-seed
+answered by nobody); in
+[34071306816](https://github.com/ayooooo123/hyperdht/actions/runs/34071306816)
+(matrix 63/117) the endpoint's runner did not preserve its mapping across the
+close-and-rebind hop (observed `:15426`, minted `:15425`; the guard on the
+operator host reflected equal) and production failed closed before any punch
+byte, the same measurement as run 2. Dispatching stopped at the two-run
+limit; the suspend-after-rotation wait is therefore verified only on the
+Linux gates, and the next `-l 2 -p` run that reaches the lifecycle is its
+remote check.
 
 **Measurements.** All ten local Linux gates pass on the final tree. Node
 aggregate **1,075 tests / 19,607 assertions**; Bare **1,031 / 19,474**; the
