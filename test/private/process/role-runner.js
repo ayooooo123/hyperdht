@@ -267,7 +267,10 @@ async function createEndpointOwner() {
     wallNow: runtime.wallNow
   })
   endpointBootstrapAuthority = authority
-  endpointController = createPrivateRoutingController({ endpointBootstrapAuthority: authority })
+  endpointController = createPrivateRoutingController({
+    endpointBootstrapAuthority: authority,
+    experimentalSurbReplies: true
+  })
 }
 
 function canonicalTuple(tuple) {
@@ -1013,6 +1016,36 @@ function immutableGet(target) {
   return sequence
 }
 
+async function routedSurbGet(target, sequence) {
+  const { REPLY_MODE } = require('../../../lib/private/protocol')
+  const reply = await endpointController.immutableGet(target, {
+    replyMode: REPLY_MODE.SURB_REQUIRED
+  })
+  if (activeOperation === null || activeOperation.sequence !== sequence) return
+  if (!reply || !b4a.isBuffer(reply.value) || !same(cryptoSuite.hash(reply.value), target)) {
+    throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+  }
+  activeOperation = null
+  await emit('value', { target, value: reply.value })
+}
+
+function surbGet(target) {
+  if (projection.role !== 'endpoint' || (state !== 'READY' && state !== 'BOOTSTRAPPING')) {
+    throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+  }
+  if (activeOperation !== null)
+    throw Object.assign(new Error(), { code: 'PROCESS_OPERATION_ACTIVE' })
+  const sequence = ++operationSequence
+  const ownedTarget = b4a.from(target)
+  const timer = schedule(() => {
+    if (activeOperation === null || activeOperation.sequence !== sequence) return
+    activeOperation.timer = null
+    void routedSurbGet(ownedTarget, sequence).catch((err) => fatal(err))
+  }, 25)
+  activeOperation = { sequence, target: ownedTarget, timer }
+  return sequence
+}
+
 // The three routed write/read operations share the get's one-slot operation model:
 // one owned operation at a time, started after a short schedule so a `cancel` can
 // still race it, and reported through its own event. Puts travel the announce
@@ -1156,7 +1189,24 @@ function snapshotFields(closed = false) {
     selectedExitRoleIndex: closed ? null : selectedExitRoleIndex,
     selectedMiddleRoleIndex: closed ? null : selectedMiddleRoleIndex,
     state: closed ? 'CLOSED' : state,
-    tableEntryCount: exitSnapshot === null ? 0 : exitSnapshot.tableEntryCount
+    tableEntryCount: exitSnapshot === null ? 0 : exitSnapshot.tableEntryCount,
+    surbHopCellCount: exitSnapshot === null ? 0 : exitSnapshot.surbHopCellCount || 0,
+    correlatedFrameCount: exitSnapshot === null ? 0 : exitSnapshot.correlatedFrameCount || 0,
+    surbHopsPeeled: closed
+      ? 0
+      : (() => {
+          let peeled = 0
+          for (const actor of roleActors) {
+            if (typeof actor.surbHopsPeeled === 'number') peeled += actor.surbHopsPeeled
+          }
+          if (guardProcessService !== null && typeof guardProcessService.snapshot === 'function') {
+            try {
+              const gs = guardProcessService.snapshot()
+              if (gs && typeof gs.surbHopsPeeled === 'number') peeled += gs.surbHopsPeeled
+            } catch {}
+          }
+          return peeled
+        })()
   }
   const fields = {
     ...summary,
@@ -1277,6 +1327,28 @@ async function configure(message) {
 
 function resetEndpointMonitor() {
   if (endpointController !== null) endpointMonitorSnapshot = endpointController.snapshot()
+}
+
+// Polls the controller out of ROTATING. Bounded well inside the coordinator's
+// command wait so a stuck rotation still surfaces as the controller's own error.
+const ROTATION_SETTLE_MS = 4_000
+const ROTATION_POLL_MS = 10
+function settleControllerRotation() {
+  return new Promise((resolve) => {
+    const startedAt = runtime.monotonicNow()
+    const poll = () => {
+      if (
+        endpointController === null ||
+        endpointController.snapshot().state !== 'ROTATING' ||
+        runtime.monotonicNow() - startedAt >= BigInt(ROTATION_SETTLE_MS)
+      ) {
+        resolve()
+        return
+      }
+      schedule(poll, ROTATION_POLL_MS)
+    }
+    poll()
+  })
 }
 
 function scheduleEndpointMonitor() {
@@ -1416,6 +1488,9 @@ async function handle(message) {
     case 'immutable-get':
       immutableGet(message.target)
       return
+    case 'surb-get':
+      surbGet(message.target)
+      return
     case 'immutable-put':
       immutablePut(message.value)
       return
@@ -1431,6 +1506,12 @@ async function handle(message) {
     case 'suspend':
       if (projection.role !== 'endpoint')
         throw Object.assign(new Error(), { code: 'PROCESS_ROLE_MISMATCH' })
+      // A controller refuses suspend while it is ROTATING, and on real links a
+      // rotation can still be finishing when the coordinator's next command
+      // arrives (run 34068302573 failed exactly there). The client contract is
+      // "suspend a READY controller", so wait for the rotation to settle within
+      // the command budget rather than fail on the timing of the previous step.
+      await settleControllerRotation()
       state = 'SUSPENDING'
       await endpointController.suspend()
       resetEndpointMonitor()

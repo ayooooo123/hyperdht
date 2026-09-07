@@ -46,8 +46,11 @@ const ROLES = Object.freeze([
 ])
 
 // Initial build, rotation, resume, and a network-change resume each rediscover the
-// same learned closers, and every isolated-address grant is one-shot.
-const LEARNED_GRANT_USES = 6
+// same learned closers, and every isolated-address grant is one-shot. The routed
+// put/get and required-SURB steps after resume each discover them again on the
+// namespace plan, where the closers are isolated candidates; six was exhausted
+// there (the exit then waits forever on an unanswered optional grant), ten holds.
+const LEARNED_GRANT_USES = 10
 
 const ALLOW_EDGES = Object.freeze([
   Object.freeze([1, 2]),

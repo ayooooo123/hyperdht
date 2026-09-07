@@ -91,6 +91,8 @@ function validCommand(type) {
       return { ...base(type, 'dht-referral', 10), value: b4a.from('immutable') }
     case 'immutable-get':
       return { ...base(type), target: b4a.alloc(32, 5) }
+    case 'surb-get':
+      return { ...base(type), target: b4a.alloc(32, 5) }
     case 'cancel':
       return { ...base(type), operationSequence: 2n }
     case 'rotate':
@@ -199,7 +201,10 @@ function validEvent(type) {
         openResources: 1,
         queuedBytes: 0,
         state: 'READY',
-        summaryDigest: b4a.alloc(32, 7)
+        summaryDigest: b4a.alloc(32, 7),
+        surbHopsPeeled: 0,
+        surbHopCellCount: 0,
+        correlatedFrameCount: 0
       }
     case 'error':
       return { ...base(type), code: 'ERR_PRIVATE_ROUTE_UNAVAILABLE' }
@@ -674,6 +679,7 @@ test('exact command and event registries are frozen and all schemas reject extra
     'store-immutable',
     'activate',
     'immutable-get',
+    'surb-get',
     'cancel',
     'rotate',
     'blackhole',
@@ -927,7 +933,10 @@ test('snapshot state exposes only exact sorted DHT record sets', (t) => {
     referralProbeCount: 1,
     role: 'lookup-exit-a',
     roleIndex: 4,
-    tableEntryCount: 2
+    tableEntryCount: 2,
+    surbHopsPeeled: 0,
+    surbHopCellCount: 0,
+    correlatedFrameCount: 0
   }
   t.alike(validateControlMessage(exit, messageContext('event', exit)), exit)
 
