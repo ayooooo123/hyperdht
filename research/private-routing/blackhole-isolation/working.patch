@@ -1,0 +1,817 @@
+diff --git a/docs/private-routing-migration.md b/docs/private-routing-migration.md
+index 3749188c2c5112f362ced8b9901f61653472bace..eb460f7c46f2a29d23c2a754c29c5767496a470d 100644
+--- a/docs/private-routing-migration.md
++++ b/docs/private-routing-migration.md
+@@ -1,5 +1,13 @@
+ # Private Routing Gate 3A / Gate 3B1 Migration Record
+ 
++## Preservation status — 2026-09-05
++
++This is an incomplete historical blackhole-isolation and candidate-demotion
++experiment based on `ab818f9`. It is preserved for research, not merge or
++production use. It includes test-only UDX failure injection and provisional selection behavior.
++The generated `choose.log` and `hook.log` files are excluded from publication:
++their command/runtime provenance is unknown and they are not test evidence.
++
+ ## Status and scope
+ 
+ This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
+diff --git a/lib/private/relay-candidate-directory.js b/lib/private/relay-candidate-directory.js
+index 38939a9bf2b8b9c2150f8f5674be17153e757ff0..fc39027735b1878af77d8d25017227860ce972d9 100644
+--- a/lib/private/relay-candidate-directory.js
++++ b/lib/private/relay-candidate-directory.js
+@@ -41,6 +41,7 @@ const SCOPE_FIELDS = Object.freeze([
+ const CLOCK_FIELDS = Object.freeze(['wallNow', 'monotonicNow'])
+ const INITIAL_FIELDS = Object.freeze(['lookupGeneration', 'announceGeneration'])
+ const REPLACEMENT_FIELDS = Object.freeze(['branchClass', 'generation'])
++const FAULT_FIELDS = Object.freeze(['branchClass'])
+ const EVIDENCE_FIELDS = Object.freeze(['transaction', 'branchClass', 'position', 'generation'])
+ 
+ const byteLengthGetter = Object.getOwnPropertyDescriptor(
+@@ -613,6 +614,7 @@ function invalidate(state) {
+   state.pending.clear()
+   state.highestCommitted.clear()
+   state.quarantine.clear()
++  state.faulted.clear()
+   state.wallNow = null
+   state.monotonicNow = null
+   state.lastWall = null
+@@ -666,8 +668,15 @@ function sampleDirectoryHandoff(directory, state, suspended) {
+   return sampleDirectoryWall(directory, state, suspended)
+ }
+ 
++// Fault demotion is a PARTITION, not a position in this list. A caller must
++// exhaust `preferred` before admitting anything from `all`: that ordering
++// between the two tiers, not record order within one, is what stops a
++// just-failed hop being handed to the sibling branch. A future KI-6 fix that
++// randomises selection keeps the property so long as it draws within a tier;
++// one that draws from `all` directly silently discards it. See KI-14.
+ function validCandidates(state, role, mask) {
+-  const candidates = []
++  const preferred = []
++  const all = []
+   for (const record of state.records) {
+     if (record.role !== role || record.capabilityMask !== mask) continue
+     if (
+@@ -676,9 +685,21 @@ function validCandidates(state, role, mask) {
+     ) {
+       continue
+     }
+-    candidates.push(record)
++    all.push(record)
++    if (state.resumeFresh || !state.faulted.has(b4aToString(record.identity, 'hex'))) {
++      preferred.push(record)
++    }
+   }
+-  return candidates
++  return { preferred, all }
++}
++
++// With nothing demoted the second tier searches the same records as the first,
++// so the fallback is skipped rather than doubling the worst case on the path
++// every healthy selection takes.
++function demotionApplies(middles, exits) {
++  return (
++    middles.preferred.length !== middles.all.length || exits.preferred.length !== exits.all.length
++  )
+ }
+ 
+ function pruneInvalidRecords(state, now) {
+@@ -691,6 +712,11 @@ function pruneInvalidRecords(state, now) {
+   for (const [identity, expiresAt] of state.quarantine) {
+     if (expiresAt <= now) state.quarantine.delete(identity)
+   }
++  // Every caller of `validCandidates` prunes first, which is what lets the
++  // demotion test there be a bare `has` with no clock of its own.
++  for (const [identity, expiresAt] of state.faulted) {
++    if (expiresAt <= now) state.faulted.delete(identity)
++  }
+ }
+ 
+ function requireLiveGuard(state, now) {
+@@ -699,15 +725,7 @@ function requireLiveGuard(state, now) {
+   incompatible()
+ }
+ 
+-function choosePairs(state, now, excluded = []) {
+-  requireLiveGuard(state, now)
+-  pruneInvalidRecords(state, now)
+-  const middles = validCandidates(state, ROLE.SAFETY, RELAY_CAPABILITY.CIRCUIT_RELAY_V1)
+-  const exits = validCandidates(
+-    state,
+-    ROLE.PRIVATE,
+-    RELAY_CAPABILITY.CIRCUIT_RELAY_V1 | RELAY_CAPABILITY.DHT_EXIT_V1
+-  )
++function searchPairs(middles, exits, excluded) {
+   for (const firstMiddle of middles) {
+     for (const firstExit of exits) {
+       for (const secondMiddle of middles) {
+@@ -722,10 +740,10 @@ function choosePairs(state, now, excluded = []) {
+       }
+     }
+   }
+-  incompatible()
++  return null
+ }
+ 
+-function chooseReplacementPair(state, now, excluded) {
++function choosePairs(state, now, excluded = []) {
+   requireLiveGuard(state, now)
+   pruneInvalidRecords(state, now)
+   const middles = validCandidates(state, ROLE.SAFETY, RELAY_CAPABILITY.CIRCUIT_RELAY_V1)
+@@ -734,12 +752,38 @@ function chooseReplacementPair(state, now, excluded) {
+     ROLE.PRIVATE,
+     RELAY_CAPABILITY.CIRCUIT_RELAY_V1 | RELAY_CAPABILITY.DHT_EXIT_V1
+   )
++  let chosen = searchPairs(middles.preferred, exits.preferred, excluded)
++  if (chosen === null && demotionApplies(middles, exits)) {
++    chosen = searchPairs(middles.all, exits.all, excluded)
++  }
++  if (chosen === null) incompatible()
++  return chosen
++}
++
++function searchPair(middles, exits, excluded) {
+   for (const middle of middles) {
+     for (const exit of exits) {
+       if (recordsDiverse([...excluded, middle, exit])) return { middle, exit }
+     }
+   }
+-  incompatible()
++  return null
++}
++
++function chooseReplacementPair(state, now, excluded) {
++  requireLiveGuard(state, now)
++  pruneInvalidRecords(state, now)
++  const middles = validCandidates(state, ROLE.SAFETY, RELAY_CAPABILITY.CIRCUIT_RELAY_V1)
++  const exits = validCandidates(
++    state,
++    ROLE.PRIVATE,
++    RELAY_CAPABILITY.CIRCUIT_RELAY_V1 | RELAY_CAPABILITY.DHT_EXIT_V1
++  )
++  let chosen = searchPair(middles.preferred, exits.preferred, excluded)
++  if (chosen === null && demotionApplies(middles, exits)) {
++    chosen = searchPair(middles.all, exits.all, excluded)
++  }
++  if (chosen === null) incompatible()
++  return chosen
+ }
+ 
+ function revalidateSelection(state, now, selected) {
+@@ -832,7 +876,7 @@ class RelayCandidateDirectory {
+       pairs[1].exit
+     ])
+     requireDirectoryState(this, state, false)
+-    return makeReservation(
++    const reservation = makeReservation(
+       state,
+       'initial',
+       new Map([
+@@ -844,6 +888,8 @@ class RelayCandidateDirectory {
+         { branchClass: BRANCH_CLASS.ANNOUNCE, generation: announceGeneration }
+       ]
+     )
++    state.resumeFresh = false
++    return reservation
+   }
+ 
+   reserveReplacement(options) {
+@@ -879,6 +925,52 @@ class RelayCandidateDirectory {
+     ])
+   }
+ 
++  // A rotation fires for two unrelated reasons. Material expiry is routine and
++  // says nothing about the hop; a loss says the branch failed while this pair
++  // was carrying it. Only the second reaches here, from
++  // `reportRouteManagerBranchLoss`, which is the manager's sole fault path -
++  // expiry reaches the controller through `armBranchExpiry`'s separate
++  // `BranchExpiry` sink and never calls this.
++  //
++  // Attribution is to the BRANCH, not to a hop: nothing in a physical loss or an
++  // elapsed deadline says whether the middle or the exit failed, so both hops of
++  // the failed branch are demoted. Both were about to be vacated anyway.
++  //
++  // Deliberately NOT `quarantine`, and the two must not be conflated.
++  // Quarantine answers a question about identity: one key advertising two
++  // digests at one epoch is proof of equivocation, so a hard bar there has no
++  // false positives. A fault is a heuristic - a timeout or a physical loss can
++  // be the network, the local host, or an unlucky but honest relay - so it earns
++  // a demotion, not a bar. Barring on suspicion would let a transient failure
++  // inherit a penalty designed for proven dishonesty, and because the exclusion
++  // set already leaves exactly one qualifying pair in the smallest supported
++  // pool, it would also let any relay deny the endpoint a route by failing.
++  //
++  // The bound is the record's own `expiresAt`: the same bound the equivocation
++  // quarantine uses, so it invents no constant, and it cannot outlive the record
++  // it applies to because `pruneInvalidRecords` drops both together.
++  reportBranchFault(options) {
++    const state = ensureDirectory(this)
++    exactObject(options, FAULT_FIELDS)
++    const branchClass = branch(ownData(options, 'branchClass'))
++    const pair = state.committed.get(branchClass)
++    if (!pair) return false
++    const now = sampleDirectoryHandoff(this, state, false)
++    pruneInvalidRecords(state, now)
++    requireDirectoryState(this, state, false)
++    let demoted = false
++    for (const record of [pair.middle, pair.exit]) {
++      if (!state.records.includes(record)) continue
++      const key = b4aToString(record.identity, 'hex')
++      const current = state.faulted.get(key)
++      if (current === undefined || current < record.expiresAt) {
++        state.faulted.set(key, record.expiresAt)
++      }
++      demoted = true
++    }
++    return demoted
++  }
++
+   retainForSuspend() {
+     if (arguments.length !== 0) incompatible()
+     const state = ensureDirectory(this)
+@@ -893,6 +985,7 @@ class RelayCandidateDirectory {
+     if (arguments.length !== 0) incompatible()
+     const state = ensureDirectory(this, true)
+     if (!state.suspended) replay()
++    state.resumeFresh = true
+     let now = sampleDirectoryHandoff(this, state, true)
+     const pairs = choosePairs(state, now)
+     now = sampleDirectoryWall(this, state, true)
+@@ -934,6 +1027,7 @@ class RelayCandidateDirectory {
+         Number(typeof state.monotonicNow === 'function'),
+       generationRecordCount: state.highestCommitted.size,
+       quarantineCount: state.quarantine.size,
++      faultedCount: state.faulted.size,
+       pendingCount: state.pending.size
+     })
+   }
+@@ -1084,6 +1178,8 @@ function consumeSealedRelayCandidateDirectory(token) {
+       sampling: false,
+       records: sealed.records,
+       quarantine: sealed.quarantine,
++      faulted: new Map(),
++      resumeFresh: false,
+       scope: sealed.scope,
+       committed: new Map(),
+       pending: new Map(),
+diff --git a/lib/private/route-manager.js b/lib/private/route-manager.js
+index e2e2e4f5b34fca6c6523edff12b18eaa6a250ec4..cf5f3d32c93c97556a86fd734115b55ac30ff7d9 100644
+--- a/lib/private/route-manager.js
++++ b/lib/private/route-manager.js
+@@ -1304,6 +1304,17 @@ function reportRouteManagerBranchLoss(manager, branchClass) {
+   if (!branch || branch.lost) return false
+   branch.lost = true
+   state.capabilities.delete(branchClass)
++  // This is the only path that says a branch failed FOR CAUSE - material expiry
++  // reaches `issueBranchSink` from `armBranchExpiry` under a different suffix and
++  // never arrives here - so it is the one place that can tell the directory a
++  // rotation is a fault rather than routine. Without it the pair being vacated
++  // stays fully qualifying and first-match hands it straight to the sibling
++  // branch (KI-14). Advisory: a directory that cannot record the demotion must
++  // not stop the branch being reported lost, or the recovery this triggers would
++  // be lost with it.
++  try {
++    state.candidateDirectory.reportBranchFault({ branchClass })
++  } catch {}
+   return issueBranchSink(state, branchClass, 'BranchLoss')
+ }
+ 
+diff --git a/test/private-routing.js b/test/private-routing.js
+index afb668fae3bca24b036613417974b0c85a150ca6..4fe4c3b9b78870fdc247c4344ce411c1606fc97a 100644
+--- a/test/private-routing.js
++++ b/test/private-routing.js
+@@ -61,6 +61,7 @@ require('./private/final-exit-activation-session')
+ require('./private/process-codec')
+ require('./private/process-audit-event')
+ require('./private/process-config-auditor')
++require('./private/process-route-cell-blackhole')
+ require('./private/dht-setup-audit-udx')
+ // The coordinator spawns role processes with `child_process`, so this stays
+ // Node-only. The capture-oracle tests read pcap bytes from disk and are
+diff --git a/test/private/process-codec.js b/test/private/process-codec.js
+index c4d7e00187f155bdd31fa1684a36b01d887da623..23043ba810ff46827859ee8e6a095095761ebcf9 100644
+--- a/test/private/process-codec.js
++++ b/test/private/process-codec.js
+@@ -95,6 +95,8 @@ function validCommand(type) {
+       return { ...base(type), operationSequence: 2n }
+     case 'rotate':
+       return { ...base(type, 'lookup-middle-a', 3), nextGeneration: 8n }
++    case 'blackhole':
++      return base(type, 'lookup-middle-a', 3)
+     case 'guard-loss':
+       return base(type, 'guard', 2)
+     case 'phase-ack':
+@@ -145,7 +147,10 @@ function validEvent(type) {
+         type
+       }
+     case 'ready':
+-      return { ...base(type), state: 'READY' }
++      // base() builds an endpoint event, and the endpoint owns no DHT node, so
++      // zero is the honest count here as well as the only one the codec accepts
++      // from a non-DHT role.
++      return { ...base(type), answeredRequestCount: 0, state: 'READY' }
+     case 'value':
+       return { ...base(type), target: b4a.alloc(32, 6), value: b4a.from('value') }
+     case 'cancelled':
+@@ -538,6 +543,15 @@ test('physical lifecycle commands are bound only to their failing link owners',
+   throwsCode(t, () =>
+     validateControlMessage(endpointRotate, messageContext('command', endpointRotate))
+   )
++  const middleBlackhole = base('blackhole', 'lookup-middle-a', 3)
++  t.alike(
++    validateControlMessage(middleBlackhole, messageContext('command', middleBlackhole)),
++    middleBlackhole
++  )
++  const wrongBlackhole = base('blackhole', 'lookup-middle-b', 5)
++  throwsCode(t, () =>
++    validateControlMessage(wrongBlackhole, messageContext('command', wrongBlackhole))
++  )
+ 
+   const guardLoss = base('guard-loss', 'guard', 2)
+   t.alike(validateControlMessage(guardLoss, messageContext('command', guardLoss)), guardLoss)
+@@ -559,6 +573,7 @@ test('exact command and event registries are frozen and all schemas reject extra
+     'immutable-get',
+     'cancel',
+     'rotate',
++    'blackhole',
+     'suspend',
+     'resume',
+     'network-change',
+diff --git a/test/private/process/control-channel.js b/test/private/process/control-channel.js
+index 7136fa936715b7ace60a025e0c71ae0d54aa0303..f3dc06179791e2e041bacb05ae91837fb84811fa 100644
+--- a/test/private/process/control-channel.js
++++ b/test/private/process/control-channel.js
+@@ -28,6 +28,7 @@ const COMMANDS = Object.freeze([
+   'immutable-get',
+   'cancel',
+   'rotate',
++  'blackhole',
+   'suspend',
+   'resume',
+   'network-change',
+@@ -89,6 +90,7 @@ const UNAVAILABLE_REASONS = new Set(['NETWORK_CHANGE', 'GUARD_LOSS', 'CANCELLED'
+ const RUNTIMES = new Set(['node', 'bare'])
+ const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
+ const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
++const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
+ 
+ const TAG = Object.freeze({
+   NULL: 0,
+@@ -758,6 +760,7 @@ const COMMAND_FIELDS = Object.freeze({
+   'immutable-get': Object.freeze([...BASE_FIELDS, 'target']),
+   cancel: Object.freeze([...BASE_FIELDS, 'operationSequence']),
+   rotate: Object.freeze([...BASE_FIELDS, 'nextGeneration']),
++  blackhole: BASE_FIELDS,
+   suspend: BASE_FIELDS,
+   resume: BASE_FIELDS,
+   'network-change': BASE_FIELDS,
+@@ -806,7 +809,7 @@ const EVENT_FIELDS = Object.freeze({
+     'replyDigest',
+     'transactionId'
+   ]),
+-  ready: Object.freeze([...BASE_FIELDS, 'state']),
++  ready: Object.freeze([...BASE_FIELDS, 'answeredRequestCount', 'state']),
+   value: Object.freeze([...BASE_FIELDS, 'target', 'value']),
+   cancelled: Object.freeze([...BASE_FIELDS, 'operationSequence']),
+   rotated: Object.freeze([...BASE_FIELDS, 'previousGeneration']),
+@@ -1017,6 +1020,12 @@ function validateCommand(message, context) {
+       )
+         invalid()
+       break
++    // Same role restriction as `rotate`, and for the same reason: the fault verbs exist to
++    // fault one named hop of the lookup branch. `blackhole` carries no generation, because
++    // unlike `rotate` it produces no notification for anything to rotate on.
++    case 'blackhole':
++      if (common.role !== 'lookup-middle-a') invalid()
++      break
+     case 'guard-loss':
+       if (common.role !== 'guard') invalid()
+       break
+@@ -1124,9 +1133,20 @@ function validateEvent(message, context) {
+         invalid()
+       break
+     case 'phase':
+-    case 'ready':
+       if (!STATES.has(message.state)) invalid()
+       break
++    case 'ready':
++      // A role that owns no DHT node cannot have had a DHT request answered, so
++      // any count but zero from one is a shape fault rather than a small lie.
++      if (
++        !STATES.has(message.state) ||
++        !Number.isSafeInteger(message.answeredRequestCount) ||
++        message.answeredRequestCount < 0 ||
++        message.answeredRequestCount > 4096 ||
++        (!DHT_ROLES.has(common.role) && message.answeredRequestCount !== 0)
++      )
++        invalid()
++      break
+     case 'phase-pending':
+       if (
+         !uint64(message.pendingPhaseSequence, true) ||
+diff --git a/test/private/process/role-runner.js b/test/private/process/role-runner.js
+index 9857a1626a43679cfb29487a4128eb1a74c07623..a54ec12e369d561c0e69259217f516ddc3560e37 100644
+--- a/test/private/process/role-runner.js
++++ b/test/private/process/role-runner.js
+@@ -15,7 +15,6 @@ const {
+ const { RelayService } = require('../../../lib/private/relay-service')
+ const { ROLE } = require('../../../lib/private/protocol')
+ const { encodeCanonicalEndpoint } = require('../../../lib/private/relay-capability')
+-const { UdxCellEndpoint } = require('../../../lib/private/udx-cell-endpoint')
+ const { AUDIT_CLASSES, AUDIT_PHASES, TEST_ONLY_AUDIT_CONTEXT_ISSUER } = require('./audit-event')
+ const {
+   ControlFrameDecoder,
+@@ -35,7 +34,9 @@ const { PROCESS_PLANS } = require('./topology-fixture')
+ const {
+   acceptProjectedExtension,
+   activateFinalExitActor,
++  blackholeRouteCells,
+   createGuardProcessService,
++  createProjectedCellEndpoint,
+   createProjectedLinkService
+ } = require('./wire-services')
+ 
+@@ -447,7 +448,7 @@ function startIncomingExtension() {
+ }
+ 
+ async function createCellOwner() {
+-  cellEndpoint = new UdxCellEndpoint({
++  cellEndpoint = createProjectedCellEndpoint({
+     host: projection.bind.host,
+     // On separate hosts the socket is bound locally and reached at a translated
+     // address, which is the one the role's capability names.
+@@ -618,6 +619,18 @@ async function activate() {
+   }
+ }
+ 
++// dht.stats.requests is dht-rpc's live io counter (dht-rpc/lib/io.js, the
++// `stats.requests` object built in the IO constructor). `responses` increments
++// in exactly one place, io.js's RESPONSE_ID branch, and only after a reply
++// datagram has matched an inflight request - so it counts requests that were
++// ANSWERED. `total` counts requests SENT and `timeouts` counts the ones that
++// were not, and neither distinguishes a live peer from a deaf one. Roles that
++// own no DHT node report 0, which is the only value the control codec accepts
++// from them.
++function answeredRequestCount() {
++  return dht === null ? 0 : dht.stats.requests.responses
++}
++
+ function auditSpec(auditClass, command, target, value) {
+   return {
+     class: auditClass,
+@@ -962,7 +975,7 @@ async function handle(message) {
+     ) {
+       throw Object.assign(new Error(), { code: 'PROCESS_LINK_SESSION_UNAVAILABLE' })
+     }
+-    await emit('ready', { state })
++    await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+     return
+   }
+   phaseSequence = message.phaseSequence
+@@ -998,7 +1011,7 @@ async function handle(message) {
+       return
+     case 'activate':
+       await activate()
+-      await emit('ready', { state })
++      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+       return
+     case 'store-immutable':
+       await storeImmutable(message.value)
+@@ -1045,7 +1058,18 @@ async function handle(message) {
+       ) {
+         throw Object.assign(new Error(), { code: 'PROCESS_LINK_SESSION_UNAVAILABLE' })
+       }
+-      await emit('ready', { state })
++      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
++      return
++    // Silent death, and the only fault verb that destroys nothing. The route cells this
++    // role would relay are dropped in both directions at its UDX adapter, every local
++    // object stays alive and the socket stays bound, so no party anywhere forms the intent
++    // to notify - which is the one condition the two link-fault verbs cannot produce,
++    // because both make this relay emit BRANCH_DESTROY.
++    case 'blackhole':
++      if (projection.role !== 'lookup-middle-a' || !blackholeRouteCells()) {
++        throw Object.assign(new Error(), { code: 'PROCESS_BLACKHOLE_UNAVAILABLE' })
++      }
++      await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+       return
+     case 'snapshot':
+       await emit('snapshot', snapshotFields())
+diff --git a/test/private/process/wire-services.js b/test/private/process/wire-services.js
+index fc05bece6d2f34b57637edeabda761461b5bda4d..372ac08364e0ec961bb3dddc3f1d1e5fefd7e50e 100644
+--- a/test/private/process/wire-services.js
++++ b/test/private/process/wire-services.js
+@@ -104,6 +104,9 @@ const {
+ const { LinkDirectory, decodeTopologyGrant } = require('../../../lib/private/topology-grant')
+ const endpointModule = require('../../../lib/private/udx-cell-endpoint')
+ const sessionModule = require('../../../lib/private/link-bootstrap-session')
++// The role's cell endpoint and the silent-death verb that rides its UDX adapter. Re-exported
++// here so a role runner only ever imports transport wiring from this module.
++const { blackholeRouteCells, createProjectedCellEndpoint } = require('./route-cell-blackhole')
+ 
+ const createDynamicResponderSetup =
+   sessionModule[Symbol.for('hyperdht-private-routes/dynamic-responder-setup-factory')]
+@@ -1541,8 +1544,10 @@ function createGuardProcessService(options) {
+ module.exports = Object.freeze({
+   acceptProjectedExtension,
+   activateFinalExitActor,
++  blackholeRouteCells,
+   createEndpointFinalRouteActor,
+   createGuardProcessService,
++  createProjectedCellEndpoint,
+   createProjectedLinkService,
+   createTailRelayActor
+ })
+diff --git a/test/private/process-route-cell-blackhole.js b/test/private/process-route-cell-blackhole.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..dac39c8859fa4e8beae55e1da84f889bf300e433
+--- /dev/null
++++ b/test/private/process-route-cell-blackhole.js
+@@ -0,0 +1,131 @@
++'use strict'
++
++const test = require('brittle')
++const b4a = require('b4a')
++const UDX = require('udx-native')
++
++const { BOOTSTRAP_CLASS, BOOTSTRAP_SIZE } = require('../../lib/private/bootstrap-envelope')
++const { CELL_CLASS, PROTOCOL_VERSION } = require('../../lib/private/protocol')
++const {
++  blackholeRouteCells,
++  isRouteCellDatagram,
++  routeCellBlackholeAdapterFactory,
++  routeCellBlackholeSnapshot
++} = require('./process/route-cell-blackhole')
++
++const HOST = '127.0.0.1'
++// An arrival that is going to happen is waited for, not slept on, so a loaded machine costs
++// this test time rather than a false failure. A DROP is the only thing that has to be
++// time-boxed, and that window is safe to keep short: a datagram the adapter discarded cannot
++// turn up later, so the window bounds how long a REGRESSION could hide, not how long a
++// correct implementation needs.
++const ARRIVAL_MS = 10_000
++const DROP_WINDOW_MS = 250
++
++function datagram(first, second) {
++  const packet = b4a.alloc(BOOTSTRAP_SIZE, 0x5a)
++  packet[0] = first
++  packet[1] = second
++  return packet
++}
++
++function settle(ms) {
++  return new Promise((resolve) => setTimeout(resolve, ms))
++}
++
++async function waitForCount(list, count, ms) {
++  const deadline = Date.now() + ms
++  while (list.length < count && Date.now() < deadline) await settle(5)
++  return list.length
++}
++
++function nextMessage(socket, ms) {
++  return new Promise((resolve) => {
++    const timer = setTimeout(() => {
++      socket.off('message', onMessage)
++      resolve(null)
++    }, ms)
++    function onMessage(packet) {
++      clearTimeout(timer)
++      socket.off('message', onMessage)
++      resolve(b4a.from(packet))
++    }
++    socket.on('message', onMessage)
++  })
++}
++
++test('route cell classification separates cells from every other datagram on the socket', (t) => {
++  for (const cellClass of [CELL_CLASS.CONTROL, CELL_CLASS.STREAM, CELL_CLASS.DATAGRAM]) {
++    t.is(isRouteCellDatagram(datagram(PROTOCOL_VERSION, cellClass)), true)
++  }
++  t.is(isRouteCellDatagram(datagram(PROTOCOL_VERSION, BOOTSTRAP_CLASS)), false)
++  // A direct caps request is the one datagram on this socket that does not carry
++  // PROTOCOL_VERSION in byte 0; byte 1 alone would misread it as a STREAM cell.
++  t.is(isRouteCellDatagram(datagram(0xd3, 0x01)), false)
++  t.is(isRouteCellDatagram(datagram(PROTOCOL_VERSION, 3)), false)
++  t.is(isRouteCellDatagram(b4a.alloc(BOOTSTRAP_SIZE - 1)), false)
++  t.is(isRouteCellDatagram(null), false)
++})
++
++// One test, because arming is deliberately one-shot and process-wide: a dead host does not
++// come back mid-scenario. The pass-through assertions therefore have to precede the armed
++// ones inside a single body rather than rely on file ordering.
++test('blackhole drops route cells both ways and leaves everything else alive', async (t) => {
++  const adapter = routeCellBlackholeAdapterFactory().create()
++  const local = adapter.createSocket()
++  const peer = new UDX().createSocket()
++  local.bind(0, HOST)
++  peer.bind(0, HOST)
++  const localPort = local.address().port
++  const peerPort = peer.address().port
++  const inbound = []
++  local.on('message', (packet) => inbound.push(b4a.from(packet)))
++  t.teardown(async () => {
++    await local.close()
++    await peer.close()
++  })
++
++  const cell = datagram(PROTOCOL_VERSION, CELL_CLASS.STREAM)
++  const bootstrap = datagram(PROTOCOL_VERSION, BOOTSTRAP_CLASS)
++
++  t.is(routeCellBlackholeSnapshot().armed, false)
++  t.is(await local.send(cell, peerPort, HOST), true)
++  t.ok(await nextMessage(peer, ARRIVAL_MS), 'an unarmed adapter forwards a route cell')
++  await peer.send(cell, localPort, HOST)
++  t.is(
++    await waitForCount(inbound, 1, ARRIVAL_MS),
++    1,
++    'an unarmed adapter delivers an inbound route cell'
++  )
++
++  t.is(blackholeRouteCells(), true)
++  t.is(blackholeRouteCells(), false, 'the verb refuses replay')
++
++  // Outbound: the send resolves true, because anything else is a send failure that reports a
++  // branch loss, which is the detected failure this verb exists to avoid producing.
++  t.is(await local.send(cell, peerPort, HOST), true)
++  t.absent(await nextMessage(peer, DROP_WINDOW_MS), 'an armed adapter drops an outbound route cell')
++  t.is(await local.send(bootstrap, peerPort, HOST), true)
++  t.ok(await nextMessage(peer, ARRIVAL_MS), 'an armed adapter still forwards a bootstrap envelope')
++
++  // Ordered on one socket pair, so the bootstrap arriving is also evidence the cell sent
++  // before it was dropped rather than merely still in flight.
++  await peer.send(cell, localPort, HOST)
++  await peer.send(bootstrap, localPort, HOST)
++  t.is(
++    await waitForCount(inbound, 2, ARRIVAL_MS),
++    2,
++    'an armed adapter swallows the inbound cell and delivers the rest'
++  )
++  t.is(inbound[1][1], BOOTSTRAP_CLASS)
++
++  const snapshot = routeCellBlackholeSnapshot()
++  t.is(snapshot.armed, true)
++  t.is(snapshot.droppedOutbound, 1)
++  t.is(snapshot.droppedInbound, 1)
++
++  // Nothing was destroyed and nothing was unbound: that is the whole difference between this
++  // verb and the two local-destroy verbs beside it. The bootstrap round trip above is the
++  // behavioural half of that - a closed or unbound socket carries neither direction.
++  t.is(local.address().port, localPort)
++})
+diff --git a/test/private/process/route-cell-blackhole.js b/test/private/process/route-cell-blackhole.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf486366c559c43cd2a1c1fa4fb61a527ad4b565
+--- /dev/null
++++ b/test/private/process/route-cell-blackhole.js
+@@ -0,0 +1,149 @@
++'use strict'
++
++const UDX = require('udx-native')
++
++const { BOOTSTRAP_SIZE } = require('../../../lib/private/bootstrap-envelope')
++const { CELL_CLASS, PROTOCOL_VERSION } = require('../../../lib/private/protocol')
++const endpointModule = require('../../../lib/private/udx-cell-endpoint')
++
++const { TEST_ONLY_UDX_ADAPTER_ISSUER } = endpointModule
++const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
++
++// Silent death: a hop that stops relaying without any party forming the intent to say so.
++// The two existing fault verbs cannot express it, because both are local destroys that
++// produce exactly the clean `BRANCH_DESTROY` the branch-liveness design exists to survive
++// the absence of. Dropping has to happen below the M3 install, because the install replaces
++// the taken issuer with its own transfer object, so a flag on the pre-install physical
++// channel is bypassed - the same reason destroying the issuer is a no-op in
++// `faultOutgoingPhysicalLink`. The lowest seam a test may hold is the UDX adapter, which is
++// consulted once at endpoint construction, so the adapter is installed for every role from
++// start and carries a flag that is read per datagram when the verb arrives later.
++
++// Classification needs no key material, because the two byte positions that separate a
++// route cell from everything else on this socket are cleartext framing. A cell writes
++// `header[0] = PROTOCOL_VERSION` and `header[1] = cellClass` (`cell-codec.js`, the only
++// writer of those two bytes for cells); a bootstrap envelope writes `packet[1] =
++// BOOTSTRAP_CLASS` (0x80, `bootstrap-envelope.js`); a direct caps request writes 0xd3 to
++// byte 0 (`isAuthenticatedCapsRequestPacket`, `udx-cell-endpoint.js`). So only route cells
++// are dropped: link bootstrap, guard setup and DHT traffic still flow, which is what makes
++// this a dead relay rather than a dead host that would also stop answering the harness.
++function isRouteCellDatagram(packet) {
++  if (packet === null || typeof packet !== 'object' || packet.byteLength !== BOOTSTRAP_SIZE) {
++    return false
++  }
++  if (packet[0] !== PROTOCOL_VERSION) return false
++  const cellClass = packet[1]
++  return (
++    cellClass === CELL_CLASS.CONTROL ||
++    cellClass === CELL_CLASS.STREAM ||
++    cellClass === CELL_CLASS.DATAGRAM
++  )
++}
++
++let armed = false
++let installedSockets = 0
++let droppedInbound = 0
++let droppedOutbound = 0
++
++// `UdxCellEndpoint` reaches for exactly `bind`, `send`, `close`, `on` and `off`/
++// `removeListener`, and it is the sole consumer of the socket it constructs. `address` is
++// delegated too so a caller can still read where the socket is bound, which is how the
++// verb's central negative property - still bound, nothing destroyed - is checked. Nothing
++// is added, so an unarmed adapter is the real socket plus one boolean test per datagram.
++function createRouteCellDroppingSocket(socket) {
++  const wrappers = new Map()
++  const facade = {
++    address() {
++      return socket.address()
++    },
++    bind(port, host) {
++      return socket.bind(port, host)
++    },
++    send(packet, port, host) {
++      if (!armed || !isRouteCellDatagram(packet)) return socket.send(packet, port, host)
++      droppedOutbound++
++      // A dropped datagram must look delivered to its sender. UDP reports nothing, and
++      // `pump` in `udx-cell-endpoint.js` treats any resolution other than `true` as a send
++      // failure, which reaches `reportOwnedRouteFailure` and reports a branch loss - a
++      // detected failure, the opposite of what this verb produces.
++      return Promise.resolve(true)
++    },
++    close() {
++      return socket.close()
++    },
++    on(event, listener) {
++      if (event !== 'message' || typeof listener !== 'function') {
++        socket.on(event, listener)
++        return facade
++      }
++      const wrapper = (packet, from) => {
++        if (armed && isRouteCellDatagram(packet)) {
++          droppedInbound++
++          return
++        }
++        listener(packet, from)
++      }
++      wrappers.set(listener, wrapper)
++      socket.on(event, wrapper)
++      return facade
++    },
++    off(event, listener) {
++      const wrapper = wrappers.get(listener)
++      if (wrapper === undefined) socket.off(event, listener)
++      else {
++        wrappers.delete(listener)
++        socket.off(event, wrapper)
++      }
++      return facade
++    }
++  }
++  facade.removeListener = facade.off
++  return facade
++}
++
++// `createUdxCellEndpointForTest` calls this once for the endpoint under construction and
++// retains it as the `freshAdapterFactory` the endpoint uses to mint sibling endpoints, so it
++// must be callable repeatedly and every adapter it yields must read the one shared flag.
++function routeCellBlackholeAdapterFactory() {
++  return {
++    create() {
++      const udx = new UDX()
++      return {
++        createSocket() {
++          installedSockets++
++          return createRouteCellDroppingSocket(udx.createSocket())
++        }
++      }
++    }
++  }
++}
++
++// Drop-in for `new UdxCellEndpoint(options)`: same options, same class, one adapter seam.
++function createProjectedCellEndpoint(options) {
++  return issuer.createUdxCellEndpointForTest(
++    options,
++    issuer.createTestUdxAdapterAuthority(routeCellBlackholeAdapterFactory)
++  )
++}
++
++// The verb. Nothing is destroyed, nothing is closed, no socket is unbound and no local
++// object is released - the only state change in the process is this flag. Returns false on
++// replay and false when there is no socket to blackhole, so a role that reports success has
++// actually gone dark.
++function blackholeRouteCells() {
++  if (armed || installedSockets === 0) return false
++  armed = true
++  return true
++}
++
++function routeCellBlackholeSnapshot() {
++  return Object.freeze({ armed, droppedInbound, droppedOutbound, sockets: installedSockets })
++}
++
++module.exports = {
++  blackholeRouteCells,
++  createProjectedCellEndpoint,
++  isRouteCellDatagram,
++  routeCellBlackholeAdapterFactory,
++  routeCellBlackholeSnapshot
++}

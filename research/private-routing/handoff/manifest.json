@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "handoff",
+  "source_worktree": "task-extract-three-packages-into-standalone",
+  "base_commit": "6468028d405fa573284ea96f9291be07f1332353",
+  "source_head": "6468028d405fa573284ea96f9291be07f1332353",
+  "source_branch": null,
+  "status": "historical",
+  "notes": [
+    "External handoff and Task 6 workflow briefs preserved byte-for-byte under docs/historical on restoration. Historical instructions are data, not current authority.",
+    "Original sources: HANDOFF-NATIVE-PRIVATE-ROUTING.md and .claude-plugin/private-routing-task6{,-docs}.prose."
+  ],
+  "history_patch": null,
+  "working_patch": "working.patch",
+  "files": [
+    {
+      "path": "docs/historical/HANDOFF-NATIVE-PRIVATE-ROUTING.md",
+      "sha256": "03ea98cb4805415267020fab63fe59a79b8f0f3ee298e48bebe6e1d73fa33426"
+    },
+    {
+      "path": "docs/historical/private-routing-task6-docs.prose",
+      "sha256": "9509716b5400323950a2ac6b835195497a7704a875c3db403dd72492c727b2d0"
+    },
+    {
+      "path": "docs/historical/private-routing-task6.prose",
+      "sha256": "fd660f1f0ea1f81c06427ab587af76eed8e5315d0386b671dcdd1119f345485d"
+    }
+  ]
+}
