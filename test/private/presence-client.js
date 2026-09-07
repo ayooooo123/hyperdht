@@ -265,3 +265,32 @@ test('missing overlap revocation target fails before publishing either tombstone
     t.is((await controller.mutableGet(publicKey)).seq, 1)
   }
 })
+
+for (const scope of [TOMBSTONE_SCOPE.PERIOD, TOMBSTONE_SCOPE.RECORD]) {
+  test('new-period tombstone blocks stale old-period fallback: ' + scope, async (t) => {
+    const controller = createFakeController()
+    const before = clientFor(controller, Number(PERIOD_MS) - Number(OVERLAP_MS))
+    const after = clientFor(controller, Number(PERIOD_MS) + 1_000)
+    const published = await before.publishPresence({ descriptor: b4a.from('old'), revision: 7 })
+    const oldState = await before.resolvePresence()
+    const stale = await controller.mutableGet(published[0].publicKey)
+    await before.revokePresence({
+      revision: 8,
+      scope,
+      targets: new Map(published.map(({ period, recordDigest }) => [period, recordDigest]))
+    })
+    const tombstone = await after.resolvePresence({ previous: oldState })
+    t.is(tombstone.period, 1n)
+    t.is(tombstone.revision, 8)
+    t.is(tombstone.present, scope === TOMBSTONE_SCOPE.PERIOD ? false : null)
+    t.alike(await after.resolvePresence({ previous: tombstone }), tombstone)
+    controller.mutableGet = async (publicKey) =>
+      b4a.equals(publicKey, published[0].publicKey) ? stale : null
+    try {
+      await after.resolvePresence({ previous: tombstone })
+      t.fail('an older period must not restore presence after observing a newer tombstone')
+    } catch (err) {
+      t.is(err.code, 'REPLAY')
+    }
+  })
+}
