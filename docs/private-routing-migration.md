@@ -497,44 +497,90 @@ every layer itself with the relays' authorities ("local peel"); that was
 rejected on diff review as the shim the packet forbids and deleted, and the
 exit no longer accepts relay authorities at all.
 
-What is still not proven, stated plainly: (1) the in-process live topology
-forwards reverse cells through opaque forwarders, not the M3 facade, so
-`live-surb-required` feeds each exit hop cell through `processRelaySurbHop`
-with that relay's own authorities from the test (the relay code path is real,
-the link between relays is simulated), and terminal delivery to the endpoint
-uses the test issuer's `deliverSurbTerminal`; (2) no fixture or production
-owner passes `surbHopPeel` to a facade yet, and the return-path relay
-capabilities are bound by the test issuer (`bindSurbReturnPath`), not by the
-route builder; (3) packed SURB frames on the reverse link carry a fixed magic
-and are not sealed by the per-link route codec, which classifies them to a
-link observer as SURB traffic (not a cross-link tag, but a visible kind);
-(4) the eleven-role gate does not exercise required mode. Those four are the
-remaining Gate C work before the wire can be called proven on live links, and
-they are recorded rather than papered over.
+What is still not proven, stated plainly, as of commit `4993aae`: (1) the
+in-process live topology forwards reverse cells through opaque forwarders, not
+the M3 facade, so `live-surb-required` feeds each exit hop cell through
+`processRelaySurbHop` with that relay's own authorities from the test (the
+relay code path is real, the link between relays is simulated), and terminal
+delivery to the endpoint uses the test issuer's `deliverSurbTerminal`; (2) no
+fixture or production owner passes `surbHopPeel` to a facade yet, and the
+return-path relay capabilities are bound by the test issuer
+(`bindSurbReturnPath`), not by the route builder; (3) packed SURB frames on
+the reverse link carry a fixed magic and are not sealed by the per-link route
+codec, which classifies them to a link observer as SURB traffic (not a
+cross-link tag, but a visible kind); (4) the eleven-role gate does not
+exercise required mode.
 
-**Measurements.** All ten local Linux gates pass on the combined tree
-(image rebuilt on the pinned dependency). Node aggregate **1,075 tests /
-19,601 assertions**; Bare **1,031 / 19,468**; the four normal/reverse process
-legs 148 each; both production-punch legs 153; namespace projection 27; live
-namespace capture 158 with raw DROP zero. Whole-repository Prettier passes.
-The one aggregate failure on the first run was the protocol registry test,
-which pins the exact sorted message-ID set and had to learn
-`ROUTED_REQUEST_V2` (63 IDs now). Presence message IDs `0x0280–0x02a3`
-remain reserved and unused: Gate D records ride the mutable-record commands
-by seat decision; the routed presence commands belong to the Gate 3B
-remainder.
+**Required mode on real links (same day, later).** Items (1), (2) and (4)
+closed. The controller now binds the return path itself on every READY
+install (`bindProductionSurbReturnPaths` from `route-manager.readBranchPath`
+and `guard-lease.readGuardSurbHop`, initial pair and every rotation; the old
+authority dies with its generation). The eleven-role harness passes
+`surbHopPeel` to each relay's M3 forwarding facade in `wire-services.js`,
+built from that role's own route secret and a per-role replay authority, so a
+hop cell is peeled at the middle and again at the guard on the real links,
+the guard emitting the terminal cell to the endpoint over the guard link. The
+endpoint role creates its controller with `experimentalSurbReplies: true` and
+the scenario, after the announce-branch puts, issues `surb-get` and requires
+the exact value, `surbHopsPeeled ≥ 1` on the lookup middle and on the guard,
+`surbHopCellCount ≥ 1` on the lookup exit and an unchanged
+`correlatedFrameCount` on it. Process legs now pass **155** assertions, the
+punch legs 160, live namespace capture 165. Three defects surfaced on the way,
+all fixed with a regression: the controller's reply mode was a sticky switch
+on the IO (every later get would have stayed on the SURB path, and a
+correlated caller's request would have become required) — it is now a
+counted per-query hold covering the query's retry; after a required reply the
+exit's route service still considered the operation active and admitted no
+further request (the SURB path never settled it) — `onSurbReplySettled` now
+does; and the endpoint's receive race left the losing transport reservation
+armed after an injected terminal, so it swallowed the next correlated reply
+on the route. `live-surb-required` proves a plain get after a required one is
+correlated again (7/46). Item (3) remains open and is a wire-shape decision
+for review, not an integration gap.
 
-Remaining work, in dependency order: (1) Gate C on live links — bind the
-return path in the route builder, pass `surbHopPeel` from the fixtures that
-construct relay facades (`wire-services.js`, `hosted-tail-fixture.js`), seal
-SURB frames under the per-link codec, and put required mode on the
-eleven-role gate; (2) the `-l 2 -p` dispatch without overrides as the check on
-the plan-scoped `ready` bound, after this tree is pushed; (3) Gate 3B
-remainder — routed `findPeer`, `lookup`, `announce`, `unannounce`, raw
-`query`, the required-mode `lookup`/`announce` mapping onto presence records,
-peer streams, the public required-mode gate; (4) external cryptographic
-review of Gate C and Gate D, and consumer integration, which also brings the
-production topology owner that D7 waits on.
+**Namespace gate and grants.** The routed put/get and required-SURB steps
+each rediscover the learned closers, which on the namespace plan are isolated
+candidates admitted only through one-shot coordinator grants; the six-grant
+pools were exhausted at the `surb-get`, and an exit whose optional grant is
+never answered waits for the probe rather than finishing — a harness
+property, recorded here, not a protocol one. `LEARNED_GRANT_USES` is now ten
+(observed bound 30). The namespace roles now also receive
+`PR_ROLE_FATAL_LOG` through the `env` wrapper inside the namespace, which is
+how this was diagnosed.
+
+**Remote check of the plan-scoped bound.** Run
+[34068302573](https://github.com/ayooooo123/hyperdht/actions/runs/34068302573)
+(`-l 2 -p`, no overrides, tip `237921b`): matrix 117/117, reflection equal on
+both sides, exchange 840.9 ms, and the endpoint's `activate` passed inside
+the shipped 20 s dht-mesh bound with no diagnostic override — the bound does
+what run 34062848870 needed. The run then failed at `suspend` (assertion 77)
+with `ERR_PRIVACY_UNAVAILABLE` from `PrivateRoutingController.suspend`: the
+controller was still `ROTATING` when the coordinator's next command arrived,
+which real-link timing can produce after the blackhole rotation and loopback
+never does. The endpoint role now waits out an in-flight rotation (bounded at
+4 s, inside the command wait) before suspending; that is the client contract
+("suspend a READY controller"), not a hidden retry. Not re-dispatched in this
+session; the next `-l 2 -p` run is the check.
+
+**Measurements.** All ten local Linux gates pass on the final tree. Node
+aggregate **1,075 tests / 19,607 assertions**; Bare **1,031 / 19,474**; the
+four normal/reverse process legs 155 each; both production-punch legs 160;
+namespace projection 27; live namespace capture 165 with raw DROP zero.
+Whole-repository Prettier passes. The protocol registry test pins the exact
+sorted message-ID set and learned `ROUTED_REQUEST_V2` (63 IDs). Presence
+message IDs `0x0280–0x02a3` remain reserved and unused: Gate D records ride
+the mutable-record commands by seat decision; the routed presence commands
+belong to the Gate 3B remainder.
+
+Remaining work, in dependency order: (1) Gate C wire shape — whether SURB
+hop and terminal frames are sealed under the per-link route codec (review
+decision), then external cryptographic review of Gate C and Gate D; (2) the
+next `-l 2 -p` dispatch as the check on the suspend-after-rotation wait;
+(3) Gate 3B remainder — routed `findPeer`, `lookup`, `announce`,
+`unannounce`, raw `query`, the required-mode `lookup`/`announce` mapping onto
+presence records, peer streams, the public required-mode gate; (4) consumer
+integration, which also brings the production topology owner that D7 waits
+on.
 
 ### Subagent design handoff — 2026-09-05
 
@@ -3178,21 +3224,22 @@ in this document's history - so re-measure rather than cite, and if you change a
 change this table in the same pass. Measured on 2026-09-06 on the tree that
 adds the pinned sodium-native fork, Gate D records, the experimental Gate C
 integration, reflector exposure accounting, the plan-scoped remote `ready`
-bound, and the routed put steps with the exact DHT storage oracle. Darwin
+bound, the routed put steps with the exact DHT storage oracle, and required
+SURB mode on the eleven-role gate. Darwin
 aggregates and remote dispatches were not re-measured in this checkpoint.
 
 | Suite                              | Command                                            | Result                                             |
 | ---------------------------------- | -------------------------------------------------- | -------------------------------------------------- |
-| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 1,075/1,075 tests, 19,601/19,601 assertions, Linux |
-| Private aggregate, Bare            | `bare test/private-routing.js`                     | 1,031/1,031 tests, 19,468/19,468 assertions, Linux |
-| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 148/148 assertions, Linux                          |
-| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 148/148 assertions, Linux                          |
-| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 148/148 assertions, Linux                          |
-| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 148/148 assertions, Linux                          |
-| Eleven-role scenario, punch Node   | `bash scripts/linux-gates.sh process:node:punch`   | 153/153 assertions, Linux                          |
-| Eleven-role scenario, punch Bare   | `bash scripts/linux-gates.sh process:bare:punch`   | 153/153 assertions, Linux                          |
+| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 1,075/1,075 tests, 19,607/19,607 assertions, Linux |
+| Private aggregate, Bare            | `bare test/private-routing.js`                     | 1,031/1,031 tests, 19,474/19,474 assertions, Linux |
+| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 155/155 assertions, Linux                          |
+| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 155/155 assertions, Linux                          |
+| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 155/155 assertions, Linux                          |
+| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 155/155 assertions, Linux                          |
+| Eleven-role scenario, punch Node   | `bash scripts/linux-gates.sh process:node:punch`   | 160/160 assertions, Linux                          |
+| Eleven-role scenario, punch Bare   | `bash scripts/linux-gates.sh process:bare:punch`   | 160/160 assertions, Linux                          |
 | Namespace projection enforcement   | `npm run test:private:namespace`                   | 27/27 assertions, privileged Linux                 |
-| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 158/158 assertions; raw DROP 0, classified ICMP 0  |
+| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 165/165 assertions; raw DROP 0, classified ICMP 0  |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
