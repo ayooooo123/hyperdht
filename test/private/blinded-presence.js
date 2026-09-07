@@ -444,4 +444,5 @@ test('presence revision floors are period scoped and identical records are idemp
   t.is(next.period, 4n)
   t.is(next.revision, 7)
   t.is(resolvePresenceState({ previous, opened: openedAt(4n, 1) }).revision, 1)
+  expectCode(t, () => resolvePresenceState({ previous: next, opened: openedAt(3n, 99) }), 'REPLAY')
 })

@@ -411,7 +411,8 @@ presence; a `RECORD` tombstone clears it only when its target matches the
 retained digest in the same period, or when polling that already accepted
 tombstone. A mismatched target stays ignored. A higher revision in that period
 can re-enable presence after a tombstone. Revisions from different periods
-are not compared. `lib/private/presence-client.js` is the production caller over
+are not compared, but a record below the retained period is always `REPLAY`.
+`lib/private/presence-client.js` is the production caller over
 `controller.mutablePut` / `mutableGet` (publish, revoke, resolve across the
 period lists; the reader credential is the client's configured secret and the
 per-record key is derived and erased inside the codec). Fixed vectors: identity
@@ -627,13 +628,18 @@ Every publication period must have a 32-byte target. Targets are checked and
 copied before the first write, so a missing overlap target cannot cause a
 partial revoke and caller mutation during an awaited write cannot change a
 later target. PERIOD revocation needs no target map. Retain each returned
-state unchanged as `previous`; direct helper callers must supply the opened
-record's period and digest. In-tree live callers use this contract.
+state unchanged as `previous`, including ignored tombstones. Keep that state
+when a lookup returns `null` or throws. Direct helper callers must supply the
+opened record's period and digest. In-tree live callers use this contract.
 
-Scope limits: this is a retained-state, same-period rollback check, not proof
-of freshness for a reader with no history. A caller that needs floors for
-several periods must retain state per period. An unmatched RECORD tombstone
-does not prove absence. No Gate C wire change, remote dispatch, or Gate 3B
+Scope limits: this is a retained-state rollback check, not proof of freshness
+for a reader with no history. The retained period is a lower bound: once a
+newer signed period is observed, an older period cannot restore presence,
+even if the newer record is later missing from storage. Within the retained
+period, the revision and digest checks still apply. This single-state rule
+does not require callers to select state for an internal fallback period.
+An unmatched RECORD tombstone does not prove absence, but it still advances
+the period/revision floor. No Gate C wire change, remote dispatch, or Gate 3B
 command mapping is part of this repair.
 
 Verification before the full Linux run: the new Node regressions failed on
@@ -644,7 +650,7 @@ both overlap periods, midnight rollover, repeated reads, and stale storage
 rejection using the actual returned tombstone state. The read-only review
 archives remain outside Git and unchanged.
 
-Final verification: `bash scripts/linux-gates.sh all` passes all ten gates
+Verification of the first repair (`c0db444`): `bash scripts/linux-gates.sh all` passes all ten gates
 with exit code 0. Node aggregate: 1,080 tests / 19,646 assertions. Bare
 aggregate: 1,036 / 19,513. All four normal/reverse process legs: 155
 assertions each; both production-punch legs: 160 each; namespace projection:
@@ -652,6 +658,30 @@ assertions each; both production-punch legs: 160 each; namespace projection:
 `/tmp/hyperdht-gate-d-linux-gates.log`. The first run's tool artifact omitted
 part of the output; the recorded counts are from a complete captured rerun.
 The temporary smoke script was removed; the regression tests remain.
+
+The later combined-boundary check found a further defect in `c0db444`: after
+reading a new-period tombstone with only an old-period descriptor retained,
+a missing new-period record let lookup fall back to the stale old descriptor.
+This affected PERIOD tombstones as well as ignored RECORD tombstones. New
+regressions failed on that commit for both scopes.
+
+The resolver now rejects `opened.period < previous.period` with `REPLAY`.
+This is a period floor, not a comparison of revisions across periods or an
+assumed relation between target digests. The combined test publishes and
+revokes in overlap, retains only the old descriptor, reads the new tombstone
+after midnight, then hides the new record and serves the stale old one.
+Both scopes now reject that fallback. A separate helper check also rejects
+an older period carrying a higher revision. Focused Node and Bare suites
+pass: blinded presence 10 / 71 and presence client 12 / 62. A standalone
+Node smoke confirms the ignored RECORD tombstone followed by stale fallback
+throws `REPLAY`.
+
+Final period-floor verification: all ten Linux gates pass, exit code 0.
+Node aggregate: 1,082 tests / 19,657 assertions; Bare: 1,038 / 19,524.
+Four normal/reverse process legs: 155 each; two production-punch legs:
+160 each; namespace: 27; live namespace: 165, raw DROP 0. Complete log:
+`/tmp/hyperdht-gate-d-period-floor-linux-gates.log`. The changed files pass
+Prettier. This run includes the older-period fallback regressions.
 
 ### Subagent design handoff — 2026-09-05
 
