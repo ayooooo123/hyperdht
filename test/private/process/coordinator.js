@@ -453,8 +453,13 @@ function createProcessControl(options) {
     const pending = deferred()
     const timer = setTimeout(() => {
       waiters.delete(waiterKey)
-      pending.reject(new ProcessControlError('PROCESS_COMMAND_DEADLINE'))
-      fail(role, 'COMMAND', 'PROCESS_COMMAND_DEADLINE')
+      // The rejection reaches the scenario's catch; name the round trip that missed.
+      const error = new ProcessControlError('PROCESS_COMMAND_DEADLINE')
+      error.role = role
+      error.event = event
+      error.message = `PROCESS_COMMAND_DEADLINE (${role}/${event})`
+      pending.reject(error)
+      fail(role, 'COMMAND', 'PROCESS_COMMAND_DEADLINE', `waiting for ${event}`)
     }, commandDeadlineFor(event))
     waiters.set(waiterKey, {
       ...pending,

@@ -1326,18 +1326,51 @@ through the route) and the public required-mode gate remain design gates:
 the first needs its own reviewed design, the second the external
 cryptographic review that every checkpoint here names as open.
 
+**Follow-ups on the presence slice (same day, astra-low workers, diffs read
+by the seat).** The endpoint role's `presencePublish` / `presenceResolve`
+zeroize every owned input (seed copy, derived identity key pair, reader
+secret, descriptor, identity) on success, failure, stale-operation return
+and cancel-before-timer, through a cleanup callback `startEndpointOperation`
+now owns. The scenario baselines the lookup exit after the publish and,
+after the required-mode resolve, asserts hop cells grew **and**
+`correlatedFrameCount` is unchanged — the D12 proof, measured after the
+publish because put acknowledgements are correlated by design. A command
+deadline now names its round trip (`PROCESS_COMMAND_DEADLINE (guard/snapshot)`),
+and a role reports a command failure that happens after `stop` has begun
+instead of swallowing it (`fatal(err, commandFailed)`); faulted link
+sessions are joined at link-service destroy.
+
+**KI-18: the namespace capture gate is intermittent on this workstation
+(harness self-checks, named now).** Status: open, harness-only, two causes,
+both named in the failure since this checkpoint. (1)
+`test/private/process/socket-close-observer.js:18` refuses a wall/monotonic
+drift above 2 ms over the role's lifetime; inside the Docker VM on this
+workstation that drift is exceeded in roughly one run in three, and the
+guard and a middle then fail their socket close at `stop` with `socket
+close observer realtime clock changed`. Before this checkpoint that error
+was swallowed by `fatal()` because `stopped` was already set and surfaced as
+the silent `PROCESS_COMMAND_DEADLINE` the 2026-09-07 log records at 100/101.
+(2) `ERR_TEARDOWN_ICMP: raw DROP=1, classified=0` (KI-16's classifier) in
+about one run in ten. Neither is a protocol property; neither threshold was
+widened (the 2 ms bound is what makes the capture timestamps trustworthy and
+"never backdate" is deliberate). Options for JD: run the namespace gate on
+native Linux, or accept a documented wider drift bound for VM hosts. Runs
+on the final tree: worker's five consecutive passes at 173/173, then the
+seat's full run failed (1), a rerun passed 173/173 with raw DROP 0, a second
+rerun failed (2).
+
 **Measurements.** `set -o pipefail; bash scripts/linux-gates.sh all` on the
-final tree with no concurrent edits, all ten gates, exit 0: Node aggregate
-**1,092 tests / 19,704 assertions**; Bare **1,047 / 19,569**; the four
-normal/reverse process legs **162** each; both production-punch legs
-**167** each; namespace projection 27; live namespace capture **172** with
-kernel raw DROP zero (the presence publish and required-mode resolve run
-inside the namespace capture too). Complete log:
-`/tmp/hyperdht-presence-linux-gates-2.log`. The earlier commits of this
-checkpoint were measured the same way (`5bcf9ac`: 1,091 / 19,687 and
-1,046 / 19,552; `b33fbe4`: 1,092 / 19,689 and 1,047 / 19,554; `f71e8de`:
-1,092 / 19,692 and 1,047 / 19,557, process 155, punch 160, live namespace
-165). Whole-repository Prettier passes.
+final tree with no concurrent edits: nine gates pass in one run (Node
+aggregate **1,092 tests / 19,704 assertions**; Bare **1,047 / 19,569**; the
+four normal/reverse process legs **163** each; both production-punch legs
+**168** each; namespace projection 27) and `namespace:live` passed **173 /
+173** with kernel raw DROP zero on the same tree in the immediately following
+run (`/tmp/hyperdht-nslive-final-1.log`), with the KI-18 intermittents
+recorded above. Earlier commits of this checkpoint: `5bcf9ac` 1,091 / 19,687
+and 1,046 / 19,552; `b33fbe4` 1,092 / 19,689 and 1,047 / 19,554; `f71e8de`
+1,092 / 19,692 and 1,047 / 19,557; `71498a1` 1,092 / 19,704 and 1,047 /
+19,569 (process 162, punch 167, live namespace 172). Whole-repository
+Prettier passes.
 
 ### Subagent design handoff — 2026-09-05
 

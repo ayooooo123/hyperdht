@@ -1087,20 +1087,43 @@ function surbGet(target) {
 // branch in production (`immutablePut`/`mutablePut` query the announce context and
 // commit through the exit that answered), which is exactly what the in-process
 // harness cannot deliver, so this is the live coverage for that path.
-function startEndpointOperation(run) {
-  if (projection.role !== 'endpoint' || (state !== 'READY' && state !== 'BOOTSTRAPPING')) {
-    throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+function startEndpointOperation(run, cleanup = null) {
+  let operation = null
+  try {
+    if (projection.role !== 'endpoint' || (state !== 'READY' && state !== 'BOOTSTRAPPING')) {
+      throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
+    }
+    if (activeOperation !== null)
+      throw Object.assign(new Error(), { code: 'PROCESS_OPERATION_ACTIVE' })
+    const sequence = ++operationSequence
+    operation = { sequence, target: b4a.alloc(32), timer: null, cleanup }
+    operation.timer = schedule(() => {
+      if (activeOperation === null || activeOperation.sequence !== sequence) return
+      operation.timer = null
+      void (async () => {
+        try {
+          await run(sequence)
+        } finally {
+          if (operation.cleanup) {
+            try {
+              operation.cleanup()
+            } finally {
+              operation.cleanup = null
+            }
+          }
+        }
+      })().catch((err) => fatal(err))
+    }, 25)
+    activeOperation = operation
+    return sequence
+  } catch (err) {
+    try {
+      if (cleanup) cleanup()
+    } finally {
+      if (operation) operation.cleanup = null
+    }
+    throw err
   }
-  if (activeOperation !== null)
-    throw Object.assign(new Error(), { code: 'PROCESS_OPERATION_ACTIVE' })
-  const sequence = ++operationSequence
-  const timer = schedule(() => {
-    if (activeOperation === null || activeOperation.sequence !== sequence) return
-    activeOperation.timer = null
-    void run(sequence).catch((err) => fatal(err))
-  }, 25)
-  activeOperation = { sequence, target: b4a.alloc(32), timer }
-  return sequence
 }
 
 function immutablePut(value) {
@@ -1148,58 +1171,80 @@ function mutableGet(publicKey) {
 // reader secret are scenario fixtures, `now` is the coordinator's wall time so both
 // ends derive the same periods, and the reader keys are erased inside the codec.
 function presencePublish(seed, readerSecret, revision, descriptor, now) {
-  const identityKeyPair = cryptoSuite.keyPair(b4a.from(seed))
+  const ownedSeed = b4a.from(seed)
   const ownedReader = b4a.from(readerSecret)
   const ownedDescriptor = b4a.from(descriptor)
-  return startEndpointOperation(async (sequence) => {
-    const client = createPresenceClient({
-      controller: endpointController,
-      identityKeyPair,
-      readerSecret: ownedReader,
-      now: () => Number(now)
-    })
-    const published = await client.publishPresence({
-      descriptor: ownedDescriptor,
-      revision: Number(revision)
-    })
-    if (activeOperation === null || activeOperation.sequence !== sequence) return
-    if (!Array.isArray(published) || published.length < 1) {
-      throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+  return startEndpointOperation(
+    async (sequence) => {
+      let identityKeyPair = null
+      try {
+        identityKeyPair = cryptoSuite.keyPair(ownedSeed)
+        const client = createPresenceClient({
+          controller: endpointController,
+          identityKeyPair,
+          readerSecret: ownedReader,
+          now: () => Number(now)
+        })
+        const published = await client.publishPresence({
+          descriptor: ownedDescriptor,
+          revision: Number(revision)
+        })
+        if (activeOperation === null || activeOperation.sequence !== sequence) return
+        if (!Array.isArray(published) || published.length < 1) {
+          throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+        }
+        activeOperation = null
+        const publicKeys = sortedDigests(published.map((entry) => b4a.from(entry.publicKey)))
+        await emit('presence-published', { publicKeys, revision })
+      } finally {
+        if (identityKeyPair) {
+          identityKeyPair.secretKey.fill(0)
+          identityKeyPair.publicKey.fill(0)
+        }
+      }
+    },
+    () => {
+      ownedSeed.fill(0)
+      ownedReader.fill(0)
+      ownedDescriptor.fill(0)
     }
-    activeOperation = null
-    const publicKeys = sortedDigests(published.map((entry) => b4a.from(entry.publicKey)))
-    await emit('presence-published', { publicKeys, revision })
-  })
+  )
 }
 
 function presenceResolve(identityPublicKey, readerSecret, now, replyMode) {
   const ownedIdentity = b4a.from(identityPublicKey)
   const ownedReader = b4a.from(readerSecret)
-  return startEndpointOperation(async (sequence) => {
-    const client = createPresenceClient({
-      controller: endpointController,
-      identityPublicKey: ownedIdentity,
-      readerSecret: ownedReader,
-      now: () => Number(now),
-      replyMode
-    })
-    const resolved = await client.resolvePresence()
-    if (activeOperation === null || activeOperation.sequence !== sequence) return
-    if (
-      !resolved ||
-      typeof resolved.present !== 'boolean' ||
-      !Number.isSafeInteger(resolved.revision)
-    ) {
-      throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+  return startEndpointOperation(
+    async (sequence) => {
+      const client = createPresenceClient({
+        controller: endpointController,
+        identityPublicKey: ownedIdentity,
+        readerSecret: ownedReader,
+        now: () => Number(now),
+        replyMode
+      })
+      const resolved = await client.resolvePresence()
+      if (activeOperation === null || activeOperation.sequence !== sequence) return
+      if (
+        !resolved ||
+        typeof resolved.present !== 'boolean' ||
+        !Number.isSafeInteger(resolved.revision)
+      ) {
+        throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+      }
+      activeOperation = null
+      await emit('presence-state', {
+        present: resolved.present,
+        period: resolved.period,
+        revision: BigInt(resolved.revision),
+        descriptor: resolved.present ? b4a.from(resolved.descriptor) : b4a.alloc(0)
+      })
+    },
+    () => {
+      ownedIdentity.fill(0)
+      ownedReader.fill(0)
     }
-    activeOperation = null
-    await emit('presence-state', {
-      present: resolved.present,
-      period: resolved.period,
-      revision: BigInt(resolved.revision),
-      descriptor: resolved.present ? resolved.descriptor : b4a.alloc(0)
-    })
-  })
+  )
 }
 
 async function cancelOperation(sequence) {
@@ -1216,6 +1261,13 @@ async function cancelOperation(sequence) {
     throw Object.assign(new Error(), { code: 'PROCESS_OPERATION_ACTIVE' })
   }
   cancelScheduled(operation.timer)
+  if (operation.cleanup) {
+    try {
+      operation.cleanup()
+    } finally {
+      operation.cleanup = null
+    }
+  }
   operation.target.fill(0)
   await emit('cancelled', { operationSequence: sequence })
 }
@@ -1755,8 +1807,9 @@ function traceFatal(err) {
   } catch {}
 }
 
-async function fatal(err) {
-  if (stopped) return
+async function fatal(err, commandFailed = false) {
+  // Stop marks the role stopped before cleanup; its errors still need a reply.
+  if (stopped && !commandFailed) return
   stopped = true
   traceFatal(err)
   if (projection !== null) {
@@ -1769,7 +1822,7 @@ async function fatal(err) {
 }
 
 const decoder = new ControlFrameDecoder((message) => {
-  commandQueue = commandQueue.then(() => handle(message)).catch((err) => fatal(err))
+  commandQueue = commandQueue.then(() => handle(message)).catch((err) => fatal(err, true))
 })
 
 runtime.stdin.on('data', (chunk) => {
