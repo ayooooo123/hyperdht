@@ -1359,7 +1359,20 @@ on the final tree: worker's five consecutive passes at 173/173, then the
 seat's full run failed (1), a rerun passed 173/173 with raw DROP 0, a second
 rerun failed (2).
 
-**Measurements.** `set -o pipefail; bash scripts/linux-gates.sh all` on the
+**Fork-native CI and the converged run.** The `Private Routing` workflow ran
+on `6014341` on GitHub's native Linux (runs 34377545316 and 34377539226,
+both green, including the privileged namespace capture gate with its strict
+clock check); at `71498a1` its Bare process leg had missed a command
+deadline at assertion 35 (run 34374496372), a runner-load intermittent of
+the KI-4 class, not reproduced since. The presence steps then dropped their
+two eleven-role routing snapshots for one round trip to the lookup exit each,
+and the unproven `closingLinks` join was removed from the link service (the
+fault path still awaited the close; only the named `fatal` report was the
+fix). On that tree one uninterrupted local run passed all ten gates: Node
+1,092 / 19,704; Bare 1,047 / 19,569; process legs 163; punch legs 168;
+namespace 27; live namespace 173, raw DROP 0.
+
+**Measurements (`6014341`).** `set -o pipefail; bash scripts/linux-gates.sh all` on the
 final tree with no concurrent edits: nine gates pass in one run (Node
 aggregate **1,092 tests / 19,704 assertions**; Bare **1,047 / 19,569**; the
 four normal/reverse process legs **163** each; both production-punch legs
