@@ -1096,6 +1096,195 @@ rules remain unchanged. Diagnostics and documentation remain uncommitted;
 the published branch remains `0c543a4`. A repair requires a reviewed
 cross-host time contract, not an unexplained increase in the allowed bound.
 
+### Continuation checkpoint — 2026-09-07, internal model review of Gates C and D, remote run 34072979459
+
+This continuation started from the session-3 handoff at `cb72ff8` and
+rebased onto `origin/continue-hyperdht-private-routing` at `8c404f5`
+once the fetch showed the later Gate D rollback repair (`c0db444`,
+`b4bad01`), the link-sealing and preflight checkpoint (`0c543a4`) and the
+timing diagnostics (`8c404f5`). The coordinator diagnostic below was carried
+across as a patch; nothing else from the older tree was reapplied.
+
+**Internal model review — 2026-09-07.** The packet
+(`/tmp/hyperdht-crypto-review-packet.md`, fourteen questions over Gate C
+required SURB replies and Gate D blinded presence records; output = ranked
+findings with file:line and a run `/tmp` script) went to three read-only
+reviewers on `cb72ff8`: `anthropic/claude-fable-5-1` (completed),
+`orcarouter/z-ai/glm-5.3` at max thinking (completed) and
+`anthropic/claude-opus-5` (stopped by a provider rate limit with an
+111-minute retry window before its report; its partial notes matched the
+other two on the blinding math). Venice `kimi-k3` and `gpt-5.6-sol` were dry
+at dispatch. Reviewers ran in write-approval mode; `/tmp` script runs were
+approved, every repository write refused, and the tree was clean when they
+finished. Each Critical/High/Medium was reproduced by the seat before it
+counted; this is an internal review and does not close the external
+cryptographic-review gate.
+
+Gate D findings and status:
+
+- D-1 (both reviewers, High): tombstone states returned without a revision
+  let a stale-serving node resurrect presence. D-2 (Medium): the same
+  revision published to both overlap periods threw `REPLAY` at the day
+  boundary. D-3 (Medium): an unchanged re-read was `REPLAY`. D-4 (Medium):
+  one `RECORD` target could not cover both overlap periods. D-7 (Low):
+  first-non-null period order let a withholding node downgrade to the
+  previous period. All five were closed by the rollback repair
+  (`c0db444`, `b4bad01`, "Gate D rollback repair" above) before this
+  adjudication; the reviewers' reproductions were run against `cb72ff8`
+  and the repaired tree rejects each case.
+- D-5 (Fable, Medium): the announce exit sees two `mutablePutRequest`s to
+  `A'_p` and `A'_{p+1}` with equal `seq` milliseconds apart during the
+  overlap hour and links the periods; two storage nodes can compare `seq`
+  continuity. Accepted and recorded as a contract note: the periods are
+  unlinkable to storage nodes that do not see both puts, not to the exit
+  that carries them. A per-period revision counter would remove the `seq`
+  correlation but not the timing one, so no change is made without a
+  design decision.
+- D-6 (both, Low): unlinkability holds only against parties that do not
+  know the stable key `A`; anyone holding `A` confirms `A' = h·A` for every
+  period at one scalar multiplication, as in Tor v3. Now stated in the
+  module header of `lib/private/blinded-presence.js`.
+- glm D2 (Medium): the module comment and the earlier record claimed the
+  AEAD stops a reader-credential holder from re-sealing; it does not (the
+  reader key derives from the credential, `A'` and the period, all in the
+  reader's hands). The signature, checked before the body is opened, is the
+  only barrier. Comment corrected; regression added: a genuine tombstone
+  body carrying the descriptor's signature, and the converse, are both
+  `ERR_AUTHENTICATION` (`blinded-presence` 11 tests / 74 assertions).
+- Confirmed sound by both, with scripts: blinding derivation reproduces the
+  pinned vectors, `a'·B = A'`, stock `crypto_sign_verify_detached` verifies,
+  low-order and identity inputs fail closed, `h ≠ 0` is checked; the nonce
+  `r` is domain-separated RFC 8032 style and cannot collide across periods,
+  readers or records; AD and signature cover every field; the AEAD nonce
+  prefix is random per record under a per-`(reader, A', period)` key; a
+  storage node learns `A'`, `seq`, a constant 895 bytes and timing.
+
+Gate C findings and status:
+
+- C-1 (Fable, Medium, reproduced): the nullifier store was a separate
+  object per facade install (`wire-services.js` created one per
+  `install()`), so a hop header captured on one circuit was admitted again
+  on a second circuit of the same relay; both wraps used the same key and
+  nonce and produced identical ciphertext (`/tmp/gate-c-c1-c2-repro.js`:
+  `replay, second store for the same relay key: ADMITTED`, `identical wrap
+output: true`). Fixed: the store now belongs to the capability authority
+  (`createSurbCapabilityAuthority({ …, wallNow, maxReplayEntries })`,
+  `processSurbHop({ message, capabilityAuthority })`); the separate replay
+  authority API is gone (`createSurbReplayAuthority`,
+  `destroySurbReplayAuthority` removed, `destroySurbCapabilityAuthority`
+  added), `processRelaySurbHop` takes the one authority, and the eleven-role
+  harness creates exactly one per relay process
+  (`createRelaySurbPeelAuthority`: middles at configure, the guard service
+  for its lifetime) and hands it to every facade. Regression: a header
+  processed twice through one relay is `ERR_REPLAY` regardless of circuit.
+- C-2 (Fable, Medium, reproduced): `now` was a value frozen at authority
+  creation, so an expired capability kept peeling (`process after
+capability expiry (frozen now): ADMITTED`); on the endpoint the SURB
+  descriptors were built and opened against the monotonic clock while hop
+  times are wall-clock advertisement fields, so hop expiry never rejected
+  there either (only the operation deadline did). Fixed: the authority reads
+  `wallNow()` at every use; `RoutedDHTIO` takes `wallNow` (the controller
+  passes its wall clock) for `buildSurbBatch`; `createSurbTerminalAdmission`
+  takes `now` (monotonic, for the operation deadline) and `wallNow` (for
+  `openSurbReply`). Regression: a capability admits, the clock moves past
+  its expiry, a fresh header is `INVALID_ROUTE`.
+- C-3 (both, Medium): the store never evicts and refuses everything at
+  capacity. With the store owned by the capability it now rotates with the
+  advertised key; the harness keeps the primitive's 65,536-entry bound
+  (eight per required reply). Recorded as the accepted DoS bound: a
+  downstream neighbour can fill a relay's store with valid one-hop headers
+  at one X25519 each until the key rotates.
+- C-4 (Fable, Low): the terminal relay recovers the hop count from the
+  deterministic pad. Production paths are always two hops
+  (`bindProductionSurbReturnPaths`), so today it confirms a constant.
+  Recorded; not changed.
+- C-5 (Fable, Low, reproduced on the facade): a hop cell the relay could
+  not peel was forwarded raw; the next hop could not open it either and the
+  endpoint handed it to the route codec, which rejected it and ended the
+  operation. Fixed: the facade drops a SURB hop frame whose peel returned
+  null (`surbHopCellsDropped` in diagnostics; regression in
+  `m3-adjacency-runtime`: the unpeelable cell is not forwarded, a plain
+  reverse payload still is, the circuit is not failed), and the endpoint
+  in required mode drops a packed hop frame instead of feeding it to the
+  codec. A relay could already end the operation by dropping or by sending
+  any invalid frame, so this closes no attacker capability; it removes the
+  honest failure mode.
+- C-6 (Fable, Low): "length in the clear on unsealed links" was written
+  against the session-3 record; the link-sealing checkpoint above already
+  corrected that every reverse frame is sealed by the adjacency
+  `CellCodec` and a physical observer sees fixed 1,200-byte cells. What
+  remains is the forward signature: a required request is 3,781 bytes over
+  four DATAGRAM cells against one cell for the same correlated get, and the
+  reverse carries one hop cell per fragment. Recorded under KI-1.
+- C-7 / glm C1 (Note): the required-mode hold upgrades a concurrent caller's
+  request on the same controller to required (never downgrades; the return
+  path is always bound at READY in production). Recorded; scoping the hold
+  to the query object is deferred.
+- C-8 / glm C2 (Note): the guard can burn a terminal handle with a forged
+  cell (one fragment lost, no forgery, no retransmit); it can already drop
+  the cell. Recorded.
+- glm's open question, route-key reuse across relay restarts, is the design
+  note's own stated condition (a signed key-generation id); with the store
+  on the capability authority a restart with the same key and window would
+  reset the store, so that condition stands as written.
+- Confirmed sound by both: the keyed BLAKE2b key schedule and its domain
+  strings, per-hop independent ephemerals and the filler algebra, MAC over
+  `E_i || beta_i`, synchronous nullifier admission, the reply AD from owned
+  state on both ends, the zero-pad strip, and every path from
+  `SURB_REQUIRED` to `onRoutedReply` closed at `dht-exit-io.js`.
+
+**Remote check, run
+[34072979459](https://github.com/ayooooo123/hyperdht/actions/runs/34072979459)**
+(`-l 2 -p`, no overrides, remote roles on `private-routing-v1` at
+`cb72ff8`): punch matrix 117/117, production reflection equal to the minted
+tuple on both sides, exchange 788.6 ms, both first owned sends, `activate`
+inside the shipped bound, the first routed get exact, cancellation, and both
+healthy-silence checks passed (56/57). The blackhole rotation then failed as
+`PROCESS_PHASE_MISMATCH (endpoint/CONTROL)`: the endpoint emitted
+`unavailable` where the coordinator expected `rotated`. Cause, reproduced at
+the directory level (`/tmp/ki18-repro.js`, three placements): the
+coordinator had logged at setup that `lookup-exit-b` and `announce-exit`
+shared one `/24` on the runners; the initial lookup pair was
+`announce-middle → lookup-exit-b`; `reserveReplacement` excludes the live
+opposite pair and the pair being replaced and applies the KI-5 subnet rule
+against both, so the only spare exit (`announce-exit`) conflicted with the
+departing `lookup-exit-b` and `chooseReplacementPair` returned
+`ERR_INCOMPATIBLE_RELAY`; the controller entered `UNAVAILABLE`. That is the
+fail-closed placement outcome the KI-5 rule specifies, not a selector
+fault, and the selector is unchanged: a three-plus-three pool whose exits
+share a `/24` cannot survive a fault. The run therefore says nothing about
+the suspend-after-rotation wait, which run 34144722025 (timing
+diagnostics, above) later reached. The coordinator now names the event that
+missed in a `PROCESS_PHASE_MISMATCH` or `PROCESS_UNEXPECTED_EVENT` failure
+(`event type=… generation=… phaseSequence=…; held …`, bounded and typed;
+configuration-audit failures stay sanitized), which is how the next such run
+reads without the role's stream. One of the two approved `-l 2` runs for this
+question was used; the log `/tmp/hyperdht-live-route-p11.log` holds the
+operator host's address and may be deleted by JD.
+
+**Gate 3B remainder.** The message IDs `0x0280–0x02a3` carry only size
+bounds in `protocol.js`, `routed-dht.js` and `exit-policy.js`; no body
+layout for the presence record, tombstone, lookup response, write token,
+write receipt, lookup, prepare, announce or unannounce bodies exists in the
+tree, and `parseExitCommandBody` admits the four record commands only. The
+routed `findPeer`, `lookup`, `announce`, `unannounce` and raw `query`
+commands, the required-mode `lookup`/`announce` mapping onto presence
+records, peer streams and the public required-mode gate therefore start with
+a wire body decision, which remains JD's. A design packet with a recommended
+layout derived from the fixed size bounds is the next artifact; no build was
+dispatched on an unapproved wire.
+
+**Measurements.** `set -o pipefail; bash scripts/linux-gates.sh all` on the
+final tree, all ten gates, exit 0: Node aggregate **1,091 tests / 19,687
+assertions**; Bare **1,046 / 19,552**; the four normal/reverse process legs
+155 each; both production-punch legs 160 each; namespace projection 27; live
+namespace capture 165 with kernel raw DROP zero. Complete log:
+`/tmp/hyperdht-review-lane-linux-gates-final.log`. A first full run on the
+same source with an older coordinator expectation failed exactly two
+`process-control` assertions (the failure detail was pinned to `null`); the
+counts above are from the complete rerun after that expectation was
+updated, with no source edit in between. Whole-repository Prettier passes.
+
 ### Subagent design handoff — 2026-09-05
 
 These are review requirements, not accepted replacement protocols:
@@ -3217,6 +3406,16 @@ from elsewhere.
 
 Until relay identity has a cost, path diversity constrains the shape of an
 attack without bounding the attacker's share of the candidate set.
+
+The rule also decides whether a fault can be survived. `reserveReplacement`
+applies it against the live opposite pair and the pair being replaced, so
+in a three-plus-three pool the one spare exit must differ by subnet from the
+exit it succeeds. Run 34072979459 (the 2026-09-07 review checkpoint) placed
+`lookup-exit-b` and `announce-exit` in one `/24` on the runners; after the
+blackhole the replacement was `ERR_INCOMPATIBLE_RELAY` and the controller
+went `UNAVAILABLE`. That is the rule failing closed, reproduced at the
+directory level with the same placement; it is not a selector defect and
+the selector is unchanged.
 
 ### KI-6: hop selection is first-match, not random — FIXED
 

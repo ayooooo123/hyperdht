@@ -307,7 +307,7 @@ test('process control rejects duplicate and unexpected events then reaps every c
   const failure = await control.failed()
   t.alike(failure, {
     code: 'PROCESS_UNEXPECTED_EVENT',
-    detail: null,
+    detail: 'event type=configured generation=1 phaseSequence=1; held generation=1 phaseSequence=1',
     phase: 'CONTROL',
     role: 'endpoint'
   })

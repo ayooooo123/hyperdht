@@ -270,6 +270,23 @@ function branchDestroyPacket(state) {
   return packet
 }
 
+// A reverse DATAGRAM sealed for the facade's downstream link, carrying `payload`.
+// `senderCounter` is shared across packets of one link so the receive window advances.
+function reverseDatagramPacket(state, payload, senderCounter) {
+  const context = state.contexts[CELL_CLASS.DATAGRAM].rx
+  const codec = new CellCodec({ crypto: cryptoSuite, cellSize: 1200 })
+  return codec.seal({
+    key: context.key,
+    noncePrefix: context.noncePrefix,
+    senderCounter,
+    class: CELL_CLASS.DATAGRAM,
+    direction: state.initiator ? DIRECTION.REVERSE : DIRECTION.FORWARD,
+    epoch: state.generation,
+    circuitId: state.localId,
+    payload
+  })
+}
+
 async function settleRelayLoss(previousChannel, nextChannel) {
   for (
     let attempt = 0;
@@ -1227,6 +1244,64 @@ test('received BRANCH_DESTROY rejection still retires the installed logical pair
   t.is(previousChannel.destroys, 1)
   t.is(nextChannel.destroys, 1)
   t.exception(() => installed.diagnostics(), 'rejected propagation retires forwarding owner')
+})
+
+test('a SURB hop cell the relay cannot peel is dropped, other reverse payloads pass', async (t) => {
+  const { packSurbRouteFrame } = require('../../lib/private/surb-path')
+  const { SURB_HOP_MAGIC } = require('../../lib/private/surb-batch')
+  const clock = fakeClock({ wall: 1_000n, monotonic: 10_000n })
+  const owner = authority(clock)
+  const previousChannel = relayChannel()
+  const nextChannel = relayChannel()
+  const previousLink = syntheticLink({
+    initiator: false,
+    completeOfferDigest: b4a.alloc(32, 0xd1),
+    channel: previousChannel,
+    wireExpiresAt: 2_000n
+  })
+  const nextLink = syntheticLink({
+    initiator: true,
+    completeOfferDigest: b4a.alloc(32, 0xd2),
+    peerIdentity: b4a.alloc(32, 0xd3),
+    channel: nextChannel,
+    wireExpiresAt: 2_000n
+  })
+  const previous = owner.adopt(previousLink.handle)
+  const next = owner.adopt(nextLink.handle)
+  const seen = []
+  const forwarding = createM3RelayForwardingFacade(
+    previous.runtime,
+    next.runtime,
+    relayOptions(clock, {
+      // A peel that refuses everything: bad MAC, replay, expired capability all
+      // surface as null here.
+      surbHopPeel(payload) {
+        seen.push(b4a.from(payload))
+        return null
+      }
+    })
+  )
+  const plan = beginM3Install(previous.runtime, next.runtime)
+  validateM3Install(plan, previousLink.state.localIdentity, 128, 1_000n)
+  const installed = commitM3Install(plan, 2_000n, forwarding)
+
+  const hopCell = b4a.concat([SURB_HOP_MAGIC, b4a.alloc(64, 0x5a)])
+  const hopFrame = packSurbRouteFrame(hopCell)
+  const plain = b4a.alloc(1100, 0x11)
+  const counter = new SenderCounter()
+  const hopPacket = reverseDatagramPacket(nextLink.state, hopFrame, counter)
+  const plainPacket = reverseDatagramPacket(nextLink.state, plain, counter)
+  nextChannel.deliver(hopPacket)
+  nextChannel.deliverUnread(plainPacket)
+  for (let attempt = 0; attempt < 20 && previousChannel.packets.length < 1; attempt++) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+
+  t.is(seen.length, 2, 'both reverse payloads were offered to the peel')
+  t.is(previousChannel.packets.length, 1, 'the unpeelable hop cell is not forwarded')
+  t.is(installed.diagnostics().surbHopCellsDropped, 1, 'the drop is counted')
+  t.is(previousChannel.destroys, 0, 'the drop does not fail the circuit')
+  installed.destroy()
 })
 
 test('forwarding publication claim and lease require object-identical synchronous take', (t) => {

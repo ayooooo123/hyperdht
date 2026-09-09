@@ -43,7 +43,7 @@ const {
 const { cryptoSuite } = require('../../../lib/private/crypto-suite')
 const {
   createSurbCapabilityAuthority,
-  createSurbReplayAuthority
+  destroySurbCapabilityAuthority
 } = require('../../../lib/private/surb')
 const { processRelaySurbHop } = require('../../../lib/private/relay-service')
 const { encodeSurbTerminalCell, tryDecodeSurbHopCell } = require('../../../lib/private/surb-batch')
@@ -663,6 +663,35 @@ function clearSelection(selection) {
   for (const value of Object.values(selection)) if (b4a.isBuffer(value)) value.fill(0)
 }
 
+// One SURB peel authority per relay process, built from that relay's own signed
+// advertisement and route secret. Every facade the relay installs shares it, so a
+// hop header is admitted once per route key regardless of which circuit carries it,
+// and the capability expires with the advertisement on the relay's wall clock. The
+// nullifier store now spans the key's lifetime, so it keeps the primitive's bound
+// (65,536 entries; eight per required reply): the store rotates with the key, and
+// a fixture-sized limit here would refuse honest replies after a few dozen.
+function createRelaySurbPeelAuthority(options) {
+  const { advertisement, routeSecretKey, clocks } = options
+  if (
+    !b4a.isBuffer(advertisement) ||
+    !b4a.isBuffer(routeSecretKey) ||
+    routeSecretKey.byteLength !== 32 ||
+    !clocks ||
+    typeof clocks.wallNow !== 'function'
+  ) {
+    throw PrivateRouteError.INVALID_ROUTE()
+  }
+  const decoded = decodeRelayCapabilityAdvertisement(advertisement, { now: clocks.wallNow() })
+  return createSurbCapabilityAuthority({
+    routeSecretKey: b4a.from(routeSecretKey),
+    routeKey: b4a.from(decoded.routeEncryptionPublicKey),
+    capabilityEpoch: decoded.epoch,
+    issuedAtMs: decoded.issuedAtMs,
+    expiresAtMs: decoded.expiresAtMs,
+    wallNow: clocks.wallNow
+  })
+}
+
 function createTailRelayActor(options) {
   const {
     adjacency,
@@ -670,7 +699,7 @@ function createTailRelayActor(options) {
     advertisement,
     identityPublicKey,
     identitySecretKey,
-    routeSecretKey = null,
+    surbCapabilityAuthority = null,
     clocks,
     outgoing = null,
     incomingLink: initialIncomingLink = null,
@@ -691,7 +720,7 @@ function createTailRelayActor(options) {
     typeof clocks.cancelScheduled !== 'function' ||
     (initialIncomingRelease !== null && typeof initialIncomingRelease !== 'function') ||
     (initialIncomingLink === null) !== (initialIncomingLinkService === null) ||
-    (routeSecretKey !== null && (!b4a.isBuffer(routeSecretKey) || routeSecretKey.byteLength !== 32))
+    (surbCapabilityAuthority !== null && typeof surbCapabilityAuthority !== 'object')
   ) {
     throw PrivateRouteError.INVALID_ROUTE()
   }
@@ -858,62 +887,45 @@ function createTailRelayActor(options) {
           schedule: clocks.schedule,
           cancelScheduled: clocks.cancelScheduled
         }
-        if (routeSecretKey !== null) {
-          // This relay peels SURB hops with its own capability secret only.
-          let decodedAdv = null
-          try {
-            decodedAdv = decodeRelayCapabilityAdvertisement(advertisement, {
-              now: clocks.wallNow()
-            })
-          } catch {
-            decodedAdv = null
-          }
-          if (decodedAdv) {
-            const capabilityAuthority = createSurbCapabilityAuthority({
-              routeSecretKey: b4a.from(routeSecretKey),
-              routeKey: b4a.from(decodedAdv.routeEncryptionPublicKey),
-              capabilityEpoch: decodedAdv.epoch,
-              issuedAtMs: decodedAdv.issuedAtMs,
-              expiresAtMs: decodedAdv.expiresAtMs,
-              now: clocks.monotonicNow()
-            })
-            const replayAuthority = createSurbReplayAuthority({ maxEntries: 256 })
-            facadeOptions.surbHopPeel = (payload) => {
-              if (!b4a.isBuffer(payload)) return null
-              let cell = unpackSurbRouteFrame(payload)
-              if (cell === null) {
-                // Accept raw hop cells as well as packed frames.
-                cell = tryDecodeSurbHopCell(payload) !== null ? b4a.from(payload) : null
-              }
-              if (cell === null) return null
-              let result = null
-              try {
-                result = processRelaySurbHop({
-                  payload: cell,
-                  capabilityAuthority,
-                  replayAuthority
-                })
-              } catch {
-                if (cell !== payload) cell.fill(0)
-                return null
-              }
+        if (surbCapabilityAuthority !== null) {
+          // This relay peels SURB hops with its own capability authority only. The
+          // authority is created once per relay (createRelaySurbPeelAuthority) and
+          // shared by every facade this relay installs, so its nullifier store spans
+          // every circuit on this route key.
+          facadeOptions.surbHopPeel = (payload) => {
+            if (!b4a.isBuffer(payload)) return null
+            let cell = unpackSurbRouteFrame(payload)
+            if (cell === null) {
+              // Accept raw hop cells as well as packed frames.
+              cell = tryDecodeSurbHopCell(payload) !== null ? b4a.from(payload) : null
+            }
+            if (cell === null) return null
+            let result = null
+            try {
+              result = processRelaySurbHop({
+                payload: cell,
+                capabilityAuthority: surbCapabilityAuthority
+              })
+            } catch {
               if (cell !== payload) cell.fill(0)
-              if (result === null) return null
-              surbHopsPeeled++
-              if (result.terminal) {
-                const term = encodeSurbTerminalCell(result.nextHop, result.payload)
-                if (result.payload) result.payload.fill(0)
-                try {
-                  return packSurbRouteFrame(term)
-                } finally {
-                  term.fill(0)
-                }
-              }
+              return null
+            }
+            if (cell !== payload) cell.fill(0)
+            if (result === null) return null
+            surbHopsPeeled++
+            if (result.terminal) {
+              const term = encodeSurbTerminalCell(result.nextHop, result.payload)
+              if (result.payload) result.payload.fill(0)
               try {
-                return packSurbRouteFrame(result.payload)
+                return packSurbRouteFrame(term)
               } finally {
-                if (result.payload) result.payload.fill(0)
+                term.fill(0)
               }
+            }
+            try {
+              return packSurbRouteFrame(result.payload)
+            } finally {
+              if (result.payload) result.payload.fill(0)
             }
           }
         }
@@ -1122,7 +1134,8 @@ async function acceptProjectedExtension(options) {
     linkService,
     observedPredecessorEndpoint,
     outgoing = null,
-    routeSecretKey
+    routeSecretKey,
+    surbCapabilityAuthority = null
   } = options
   const opened = await accepted
   let setup = linkService.openSetupTransport(opened)
@@ -1194,7 +1207,7 @@ async function acceptProjectedExtension(options) {
       advertisement,
       identityPublicKey,
       identitySecretKey,
-      routeSecretKey,
+      surbCapabilityAuthority,
       clocks,
       outgoing,
       incomingLink: opened,
@@ -1633,6 +1646,11 @@ function createGuardProcessService(options) {
       ...candidateAdvertisements.map((candidate) => candidate.advertisement)
     ]
   })
+  const surbCapabilityAuthority = createRelaySurbPeelAuthority({
+    advertisement,
+    routeSecretKey,
+    clocks
+  })
   const takeBootstrapAccept = require('../../../lib/private/caps-responder')[
     Symbol.for('hyperdht-private-routes/bootstrap-accept-authority-taker')
   ]
@@ -1724,7 +1742,7 @@ function createGuardProcessService(options) {
               advertisement,
               identityPublicKey,
               identitySecretKey,
-              routeSecretKey,
+              surbCapabilityAuthority,
               clocks,
               outgoing: {
                 allowedRole: ROLE.SAFETY,
@@ -1875,6 +1893,7 @@ function createGuardProcessService(options) {
     for (const responder of branchResponders) responder.destroy()
     branchResponders.clear()
     caps.destroy()
+    destroySurbCapabilityAuthority(surbCapabilityAuthority)
     if (bootstrapSession) await bootstrapSession.close().catch(() => {})
     bootstrapSession = null
     if (authority) endpointModule.destroyBootstrapUdxAuthority(authority)
@@ -1911,5 +1930,6 @@ module.exports = Object.freeze({
   createGuardProcessService,
   createProjectedCellEndpoint,
   createProjectedLinkService,
+  createRelaySurbPeelAuthority,
   createTailRelayActor
 })

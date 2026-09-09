@@ -16,8 +16,7 @@ const {
   openSurbReply,
   revokeSurbOpenAuthority,
   createSurbCapabilityAuthority,
-  createSurbReplayAuthority,
-  destroySurbReplayAuthority
+  destroySurbCapabilityAuthority
 } = require('../../lib/private/surb')
 
 const NOW = 1_700_000_000_000n
@@ -76,14 +75,18 @@ function pathOf(relays) {
   return relays.map(hopOf)
 }
 
-function capabilityOf(r, now = NOW) {
+// One authority per relay object: it owns that relay's nullifier store, so the
+// tests that replay through one relay must reuse it. `clock.now` is read live.
+function capabilityOf(r, options = {}) {
+  const clock = options.clock || { now: NOW }
   return createSurbCapabilityAuthority({
     routeSecretKey: r.routeSecretKey,
     routeKey: r.routeKey,
     capabilityEpoch: r.capabilityEpoch,
     issuedAtMs: r.issuedAtMs,
     expiresAtMs: r.expiresAtMs,
-    now
+    wallNow: () => clock.now,
+    maxReplayEntries: options.maxReplayEntries
   })
 }
 
@@ -149,12 +152,8 @@ function seal(descriptor, plaintext, replyBinding = DEFAULT_BINDING) {
   return sealSurbReply({ descriptor, replyBinding, plaintext })
 }
 
-function processHop(message, relay, replayAuthority) {
-  return processSurbHop({
-    message,
-    capabilityAuthority: capabilityOf(relay),
-    replayAuthority
-  })
+function processHop(message, relay, capabilityAuthority = capabilityOf(relay)) {
+  return processSurbHop({ message, capabilityAuthority })
 }
 
 function open(openAuthority, payload, opts = {}) {
@@ -171,7 +170,7 @@ function roundTrip(relays, terminalHandle, descriptor, openAuthority, plaintext)
   let msg = seal(descriptor, plaintext)
   const headerLengths = []
   const sizes = []
-  const replays = relays.map(() => createSurbReplayAuthority({ maxEntries: 64 }))
+  const replays = relays.map((r) => capabilityOf(r, { maxReplayEntries: 64 }))
 
   for (let i = 0; i < relays.length; i++) {
     headerLengths.push(msg.header.byteLength)
@@ -229,7 +228,7 @@ test('the first hop never sees plaintext', (t) => {
   const { descriptor } = build(relays, terminalHandle)
   const reply = b4a.from('SECRET-MARKER-payload')
   const msg = seal(descriptor, reply)
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(relays[0], { maxReplayEntries: 8 })
 
   t.absent(b4a.includes(msg.payload, reply), 'responder output carries no plaintext marker')
   const fwd = processHop(msg, relays[0], replay)
@@ -242,11 +241,11 @@ test('a hop learns only its immediate next hop, not the whole path', (t) => {
   const terminalHandle = b4a.alloc(32, 9)
   const { descriptor } = build(relays, terminalHandle)
   const msg = seal(descriptor, b4a.from('x'))
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(relays[0], { maxReplayEntries: 8 })
 
   const r1 = consumeSurbForwardingAuthority(processHop(msg, relays[0], replay))
   t.alike(r1.nextHop, relays[1].id, 'hop 1 sees hop 2 as next')
-  const replay2 = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay2 = capabilityOf(relays[0], { maxReplayEntries: 8 })
   expectInvalidRoute(
     t,
     () => processHop(r1.message, relays[0], replay2),
@@ -259,7 +258,7 @@ test('tampered ephem is rejected', (t) => {
   const { descriptor } = build(relays, b4a.alloc(32, 2))
   const msg = seal(descriptor, b4a.from('ephem-test'))
   msg.ephem[0] ^= 0x01
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(relays[0], { maxReplayEntries: 8 })
   expectInvalidRoute(t, () => processHop(msg, relays[0], replay), 'ephem tamper -> INVALID_ROUTE')
 })
 
@@ -268,7 +267,7 @@ test('tampered header is rejected', (t) => {
   const { descriptor } = build(relays, b4a.alloc(32, 2))
   const msg = seal(descriptor, b4a.from('y'))
   msg.header[0] ^= 0x01
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(relays[0], { maxReplayEntries: 8 })
   expectInvalidRoute(t, () => processHop(msg, relays[0], replay), 'header tamper -> INVALID_ROUTE')
 })
 
@@ -277,7 +276,7 @@ test('tampered header MAC is rejected', (t) => {
   const { descriptor } = build(relays, b4a.alloc(32, 3))
   const msg = seal(descriptor, b4a.from('y2'))
   msg.mac[0] ^= 0x01
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(relays[0], { maxReplayEntries: 8 })
   expectInvalidRoute(t, () => processHop(msg, relays[0], replay), 'mac tamper -> INVALID_ROUTE')
 })
 
@@ -287,7 +286,7 @@ test('tampered payload is rejected at open', (t) => {
   const { descriptor, openAuthority } = build(relays, terminalHandle)
   let msg = seal(descriptor, b4a.from('z'))
   for (let i = 0; i < relays.length; i++) {
-    const replay = createSurbReplayAuthority({ maxEntries: 8 })
+    const replay = capabilityOf(relays[i], { maxReplayEntries: 8 })
     const r = consumeSurbForwardingAuthority(processHop(msg, relays[i], replay))
     msg = r.message
   }
@@ -300,7 +299,7 @@ test('wrong route key cannot process the hop', (t) => {
   const { descriptor } = build(relays, b4a.alloc(32, 5))
   const msg = seal(descriptor, b4a.from('w'))
   const wrong = relay()
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(wrong, { maxReplayEntries: 8 })
   expectInvalidRoute(t, () => processHop(msg, wrong, replay), 'wrong key -> INVALID_ROUTE')
 })
 
@@ -314,7 +313,7 @@ test('noncanonical X25519 public keys are rejected', (t) => {
   noncanonicalEphem[31] ^= 0x80
   const noncanonicalEphemSnapshot = b4a.from(noncanonicalEphem)
   const relaySecretSnapshot = b4a.from(relays[0].routeSecretKey)
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(relays[0], { maxReplayEntries: 8 })
   expectInvalidRoute(
     t,
     () => processHop({ ...msg, ephem: noncanonicalEphem }, relays[0], replay),
@@ -378,7 +377,7 @@ test('malformed input is rejected fail-closed', (t) => {
   const terminalHandle = b4a.alloc(32, 8)
   const { descriptor } = build(relays, terminalHandle)
   const msg = seal(descriptor, b4a.from('m'))
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(relays[0], { maxReplayEntries: 8 })
 
   expectInvalidRoute(
     t,
@@ -482,7 +481,7 @@ test('epoch substitution rejected before replay-store growth', (t) => {
   const r = relay()
   const { descriptor } = build([r], b4a.alloc(32, 1))
   const msg = seal(descriptor, b4a.from('epoch'))
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(r, { maxReplayEntries: 8 })
 
   const wrongEpoch = createSurbCapabilityAuthority({
     routeSecretKey: r.routeSecretKey,
@@ -490,20 +489,13 @@ test('epoch substitution rejected before replay-store growth', (t) => {
     capabilityEpoch: EPOCH + 1n,
     issuedAtMs: ISSUED,
     expiresAtMs: EXPIRES,
-    now: NOW
+    wallNow: () => NOW
   })
 
-  const sizeBefore = replay
-  // access internal size via a successful later admit of a different SURB is hard;
-  // instead: failed process must not grow. We probe by attempting a second valid admit path.
+  // A failed process must not grow the store: a second valid admit path must remain.
   expectInvalidRoute(
     t,
-    () =>
-      processSurbHop({
-        message: msg,
-        capabilityAuthority: wrongEpoch,
-        replayAuthority: replay
-      }),
+    () => processSurbHop({ message: msg, capabilityAuthority: wrongEpoch }),
     'epoch substitution -> INVALID_ROUTE'
   )
 
@@ -515,11 +507,9 @@ test('epoch substitution rejected before replay-store growth', (t) => {
   consumeSurbForwardingAuthority(fwd)
 
   // And the original message still processes on the correct epoch (store never saw its nullifier).
-  const replay2 = createSurbReplayAuthority({ maxEntries: 8 })
-  const fwd2 = processHop(msg, r, replay2)
+  const fwd2 = processHop(msg, r, replay)
   t.ok(fwd2, 'original message still processable on correct epoch')
   consumeSurbForwardingAuthority(fwd2)
-  void sizeBefore
 })
 
 test('old key rejected at hop processing', (t) => {
@@ -531,7 +521,7 @@ test('old key rejected at hop processing', (t) => {
   old.capabilityEpoch = r.capabilityEpoch
   old.issuedAtMs = r.issuedAtMs
   old.expiresAtMs = r.expiresAtMs
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(old, { maxReplayEntries: 8 })
   expectInvalidRoute(t, () => processHop(msg, old, replay), 'old key rejected')
 })
 
@@ -547,7 +537,7 @@ test('wrong routeKey/secret mismatch rejected at authority creation', (t) => {
         capabilityEpoch: EPOCH,
         issuedAtMs: ISSUED,
         expiresAtMs: EXPIRES,
-        now: NOW
+        wallNow: () => NOW
       }),
     'routeKey/secret mismatch'
   )
@@ -559,7 +549,7 @@ test('MAC failure leaves replay store size unchanged and no wrap', (t) => {
   const msg = seal(descriptor, b4a.from('mac-fail'))
   const originalPayload = b4a.from(msg.payload)
   msg.mac[0] ^= 0x01
-  const replay = createSurbReplayAuthority({ maxEntries: 4 })
+  const replay = capabilityOf(r, { maxReplayEntries: 4 })
 
   expectInvalidRoute(t, () => processHop(msg, r, replay), 'MAC failure')
 
@@ -588,7 +578,7 @@ test('concurrent double-process yields exactly one forwarding authority', (t) =>
   const r = relay()
   const { descriptor } = build([r], b4a.alloc(32, 1))
   const msg = seal(descriptor, b4a.from('once'))
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(r, { maxReplayEntries: 8 })
 
   const first = processHop(msg, r, replay)
   t.ok(first, 'first process issues forwarding authority')
@@ -610,7 +600,7 @@ test('replay rejected before transformation', (t) => {
   const { descriptor } = build([r], b4a.alloc(32, 1))
   const msg = seal(descriptor, b4a.from('replay'))
   const payloadBefore = b4a.from(msg.payload)
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(r, { maxReplayEntries: 8 })
   const first = processHop(msg, r, replay)
   consumeSurbForwardingAuthority(first)
 
@@ -620,7 +610,7 @@ test('replay rejected before transformation', (t) => {
 
 test('quota-full fails closed', (t) => {
   const r = relay()
-  const replay = createSurbReplayAuthority({ maxEntries: 2 })
+  const replay = capabilityOf(r, { maxReplayEntries: 2 })
   for (let i = 0; i < 2; i++) {
     const built = build([r], b4a.alloc(32, i + 1))
     const msg = seal(built.descriptor, b4a.from('q' + i))
@@ -638,7 +628,7 @@ test('one-use open on success and on failure', (t) => {
   const b = build(relays, terminalHandle)
 
   let msg = seal(a.descriptor, b4a.from('success-open'))
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(relays[0], { maxReplayEntries: 8 })
   const r = consumeSurbForwardingAuthority(processHop(msg, relays[0], replay))
   const plain = open(a.openAuthority, r.message.payload)
   t.alike(plain, b4a.from('success-open'))
@@ -650,7 +640,7 @@ test('one-use open on success and on failure', (t) => {
   )
 
   let msg2 = seal(b.descriptor, b4a.from('fail-open'))
-  const replay2 = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay2 = capabilityOf(relays[0], { maxReplayEntries: 8 })
   const r2 = consumeSurbForwardingAuthority(processHop(msg2, relays[0], replay2))
   r2.message.payload[0] ^= 0xff
   expectInvalidRoute(t, () => open(b.openAuthority, r2.message.payload), 'open fails on tamper')
@@ -693,14 +683,14 @@ test('expiry rejects build, capability, and open', (t) => {
         capabilityEpoch: EPOCH,
         issuedAtMs: ISSUED,
         expiresAtMs: NOW,
-        now: NOW
+        wallNow: () => NOW
       }),
     'expired capability at authority create'
   )
 
   const built = build([r], b4a.alloc(32, 1))
   let msg = seal(built.descriptor, b4a.from('exp'))
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(r, { maxReplayEntries: 8 })
   const fwd = consumeSurbForwardingAuthority(processHop(msg, r, replay))
   expectInvalidRoute(
     t,
@@ -715,13 +705,40 @@ test('expiry rejects build, capability, and open', (t) => {
   )
 })
 
+test('a header replayed on a second circuit of the same relay is refused', (t) => {
+  // The store belongs to the route key, not to the circuit: the same relay serving
+  // two circuits admits one header once. A second admission would wrap under the
+  // same key and nonce, so the ciphertexts would even be identical.
+  const r = relay()
+  const cap = capabilityOf(r, { maxReplayEntries: 8 })
+  const { descriptor } = build([r], b4a.alloc(32, 1))
+  const msg = seal(descriptor, b4a.from('once-per-key'))
+  consumeSurbForwardingAuthority(processHop(msg, r, cap))
+  expectCode(t, () => processHop(msg, r, cap), 'ERR_REPLAY', 'second circuit, same key: replay')
+})
+
+test('a capability expires on its own clock after creation', (t) => {
+  const r = relay()
+  const clock = { now: NOW }
+  const cap = capabilityOf(r, { clock, maxReplayEntries: 8 })
+  const first = build([r], b4a.alloc(32, 1))
+  consumeSurbForwardingAuthority(processHop(seal(first.descriptor, b4a.from('live')), r, cap))
+  clock.now = EXPIRES
+  const second = build([r], b4a.alloc(32, 2))
+  expectInvalidRoute(
+    t,
+    () => processHop(seal(second.descriptor, b4a.from('late')), r, cap),
+    'expired capability refuses a fresh header'
+  )
+})
+
 test('revoke clears open authority', (t) => {
   const r = relay()
   const { descriptor, openAuthority } = build([r], b4a.alloc(32, 1))
   t.ok(revokeSurbOpenAuthority(openAuthority), 'first revoke returns true')
   t.absent(revokeSurbOpenAuthority(openAuthority), 'second revoke returns false')
   let msg = seal(descriptor, b4a.from('revoked'))
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(r, { maxReplayEntries: 8 })
   const fwd = consumeSurbForwardingAuthority(processHop(msg, r, replay))
   expectCode(
     t,
@@ -757,7 +774,7 @@ test('replyBinding mismatch fails open', (t) => {
   const binding = b4a.from('binding-A')
   const { descriptor, openAuthority } = build([r], b4a.alloc(32, 1), { replyBinding: binding })
   let msg = seal(descriptor, b4a.from('bind'), binding)
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(r, { maxReplayEntries: 8 })
   const fwd = consumeSurbForwardingAuthority(processHop(msg, r, replay))
   expectInvalidRoute(
     t,
@@ -776,7 +793,7 @@ test('no HopContext bytes appear in any wire message', (t) => {
     for (let j = 0; j < relays.length; j++) {
       assertNoHopContext(t, wire, relays[j], 'hop ' + i + ' wire lacks context of relay ' + j)
     }
-    const replay = createSurbReplayAuthority({ maxEntries: 8 })
+    const replay = capabilityOf(relays[i], { maxReplayEntries: 8 })
     const r = consumeSurbForwardingAuthority(processHop(msg, relays[i], replay))
     if (!r.terminal) msg = r.message
     else {
@@ -799,7 +816,7 @@ test('deterministic fuzz: random path lengths and payload sizes round-trip', (t)
     const reply = prng.bytes(size)
 
     let msg = seal(descriptor, reply, binding)
-    const replays = relays.map(() => createSurbReplayAuthority({ maxEntries: 8 }))
+    const replays = relays.map((relayRecord) => capabilityOf(relayRecord, { maxReplayEntries: 8 }))
     for (let i = 0; i < n; i++) {
       if (msg.header.byteLength !== RHO) t.fail('non-constant header at iter ' + iter)
       const r = consumeSurbForwardingAuthority(processHop(msg, relays[i], replays[i]))
@@ -837,7 +854,7 @@ test('deterministic fuzz: single-bit tamper is rejected', (t) => {
     try {
       let msg = msg0
       for (let i = 0; i < relays.length; i++) {
-        const replay = createSurbReplayAuthority({ maxEntries: 8 })
+        const replay = capabilityOf(relays[i], { maxReplayEntries: 8 })
         const r = consumeSurbForwardingAuthority(processHop(msg, relays[i], replay))
         if (i < relays.length - 1) msg = r.message
         else open(openAuthority, r.message.payload)
@@ -901,7 +918,7 @@ test('conformance vector — deterministic wire fields match the fixture byte-fo
     payload: b4a.alloc(48)
   }
   for (let i = 0; i < fix.outputs.hops.length; i++) {
-    const replay = createSurbReplayAuthority({ maxEntries: 8 })
+    const replay = capabilityOf(secrets[i], { maxReplayEntries: 8 })
     const fwd = processHop(msg, secrets[i], replay)
     const r = consumeSurbForwardingAuthority(fwd)
     const exp = fix.outputs.hops[i]
@@ -959,7 +976,7 @@ test('low-order DH points are rejected fail-closed', (t) => {
   const r = relay()
   const { descriptor } = build([r], terminalHandle)
   const msg = seal(descriptor, b4a.from('test'))
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(r, { maxReplayEntries: 8 })
 
   expectInvalidRoute(
     t,
@@ -975,7 +992,7 @@ test('low-order DH points are rejected fail-closed', (t) => {
         capabilityEpoch: EPOCH,
         issuedAtMs: ISSUED,
         expiresAtMs: EXPIRES,
-        now: NOW
+        wallNow: () => NOW
       }),
     'zero routeSecretKey at authority create rejected'
   )
@@ -1038,7 +1055,7 @@ test('caller key material remains intact after failed operations', (t) => {
   const msg = seal(descriptor, b4a.from('test'))
   const msgEphemCopy = b4a.from(msg.ephem)
   msg.mac[0] ^= 0x01
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
+  const replay = capabilityOf(validRelay, { maxReplayEntries: 8 })
   expectInvalidRoute(t, () => processHop(msg, validRelay, replay))
   t.alike(validRelay.routeSecretKey, validRelaySecretCopy, 'route secret unmutated')
   t.alike(msg.ephem, msgEphemCopy, 'message ephem unmutated')
@@ -1063,11 +1080,11 @@ test('caller key material remains intact after failed operations', (t) => {
   t.alike(binding, bindingCopy, 'replyBinding unmutated after failed open')
 })
 
-test('destroySurbReplayAuthority clears and rejects further use', (t) => {
-  const replay = createSurbReplayAuthority({ maxEntries: 4 })
-  t.ok(destroySurbReplayAuthority(replay), 'destroy returns true')
-  t.absent(destroySurbReplayAuthority(replay), 'second destroy returns false')
+test('destroySurbCapabilityAuthority clears and rejects further use', (t) => {
   const r = relay()
+  const replay = capabilityOf(r, { maxReplayEntries: 4 })
+  t.ok(destroySurbCapabilityAuthority(replay), 'destroy returns true')
+  t.absent(destroySurbCapabilityAuthority(replay), 'second destroy returns false')
   const { descriptor } = build([r], b4a.alloc(32, 1))
   const msg = seal(descriptor, b4a.from('x'))
   expectCode(t, () => processHop(msg, r, replay), 'ERR_DESTROYED', 'process after destroy')
@@ -1158,7 +1175,7 @@ if (typeof process !== 'undefined' && process.env && process.env.SURB_REGEN_FIXT
       payload: b4a.alloc(48)
     }
     for (let i = 0; i < secrets.length; i++) {
-      const replay = createSurbReplayAuthority({ maxEntries: 8 })
+      const replay = capabilityOf(secrets[i], { maxReplayEntries: 8 })
       const r = consumeSurbForwardingAuthority(processHop(msg, secrets[i], replay))
       if (r.terminal) {
         outputs.hops.push({ nextHop: hex(r.nextHop), terminal: true })
