@@ -1666,14 +1666,42 @@ exit 0:
 | Namespace projection                                    | 27/27                                       |
 | Namespace live capture                                  | 185/185; kernel raw DROP 0                  |
 
-The 2 ms clock bounds are unchanged. This is local Linux-container evidence;
-fork-native CI on the pushed commit and a remote `-l 2 -p` dispatch on real
-links are the next two pieces of evidence, and the second needs the standing
-owner approval to be spent. The disposable profile is deleted after
+The 2 ms clock bounds are unchanged. The disposable profile was deleted after
 publication; the default VM and its unrelated containers were not touched.
+
+**Publication and CI.** The pending fifteen-file documentation cleanup was
+landed first as `f20c32c` (three-way merge of this record, no conflicts), then
+this slice as
+[`74875ec`](https://github.com/ayooooo123/hyperdht/commit/74875ec6c16984287f24e522aed93b2bfe86fd24),
+pushed fast-forward `cae9721..74875ec` to `private-routing-v1`. Fork-native CI
+on that commit passed: Private Routing
+[34406142729](https://github.com/ayooooo123/hyperdht/actions/runs/34406142729)
+and
+[34406147524](https://github.com/ayooooo123/hyperdht/actions/runs/34406147524),
+each with the native-Linux `live-linux` job, and Build Status
+[34406147525](https://github.com/ayooooo123/hyperdht/actions/runs/34406147525)
+on Linux, macOS and Windows.
+
+**Remote dispatches (standing approval, two per question, both consumed).**
+Both used `env -u PR_COMMAND_TIMEOUT_MS -u PR_SCENARIO_TIMEOUT_MS bash
+scripts/live-route.sh up -p -l 2` with remote roles at `74875ec`. Run
+[34406688476](https://github.com/ayooooo123/hyperdht/actions/runs/34406688476):
+punch matrix 0/117, every directed pair silent including runner-to-runner
+pairs, role 4 never attached (`HOLEPUNCH_ABORTED`). Run
+[34407746216](https://github.com/ayooooo123/hyperdht/actions/runs/34407746216):
+punch matrix 8/117, 109 silent, role 1 never attached. No LINK_OFFER was
+exchanged in either run, so neither is evidence for or against this slice;
+both are runner NAT placement outcomes of the kind `cb72ff8` already recorded
+for two post-push `-l 2 -p` dispatches. Both bridge workflows were cancelled.
+KI-4's confirmation on real links therefore still waits for a dispatch whose
+punch round reaches the matrix; the local ten-gate evidence and the native-Linux
+CI above are what this slice stands on.
 
 This remains package-private and experimental. Public required mode and peer
 streams stay open; this slice changes neither boundary and adds no wire byte.
+The peer-stream design packet with its review-lane verdict is
+[`2026-09-09-private-routing-peer-stream-design-packet.md`](superpowers/specs/2026-09-09-private-routing-peer-stream-design-packet.md);
+it is a packet for JD to ratify, not an approved design.
 
 ### Subagent design handoff — 2026-09-05
 
