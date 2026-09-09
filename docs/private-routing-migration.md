@@ -49,14 +49,65 @@ offer admission" checkpoint below):
   and [publication evidence](#continuation-checkpoint--2026-09-09-required-mode-puts-and-v2-allocation).
 
 **Open gates:** KI-4's responder-side offer admission is repaired under the
-reviewed cross-host time contract (see that checkpoint); its confirmation on
-real links is an owner-approved remote dispatch that has not run since.
+reviewed cross-host time contract. Four later real-link dispatches stopped
+before LINK_OFFER, including the two attempts under JD's instruction to finish
+the remaining work. None confirms the repair on real links. Further useful
+evidence needs a reachable multi-host placement, not a relaxed protocol check.
 Peer streams need a separate reviewed wire design; external cryptographic
-review and the aggregate public-controller gate remain open. Further remote
-lifecycle dispatch requires explicit owner approval.
+review and the aggregate public-controller gate remain open.
 Hyperswarm, mobile, and PearTube integration follow those gates. KI-1
 timing/volume correlation and KI-5 operator diversity remain explicit limits;
 mixing/cover traffic is deferred and anonymous-admission Gate A is dropped.
+
+**External review acceptance:** an internal model report is not the required
+external human cryptographic review. The review must identify its author,
+the exact source and native dependency revisions, the reviewed Gate C and Gate D
+transcripts, findings and their disposition, and a signed-off re-review of
+repairs. Include the single-use SURB replay/key ownership, deadline domains,
+reply-mode binding, blinded-key derivation, record signatures, rollback,
+tombstones, and the stated linkability limits. Any added peer-stream wire and
+key schedule must be included in that review before public exposure. Current
+source, regression cases, Linux capture evidence, and earlier internal findings
+are review inputs, not substitutes for that report. No external reviewer or
+completed engagement is identified in the project record.
+
+**Remaining-work verification — 2026-09-09 (`06dc259` source):**
+
+- Native CI previously omitted the Node and Bare production endpoint-punch
+  scenarios present in `scripts/linux-gates.sh all`. Both steps are now added
+  to `test-private-routing.yml`, with the same normal candidate order and
+  `PR_PRODUCTION_ENDPOINT_PUNCH=1`. Both commands passed in the Linux gate
+  runner, 180 assertions each. This is local command evidence, not yet CI
+  evidence for the workflow edit.
+- Mixed-host run [34410082928](https://github.com/ayooooo123/hyperdht/actions/runs/34410082928)
+  used `up -p -l 2` without overrides. Punch matrix 0/117; role 4
+  (`lookup-exit-a`) never attached, `HOLEPUNCH_ABORTED`; driver exit 1.
+- The launcher's all-runner fallback,
+  [34411036338](https://github.com/ayooooo123/hyperdht/actions/runs/34411036338),
+  used `up -p` without overrides at `06dc259`. Role 5 could not be reached
+  for punching; the nine reporting roles returned 6/105 directed pairs,
+  99 silent. Endpoint role 1 never attached; driver exit 1. The denominator
+  excludes the absent role report, so this is not a 6/117 complete matrix.
+- Both remote allocations were cancelled after the drivers failed. No private
+  link setup or lifecycle result was reached. These are reachability failures;
+  the precise underlying NAT or network cause is not established. Operator
+  addresses remain outside the repository and vault.
+- Final local verification ran once, uninterrupted, with
+  `DOCKER_CONTEXT=colima-hyperdht-gates-finish bash scripts/linux-gates.sh all`.
+  All ten gates passed: Node private aggregate 1,099 tests / 19,762 assertions;
+  Bare private aggregate 1,054 / 19,627; four normal/reverse process legs
+  175 assertions each; two production-punch legs 180 each; namespace projection
+  27; namespace live capture 185 with raw DROP zero.
+- That disposable VM was created without activating its Docker context.
+  External NTP was paused there only. A 45-second wall/monotonic probe measured
+  −0.419793 to +0.001376 ms drift; the actual capture kept the unchanged 2 ms
+  checks. The running gate container was also observed on the disposable
+  Docker context. The VM was deleted after verification. Shared services were
+  not restarted.
+- Repository-wide Prettier passed separately. Runtime-exported bounds were
+  checked directly: advertisement 260–388 bytes, presence descriptor 814,
+  inner route payload 1,073, outer cell 1,200. No peer-stream implementation
+  or new wire was included in these results.
 
 ## Implementation history
 
@@ -1411,6 +1462,16 @@ on the final tree: worker's five consecutive passes at 173/173, then the
 seat's full run failed (1), a rerun passed 173/173 with raw DROP 0, a second
 rerun failed (2).
 
+**Environment decision — 2026-09-09:** use the native-Linux CI capture gate
+as required release evidence. Keep both 2 ms clock checks and the fail-closed
+ICMP classifier unchanged. Local VM capture is supporting evidence only when
+the actual run passes those checks. Record every attempt. A clock or ICMP
+failure is failed supporting evidence, not a result to omit. Count only a
+predeclared uninterrupted run that passes. A disposable coherent-clock VM may
+supplement CI without changing the shared workstation VM or its services.
+This settles the environment choice, not the cause of every historical unmatched
+ICMP packet.
+
 **Fork-native CI and the converged run.** The `Private Routing` workflow ran
 on `6014341` on GitHub's native Linux (runs 34377545316 and 34377539226,
 both green, including the privileged namespace capture gate with its strict
@@ -1653,8 +1714,9 @@ assertion had passed (120 of 121 before the role failure). A disposable
 `systemd-timesyncd` stopped, and a 45-second sub-millisecond probe showed
 zero wall/monotonic drift. One uninterrupted
 `DOCKER_CONTEXT=colima-hyperdht-gates-ki4 bash scripts/linux-gates.sh all`
-on the same tree (the documentation cleanup already layered in, so the
-aggregate's repository-wide Prettier check covers it) passed all ten gates,
+on the same tree with the documentation cleanup already layered in passed
+all ten gates. Repository-wide Prettier was checked separately, not by the
+private aggregate. The gate runner returned
 exit 0:
 
 | Gate                                                    | Result                                      |

@@ -62,6 +62,18 @@ jobs:
           PR_CANDIDATE_ORDER: reverse
           PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
         run: npm run test:private:process:bare
+      - name: Production endpoint punch (Node roles)
+        env:
+          PR_CANDIDATE_ORDER: normal
+          PR_PRODUCTION_ENDPOINT_PUNCH: '1'
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+        run: npm run test:private:process:node
+      - name: Production endpoint punch (Bare roles)
+        env:
+          PR_CANDIDATE_ORDER: normal
+          PR_PRODUCTION_ENDPOINT_PUNCH: '1'
+          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+        run: npm run test:private:process:bare
       - name: Role failure stacks
         if: failure()
         run: cat "${{ runner.temp }}/role-fatal.log" || echo "no role stacks recorded"

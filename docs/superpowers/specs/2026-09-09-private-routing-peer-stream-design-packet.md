@@ -1,283 +1,214 @@
-# Private Routing: Peer Streams — Design Packet
+# Private Routing: Peer Streams — Design Review Record
 
 **Date:** 2026-09-09
-**Status:** review packet, not an approved design. No wire byte, message ID,
-controller method, or test in the tree implements peer streams. Every layout
-below is a proposal for JD to ratify; the M3 registry rule stands (a new message
-family is a versioned wire change and is JD's decision).
-**Inputs:** [`private-routing-v1.md`](../../private-routing-v1.md) §"Connection
-to an unchanged peer", §"Connection between private-capable peers", §"Private
-rendezvous and stream handoff"; the
-[M3 wire registry](./2026-07-14-native-dht-private-routing-m3-wire-registry.md)
-§1.5, §10, §11, §17; the
-[blinded presence note](./2026-08-10-private-routing-blinded-presence-keys-note.md);
-[`private-routing-migration.md`](../../private-routing-migration.md)
-§"Current implementation".
+**Source baseline:** `06dc259c10d6270977d88e1bc12834d9051e1a77`
+**Status:** not implementation-ready. No peer-stream wire or public API is enabled.
 
-## 1. What exists, and what it already fixes
+JD directed the seat to own the remaining work. The choices below are the
+seat's design direction, not nine unanswered questions for JD. They do not
+waive the existing reviewed-wire or external human cryptographic-review gates.
+The earlier packet's claim that legacy egress was ready after a few choices
+was wrong. This revision records the source constraints and the rejected parts
+of that packet before any implementation relies on them.
 
-- **Adjacent links carry three cell classes.** Every established link derives
-  independent CONTROL, STREAM and DATAGRAM contexts (`guard-link.js`
-  `deriveState`; `m3-adjacency-runtime.js` accepts exactly those three classes
-  in the forwarding facade). STREAM contexts are keyed, counted with the
-  ordered receiver, and already carried by production code: the cell endpoint
-  sends `CELL_CLASS.STREAM` (`udx-cell-endpoint.js`) and the link-control
-  session receives it (`link-control-session.js`), because the registry maps
-  `ROUTE_PAYLOAD` (context 3) onto M2 `STREAM = 1`. A peer stream is therefore
-  the class the transport was built for, not a new class; what is new is the
-  object family inside it.
-- **Endpoint↔exit inner AEAD exists.** Routed DHT requests are sealed to the exit
-  under a route-payload context an intermediate relay cannot open
-  (`ROUTED_REQUEST_V1` / `ROUTED_REPLY_V1`, nine-command inventory, outer
-  reply ceiling 8,270 bytes over nine fragments, the nested 8,062-byte lookup
-  response over eight). Authority to reach anything through the exit is an
-  exit-issued live `DESTINATION_REF_V1` (164-byte body, 172-byte object,
-  table-bound, at most 300 s). No command outside the inventory is executable:
-  peer streams cannot be smuggled through the routed-request family and must
-  not be.
-- **Reply paths.** Correlated replies ride the reverse route; `SURB_REQUIRED`
-  replies are single-use, relay-peeled, bounded (3,936 bytes). A SURB is a
-  request/response primitive, not a duplex; it is the right carrier for the
-  rendezvous _setup_ messages, not for stream bytes.
-- **Presence (Gate D).** A responder publishes a blinded, reader-key-encrypted
-  record under `A' = blind(A, period)`; the plaintext body carries an opaque
-  descriptor of at most `MAX_DESCRIPTOR_BYTES = 814` bytes
-  (`blinded-presence.js`). Resolution proves presence at a revision and hands
-  the application the descriptor bytes verbatim. The descriptor _content_ is
-  unspecified today; that is where a private route descriptor goes.
-- **Relay service.** Per-circuit quotas (`maxCells`, `maxBytes`, `maxCommands`,
-  `idleTimeoutMs`) are admitted limits signed in `LINK_ACCEPT_V1`; teardown
-  erases contexts and closes physical ownership. A long-lived stream sits inside
-  those quotas or renegotiates by rotation; nothing new at the relay for v1.
-- **Registry room.** `0x0300–0xffff` is unassigned and rejected in M3 v1; the
-  private-storage overlay IDs `0x0280–0x02a3` are superseded and stay reserved
-  (D10). A stream family therefore takes a fresh block at or above `0x0300` and
-  bumps the negotiated protocol version, or it does not ship.
+## Design direction
 
-## 2. Two flows, one order
+| Concern              | Decision                                                                                                                                                                                                                                                       |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wire version         | Use a new negotiated M3 version for peer streams. Do not add accepted stream IDs to protocol v1 or reuse the retired private-storage IDs. Exact layouts remain subject to review.                                                                              |
+| Scope and order      | Preserve both original targets: legacy HyperDHT egress, then private-to-private streams. No generic VPN, clearnet proxy, or direct fallback.                                                                                                                   |
+| Discovery            | Application supplies the expected legacy Noise key. Resolution stays inside the exit and returns single-use opaque authority, not direct send authority. Do not reopen public routed `findPeer`, `lookup`, or raw `query` under D11.                           |
+| Descriptor           | Carry the full canonical entry advertisement if the complete descriptor fits Gate D's 814-byte limit. The live advertisement is 260–388 bytes, not the historical registry's 420–548-byte form. Do not approve a descriptor that omits usable entry discovery. |
+| Descriptor signature | Reuse the verified Gate D record signature when the descriptor is consumed through that record. No redundant inner signature unless an independently transferable delegation requires it.                                                                      |
+| Quotas               | Enforce a shared generation budget before deriving a smaller stream allowance. Count frames as well as bytes; byte-only credit permits a flood of tiny frames. Do not treat signed limits as existing runtime enforcement.                                     |
+| API ownership        | Controller-owned, package-private peer connection/listener APIs. No root export, caller-supplied socket, or direct-authority raw-stream API.                                                                                                                   |
+| Entry ownership      | Explicit authenticated terminal capability and route purpose. A peer entry is not implicitly authorized because a route terminates at a DHT exit. Do not invent a fourth physical role merely to rename the terminal service.                                  |
+| Carrier              | Keep setup and data classes explicit. The current live route uses outer DATAGRAM cells; ordered stream delivery requires a reviewed transport change, not just a new decoder.                                                                                  |
+| Lifetime             | Bind each stream to admitted route generations. Route expiry, loss, rotation, suspension, or network change closes the stream; no unreviewed cross-generation transfer.                                                                                        |
+| Release              | Public required mode remains disabled. Internal model review is not external human cryptographic review.                                                                                                                                                       |
 
-The v1 document approves two flows. Recommended sequencing: **legacy egress
-first**, because it needs no descriptor format, no destination-side route, and
-exercises the one genuinely new mechanism (a routed duplex terminating at an
-exit) against an unchanged peer; **private-to-private rendezvous second**,
-reusing that duplex plus the Gate D descriptor slot.
+## Verified implementation constraints
 
-### 2.1 Legacy egress: routed duplex to an exit that speaks `relayThrough`
+### Three layers must not be confused
 
-```text
-private client -> guard -> middle -> egress exit ==(blind-relay)== legacy peer
-       `-------------- end-to-end Noise ------------------------'
-```
+1. Adjacent links have CONTROL, STREAM, and DATAGRAM cryptographic contexts.
+   STREAM is used by extension setup in `udx-cell-endpoint.js`.
+2. The M3 context envelope registry maps its `ROUTE_PAYLOAD` context to STREAM.
+   That mapping alone does not describe the live post-finalization transport.
+3. The live `sendM3RouteFrame()` in `m3-adjacency-runtime.js` seals an exact
+   1,100-byte frame in an outer **DATAGRAM** cell. Its receive pump rejects
+   other outer classes. Inside that frame, `RoutePayloadCodec` has independent
+   STREAM and DATAGRAM counters. Current DHT requests and replies use inner
+   DATAGRAM.
 
-- Discovery: not solved, and a dependency. D11 refuses routed public `findPeer`,
-  `lookup` and raw `query` in protocol v1, and no current exit command can mint
-  a `LEGACY_EGRESS_V1` target. The v1 document assumes "a valid legacy DHT
-  result produced the opaque egress target"; nothing in the tree produces one.
-  Two options for JD: (a) an explicit first-contact input contract — the
-  application supplies the legacy peer's Noise public key and the exit
-  resolves it upstream inside a new bounded command that returns only an
-  opaque single-use egress reference (a `DESTINATION_REF_V1`-class value bound
-  to `LEGACY_EGRESS_V1` provenance, never an address); or (b) a routed
-  `findPeer` limited to that same opaque output, which reopens D11. Either is
-  the tenth exit command policy entry and a versioned wire change.
-- Open: a new object family, proposed `STREAM_OPEN_V1 / STREAM_OPENED_V1 /
-STREAM_CLOSE_V1`, carried as `ROUTE_PAYLOAD` on the STREAM context of the
-  branch, sealed endpoint↔exit like a routed request. `STREAM_OPEN_V1` binds:
-  the destination reference, the expected remote Noise public key (32),
-  `holepunch: false`, local-address sharing disabled, a fresh 32-byte session
-  capability, negotiated bounds (per-direction byte budget, idle timeout ≤
-  admitted `idleTimeoutMs`), and the operation budget as a _duration_ (KI-15
-  rule: no cross-host absolute time).
-- Pairing: the exit runs the existing HyperDHT peer handshake with itself as
-  `relayThrough` and pairs the unchanged peer's raw relay stream to the routed
-  duplex by the session capability, exactly as v1 §"Connection to an unchanged
-  peer" prescribes; it forwards Noise bytes byte-for-byte and never
-  instantiates SecretStream.
-- Data: `STREAM_DATA_V1` cells on the STREAM context, ordered receiver, exact
-  next counter (CONTROL/STREAM rule), fixed 1,200-byte outer cell, at most
-  1,073 bytes of logical route payload after the route frame, of which the
-  `STREAM_DATA_V1` decoder will bound a smaller slice once its header is
-  tabulated. No fragmentation layer: Noise and UDX framing already tolerate
-  arbitrary segmentation, so each cell carries an opaque slice and a 16-bit
-  length.
-- Close: `STREAM_CLOSE_V1` in either direction; either transport closing
-  closes the paired side and erases the session capability. Half-close is a
-  flag on `STREAM_CLOSE_V1`, never an implicit state.
-- What the exit learns: the legacy peer's address and the Noise identities it
-  can observe on the blind-relay handshake (unchanged HyperDHT exposure), the
-  stream's timing and volume. What it cannot do: substitute the peer (the
-  source binds Noise to the expected key) or turn itself into a general proxy
-  (the destination reference is provenance-qualified and single-use).
+`RoutePayloadCodec` accepts at most 1,073 payload bytes. That is the budget for
+the complete inner object, including its header and any additional envelope;
+it is not a stream data allowance. Fixed outer cells are 1,200 bytes.
 
-### 2.2 Private-to-private: descriptor in the presence slot, rendezvous at the destination's entry
+The current route pump retains at most `MAX_FRAGMENTS` frames and discards
+excess frames while continuing to process teardown and branch loss. That is
+intentional DATAGRAM behavior. Reusing it unchanged for ordered streams would
+lose bytes. Stopping the pump when the consumer is slow would instead restore
+the previously fixed branch-loss starvation bug.
 
-```text
-source safety route -> destination entry relay -> destination route -> destination
-          `---------------- end-to-end Noise ---------------------'
-```
+### Admission is not spending
 
-- Descriptor: the 814-byte Gate D descriptor slot carries a
-  `PRIVATE_ROUTE_DESCRIPTOR_V1`: descriptor ID (16), destination Noise public
-  key (32), entry relay advertisement digest (32) plus the entry's reachable
-  endpoint and route-encryption key as the v1 text requires (or the full 420 /
-  548-byte advertisement if the budget allows — a decision), the destination's
-  ephemeral route key (32), protocol parameters digest (32), route epoch (8),
-  expiry as a wall time in the _destination's_ domain (8), a nested hop
-  instruction sealed to the entry relay (bounded; this is the "encrypted nested
-  hop material"), and an endpoint signature under the _blinded_ key `A'` of the
-  period (so a descriptor never carries or is signed by the stable identity;
-  the Noise identity inside is the only stable value and is what the connecting
-  peer intends to authenticate anyway). Size must be tabulated against 814
-  before this is ratified; if the full advertisement does not fit, the
-  descriptor carries the digest and the entry's canonical endpoint, and the
-  source fetches the advertisement over the routed DHT as it does for relays.
-- Open: the v1 state machine verbatim — `DESCRIPTOR_VERIFIED → ACTIVATE →
-READY → ACK → OPEN`, five-second open deadline, at most four retries with
-  identical authenticated bodies, single-use redemption
-  `(descriptor ID, epoch, activation nonce, source route key)` consumed
-  atomically at the destination. `ACTIVATE` binds both expected Noise keys,
-  the descriptor digest, and negotiated bounds. Carrier: the outer M3
-  `ROUTE_PAYLOAD` context is inherited STREAM, but the route-payload codec
-  carries an inner class of its own, and the routed DHT already sends its
-  requests and replies as inner `CELL_CLASS.DATAGRAM` over `ROUTE_PAYLOAD`
-  (`route-payload.js` `routeClass`, `live-route-authority.js`,
-  `dht-exit-io.js`) with the 64-wide replay window. The four rendezvous
-  messages ride that same inner datagram class, retried under fresh logical
-  counters with identical bodies; no new outer context is needed for them. A
-  new outer context is reserved only if the destination-entry ownership
-  (decision 7) cannot reuse route-payload framing across the entry boundary
-  (decision 9). The duplex transfers exactly once, after `OPEN`, onto the
-  inner STREAM class.
-- Entry relay: this is the largest gap, not a detail. `M3_LINK_ROLE` has exactly
-  `CLIENT`, `SAFETY_RELAY` and `DHT_EXIT` (`protocol.js`), the branch is a fixed
-  three-position path that terminates in a DHT exit, and every finalization
-  transcript, admitted-limits digest and forwarding owner is built for that
-  shape. A destination entry is a fourth authenticated role: it must accept a
-  source-side extension (or a datagram-carried ACTIVATE) at one edge and own a
-  destination-side route at the other, with a route-construction and
-  finalization transcript that binds both circuits, and forwarding ownership
-  that crosses that boundary without either side gaining the other's send
-  authority. The nested hop instruction is only the carrier for that admission.
-  None of the transcript, role, capability bit, advertisement field or
-  forwarding owner exists; each is a versioned wire and ownership decision.
-- Data and close: identical to 2.1 (`STREAM_DATA_V1` / `STREAM_CLOSE_V1`), both
-  endpoints being private; no exit exists on this path.
-- What each party learns: the entry relay holds an authenticated association
-  between the source's safety-route circuit and the destination's route
-  circuit. That is a deterministic protocol-state linkage at one relay,
-  stronger than the timing/volume correlation KI-1 concedes, and it must be
-  disclosed as an entry-role property in its own right. The entry never sees
-  the source address. Other relays see timing and volume (KI-1); the
-  destination learns the source Noise identity and nothing about its address;
-  the source learns the destination's Noise identity.
+`guard-link.js`, `link-parameters.js`, and `tail-control.js` encode, compare,
+and authenticate `maxCells`, `maxBytes`, and `maxCommands`. The inspected live
+M3 send/receive paths do not decrement those fields. `RelayService.trySend()`
+bounds queued bytes; it is not a lifetime cell/byte/command ledger.
 
-## 3. Message family (proposed IDs, all new, all above `0x0300`)
+Therefore the earlier packet's promise to put streams inside already-enforced
+route quotas was unsupported. A shared ledger needs defined ownership,
+charging rules, failure behavior, and rotation behavior before that promise is
+valid. The default request is 64 cells, 65,536 bytes, and ten commands. Under
+a proposed 1,200-byte-per-cell charge, the byte limit would permit only 54
+cells before setup, retries, and control reserves. Increasing defaults is not
+a substitute for implementing accounting.
 
-| ID       | Object                        | Carrier                                                       | Auth                                                                                                        |
-| -------- | ----------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `0x0300` | `STREAM_OPEN_V1`              | STREAM `ROUTE_PAYLOAD`, endpoint→exit                         | route-payload AEAD                                                                                          |
-| `0x0301` | `STREAM_OPENED_V1`            | STREAM `ROUTE_PAYLOAD`, exit→endpoint                         | route-payload AEAD                                                                                          |
-| `0x0302` | `STREAM_DATA_V1`              | STREAM `ROUTE_PAYLOAD`, both directions                       | route-payload AEAD, exact next counter                                                                      |
-| `0x0303` | `STREAM_CLOSE_V1`             | STREAM `ROUTE_PAYLOAD`, both directions                       | route-payload AEAD                                                                                          |
-| `0x0310` | `PRIVATE_ROUTE_DESCRIPTOR_V1` | Gate D descriptor slot (≤ 814 bytes)                          | Gate D mutable signature under `A'`; an inner signature only if a delegation contract needs it (decision 4) |
-| `0x0311` | `ACTIVATE_V1`                 | inner DATAGRAM over `ROUTE_PAYLOAD`, source→entry→destination | nested per-hop AEAD + destination tuple                                                                     |
-| `0x0312` | `READY_V1`                    | inner DATAGRAM over `ROUTE_PAYLOAD`, destination→source       | destination signature over the tuple                                                                        |
-| `0x0313` | `ACK_V1`                      | inner DATAGRAM over `ROUTE_PAYLOAD`, source→destination       | source route-key signature                                                                                  |
-| `0x0314` | `OPEN_V1`                     | inner DATAGRAM over `ROUTE_PAYLOAD`, destination→source       | destination signature, redemption bound                                                                     |
+### Presence and entry discovery
 
-Every body is fixed-size or carries one explicit length; every AEAD context is
-domain-separated by class, direction, circuit, generation and the descriptor
-digest where one exists; counters follow the v1 rules: STREAM exact-next, and
-for a datagram-class carrier the M3 route/finalization 64-wide window (the
-adjacent-link DATAGRAM receiver in `guard-link.js` is configured at 256 and is
-not that window). Byte layouts are deliberately not proposed here: the
-registry's precedent is that layouts are tabulated with size bounds and
-justified field by field in the design that ratifies them.
+`blinded-presence.js` permits at most 814 opaque descriptor bytes. Gate D
+verifies the mutable-record signature under the blinded period key and binds
+record revision before exposing the decrypted descriptor. The descriptor
+codec and its live route owner do not yet exist.
 
-## 4. Decisions JD must ratify before any build
+A useful private-peer descriptor must authenticate the expected destination
+Noise identity, the entry advertisement, the destination route key, route
+parameters, generation/epoch, expiry, and the entry's bounded route-admission
+material. Its byte table must include every envelope and authentication tag.
+An identity hash without a means to obtain the corresponding authenticated
+entry advertisement is not a complete discovery scheme.
 
-1. New message block at `0x0300` and the protocol-version bump it implies.
-2. Legacy egress first (2.1) with `LEGACY_EGRESS_V1` as the tenth exit-policy
-   entry, or private-to-private first.
-3. Whether the Gate D descriptor carries the full entry advertisement or its
-   digest plus canonical endpoint (the 814-byte budget decides).
-4. Descriptor signature under the blinded period key (recommended) versus a
-   fresh per-descriptor key certified by the blinded key.
-5. Stream quotas: reuse admitted `maxBytes` / `idleTimeoutMs` unchanged, or a
-   separate stream budget negotiated in `STREAM_OPEN_V1`.
-6. Whether the source's duplex transfer to HyperDHT `connect` happens inside
-   the controller (required mode) or through a new `createRawStream`-class
-   surface; the v1 table says `pool`/raw streams may exist only as a routed
-   implementation carrying no direct authority.
-7. The destination entry role itself (§2.2): a fourth `M3_LINK_ROLE`, its
-   capability bit in the advertisement, the two-circuit finalization
-   transcript, and which existing owner (relay service, tail control, or a new
-   one) holds the cross-boundary forwarding state. Without this decision §2.2
-   cannot be scheduled at all; §2.1 does not depend on it.
-8. The legacy-egress discovery input (§2.1): first-contact key supplied by the
-   application with exit-side resolution to an opaque reference, or a bounded
-   routed `findPeer` that reopens D11. §2.1 cannot be scheduled without it.
-9. Whether route-payload framing (inner DATAGRAM for setup, inner STREAM for
-   the duplex) crosses the destination-entry boundary unchanged, or the entry
-   needs a newly registered outer context. Only decision 7 can force the
-   second; the rendezvous messages themselves do not.
+## Legacy egress: required Noise order
 
-## 5. Review questions for the lane
+The previous packet incorrectly put Noise after relay pairing. Existing
+HyperDHT performs Noise IK first and starts SecretStream over the paired raw
+transport afterward. `relayThrough` is inside the encrypted Noise payload;
+the exit cannot create or edit it on the endpoint's behalf.
 
-1. Does 2.1's session capability plus expected-key binding leave any way for
-   the exit to pair the routed duplex with a peer of its choosing that Noise
-   would not reject? Name the check that stops it, or the gap.
-2. In 2.2, can the entry relay distinguish an ACTIVATE for a destination route
-   from ordinary route traffic in a way that lets it correlate a source's exit
-   with a destination beyond what KI-1 already concedes?
-3. Is signing the descriptor under `A'` sound given the Gate D linkability
-   statement (unlinkable only against parties without `A`)? The connecting peer
-   holds `A` by construction; the storage node does not.
-4. Which of the six decisions are forced by existing invariants, and which are
-   genuinely open?
-5. Minimum falsifying test set for a first slice (the eleven-role gate plus the
-   namespace capture oracle), in dependency order.
+Required sequence for a future adapter:
 
-## Review lane — 2026-09-09
+1. Resolve the application-supplied Noise key inside the exit under bounded,
+   live, route/generation-bound authority. Keep candidate addresses there.
+2. Reserve a real framed UDX raw stream at the exit. Return only the opaque
+   egress reference and the relay metadata needed to author the handshake.
+3. The endpoint generates the session capability. Use that same value as the
+   blind-relay token; do not introduce a second independent pairing key.
+4. The endpoint's `NoiseWrap` creates IK message 1. Its payload names the exit
+   relay and reserved UDX ID, disables reusable-socket behavior, includes no
+   local addresses or hole-punch request, and does not advertise an open
+   endpoint firewall.
+5. The exit forwards the Noise ciphertext unchanged through the
+   authority-bound DHT relay candidate. It does not call ordinary `connect()`
+   to create an exit-owned application Noise handshake.
+6. The legacy server returns its Noise reply and may register the pending
+   responder half of blind-relay pairing.
+7. The exit carries that reply unchanged to the endpoint. The endpoint calls
+   `NoiseWrap.recv()`, checks the expected responder key, then calls `final()`.
+8. An authenticated handshake-accept message tells the exit that the endpoint
+   accepted the reply. It is a state-transition signal, not a cryptographic
+   proof that a malicious endpoint executed particular local code.
+9. Only then may the exit start its initiator-side blind-relay pairing with
+   the reserved real UDX stream and the same session capability.
+10. After successful pairing, the exit connects that raw stream to the returned
+    relay stream ID and reports OPEN. The endpoint starts SecretStream over
+    the routed duplex with its finalized handshake state.
 
-`omp/openai-codex/gpt-5.6-sol` (medium, read-only) reviewed the packet against
-the tree and the approved documents. Verdict: **not ready to ratify**. Legacy
-egress (§2.1) is coherent once decisions 1, 2, 5, 6 and 8 are taken;
-private-to-private (§2.2) is not schedulable until the destination-entry trust
-boundary (decision 7) is designed and approved, and it must carry the entry's
-deterministic cross-circuit linkage as its own disclosure. Six claims in the
-first draft were contradicted by the tree or the registry and are corrected
-above: `DESTINATION_REF_V1` is a 164-byte body in a 172-byte object; the
-8,270-byte outer reply is nine fragments (eight applies to the nested 8,062-byte
-lookup response); STREAM cells are already sent and received in production;
-the rendezvous messages are inner DATAGRAM over `ROUTE_PAYLOAD`, as the routed
-DHT already is, not a separate outer context; 1,073 is
-the whole logical route payload, not a per-message slice; and the 64-wide
-datagram window is route/finalization semantics, not the adjacent-link
-receiver. Question 1: no identity-substitution path at a malicious exit,
-because Noise IK binds the responder static key (`lib/noise-wrap.js`,
-`lib/connect.js`); the session capability only prevents cross-session
-pairing. Question 3: an inner descriptor signature under `A'` is sound but
-redundant with the Gate D mutable signature unless it carries a delegation
-contract. Forced by existing invariants: decisions 1, 7 (in substance) and the
-constraints inside 2, 5 and 8; open: 3, 4, 6, 9 and the choices inside 2, 5
-and 8. The reviewer's minimum falsifying test set, in dependency order:
-registry (unique IDs, old-version rejection, exact inventory, unknown
-role/context rejection); authority (provenance-bound single-use egress
-reference; cross-exit, cross-generation, replay, wrong-key and conflicting
-capability rejection); routed duplex (ordering, segmentation, backpressure,
-quota exhaustion, timeout, close, explicit half-close, capability erasure);
-a real unchanged-peer blind-relay round trip with a mispairing exit failing
-remote-key authentication; the Node and Bare eleven-role gates; synthetic
-capture-oracle falsification (`test/private/route-oracles.js`) before any
-live capture is trusted; namespace projection then live capture with the
-oracle extended to endpoint→guard only, fixed cells, no plaintext on route
-edges, hop-by-hop ciphertext change, and a positive plaintext control only at
-the legacy-peer edge. The verdict is the seat's; JD ratifies the decisions.
+Source: `lib/connect.js` `connectThroughNode` and `relayConnection`;
+`lib/noise-wrap.js`; `lib/server.js` handshake handling and `_relayConnection`;
+`node_modules/blind-relay/index.js` `BlindRelayRequest` and `BlindRelayLink`.
 
-## 6. Non-goals for the first slice
+### Legacy adapter boundaries still requiring proof
 
-Mixing or cover traffic (Gate B), multiple concurrent streams per circuit,
-relay-to-direct upgrade of any kind, mobile suspend semantics for open streams,
-Hyperswarm integration, and any public required-mode exposure. Each is either
-deferred by the gates index or blocked on the external cryptographic review.
+- `blind-relay` exchanges real UDX stream IDs and calls `relayTo()`. A normal
+  JavaScript duplex is not a replacement for that raw-stream endpoint.
+- The exit relay must admit only live, authority-bound session tokens and
+  permitted pairing roles. An unrestricted `blind-relay.Server` would expose
+  a general relay service. Token lookup must happen before resource allocation.
+- Direct peer-handshake handling can skip relay setup in `server.js`. The
+  adapter must reject that path and accept raw traffic only through the
+  authorized relay transport. Merely setting a `holepunch` option is not proof.
+- The current `EXIT_LOCAL` enum has no live issuer/verifier for this operation;
+  `verifyDhtExitRoutedDestination()` accepts `DHT_NODE_HANDLE`. A zero reference
+  is not authority. Legacy resolution needs a reviewed activation-bound issuer.
+- The unchanged peer's encrypted Noise reply can contain its addresses.
+  The private controller can discard them and provide no direct send authority,
+  but cannot promise that the endpoint process never decrypts address bytes.
+  The security contract must distinguish address knowledge from send authority.
+
+## Private-to-private: entry and transcript requirements
+
+The entry would associate two separately authenticated route generations.
+That is deterministic cross-circuit linkage at one relay, stronger than the
+existing timing/volume limitation. It must be disclosed separately. The entry
+must not receive either peer's Noise session keys or direct endpoint authority.
+
+An entry admission must bind the destination's live route slot and expiry,
+the authenticated source-side route, the exact descriptor, both ephemeral
+route keys, nonces, and downward-only limits. Both route owners must retain
+revocation authority. Closing either circuit must revoke the pairing before
+asynchronous callbacks can reuse it.
+
+ACTIVATE → READY → ACK → OPEN is the required semantic order. Each message
+may authenticate only the context and messages that already exist. A transcript
+that includes all four message digests in ACTIVATE or READY is cyclic and is
+rejected. A cumulative transcript must be specified byte-for-byte, including
+which authentication suffixes enter each digest.
+
+Identical retries retain identical authenticated bodies under fresh datagram
+counters. Changed bodies under a reused semantic ID are rejected. OPEN transfers
+exactly one duplex at each endpoint. Bounded tombstones may answer delayed
+messages but cannot restore send authority or transfer another duplex.
+
+The entry's ownership of two endpoint–entry codecs does not make their
+ciphertexts interchangeable. Opening/resealing at the entry requires an
+explicit end-to-end authenticated setup construction. Simply copying one
+circuit's frame into the other fails its keys, descriptor binding, circuit ID,
+and direction. A proposed 284-byte descriptor and generic signed transcript
+from the review did not settle these contracts and are not approved layouts.
+
+## Transport and accounting acceptance
+
+Before either flow can be implemented safely, settle and prove:
+
+- One receive owner and class-aware dispatch per route. No competing DHT and
+  stream readers; no starvation of teardown, loss, or credit messages.
+- Bounded data and control residency. Overflow of authenticated ordered traffic
+  fails the owning stream/route instead of silently discarding a frame.
+- Cumulative frame and byte credits. Duplicate/stale credit cannot create
+  capacity; a peer cannot gain extra frame slots by using tiny payloads.
+- Credit reservations across both entry legs. A bridge cannot grant more than
+  the destination's receive capacity or either leg's remaining budget.
+- Shared generation accounting, including setup, retries, data, and close.
+  Define control reserves and quota-driven rotation before selecting defaults.
+- Exact offsets, segmentation, half-close, reset, idle deadline, queue erasure,
+  and delayed-callback behavior. No application bytes before authenticated OPEN.
+
+These are implementation prerequisites, not implemented properties.
+
+## Review outcome and next acceptance boundary
+
+Two read-only Sol reviews examined the source. The second lane first attempted
+Orca GLM, which failed for insufficient credits; the replacement used the same
+Sol model on separate context. This is not independent-model or external human
+cryptographic approval. The seat rejects both the original packet and the
+incomplete byte proposals as ready to build.
+
+The next accepted artifact must supply complete canonical byte tables,
+non-cyclic authentication/KDF inputs, role and capability admission, live
+ownership transfers, and the quota/flow-control state machine together.
+Approximate Noise sizes, unnamed issuers, generic duplex callbacks, and partial
+OPENED/CLOSE layouts do not meet that boundary.
+
+Verification must then exercise real production owners: unchanged-peer Noise
+with malicious mispair rejection; private-to-private rendezvous; slow readers
+and simultaneous half-close; expiry/rotation/suspend; Node and Bare processes;
+and Linux capture with explicit negative controls for endpoint-to-guard-only
+traffic, fixed cells, plaintext leaks, and hop-by-hop ciphertext changes.
+Existing DHT capture evidence does not prove peer-stream privacy.
+
+Public required mode remains blocked on the complete aggregate gate and a
+named external human cryptographic review of the exact final source and native
+dependency revisions. Mixing/cover traffic and anonymous admission remain out
+of this work; consumer integration follows the public gate.
