@@ -785,7 +785,13 @@ function registerLiveProcessSuite(launch) {
         presenceKeys.slice().sort((left, right) => b4a.compare(left, right)),
         'the endpoint published under exactly the blinded keys of the publication periods'
       )
-      const presenceBaseline = (await routingSnapshots()).get(surbRouting.lookupPair.exitRole)
+      // One round trip to the lookup exit is all the proof needs; a full routing
+      // snapshot here is eleven round trips inside the timing-sensitive tail.
+      const presenceBaseline = await sendAndWait(
+        surbRouting.lookupPair.exitRole,
+        'snapshot',
+        'snapshot'
+      )
       const resolved = await sendAndWait('endpoint', 'presence-resolve', 'presence-state', {
         identityPublicKey: presenceIdentity.publicKey,
         readerSecret: presenceReader,
@@ -801,8 +807,11 @@ function registerLiveProcessSuite(launch) {
       )
       // No rotation since the surb-get derivation, so the lookup exit is the same role;
       // the put above grew the announce exit's count, which is why no re-derivation.
-      const presenceRoutingAfter = await routingSnapshots()
-      const presenceExit = presenceRoutingAfter.get(surbRouting.lookupPair.exitRole)
+      const presenceExit = await sendAndWait(
+        surbRouting.lookupPair.exitRole,
+        'snapshot',
+        'snapshot'
+      )
       t.ok(
         presenceExit.surbHopCellCount > presenceBaseline.surbHopCellCount,
         'the presence read was answered over the SURB path'

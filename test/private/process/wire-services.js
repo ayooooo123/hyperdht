@@ -192,7 +192,6 @@ function createProjectedLinkService(options) {
   const consumed = new Set()
   const sessions = new Set()
   const links = new Set()
-  const closingLinks = new Set()
   // Faulting one adjacent link needs the session that owns it: closing that session
   // invalidates the UDX record and reports a real physical loss to the M3 runtime,
   // which is what makes a relay emit BRANCH_DESTROY upstream.
@@ -580,17 +579,8 @@ function createProjectedLinkService(options) {
     linkSessions.delete(link)
     sessions.delete(session)
     links.delete(link)
-    // Remove the live link immediately, but retain its close for terminal cleanup.
-    const closing = session
-      .close()
-      .catch(() => {})
-      .then(() => releaseGrant(session))
-    closingLinks.add(closing)
-    try {
-      await closing
-    } finally {
-      closingLinks.delete(closing)
-    }
+    await session.close().catch(() => {})
+    releaseGrant(session)
     return true
   }
 
@@ -629,7 +619,6 @@ function createProjectedLinkService(options) {
     if (destroyed) return false
     destroyed = true
     await closeOwnedSessions(PrivateRouteError.ERR_DESTROYED(), true)
-    await Promise.allSettled(closingLinks)
     consumed.clear()
     return true
   }
