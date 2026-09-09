@@ -1901,12 +1901,32 @@ pass those route assertions and still be correctly dropped. Missing captured
 ICMP or another dropped IP packet also remains possible. The log cannot
 distinguish these cases; the old workflow retained no pcaps.
 
-CI now retains the existing synthetic namespace pcaps and socket-close windows
-for seven days, including failed runs. No classifier, clock tolerance,
-firewall rule, assertion, or retry policy changed. A recurrence must be
-diagnosed from those bytes. If they are insufficient, the next evidence needed
-is per-rule firewall counts plus tcpdump shutdown statistics and exit status;
-the summed counter alone cannot distinguish the two final DROP rules.
+CI retains the synthetic namespace pcaps, socket-close windows, numbered full
+per-rule firewall listings, tcpdump stderr (including packet-loss statistics),
+the waiter's actual tcpdump exit status, and forced-kill indicators for seven
+days, including failed runs. Firewall samples cover the audit before and after
+capture stop, plus teardown before the chain is removed, even if the scenario
+failed before reaching its audit. Capture waiters preserve the real tcpdump PID
+for SIGINT and record status only after that process exits.
+
+No classifier, clock tolerance, firewall rule, assertion, or retry policy
+changed. A recurrence must be diagnosed from this bundle; the summed counter
+alone cannot distinguish the two final DROP rules. Missing status or a forced
+kill is incomplete shutdown evidence, not a clean capture.
+
+Diagnostic follow-up local evidence (2026-09-09): the explicitly selected
+`colima` context passed namespace projection, 27/27. Its live scenario failed
+before the capture audit at 111/112, during presence revocation:
+`TRANSPORT_UNAVAILABLE` → `ROUTE_UNAVAILABLE` → `ERR_REPLAY` at
+`readLiveRoutePair` (`route-manager.js:1139`, already-spent lease). The reason
+that lease was spent is not established; this is separate from KI-19, and no
+routing fix is claimed. The failed live scenario was not retried locally.
+
+A separate projection smoke with a host-mounted evidence directory passed
+27/27 and retained per-rule counters plus all 13 tcpdump logs/status files.
+A throwaway real-process fault smoke killed one owned tcpdump with SIGKILL,
+observed retained exit status 137, and verified namespace cleanup. This proves
+nonzero capture exits are recorded, not replaced with a successful default.
 
 Later green runs are separate observations, not a fix or waiver for this one.
 
