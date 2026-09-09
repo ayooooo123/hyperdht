@@ -1211,11 +1211,12 @@ capability expiry (frozen now): ADMITTED`); on the endpoint the SURB
   any invalid frame, so this closes no attacker capability; it removes the
   honest failure mode.
 - Follow-ups on the same boundary, same day: the terminal admission now
-  samples the wall clock before the entry is spent and treats a throwing or
-  non-time callback as `INVALID_ROUTE` after revoking the table, so the
-  entry's one-use open authority is revoked with it (regression: the
-  authority is already spent when revoked afterwards; it failed on the
-  committed ordering). The harness peel-authority factory passes the
+  samples the wall clock after the handle lookup and before the entry is
+  spent, and treats a throwing or non-time callback as `INVALID_ROUTE`
+  after revoking the table, so the entry's one-use open authority is
+  revoked with it; an unknown handle still returns `null` with no clock
+  read and no table change (regression covers both; each ordering it
+  replaces failed it). The harness peel-authority factory passes the
   original secret and key (the authority copies them) and clears every
   buffer of the decoded advertisement.
 - C-6 (Fable, Low): "length in the clear on unsealed links" was written
@@ -1285,13 +1286,13 @@ dispatched on an unapproved wire.
 
 **Measurements.** `set -o pipefail; bash scripts/linux-gates.sh all` on the
 final tree with no concurrent edits, all ten gates, exit 0: Node aggregate
-**1,092 tests / 19,689 assertions**; Bare **1,047 / 19,554**; the four
+**1,092 tests / 19,692 assertions**; Bare **1,047 / 19,557**; the four
 normal/reverse process legs 155 each; both production-punch legs 160 each;
 namespace projection 27; live namespace capture 165 with kernel raw DROP
-zero. Complete log: `/tmp/hyperdht-review-lane-linux-gates-followup.log`.
-The first commit of this checkpoint (`5bcf9ac`) was measured the same way
-at 1,091 / 19,687 and 1,046 / 19,552 (`…-final.log`); the follow-up adds the
-admission-ordering regression. Whole-repository Prettier passes.
+zero. Complete log: `/tmp/hyperdht-review-lane-linux-gates-order.log`.
+The two earlier commits of this checkpoint were measured the same way
+(`5bcf9ac`: 1,091 / 19,687 and 1,046 / 19,552; `b33fbe4`: 1,092 / 19,689
+and 1,047 / 19,554). Whole-repository Prettier passes.
 
 ### Subagent design handoff — 2026-09-05
 
