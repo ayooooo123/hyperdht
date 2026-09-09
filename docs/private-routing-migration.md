@@ -23,7 +23,9 @@ final-exit, and DHT-exit owners rather than a structural or fake transport.
 
 The implementation checkpoint is
 [`cae9721`](https://github.com/ayooooo123/hyperdht/commit/cae9721f946b4d3b2b8adcb61b3230332371e830),
-published to `private-routing-v1` on 2026-09-09:
+published to `private-routing-v1` on 2026-09-09, followed on the same branch
+by the KI-4 offer-admission repair (the "KI-4 cross-host time contract for
+offer admission" checkpoint below):
 
 - **Routed DHT and Gate C:** immutable/mutable get and put support explicit
   `replyMode: 'SURB_REQUIRED'` behind `experimentalSurbReplies: true`.
@@ -46,10 +48,12 @@ published to `private-routing-v1` on 2026-09-09:
   matrix. See the [measurements](#gate-3b1-task-17-live-eleven-process-scenario-status)
   and [publication evidence](#continuation-checkpoint--2026-09-09-required-mode-puts-and-v2-allocation).
 
-**Open gates:** KI-4's guard-offer cross-host time contract needs a reviewed
-repair; peer streams need a separate reviewed wire design; external
-cryptographic review and the aggregate public-controller gate remain open.
-Further remote lifecycle dispatch requires explicit owner approval.
+**Open gates:** KI-4's responder-side offer admission is repaired under the
+reviewed cross-host time contract (see that checkpoint); its confirmation on
+real links is an owner-approved remote dispatch that has not run since.
+Peer streams need a separate reviewed wire design; external cryptographic
+review and the aggregate public-controller gate remain open. Further remote
+lifecycle dispatch requires explicit owner approval.
 Hyperswarm, mobile, and PearTube integration follow those gates. KI-1
 timing/volume correlation and KI-5 operator diversity remain explicit limits;
 mixing/cover traffic is deferred and anonymous-admission Gate A is dropped.
@@ -1545,6 +1549,131 @@ This remains package-private and experimental. The owner-approved Gate C
 wire is not external cryptographic approval. Public required mode, peer
 streams, and the KI-4 cross-host guard-offer time contract remain open;
 this slice changes none of those boundaries.
+
+### Continuation checkpoint — 2026-09-09, KI-4 cross-host time contract for offer admission
+
+Continued from `cae9721` in a fresh worktree. The open KI-4 item was the
+guard-offer admission failure of run 34147485033: the guard rejected the
+endpoint's first LINK_OFFER at `validOffer` because the offered deadline lay
+27 ms beyond `guardNow + MAX_ADJACENT_LINK_MS`. The endpoint mints that
+deadline as `endpointNow + MAX_ADJACENT_LINK_MS`, so any endpoint clock ahead
+of the guard's by more than the one-way transit time was refused. The same
+predicate sat in `validExtensionOffer`; the local Linux run recorded in the
+guard-offer diagnostics checkpoint (`announce-middle` ERR_AUTHENTICATION at
+`guard-link.js:769`) is that line.
+
+**The contract.** A responder checks peer-minted wall timestamps for
+authenticated ordering only: an offer whose deadline has already passed on
+the responder's clock is expired, and the requested expiry must not precede
+the signed deadline. No comparison measures how far ahead the peer's clock
+runs. The bound on how far a deadline may lie in the responder's future is
+the bound the responder already enforced locally on the requested limits:
+`limitsWithinAdvertisement` caps `expiresAtMs` at 300 s from the responder's
+own clock and at its advertisement expiry, and the validators require
+`requestedLimits.expiresAtMs >= offerDeadlineMs`. Every lifetime a responder
+schedules from a peer timestamp is clamped in its own domain: the extension
+responder now signs `min(requestedExpiry, offerDeadline, responderNow +
+MAX_ADJACENT_LINK_MS)` as the admitted expiry, so a slower exit shortens the
+link instead of refusing it. Index-zero admitted limits were never bounded by
+the offer deadline (they are the requested limits) and are unchanged. Replay
+reservations still live until the peer deadline as read on the responder's
+clock: cell IDs derive from the offer digest, so the reservation must cover
+the whole window in which the responder would still accept the offer. The
+previous KI-4 slice removed the initiator's peer-clock-versus-local-current
+comparisons on the same principle; this slice completes the responder side.
+No skew-allowance constant, wire byte, or endpoint-side check changed.
+
+Resulting tolerance, without a constant: a responder admits an initiator
+whose clock runs ahead by up to the 300 s limits cap less the offered window,
+and behind by up to the offered window less the handshake time (expiry).
+Initiator-side completion, unchanged, accepts a responder ahead by up to the
+offered window less the handshake time (`acceptedAtMs <= offerDeadlineMs`)
+and, with the clamp, behind by the same amount (`admittedLimits.expiresAtMs`
+must still be in the initiator's future). For the observed 27 ms the admitted
+expiry is `initiatorDeadline - 27 ms + transit`; completion would need a
+return path of almost fifteen seconds to see it expired.
+
+**Deliberate bound change.** An adversarial initiator can now hold an
+index-zero or extension replay reservation for up to 300 s instead of 15 s;
+each costs one valid signature from any identity, and the caches already
+return ERR_BUSY at `MAX_RESPONDER_REPLAYS = 4096`. The sustained fill rate
+needed to keep a cache full drops from about 273 to about 14 offers per
+second; storage and admission stay capped. Honest reservations do not change,
+because honest deadlines are at most 15 s from the initiator's clock. The
+alternatives were rejected on record: an explicit skew allowance reusing the
+advertisement's 30 s `MAX_FUTURE_SKEW` contradicts the earlier KI-4 policy and
+turns the responder bound into 45 s; a relative budget on the wire (KI-15
+style) is a signed-body semantic change and would need the replay cache to
+live for the advertisement lifetime; clamping the reservation to 15 s locally
+breaks exact replay coverage.
+
+**Review lane.** The packet (fault, deadline data flow, candidate contract,
+the three alternatives, four questions) went to `omp/openai-codex/gpt-5.6-sol`
+read-only after `orcarouter/kimi/kimi-k3` was credit-gated. Verdicts: the
+contract is sound and names every remaining cross-clock check as an
+"expired here?" or signed-ordering check; the 300 s reservation exposure with
+the 4096 cap is accepted over an unstated skew assumption; the extension
+clamp cannot shorten any offer the old validator admitted (for those,
+`deadline <= validationNow + 15 s <= sampleNow + 15 s`) and only bounds newly
+admitted skewed offers; the test set was expanded by a five-second skew and a
+replay-after-15-s case. The verdict is the seat's.
+
+**Regressions (fail before, pass after).** In `test/private/guard-link.js`:
+the index-zero responder admits an initiator 27 ms and 5 s ahead and the
+initiator completes with the requested lifetime intact; the extension
+responder admits both skews and signs an admitted expiry exactly
+`MAX_ADJACENT_LINK_MS` from its own clock; the native UDX completion scenario
+gains 27 ms and 5 s responder-behind cases over a full offered window. Before
+the fix each of these throws ERR_AUTHENTICATION at `validOffer` or
+`validExtensionOffer`, the run-34147485033 site. Retained bounds are pinned:
+a deadline at or before the responder clock is expired whatever the initiator
+clock; a deadline exactly at the responder-local 300 s cap is admitted and one
+millisecond past it is refused; a second copy of the same signed offer is
+ERR_REPLAY sixteen responder seconds later while the peer deadline still
+stands, and expired once that deadline passes. The boundary the contract
+introduces is pinned fail-closed: with the responder 5 s behind and the
+initiator's clock moved past the clamped admitted expiry before completion,
+`completeExtensionLink` refuses with ERR_AUTHENTICATION. The existing
+`deadline over five seconds` mutation (0xff deadline) is still refused, now
+by the requested-limits ordering rather than the removed comparison. Focused
+suite: 56 tests, 1,091 assertions.
+
+NAT punch plan `notBefore` is the same class of comparison (the plan start is
+the initiator's clock) and is untouched: NAT admission passed on every remote
+run, no NAT-window rejection was ever recorded, and the recorded evidence
+threshold for changing it has not been met.
+
+**Verification.** The final source/test tree first ran `linux-gates.sh all` in
+the default Colima VM: nine gates passed and the namespace live capture failed
+at the network-change teardown with the KI-18 signature (`socket close
+observer realtime clock changed`, 18.7 ms and 19.0 ms drift over 7.3 s on the
+guard and a lookup middle), after every KI-4 activation, presence and put
+assertion had passed (120 of 121 before the role failure). A disposable
+`hyperdht-gates-ki4` profile was then created with `--activate=false`, its
+`systemd-timesyncd` stopped, and a 45-second sub-millisecond probe showed
+zero wall/monotonic drift. One uninterrupted
+`DOCKER_CONTEXT=colima-hyperdht-gates-ki4 bash scripts/linux-gates.sh all`
+on the same tree (the documentation cleanup already layered in, so the
+aggregate's repository-wide Prettier check covers it) passed all ten gates,
+exit 0:
+
+| Gate                                                    | Result                                      |
+| ------------------------------------------------------- | ------------------------------------------- |
+| Aggregate, Node                                         | 1,099/1,099 tests; 19,762/19,762 assertions |
+| Aggregate, Bare                                         | 1,054/1,054 tests; 19,627/19,627 assertions |
+| Normal/reverse process legs, Node and Bare (four gates) | 175/175 each                                |
+| Production-punch legs, Node and Bare (two gates)        | 180/180 each                                |
+| Namespace projection                                    | 27/27                                       |
+| Namespace live capture                                  | 185/185; kernel raw DROP 0                  |
+
+The 2 ms clock bounds are unchanged. This is local Linux-container evidence;
+fork-native CI on the pushed commit and a remote `-l 2 -p` dispatch on real
+links are the next two pieces of evidence, and the second needs the standing
+owner approval to be spent. The disposable profile is deleted after
+publication; the default VM and its unrelated containers were not touched.
+
+This remains package-private and experimental. Public required mode and peer
+streams stay open; this slice changes neither boundary and adds no wire byte.
 
 ### Subagent design handoff — 2026-09-05
 
@@ -3401,15 +3530,18 @@ and proves that issuing it cannot lose the replacement.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
-**Status: partially fixed; offer admission remains open.** The earlier two
-causes and handshake-completion clock-skew rejection are fixed. Run
+**Status: responder-side offer admission repaired under a reviewed contract;
+see the verification table in that checkpoint for the gate evidence. Remote
+confirmation on real links is a separate dispatch.** The earlier two causes
+and handshake-completion clock-skew rejection were fixed first. Run
 [`34147485033`](https://github.com/ayooooo123/hyperdht/actions/runs/34147485033)
-exposed another instance at initial guard-offer admission: 15,027 ms
-remaining against a 15,000 ms bound. See the guard offer deadline checkpoint.
-The startup-anchor clock mechanism is specific to the process harness;
-the sender/receiver absolute-wall deadline comparison is protocol-level.
-Signature, local expiry, and replay checks remain enforced. No repair to
-this newly measured admission failure is included.
+then exposed the responder-side instance at initial guard-offer admission:
+15,027 ms remaining against a 15,000 ms bound. See the guard offer deadline
+checkpoint for the diagnosis and the "KI-4 cross-host time contract for
+offer admission" checkpoint for the contract, the review lane, and the
+regressions. The startup-anchor clock mechanism is specific to the process
+harness; the responder's future-deadline comparison was protocol-level and
+is gone. Signature, local expiry, and replay checks remain enforced.
 
 On 2026-09-05, collection commit `efb5051` produced:
 
@@ -4326,7 +4458,7 @@ The remaining deferred scope is explicit:
   traffic, tracked as
   [KI-1](#ki-1-routes-are-correlatable-by-timing-and-volume);
 - peer streams, a separately reviewed wire design;
-- KI-4's cross-host guard-offer time contract and independent remote lifecycle
+- KI-4's remote confirmation on real links, and independent remote lifecycle
   evidence under owner-approved dispatch;
 - external cryptographic review and public required-mode approval;
 - root public required-mode integration, Hyperswarm, mobile, and PearTube

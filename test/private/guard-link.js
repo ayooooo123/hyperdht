@@ -279,7 +279,7 @@ function identityForRole(role, start) {
   throw new Error('missing deterministic role identity')
 }
 
-function fixture(guard = cryptoSuite.keyPair(seed(2))) {
+function fixture(guard = cryptoSuite.keyPair(seed(2)), advertisementExpiresAtMs = 20_000n) {
   const route = cryptoSuite.encryptionKeyPair(seed(5))
   const endpoint = encodeCanonicalEndpoint({
     addressFamily: 4,
@@ -312,7 +312,7 @@ function fixture(guard = cryptoSuite.keyPair(seed(2))) {
         maxQueuedBytes: 65_536,
         epoch: 1n,
         issuedAtMs: NOW,
-        expiresAtMs: 20_000n,
+        expiresAtMs: advertisementExpiresAtMs,
         providerServicePolicyEntries: providerServicePolicyForCapabilities(capabilityMask)
       },
       guard.secretKey
@@ -727,7 +727,7 @@ function tailControlEnvelope(encoded) {
 }
 
 async function admittedExtensionFixture(options = {}) {
-  const clock = tailClock()
+  const clock = tailClock({ wall: options.wall })
   const currentIdentity = identityForRole(ROLE.SAFETY, 50)
   const nextIdentity = identityForRole(ROLE.PRIVATE, 80)
   const currentRoute = cryptoSuite.encryptionKeyPair(seed(0x91))
@@ -762,7 +762,8 @@ async function admittedExtensionFixture(options = {}) {
     maxBytes: 65_536,
     maxCommands: 10,
     idleTimeoutMs: 5_000,
-    expiresAtMs: 5_000n
+    expiresAtMs: 5_000n,
+    ...(options.requestedLimits || {})
   })
   const owner = tailAuthority(clock)
   const [initiatorChannel, responderChannel] = tailChannelPair()
@@ -1493,6 +1494,31 @@ test('extension adjacent completion accepts signed peer clock skew over native U
   const cases = [
     { name: 'responder behind', skew: -1n },
     { name: 'responder ahead', skew: 1n },
+    // KI-4: the responder's clock trails the initiator's by more than the
+    // transit time while the offered window is the full 15 s. Before the
+    // contract change the responder refused the offer at validExtensionOffer.
+    {
+      name: 'responder 27 ms behind a full offered window',
+      skew: -27n,
+      requestedLimits: { expiresAtMs: 20_000n }
+    },
+    {
+      name: 'responder 5 s behind a full offered window',
+      skew: -5_000n,
+      wall: NOW + 5_000n,
+      requestedLimits: { expiresAtMs: 20_000n }
+    },
+    // The boundary the contract introduces for newly admitted skewed offers:
+    // the clamped admitted lifetime is on the responder clock, so a return
+    // path long enough to outlast it is refused at completion, fail-closed.
+    {
+      name: 'responder 5 s behind, return delayed past the clamped lifetime',
+      skew: -5_000n,
+      wall: NOW + 5_000n,
+      requestedLimits: { expiresAtMs: 20_000n },
+      completeAt: NOW + 15_000n,
+      error: 'ERR_AUTHENTICATION'
+    },
     { name: 'accepted at expiry', acceptedAt: 5_000n, error: 'ERR_AUTHENTICATION' },
     { name: 'accepted past window', acceptedAt: 5_001n, error: 'ERR_AUTHENTICATION' },
     { name: 'forged signature', acceptedAt: NOW + 1n, forge: true, error: 'ERR_AUTHENTICATION' }
@@ -1502,7 +1528,11 @@ test('extension adjacent completion accepts signed peer clock skew over native U
     const currentIdentity = identityForRole(ROLE.SAFETY, 50)
     const nextIdentity = identityForRole(ROLE.PRIVATE, 80)
     const native = await nativeAdjacentPair(currentIdentity, nextIdentity)
-    const x = await admittedExtensionFixture({ nextEndpoint: native.endpoint })
+    const x = await admittedExtensionFixture({
+      nextEndpoint: native.endpoint,
+      requestedLimits: scenario.requestedLimits,
+      wall: scenario.wall
+    })
     const responderClock = { ...x.clock, wallNow: () => x.clock.wallNow() + skew }
     const currentSignerOwner = createRelayIdentitySigningAuthority({
       identitySecretKey: x.currentIdentity.secretKey
@@ -1554,6 +1584,7 @@ test('extension adjacent completion accepts signed peer clock skew over native U
           })
           const accepted = extensionResponder.accept()
           t.ok(accepted.accepted, 'production responder adopts the native adjacent link')
+          if (scenario.completeAt !== undefined) x.clock.setWall(scenario.completeAt)
           if (scenario.acceptedAt !== undefined) {
             responses[0] = resign(
               responses[0],
@@ -2038,16 +2069,21 @@ function extensionResponderClock({ wall = NOW, monotonic = 10_000n, synchronous 
 
 function extensionResponderExchange({
   signerIdentity = null,
-  clock = extensionResponderClock()
+  clock = extensionResponderClock(),
+  initiatorNow = NOW,
+  requestedLimits = null
 } = {}) {
   const responderIdentity = identityForRole(ROLE.SAFETY, 20)
   const initiatorIdentity = identityForRole(ROLE.SAFETY, 40)
   const f = fixture(responderIdentity)
   const initiated = createIndexZeroGuardLinkOffer({
     advertisement: f.advertisement,
-    now: NOW,
+    now: initiatorNow,
     randomBytes: (size) => b4a.alloc(size, 0x44),
-    ...setup({ clientCircuitIdentity: initiatorIdentity })
+    ...setup({
+      clientCircuitIdentity: initiatorIdentity,
+      ...(requestedLimits ? { requestedLimits } : {})
+    })
   })
   const object = decodeM3Object(initiated.offer)
   object.body[96] = M3_LINK_ROLE.SAFETY_RELAY
@@ -3030,6 +3066,206 @@ test('index-zero signed accept includes the offer boundary without shortening li
     destroyM3EstablishedLink(x.accepted.established)
     x.responder.destroy()
   }
+})
+
+// KI-4 cross-host time contract: a responder orders peer-minted deadlines
+// against its own clock only to refuse what has already expired; it never
+// measures how far ahead the peer's clock runs. The bound on how far a deadline
+// may lie in the responder's future is the responder-local requested-limits
+// cap (300 s), and the lifetime the extension responder signs is clamped on
+// its own clock.
+function fastInitiatorOffer(f, skew, requestedExpiresAtMs = 20_000n) {
+  const linkSetup = setup({
+    now: NOW + skew,
+    requestedLimits: { ...setup().requestedLimits, expiresAtMs: requestedExpiresAtMs }
+  })
+  const initiated = createIndexZeroGuardLinkOffer({
+    advertisement: f.advertisement,
+    now: NOW,
+    randomBytes: (size) => b4a.alloc(size, 0x44),
+    ...linkSetup
+  })
+  const deadline = decodeM3Object(initiated.offer).body.readBigUInt64BE(294)
+  return { initiated, deadline, linkSetup }
+}
+
+test('index-zero responder admits an offer from an initiator whose clock runs ahead', (t) => {
+  for (const skew of [27n, 5_000n]) {
+    const f = fixture()
+    const { initiated, deadline } = fastInitiatorOffer(f, skew)
+    t.ok(
+      deadline > NOW + 15_000n,
+      `offer deadline lies beyond the responder's own 15 s window (initiator +${skew} ms)`
+    )
+    const observedPredecessorEndpoint = encodeCanonicalEndpoint({
+      addressFamily: 4,
+      addressBytes: b4a.from([198, 51, 100, 9]),
+      port: 44000
+    })
+    const responder = responderFor(f, () => ({
+      offer: initiated.offer,
+      observedPredecessorEndpoint,
+      physicalChannel: Object.freeze({ destroy() {} })
+    }))
+    let accepted = null
+    let established = null
+    try {
+      accepted = responder.accept()
+      t.is(
+        decodeM3Object(accepted.accept).body.readBigUInt64BE(165),
+        20_000n,
+        'index-zero admitted lifetime remains the requested limit'
+      )
+      established = completeIndexZeroGuardLink(initiated.pending, accepted.accept, {
+        advertisement: f.advertisement,
+        physicalChannel: Object.freeze({ destroy() {} }),
+        now: NOW + skew + 5n
+      })
+      t.is(readM3EstablishedLink(established).expiresAt, 20_000n, `completes at +${skew} ms`)
+    } finally {
+      if (established) destroyM3EstablishedLink(established)
+      if (accepted) destroyM3EstablishedLink(accepted.established)
+      responder.destroy()
+    }
+  }
+})
+
+test('index-zero responder still refuses an offer that has expired on its own clock', (t) => {
+  const f = fixture()
+  const { initiated, deadline } = fastInitiatorOffer(f, 0n)
+  t.is(deadline, NOW + 15_000n)
+  const responder = createIndexZeroGuardLinkResponder({
+    advertisement: f.advertisement,
+    responderIdentitySecretKey: f.guard.secretKey,
+    responderRouteEncryptionSecretKey: f.route.secretKey,
+    now: () => deadline,
+    receiveOffer: () => ({
+      offer: initiated.offer,
+      observedPredecessorEndpoint: encodeCanonicalEndpoint({
+        addressFamily: 4,
+        addressBytes: b4a.from([198, 51, 100, 9]),
+        port: 44000
+      }),
+      physicalChannel: Object.freeze({ destroy() {} })
+    }),
+    randomBytes: (size) => b4a.alloc(size, 0x55)
+  })
+  expectRouteCode(
+    t,
+    () => responder.accept(),
+    'ERR_AUTHENTICATION',
+    'a deadline at or before the responder clock is expired, whatever the initiator clock'
+  )
+  responder.destroy()
+  abortIndexZeroGuardLink(initiated.pending)
+})
+
+test('index-zero offer deadline is bounded by the responder-local requested-limits cap', (t) => {
+  for (const [name, horizon, accepts] of [
+    ['at the 300 s cap', 300_000n, true],
+    ['one millisecond past the cap', 300_001n, false]
+  ]) {
+    const f = fixture(cryptoSuite.keyPair(seed(2)), 400_000n)
+    const { initiated, linkSetup } = fastInitiatorOffer(f, 0n)
+    const offer = resign(
+      initiated.offer,
+      M3_MESSAGE_ID.LINK_OFFER_V1,
+      OFFER_DOMAIN,
+      linkSetup.clientCircuitIdentity.secretKey,
+      (body) => {
+        body.writeBigUInt64BE(NOW + horizon, 286)
+        body.writeBigUInt64BE(NOW + horizon, 294)
+      }
+    )
+    const responder = responderFor(f, () => ({
+      offer,
+      observedPredecessorEndpoint: encodeCanonicalEndpoint({
+        addressFamily: 4,
+        addressBytes: b4a.from([198, 51, 100, 9]),
+        port: 44000
+      }),
+      physicalChannel: Object.freeze({ destroy() {} })
+    }))
+    if (accepts) {
+      const accepted = responder.accept()
+      t.ok(accepted.established, name)
+      destroyM3EstablishedLink(accepted.established)
+    } else {
+      expectRouteCode(t, () => responder.accept(), 'ERR_AUTHENTICATION', name)
+    }
+    responder.destroy()
+    abortIndexZeroGuardLink(initiated.pending)
+  }
+})
+
+test('extension responder admits a faster initiator and clamps the lifetime it signs', (t) => {
+  for (const [name, initiatorNow, responderNow] of [
+    ['responder 27 ms behind', NOW, NOW - 27n],
+    ['responder 5 s behind', NOW + 5_000n, NOW]
+  ]) {
+    const clock = extensionResponderClock({ wall: responderNow })
+    const x = extensionResponderExchange({
+      clock,
+      initiatorNow,
+      requestedLimits: { ...setup().requestedLimits, expiresAtMs: 20_000n }
+    })
+    const deadline = decodeM3Object(x.offer).body.readBigUInt64BE(294)
+    t.ok(deadline > responderNow + 15_000n, `${name}: deadline exceeds the responder window`)
+    const responder = extensionGuardLinks.createExtensionLinkResponder(x.options)
+    const { accepted } = responder.accept()
+    t.ok(accepted, `${name}: offer admitted`)
+    const accept = decodeM3Object(x.outbound[0]).body
+    t.is(accept.readBigUInt64BE(173), responderNow, `${name}: accepted at the responder clock`)
+    t.is(
+      accept.readBigUInt64BE(165),
+      responderNow + 15_000n,
+      `${name}: admitted expiry is MAX_ADJACENT_LINK_MS on the responder clock, below the deadline`
+    )
+    t.ok(responder.destroy())
+    t.ok(destroyRelayIdentitySigningAuthority(x.identityOwner))
+  }
+})
+
+test('index-zero replay reservation covers the whole responder-side acceptance window', (t) => {
+  const f = fixture()
+  const { initiated, deadline } = fastInitiatorOffer(f, 5_000n)
+  t.is(deadline, 20_000n)
+  let responderNow = NOW
+  const responder = createIndexZeroGuardLinkResponder({
+    advertisement: f.advertisement,
+    responderIdentitySecretKey: f.guard.secretKey,
+    responderRouteEncryptionSecretKey: f.route.secretKey,
+    now: () => responderNow,
+    receiveOffer: () => ({
+      offer: initiated.offer,
+      observedPredecessorEndpoint: encodeCanonicalEndpoint({
+        addressFamily: 4,
+        addressBytes: b4a.from([198, 51, 100, 9]),
+        port: 44000
+      }),
+      physicalChannel: Object.freeze({ destroy() {} })
+    }),
+    randomBytes: (size) => b4a.alloc(size, 0x55)
+  })
+  const accepted = responder.accept()
+  responderNow = NOW + 16_000n
+  t.ok(responderNow < deadline, 'past the responder-local 15 s but before the peer deadline')
+  expectRouteCode(
+    t,
+    () => responder.accept(),
+    'ERR_REPLAY',
+    'the same signed offer is still a replay while the responder would accept it'
+  )
+  responderNow = deadline
+  expectRouteCode(
+    t,
+    () => responder.accept(),
+    'ERR_AUTHENTICATION',
+    'once expired on the responder clock the reservation is gone and the offer is expired'
+  )
+  destroyM3EstablishedLink(accepted.established)
+  responder.destroy()
+  abortIndexZeroGuardLink(initiated.pending)
 })
 
 test('index-zero accept rejects replay, late completion, and M2 handles', (t) => {
