@@ -1585,7 +1585,8 @@ function createGuardProcessService(options) {
     middleRoutes,
     clocks,
     onActor,
-    onFailure
+    onFailure,
+    onDiagnostic
   } = options
   const candidateRoleIndexes = new Set()
   const validCandidates =
@@ -1647,6 +1648,13 @@ function createGuardProcessService(options) {
   let registeredEstablished = null
   let destroyed = false
 
+  function diagnostic(stage, err = null, window = null) {
+    if (typeof onDiagnostic !== 'function') return
+    try {
+      onDiagnostic(stage, err, window)
+    } catch {}
+  }
+
   function randomBytes(size) {
     return cryptoSuite.randomBytes(size)
   }
@@ -1669,69 +1677,113 @@ function createGuardProcessService(options) {
       Object.freeze({
         accept(exchange) {
           if (destroyed) throw PrivateRouteError.ERR_DESTROYED()
-          const responder = guardLinks.createIndexZeroGuardLinkResponder({
-            advertisement,
-            responderIdentitySecretKey: identitySecretKey,
-            responderRouteEncryptionSecretKey: routeSecretKey,
-            now: clocks.wallNow,
-            receiveOffer: () =>
-              Object.freeze({
-                offer: exchange.offer,
-                observedPredecessorEndpoint: endpointBytes,
-                physicalChannel: exchange.physicalChannel
-              }),
-            randomBytes
-          })
-          branchResponders.add(responder)
-          const accepted = responder.accept()
-          const adjacencyAuthority = new M3AdjacencyAuthority({
-            wallNow: clocks.wallNow,
-            monotonicNow: clocks.monotonicNow,
-            schedule: clocks.schedule,
-            cancelScheduled: clocks.cancelScheduled,
-            crypto: cryptoSuite
-          })
-          const adjacency = adjacencyAuthority.adopt(accepted.established)
-          const actor = createTailRelayActor({
-            adjacency,
-            adjacencyAuthority,
-            advertisement,
-            identityPublicKey,
-            identitySecretKey,
-            routeSecretKey,
-            clocks,
-            outgoing: {
-              allowedRole: ROLE.SAFETY,
-              resolve: resolveMiddle
-            },
-            // The route runtime closes this endpoint-owned logical channel after the
-            // ACK is observed; closing it in the send turn can discard the queued ACK.
-            incomingRelease: async () => true,
-            attachments: [
-              {
-                destroy() {
-                  branchResponders.delete(responder)
-                  responder.destroy()
+          let sample = typeof onDiagnostic === 'function' ? { now: null } : null
+          const wallNow =
+            sample === null
+              ? clocks.wallNow
+              : () => {
+                  const current = clocks.wallNow()
+                  if (sample !== null) sample.now = current
+                  return current
+                }
+          let stage = 'offer-received'
+          diagnostic(stage)
+          try {
+            stage = 'responder-create'
+            const responder = guardLinks.createIndexZeroGuardLinkResponder({
+              advertisement,
+              responderIdentitySecretKey: identitySecretKey,
+              responderRouteEncryptionSecretKey: routeSecretKey,
+              now: wallNow,
+              receiveOffer: () =>
+                Object.freeze({
+                  offer: exchange.offer,
+                  observedPredecessorEndpoint: endpointBytes,
+                  physicalChannel: exchange.physicalChannel
+                }),
+              randomBytes
+            })
+            branchResponders.add(responder)
+            stage = 'offer-validate'
+            const accepted = responder.accept()
+            stage = 'offer-authenticated'
+            diagnostic(stage)
+            const adjacencyAuthority = new M3AdjacencyAuthority({
+              wallNow: clocks.wallNow,
+              monotonicNow: clocks.monotonicNow,
+              schedule: clocks.schedule,
+              cancelScheduled: clocks.cancelScheduled,
+              crypto: cryptoSuite
+            })
+            const adjacency = adjacencyAuthority.adopt(accepted.established)
+            stage = 'adjacency-adopted'
+            diagnostic(stage)
+            const actor = createTailRelayActor({
+              adjacency,
+              adjacencyAuthority,
+              advertisement,
+              identityPublicKey,
+              identitySecretKey,
+              routeSecretKey,
+              clocks,
+              outgoing: {
+                allowedRole: ROLE.SAFETY,
+                resolve: resolveMiddle
+              },
+              // The route runtime closes this endpoint-owned logical channel after the
+              // ACK is observed; closing it in the send turn can discard the queued ACK.
+              incomingRelease: async () => true,
+              attachments: [
+                {
+                  destroy() {
+                    branchResponders.delete(responder)
+                    responder.destroy()
+                  }
+                }
+              ]
+            })
+            actors.add(actor)
+            onActor(actor)
+            // Destroying just this actor releases the grant for its dialed middle, so a
+            // rebuilt branch can authorize that adjacency again while the guard's other
+            // branches stay live.
+            void actor.serve().catch((err) => {
+              actors.delete(actor)
+              try {
+                actor.destroy()
+              } catch {}
+              onFailure(err)
+            })
+            diagnostic('response-created')
+            return accepted.accept
+          } catch (err) {
+            let window = null
+            try {
+              if (
+                sample !== null &&
+                typeof sample.now === 'bigint' &&
+                b4a.isBuffer(exchange.offer) &&
+                exchange.offer.byteLength >= 310
+              ) {
+                // M3 header (8), then requested-limit expiry at body offset 286
+                // and offer deadline at body offset 294. Read only those two U64s.
+                const limitExpiry = exchange.offer.readBigUInt64BE(294)
+                const deadline = exchange.offer.readBigUInt64BE(302)
+                window = {
+                  remainingMs: deadline - sample.now,
+                  limitGapMs: limitExpiry - deadline
                 }
               }
-            ]
-          })
-          actors.add(actor)
-          onActor(actor)
-          // Destroying just this actor releases the grant for its dialed middle, so a
-          // rebuilt branch can authorize that adjacency again while the guard's other
-          // branches stay live.
-          void actor.serve().catch((err) => {
-            actors.delete(actor)
-            try {
-              actor.destroy()
             } catch {}
-            onFailure(err)
-          })
-          return accepted.accept
+            diagnostic(stage, err, window)
+            throw err
+          } finally {
+            sample = null
+          }
         }
       })
     )
+    diagnostic('responder-registered')
   }
 
   async function start() {

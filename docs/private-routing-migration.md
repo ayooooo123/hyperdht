@@ -818,6 +818,284 @@ four normal/reverse process legs 155 each; two production-punch legs
 Changed-file formatting passes. These local results supersede the
 preflight-only counts above; they do not change the failed remote result.
 
+### Continuation checkpoint — activation diagnostics
+
+JD approved bounded harness diagnostics and exactly one further remote
+lifecycle attempt, with the normal deadlines and no further retries.
+
+The retained evidence from run `34080635056` contains only the endpoint
+shared-guard response timeout; the workflow has no retained artifacts.
+A one-off native-UDP experiment opens a branch with the valid responder.
+Both a missing responder and an injected responder authentication failure
+produce the same endpoint `ERR_PRIVACY_UNAVAILABLE`. The latter error is
+discarded by the shared-guard dispatcher's existing rejection handler.
+These results show why the old timeout does not establish packet loss,
+responder absence, or authentication failure as its cause.
+
+The guard process harness now reports responder registration, offer
+receipt, offer authentication, adjacency adoption, and response creation
+through the existing opt-in `PR_ROLE_FATAL_LOG` sink. The diagnostic path
+is limited to 32 lines per process and does not emit payloads, keys,
+addresses, error messages, or stacks. Diagnostic sink failure does not
+change the exchange. There is no production-library or wire change.
+`response-created` records the returned accept message, not successful
+physical transmission or endpoint receipt.
+
+Native smoke checks distinguish successful response creation from an
+authentication rejection during responder construction; both still behave
+as before if the diagnostic callback itself throws. A separate sink smoke
+verifies default-off behavior, the 32-line bound, and exclusion of error
+messages and stacks. These are one-off diagnostic checks, not permanent
+test additions. The approved run must explicitly set the local guard's
+log path; `live-route.sh` does not set it for the operator host.
+
+Local verification for this diagnostic change is not a clean combined
+ten-gate pass. Nine gates passed: Node 1,087/19,678, Bare 1,042/19,543,
+four process legs 155 each, two punch legs 160 each, and namespace
+projection 27. The live namespace run passed through network change,
+then failed during teardown with `PROCESS_COMMAND_DEADLINE` at 100/101.
+
+A separate comparison used temporary read-only overlays, not repository
+edits, and added failure-only command identification. The committed
+`0c543a4` baseline reached the final audit, then failed the existing
+realtime-clock integrity check at 155/156. The current diagnostic build
+passed that same targeted lifecycle, 165 assertions and raw DROP zero.
+The earlier teardown deadline was not reproduced and its cause remains
+unknown. No deadline or clock-audit threshold was changed. The temporary
+comparison overlays were removed.
+
+Approved diagnostic run
+[34139920391](https://github.com/ayooooo123/hyperdht/actions/runs/34139920391)
+was dispatched with `scripts/live-route.sh up -p -l 2`, no deadline
+overrides, and an explicit mode-0600 diagnostic log for the guard on the
+operator host. The workflow's remote roles use `private-routing-v1` at
+`b4bad01aeaa12973b6f657ecc89c07b8dd2c8485`; the guard and coordinator use
+the local `0c543a4` tree with the harness-only diagnostic additions.
+This is an activation diagnostic, not an all-roles validation of the
+published repair branch.
+
+**Remote outcome: failed before branch activation.** Coordinator exit 1,
+36/37 assertions. The harness punch matrix was 117/117 and both
+production reflections matched. The guard then failed `nat-arm`, before
+either production first-send assertion, with
+`PROCESS_ROLE_FAILURE (guard/CONTROL)`.
+
+The explicitly enabled local fatal log contains `PrivateRouteError:
+Operation is unauthorized`, with the stack through `acceptNatPunch`,
+`armNatPunch`, and `verifyNatPunchPlan` at `nat-punch-plan.js:535`.
+That line rejects `now < notBefore || now >= expiresAt`. Thus the signed
+plan failed its validity-window check; the log does not contain the three
+time values needed to distinguish a future plan from an expired one.
+The strict validity check was not changed.
+
+The bounded guard diagnostic log contains zero branch-stage records.
+No responder was registered and no branch offer was observed by this
+diagnostic path. The approved attempt was consumed before reaching the
+old shared-guard failure and supplies no evidence for its cause.
+Rotation, suspend/resume, and network change remain untested remotely.
+No retry was dispatched. Cancellation was requested for the remaining
+bridge workflow after the coordinator exited.
+
+Next evidence needed is the plan's age and clock offset at guard
+admission, not a longer deadline or relaxed validity window. The original
+shared-guard timeout and local teardown/clock-audit failures remain open.
+The diagnostic additions and this checkpoint are not committed or pushed.
+The bridge workflow subsequently completed with conclusion `cancelled`.
+
+### Continuation checkpoint — NAT admission timing diagnostics
+
+After JD continued the investigation, the guard harness was extended to
+observe the existing NAT authority clock reads during synchronous
+`acceptNatPunch`. It returns the same coherent clock values to production
+code. On failure only, it records the first/last offsets from the parsed
+plan's `notBefore`, time remaining to `expiresAt`, sample count, sample
+span, and the last sample minus a later `Date.now()` observation.
+The system-clock comparison includes time spent inside admission and is
+not a direct measurement of remote clock skew.
+
+These records share the existing 32-line guard diagnostic bound and are
+off unless `PR_ROLE_FATAL_LOG` is set. The timing-only reader loads the
+two U64 fields at offsets 109 and 117. It does not decode or copy the
+plan's identities, digests, or punch nonces, and does not verify signatures.
+A `rejected-window` record is not proof that the plan authenticated or
+that timing caused the rejection. It emits no absolute
+timestamps, plan bytes, identities, addresses, keys, or free-form errors.
+Truncated headers and failed log writes do not replace the original
+admission error. Capture state is cleared on both success and failure.
+No deadline, validity rule, wire field, or production library was changed.
+
+A one-off smoke used the real signed offer/counter/complete/accept path
+with controlled clocks and the existing test socket adapter. A guard 100 ms
+behind the plan start failed at `verifyNatPunchPlan`, with two samples,
+offset -100 ms, 5,000 ms remaining, and zero sample span. Expiration failed
+earlier at `takePendingNatToken`, with one sample and zero remaining time.
+A changed responder signature failed while its timing values remained in
+range. A valid plan armed successfully and produced no failure diagnostic.
+Default-off behavior, shared 32-line bound, numeric-only output,
+unchanged plan bytes, original error identity, and sink-failure isolation
+were also verified.
+
+[INFERENCE] The remote stack from `34139920391` points to `now < notBefore`,
+not expiration: the counter token stores the same expiry as the signed
+plan and is checked before `verifyNatPunchPlan`; the shipped coherent
+clock returns the same value throughout this synchronous operation.
+The local future-plan smoke reproduces that exact rejection site. The
+remote offset magnitude remains unmeasured, so this is not a remote
+timestamp observation and is not grounds to weaken the validity check.
+
+Node and Bare production-punch process gates pass, 160 assertions each.
+This focused verification does not erase the earlier namespace teardown
+and clock-audit failures. At the end of that local-only check, no remote
+dispatch, commit, or push had been performed.
+
+Before dispatch, the full-plan diagnostic decoder was replaced by the
+timing-only reads above to avoid copying non-time plan material. The
+signed-negotiation smoke still passes. A disposable Node/Bare smoke also
+verifies the actual reader on a header-only buffer, without any endpoint
+or nonce section, and checks truncated input, unchanged bytes, default-off
+behavior, and the shared bound. The disposable script was removed.
+JD approved exactly one remote `up -p -l 2` timing attempt with normal
+deadlines and an explicit private guard log. No retry, commit, push,
+wire change, or validity relaxation is authorized by that approval.
+
+The final timing-only reporter passes both production-punch process
+gates again, 160 assertions each. Approved run
+[34144722025](https://github.com/ayooooo123/hyperdht/actions/runs/34144722025)
+was dispatched with normal credentials and deadlines, and an explicit
+mode-0600 guard log. Remote roles use `private-routing-v1` at `b4bad01`;
+the operator-host guard and coordinator use local `0c543a4` plus the
+harness diagnostics. No claim is made that this tests the repair branch
+on all roles.
+
+**Timing run outcome: 76/77 assertions, coordinator exit 1.** The punch
+matrix was 117/117, both reflections matched, both production first-send
+checks passed, and the endpoint activated. The first immutable get,
+cancellation, healthy-branch checks, blackhole rotation, and routed
+readback through the replacement pair passed.
+
+The scenario then failed the `suspend` command after rotation, before
+the `suspended` event. The endpoint stack identifies
+`PrivateRoutingController.suspend` at `private-routing-controller.js:1605`,
+whose precondition requires READY state and a route manager. It did not
+enter the suspend body. No remote suspend/resume, later writes, required
+SURB reply, or network-change result is claimed for this attempt.
+
+The guard log records one responder registration, three authenticated
+offers with adjacency adoption and response construction, then a fourth
+offer rejected with `ERR_AUTHENTICATION` before the authenticated-offer
+stage. Response construction alone is not proof of transmission. There
+are zero NAT-window rejection records: NAT admission passed, so this run
+provides no timing values for the prior NAT failure.
+
+A further one-off native-UDP probe keeps the guard at 1,000 ms and moves
+the endpoint from 1,000 to 1,100 ms. Equal clocks open the branch; the
+100 ms guard lag produces `ERR_AUTHENTICATION` at `validOffer` and the
+same endpoint timeout. The capability remains valid at both clocks.
+Source inspection shows the offer is minted up to
+`endpointNow + MAX_ADJACENT_LINK_MS`, while `validOffer` refuses a
+deadline beyond `guardNow + MAX_ADJACENT_LINK_MS`.
+[INFERENCE] Clock disagreement is therefore a candidate for the observed
+guard rejection, but the remote log does not identify which authentication
+predicate failed. The original activation timeout is not closed by this
+later rejection.
+
+No production rule was changed. The approved attempt is consumed; no
+retry was made. The remaining bridge workflow was cancelled and completed
+with conclusion `cancelled`. The next evidence needed is the rejected
+guard-offer predicate and its deadline position, not a relaxed bound.
+
+### Continuation checkpoint — guard offer deadline diagnostics
+
+The optional process-harness observer now separates responder construction
+from offer validation. On rejection, it reports a fixed failure-site tag
+(`valid-offer`, `offer-decode`, or `other`) and, when available, the offer
+deadline relative to the exact sampled guard clock plus the requested-limit
+expiry relative to that deadline. These tags identify a stage, not every
+predicate in a compound validation check.
+
+Only two U64 values are read from the received offer, at encoded offsets
+294 and 302. No offer copy or full decode is made for reporting. No absolute
+time, identity, endpoint, key, nonce, signature, or free-form stack is logged.
+The values describe an untrusted received window, not an authentication
+claim or a measured remote clock offset. The existing opt-in sink and shared
+32-record limit remain. With logging off, the original clock function is
+passed directly; with logging on, its returned value is unchanged.
+
+A disposable signed native-UDP smoke passed in Node and Bare:
+
+- Equal clocks open the branch.
+- A guard 100 ms behind rejects at `offer-validate` / `valid-offer`, with
+  `offer_remaining_ms=15100`.
+- A deadline equal to the guard clock rejects at the same stage/site, with
+  `offer_remaining_ms=0`.
+- A mismatched responder key rejects at `responder-create` / `other`, with
+  `offer_remaining_ms=15000`.
+- Logging off, a failed sink, and a throwing observer preserve the tested
+  acceptance and rejection outcomes. Output stops at 32 records.
+
+Verification is not all green. Direct host process runs stopped at socket
+binding; their role addresses require the documented Linux runner. On that
+runner, Bare passed 155/155. Node failed 34/35 during activation:
+`announce-middle` reported `ERR_AUTHENTICATION` at
+`validExtensionOffer`, `guard-link.js:769`, after two successful guard
+response constructions. That compound check includes signature, role,
+identity, deadline, and nonzero-field checks; the failed predicate is not
+known. No passing Node process result is claimed for this checkpoint, and
+no retry was used to replace that result.
+
+Source formatting passed. The disposable probe is removed after use.
+No production library, wire format, or validity bound changed. No new
+remote attempt, commit, or push was made. Further remote dispatch still
+requires explicit approval; the earlier remote fault and this local
+extension rejection remain open.
+
+JD approved exactly one further normal-deadline guard diagnostic attempt,
+with no retries. Run
+[`34147485033`](https://github.com/ayooooo123/hyperdht/actions/runs/34147485033)
+was dispatched with `-p -l 2`: the guard and coordinator use the operator
+host's uncommitted diagnostics; remote roles use `private-routing-v1` at
+`b4bad01aeaa12973b6f657ecc89c07b8dd2c8485`. This is a diagnosis of the
+mixed-revision scenario, not all-role validation of published `0c543a4`.
+
+**Guard diagnostic run outcome: 38/39 assertions, coordinator exit 1.**
+The punch matrix passed 117/117, reflection checks passed, and both
+production first-send checks passed. Initial endpoint activation failed;
+no application lifecycle result is claimed for this attempt.
+
+The private guard log contains exactly three branch records:
+
+```text
+guard branch responder-registered OK
+guard branch offer-received OK
+guard branch offer-validate ERR_AUTHENTICATION site=valid-offer offer_remaining_ms=15027 limit_gap_ms=0
+```
+
+Thus the first offer reached role 2 during initial activation and failed
+inside `validOffer`, before adjacency adoption or response construction.
+The measured deadline exceeds the validator's 15,000 ms maximum by 27 ms.
+This proves that the upper-bound condition at `guard-link.js:729` is
+violated in this attempt; it does not prove every other condition passed.
+The observer samples the same `current = now()` value passed to
+`validOffer`, with no second clock read for reporting.
+
+The remote endpoint stack points to the shared-guard timeout at
+`udx-cell-endpoint.js:4122`. Retrieved workflow logs contain no named
+`LINK_OFFER_V1` / `LINK_ACCEPT_V1` frame timeline, so packet-capture proof
+is not claimed. Guard-side evidence directly proves receipt and rejection,
+not packet loss on the incoming offer. It explains this attempt's timeout,
+but does not establish the cause of the original run or the later fourth
+offer from the previous attempt.
+
+There are zero NAT-window rejection records. NAT admission passed; no
+failing NAT time offset was measured. The 27 ms excess is a deadline
+position at guard validation, not a measured endpoint/guard clock offset.
+
+The approved attempt is consumed. No retry was dispatched. Workflow
+cancellation completed with conclusion `cancelled`. Production validity
+rules remain unchanged. Diagnostics and documentation remain uncommitted;
+the published branch remains `0c543a4`. A repair requires a reviewed
+cross-host time contract, not an unexplained increase in the allowed bound.
+
 ### Subagent design handoff — 2026-09-05
 
 These are review requirements, not accepted replacement protocols:
@@ -2669,8 +2947,15 @@ and proves that issuing it cannot lose the replacement.
 
 ### KI-4: intermittent wall-clock deadline rejections on CI
 
-**Status: the earlier two causes and the reproduced signed clock-skew rejection
-are fixed. Signature, local expiry, and replay checks remain enforced.**
+**Status: partially fixed; offer admission remains open.** The earlier two
+causes and handshake-completion clock-skew rejection are fixed. Run
+[`34147485033`](https://github.com/ayooooo123/hyperdht/actions/runs/34147485033)
+exposed another instance at initial guard-offer admission: 15,027 ms
+remaining against a 15,000 ms bound. See the guard offer deadline checkpoint.
+The startup-anchor clock mechanism is specific to the process harness;
+the sender/receiver absolute-wall deadline comparison is protocol-level.
+Signature, local expiry, and replay checks remain enforced. No repair to
+this newly measured admission failure is included.
 
 On 2026-09-05, collection commit `efb5051` produced:
 
