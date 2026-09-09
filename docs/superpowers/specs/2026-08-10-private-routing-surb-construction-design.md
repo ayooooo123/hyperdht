@@ -1,9 +1,11 @@
-# Private Routing: SURB Construction (Gate C — implementation-ready design)
+# Private Routing: SURB Construction (Gate C)
 
-**Status:** DESIGN — implementation-ready, NOT owner-approved, NOT wire-stable. Hand-rolled
-on existing `crypto-suite` primitives; **no new dependency.** Implementation is gated behind
-Step 0 (confirm group ops) → fixed test vectors → substitution/property/fuzz → external
-cryptographic review, per the repo's standing bar.
+**Status:** implemented with owner-approved experimental wire and live DHT
+integration; external cryptographic review and wire stabilization remain open.
+The original construction sketch and primitive inventory below are historical:
+the [ownership amendment](#ownership-amendment--2026-09-06) supersedes its
+buffer-based APIs and manual replay reset. See
+[current implementation and open gates](../../private-routing-migration.md#current-implementation).
 **Date:** 2026-08-10
 **Parent:** [`2026-08-10-private-routing-datagram-surb-design.md`](./2026-08-10-private-routing-datagram-surb-design.md)
 **Construction:** onion reply blocks with **per-hop independent X25519 DH** (not Sphinx
@@ -12,8 +14,8 @@ SURBs and Lightning BOLT-04.
 
 ## Step 0 — primitive availability (RESOLVED 2026-08-10)
 
-Verified against the pinned deps (`sodium-universal@5.0.1` over `sodium-native@5.1.0`,
-Node 22):
+Historical inventory against `sodium-universal@5.0.1` over the original
+`sodium-native@5.1.0` baseline, Node 22:
 
 - **Available:** X25519 `crypto_scalarmult` + `crypto_scalarmult_base`; `crypto_box_seal` /
   `crypto_box_seal_open`; `crypto_generichash` (BLAKE2b); XChaCha20-Poly1305 AEAD; ed25519
@@ -21,11 +23,11 @@ Node 22):
   `crypto_core_ed25519_add`.
 - **NOT available:** ristretto255 (nothing); `crypto_core_ed25519_scalar_mul` (scalar×scalar).
 
-Consequence: the classic Sphinx per-hop **blinding chain** (`x_{i+1} = b_i · x_i mod L`) is
-**not implementable** on these deps — it needs scalar×scalar mult. The construction instead
-uses **per-hop independent X25519 ephemerals**: only point DH (`crypto_scalarmult`), which
-exists and which `crypto-suite` already uses. No new dependency, no scalar arithmetic, no
-ristretto/cofactor handling (X25519 clamps/handles cofactor for DH).
+That baseline lacked the scalar×scalar operation needed for the classic Sphinx
+blinding chain (`x_{i+1} = b_i · x_i mod L`), so this design selected independent
+per-hop X25519 ephemerals. Gate D later introduced a pinned native scalar-multiply
+binding; Gate C still uses the independent-X25519 construction. That dependency
+change does not authorize a new SURB wire or a JavaScript scalar implementation.
 
 ## Keys the initiator already has
 
@@ -98,6 +100,10 @@ location and the return path (the responder learns only `H_1`).
 
 ## API (`lib/private/surb.js`)
 
+Historical buffer-based sketch, superseded by the one-use authorities in the
+[ownership amendment](#ownership-amendment--2026-09-06). These are not the current
+call signatures.
+
 ```
 buildSurb({ returnPath: [Y_1..Y_m], epoch, now })
     → { surb: { firstHop: H_1, ephem: E_1, header: β_1, mac: γ_1,
@@ -122,6 +128,10 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
   `fragments.js`.
 
 ## Single-use / anti-replay
+
+The manual-reset cache described here belongs to the original sketch. Current
+replay admission and capability-window ownership follow the amendment below;
+there is no production `createNullifierGuard.reset()` contract.
 
 - Each hop derives a **nullifier** `n_i = H("surb/nullifier" ‖ s_i)`. A relay feeds it to a
   per-epoch replay cache (`createNullifierGuard`): a repeat in the epoch is rejected, and the
@@ -160,32 +170,36 @@ openSurbPayload(wrapped, openKeys) → plaintext     // strip k_wrap layers, the
 
 ## Implementation gate (do not skip)
 
-1. Confirm group ops (Step 0) — **done**. 2. Implement `surb.js` — **done** (tested); DHT
-   integration behind an off-by-default flag is **still pending**. 3. Conformance vectors —
-   **done for the deterministic wire fields**: `test/private/fixtures/surb-vector-v1.json` pins
-   every deterministic field byte-for-byte (`ephem`, full `header`, `mac`, `replyPub`, and per
-   hop `nextHop`/`nullifier`/`nextEphem`/`nextMac`/`nextHeader`), so a second implementation can
-   conform. The **reply payload is NOT vectored** — `crypto_box_seal` is randomized; a payload
-   conformance vector needs a deterministic seal (future). 4. Substitution / property / fuzz —
-   **done** (tamper header/MAC/payload, wrong key, malformed fail-closed, fail-closed replay
-   guard, 200-iter random round-trips + single-bit tampers). 5. **External cryptographic
-   review** — pending (a human gate; not self-certifiable). Wire format is not stable until a
-   second impl conforms to the vectors + review passes.
+1. **Primitives and ownership:** implemented with bounded, one-use capabilities
+   and authenticated context/replay binding.
+2. **DHT integration:** implemented behind `experimentalSurbReplies: true`,
+   including authenticated V2 requests, bounded SURB batches, per-fragment
+   authorities, and relay-local live peeling.
+3. **Conformance and adversarial coverage:** the current fixture and focused
+   suites cover the amended construction. Original fixture/API descriptions in
+   the dated reference sections are not a second implementation contract.
+4. **External cryptographic review:** still open and not self-certifiable.
+   Implementation tests and owner approval for experimentation do not establish
+   independent conformance, filler indistinguishability, or production anonymity.
 
 ## Open questions
 
-- Payload size vs the 1,200-byte cell: **OPEN.** A _provisional SURB-only_ cap
-  `MAX_REPLY_BYTES = 512` is guarded in `sealReply`. Worst-case SURB message on a full-header
-  leg = `pt + 468` (ephem 32 + header 324 + mac 16 + box 48 + 3×16 wrap tags) ≈ 980 B at the
-  cap, leaving ~220 B for Noise/UDX/cell framing — **which is not yet measured**. Re-derive
-  the cap against real framing overhead when the DATAGRAM path is wired; replies over the cap
-  need fragmentation or a multi-SURB batch.
-- Route-key type: **resolved** — relays already publish X25519 route keys, used directly for
-  per-hop DH; no advertisement wire change.
-- Whether the responder needs > 1 reply (multi-SURB batch) for `get` responses that exceed
-  one payload slot.
+- The old framing and batch questions are resolved: the primitive accepts at
+  most 512 plaintext bytes, and the live reply profile uses a 20-byte fragment
+  header plus 492 bytes, at most eight fragments / 3,936 reply-message bytes.
+- The V2 request allocator covers the existing 4,910-byte generic envelope
+  ceiling; the largest legal immutable-put request with eight descriptors is
+  4,839 bytes. These are different bounds, not a wire-limit increase.
+- Advertised X25519 route keys remain the per-hop DH keys; no advertisement
+  format change was needed.
+- Independent cryptographic review, conformance, and public-mode approval remain
+  open. Independently routed/timed replies or mixing need a separate reviewed
+  design; current replies use the existing reverse relays and deadlines.
 
 ## Reference implementation (built + tested 2026-08-10)
+
+Historical measurements and APIs from the initial reference, not current suite
+totals or an active implementation checklist.
 
 `lib/private/surb.js` + `test/private/surb.js` (brittle). Per-hop X25519 on `crypto-suite`
 (`keyAgreement`, `seal`/`open`) + `crypto_box_seal` for the reply; **fixed-size Sphinx
@@ -198,10 +212,9 @@ plaintext; a hop learns only its next hop; tampered header/MAC/payload + wrong k
 malformed input fail-closed; fail-closed replay guard (strict single-use up to capacity);
 nullifiers deterministic per hop, fresh per SURB; 200-iter property/fuzz; a **byte-for-byte
 conformance fixture** over all deterministic wire fields; payload-budget enforcement; and a
-(weak) filler non-degeneracy sanity check. Still NOT wired into the DHT and NOT wire-stable —
-remaining: a **deterministic-seal payload vector** (box_seal is randomized), statistical
-review of filler indistinguishability, DHT wiring into the DATAGRAM reply path, and external
-cryptographic review.
+(weak) filler non-degeneracy sanity check. At that checkpoint it was not wired
+into the DHT or wire-stable. Its then-open deterministic reply-vector, filler,
+integration, and review questions must be read with the later amendments below.
 
 ## Reference hardening — 2026-09-05
 
@@ -224,12 +237,10 @@ The suite is now in `test/private-routing.js`. Seeded choices replace
 `Math.random`, the tamper loop requires rejection, and the weak filler
 non-degeneracy check is removed.
 
-These changes do **not** implement the ownership part of invariant 5:
-`processSurbHop` does not admit the replay token, `openSurbPayload` does not
-consume caller keys, and `createNullifierGuard.reset()` is not an authenticated
-epoch transition. Production ownership, epoch binding, reply-mode
-authentication, fragmentation, and DATAGRAM integration still need an accepted
-design. Owner approval and external cryptographic review remain open.
+Those hardening changes did not yet implement one-use ownership, authenticated
+epoch transition, reply-mode selection, or live DATAGRAM integration. The
+2026-09-06 ownership and integration amendments below supersede those gaps;
+external cryptographic review remains open.
 
 The initial hardening suite passed **21 tests / 100 assertions** under both
 Linux Node and Bare, with a separate internal review. The advisory follow-up
@@ -282,10 +293,9 @@ replyBinding`; the builder and sealer must bind identical bytes. Overhead is
 `node test/private/surb.js` passes **31 tests / 115 assertions**. The
 conformance fixture was regenerated for the new key schedule. Removed exports:
 `sealReply`, `openSurbPayload`, `nullifierOf`, `createNullifierGuard`; there
-are no other callers. Still not implemented and still human-gated: reply-mode
-selection inside the authenticated routed request, the SURB batch framing, a
-492-byte fragment profile, exit and initiator integration, and any wire
-ratification or anonymity claim.
+are no other callers. At this point, reply-mode selection, batch framing, the
+492-byte fragment profile, and exit/initiator integration were not implemented.
+The next section records their subsequent owner-approved experimental integration.
 
 ## Integration — 2026-09-06 (experimental, off by default)
 
@@ -298,6 +308,10 @@ exit's only SURB output is the sealed first-hop cell on its reverse link; relays
 with `processRelaySurbHop` through the M3 facade's opt-in `surbHopPeel`; the endpoint
 admits by terminal handle. `SURB_REQUIRED` never falls back to the correlated path and
 is refused unless the controller was created with `experimentalSurbReplies: true`.
-What is proven, what is simulated in the live test, and the four open items are recorded
-in `docs/private-routing-migration.md`, "Continuation checkpoint — 2026-09-06, Gate D
-records, exposure accounting, live put coverage".
+Later fixes add link-sealed physical carriage, relay-local replay ownership and
+expiry enforcement, and required-mode puts including presence publication and
+revocation. The live scenario proves exact maximum-size write readback and
+authenticated absence after a period-scoped tombstone at a higher revision,
+without correlated replies on the relevant exit. See [current implementation and evidence](../../private-routing-migration.md#current-implementation).
+Current return relays and deadlines belong to the existing route; neither
+independent return routing nor general timing anonymity is claimed.

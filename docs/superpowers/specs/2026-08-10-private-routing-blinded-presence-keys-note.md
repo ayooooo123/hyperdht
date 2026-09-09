@@ -1,80 +1,78 @@
-# Private Routing: Blinded Presence-Record Keys (Candidate Gate D — forward note)
+# Private Routing: Blinded Presence-Record Keys (Gate D)
 
-**Status:** FORWARD-LOOKING REQUIREMENT — not a spec for current code. The component it
-constrains (address-free private presence records for `lookup`/`announce`) is **not
-implemented at Gate 3B1** (route construction). This note exists so the requirement is
-captured before that gate is designed; it must be folded into that gate's spec, not
-implemented standalone.
+**Status:** implemented experimentally over DHT mutable records, including required
+SURB publication/resolution/revocation. External cryptographic review and public
+required-mode approval remain open. The original derivation sketch below is
+historical, not the accepted record transcript.
 **Date:** 2026-08-10
-**Relates to:** [`private-routing-v1.md`](../../private-routing-v1.md) (Required-mode
-method contract: `lookup`/`announce` "use native address-free private presence records
-only"; Security Contract: "DHT storage nodes see stored record keys and bounded
-descriptor bytes" and "Route identities and route keys rotate independently from stable
-Noise identities") and [`private-routing-logos-lessons.md`](../../private-routing-logos-lessons.md) item **D**.
+**Relates to:** [v1 design](../../private-routing-v1.md),
+[current implementation and open gates](../../private-routing-migration.md#current-implementation),
+and [Logos lessons, Gate D](../../private-routing-logos-lessons.md).
 **Prior art:** Tor v3 onion-service blinded public keys (per-time-period key derivation).
 
 ## What exists today (grounding)
 
-- Destination opacity in the live routing path is **hash-based**, not key-blinded:
-  `lib/private/opaque-destination.js` derives an opaque id via `sodium.crypto_generichash`
-  over `KEY_DOMAIN = "hyperdht-private-routes/routed-dht/opaque-destination-key/v1"`
-  (`destination-ref.js` `DESTINATION_REF_SIZE = 172`). This hides the destination from
-  intermediaries **in-band**, per request. It is not a public key stored on DHT nodes.
-- A `grep` of `lib/private` for `blind` returns zero hits: route/descriptor material
-  **rotates by `epoch`** throughout, but there is no key-_blinding_ primitive.
-- Private presence records themselves — the address-free records `announce`/`lookup`
-  would store on DHT nodes in `required` mode — do not exist yet.
+- `lib/private/blinded-presence.js` implements period-key derivation, blinded
+  signing, fixed-size encrypted records, and authenticated tombstones.
+- `lib/private/presence-client.js` implements publication, resolution, revocation,
+  period overlap, and rollback protection over mutable DHT records. Its configured
+  reply mode applies to both reads and writes.
+- The pinned sodium-native fork supplies `crypto_core_ed25519_scalar_mul`;
+  no JavaScript scalar multiplication is used.
+- Opaque destination references are a separate route-authority boundary, not the
+  presence key-blinding mechanism. Gate D supersedes the stable-key, plaintext-topic
+  private-storage overlay for presence; the overlay's old IDs remain reserved.
 
 ## The requirement
 
-When the private-presence gate is designed, the record that gets **stored on and served
-by DHT storage nodes** MUST use **blinded, epoch-rotating keys**, not mere rotation:
+Presence records use **blinded, time-period-derived keys**, not a stable public
+identity as the storage identifier:
 
-- Derive a per-time-period **blinded public key** from the destination's stable key plus
-  an epoch blinding factor (Tor v3 model), so the storage-key under which a presence
-  record is published changes each period and cannot be linked across periods or back to
-  the stable identity by the storing node.
-- Rotation alone is insufficient: without blinding, a storage node can correlate
-  successive records of the same private service (same key → same service over time), and
-  can enumerate which services are present. Blinding removes both.
-- The blinding scheme must let a legitimate looker-up who knows the destination's stable
-  identity compute the current blinded key and locate/verify the record, while a storage
-  node holding the record cannot.
-- **Separate concern — body confidentiality.** Blinding hides _identity and linkage_ from
-  the storage node; it does **not** control who may _read_ the descriptor. The public
+- Derive a per-time-period blinded public key from the stable key and period
+  parameters, so publication does not reuse a stable storage identifier.
+- Blinding avoids a stable identifier in stored records; rotation without that
+  property would leave straightforward key-based linkage. It does not hide
+  timing or volume, and a party that knows the stable identity can derive and
+  link its period keys.
+- A legitimate resolver derives the expected period key from the stable identity
+  and verifies the returned record against that expected key, not an identity
+  supplied by the record.
+- **Separate concern — body confidentiality.** Blinding avoids publishing the
+  stable identity; it does **not** control who may read the descriptor. The public
   stable key `A` is not a confidentiality boundary (it may be widely known). Restricting
   readers requires a separate **reader credential** — a shared secret or the looker's own
   keypair (Tor v3 "client authorization" style) — used to derive the body-encryption key.
   If no reader restriction is intended, say plainly that the body is enumeration-protected
   from the storage node but not access-controlled.
 
-## Why not now
+## Implementation boundary
 
-The host has no code: there is no presence-record encode/store/lookup path at Gate 3B1.
-Writing a full integration spec now would be speculative. This note is the carried
-requirement; the actual key-derivation bytes, signature scheme, and storage-node
-verification belong in the presence-record gate's own spec, where they can be grounded in
-real encode/decode functions and test vectors.
+The accepted dependency, signing transcript, period/overlap rules, encrypted
+record layout, tombstone semantics, and verification are recorded in the
+[Gate D implementation checkpoint](../../private-routing-migration.md#continuation-checkpoint--2026-09-06-gate-d-records-exposure-accounting-live-put-coverage)
+and its subsequent review repairs. D10 selects those blinded records over mutable
+DHT commands; D12's required-mode writes are complete. Peer-stream consumption
+and public required-mode integration remain separate gates.
 
-## Acceptance (for the future gate)
+## Contract and review boundary
 
-- Presence-record storage keys are blinded per epoch; two records of the same service in
-  different epochs are unlinkable by the storage node.
-- A storage node cannot enumerate the set of private services it holds records for beyond
-  what fixed-size padding and query volume reveal.
-- A looker-up with the destination's stable identity resolves and verifies the current
-  record; a node without it cannot.
-- Extends the existing domain-separated `crypto_generichash` derivation discipline; no
-  weakening of the Noise-identity/route-key separation.
+- Storage keys change with the derived period key; the stable identity is not
+  published in the record.
+- Descriptor confidentiality requires the separate reader credential, even when
+  the stable identity and period parameters are known.
+- Resolution checks the caller-derived key and period, authenticated revision,
+  overlap, and tombstone state; an absent response from storage alone is not
+  authenticated revocation.
+- Timing/volume and known-identity linkage remain visible. Implementation and
+  live-gate evidence are not external cryptographic approval.
 
-## Concrete derivation (ready to fold into the presence-record gate)
+## Historical derivation sketch — 2026-08-10
 
-Tor rend-spec-v3 key blinding. **Group-op note (Step 0, 2026-08-10):** ristretto255 is not
-available in the pinned sodium, and `crypto_core_ed25519_scalar_mul` is missing. Public
-blinding `A' = h·A` is point×scalar (`crypto_scalarmult_ed25519`, available); private
-blinding `a' = h·a mod L` is scalar×scalar with **no** primitive — the future gate must
-supply a vetted constant-time mod-`L` multiply (or bump sodium), plus Tor's clamping-aware
-derivation for ed25519.
+The sketch below motivated Gate D but is not its wire specification: its
+illustrative domains, storage-key formula, and buffer API must not be used as
+replacement codecs or signing transcripts. At the time, the baseline sodium
+package lacked scalar×scalar multiplication. The accepted implementation now
+uses the pinned native binding; no substitute JavaScript arithmetic is needed.
 
 Let `(A, a)` be the destination's stable identity keypair (`A = a·B`). For epoch `e` with
 public period parameters `P_e` (period number + length), `H_s` = BLAKE2b reduced mod `L`,
@@ -96,15 +94,15 @@ cannot attribute.
 **Lookup:** a peer that knows `A` recomputes `h, A', k_e` from public `P_e`, fetches `k_e`,
 and verifies the signature under `A'`. It can **read** the body only if it also holds the
 reader credential above — knowing `A` alone locates and authenticates the record but does
-not decrypt it. A storage node holding `{k_e, A', body}` cannot recover `A`, cannot link
-`A'` across epochs (different `h` ⇒ different `A'`, `k_e`), and cannot enumerate which
-services it stores.
+not decrypt it. This sketch assumes the storing node does not already know `A`.
+Knowing `A` permits period-key derivation and linkage; blinding does not prevent
+that lookup or eliminate timing and volume correlation.
 
 Notes:
 
-- The ed25519 blinding must follow Tor's clamping-aware derivation (rend-spec-v3 §A.2);
-  ristretto255 (which would be cleaner) is **unavailable** in the pinned sodium.
-- Rotation is automatic (new epoch ⇒ new key); early revocation uses an identity-signed
-  tombstone, consistent with v1's existing capability-store downgrade-tombstone model.
-- Still gated: implement inside the future presence-record gate with its own encode/decode,
-  fixed test vectors, and review. Not implementable now — no host path exists.
+- The original proposal used Tor's clamping-aware derivation as prior art; the
+  implemented transcript and domains are recorded in the migration checkpoint.
+- Revocation is a blinded-key-signed Gate D tombstone, not the proposed
+  identity-signed legacy-capability downgrade object.
+- The encode/store/resolve/revoke path and fixed vectors now exist.
+  External cryptographic review remains open.

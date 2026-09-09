@@ -1,6 +1,6 @@
 # Private Routing Gate 3B1 Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents are available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical execution plan.** The Gate 3B1 live immutable-get slice through Task 17 is implemented. Original checkboxes, execution paths, and immutable-get-only boundaries below describe that slice, not today's work queue or supported internal commands. See [current implementation and open gates](../../private-routing-migration.md#current-implementation) for subsequent DHT/SURB/presence work.
 
 **Goal:** Replace Gate 3A's trusted logical route authority with signed relay discovery, a pinned guard, two authenticated live three-position branches, and one fail-closed immutable DHT get whose endpoint emits packets only to its guard after pinning.
 

@@ -10,15 +10,14 @@ reasoning is not re-litigated.
 
 **No anonymous-admission mechanism (RLN, VOPRF tokens, or otherwise) is added.**
 
-This protocol keeps **everything inside the hyperdht peer network**. There is no exit from
-the DHT network — no bridge to the clearnet or to non-participating services. Such a bridge
-would be an **entirely separate VPN-service protocol** with its own threat model, and is
-explicitly not what is being built here. Absent any exit, anonymous admission solves a
-problem this system does not have.
+The implemented slice has bounded DHT request-exit roles, but no generic VPN,
+clearnet, or legacy-peer egress. A third-party proxy service would need its own
+threat model and approval. The decision not to add anonymous admission remains
+in force; it must not be justified by claiming that the DHT exit role is absent.
 
-## Why (the only real abuse surface, and it's already handled)
+## Existing resource controls and their limits
 
-With all traffic internal to the peer network, the abuse surface reduces to **one** thing:
+The current resource controls include:
 
 - **Volunteer-relay resource exhaustion.** A middle/guard relay spends memory, bandwidth,
   and per-cell crypto forwarding for strangers. Already bounded in
@@ -28,8 +27,9 @@ With all traffic internal to the peer network, the abuse surface reduces to **on
   refuses circuit 129. An admission token would add a per-circuit cost without lowering
   that ceiling. Marginal value, real complexity → not worth it.
 
-Same class of resource problem vanilla Hyperswarm already lives with, handled the same way
-(quotas + the commons model).
+These ceilings bound allocated relay state; they do not establish complete abuse,
+Sybil, or denial-of-service resistance. Typed DHT-exit command policies separately
+bound destinations, request/reply bytes, costs, and outstanding operations.
 
 ## Why the imported mechanisms were rejected (record)
 
@@ -38,34 +38,31 @@ Same class of resource problem vanilla Hyperswarm already lives with, handled th
   cannot be hand-rolled safely. (2) It needs a Merkle membership tree of **all** members
   replicated to every verifier — exactly the large shared-writer set Autobase scales badly
   for (Autobase is for small per-room/org/doc writer sets).
-- **VOPRF anonymous tokens (Privacy-Pass style):** the hand-rollable, no-dependency
-  alternative (issuer public key + relay-local per-epoch ephemeral nullifier set; no
-  Autobase, no replicated membership, no chain). Sound, but it only protects an **exit** —
-  which this protocol does not have.
+- **VOPRF anonymous tokens (Privacy-Pass style):** considered as an alternative
+  to replicated membership machinery, but not selected. No issuer, token flow,
+  or admission protocol is implemented or approved by this note.
 
 ## Correction of an earlier factual error
 
-An earlier draft described DHT-exit abuse as "announce flooding." Wrong on two counts.
-First, this protocol has no exit at all. Second, even the fork's internal DHT-request
-handling is typed and bounded: `DHT_EXIT_ORIGIN_SERVICE_POLICY` is the first four entries
-of `EXIT_ORIGIN_SERVICE_POLICY` (`lib/private/exit-policy.js`) — **immutable/mutable
-get/put only** (`M3_MESSAGE_ID.IMMUTABLE_GET_V1 0x0120 … MUTABLE_PUT_V1 0x0123`).
-`announce` is a separate `PRIVATE_ANNOUNCE`/private-records capability, not part of that
-policy. (A private endpoint using the DHT via a route is using the DHT _itself_, staying
-inside the network — not exiting it.)
+The earlier “no exit at all” wording conflated a DHT request-exit with generic
+egress. The fork implements the former. `DHT_EXIT_ORIGIN_SERVICE_POLICY` in
+`lib/private/exit-policy.js` permits the four immutable/mutable get/put commands
+(`0x0120–0x0123`), not arbitrary proxying or public announce/lookup.
+Gate D presence uses mutable records. The old `PRIVATE_ANNOUNCE` overlay and
+storage-session IDs remain reserved/rejected for presence under D10; they are
+not an implemented announce-flooding surface. See
+[current implementation and open gates](../../private-routing-migration.md#current-implementation).
 
 ## If a separate VPN/exit service is ever built
 
-That would be a **different protocol**, not an extension of this one. It would introduce
-external attribution (the exit's address answering for others' traffic) and anonymous
-proxying to third parties — and _there_ anonymous admission earns its keep, via VOPRF
-tokens on the exit reservation path (issuer-key + relay-local nullifiers), never on plain
-circuit relay, and never RLN/Autobase-membership. Out of scope here; recorded so the
-analysis is not lost.
+A generic proxy service would be separate reviewed work with external
+attribution and third-party abuse risks. Whether anonymous admission belongs
+there would require a new decision; this historical discussion neither approves
+a VOPRF implementation nor reintroduces dropped RLN/Autobase membership.
 
 ## Non-goals
 
-No admission machinery ships. No exit/egress. No chain, no token economics, no
-deanonymization mechanism. Core private routing (guards, circuits, cells) already provides
-the privacy for a closed peer network; admission was an imported anonymity-network add-on
-this protocol does not warrant.
+No anonymous-admission machinery, generic VPN/legacy-peer egress, chain, token
+economics, or deanonymization mechanism is added. This decision does not claim
+production anonymity or replace external review of the implemented routing,
+SURB, and presence paths.

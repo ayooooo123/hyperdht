@@ -4,7 +4,7 @@
 
 **Date:** 2026-07-29
 
-**Plan reference:** [Gate 3B1 implementation plan](../../superpowers/plans/2026-07-18-private-routing-gate-3b1.md); required post-review Task 5/6/7/9 reconciliation is listed under Plan effect, and the plan is not modified by this revision
+**Plan reference:** [Historical Gate 3B1 implementation plan](../../superpowers/plans/2026-07-18-private-routing-gate-3b1.md). The Plan effect section preserves the original Task 5/6/7/9 reconciliation requirements; it is not the current work queue. See [current implementation and open gates](../../private-routing-migration.md#current-implementation).
 
 **Byte-level source:** reviewed private-routes prototype commit `0305df915b6a767093f9e75e6c06bc0a35da6169`
 
