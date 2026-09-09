@@ -120,6 +120,23 @@ function validCommand(type) {
       return { ...base(type), seed: b4a.alloc(32, 10), seq: 1n, value: b4a.from('routed mutable') }
     case 'mutable-get':
       return { ...base(type), publicKey: b4a.alloc(32, 11) }
+    case 'presence-publish':
+      return {
+        ...base(type),
+        seed: b4a.alloc(32, 13),
+        readerSecret: b4a.alloc(32, 14),
+        revision: 1n,
+        descriptor: b4a.from('blinded presence'),
+        now: 1_700_000_000_000n
+      }
+    case 'presence-resolve':
+      return {
+        ...base(type),
+        identityPublicKey: b4a.alloc(32, 15),
+        readerSecret: b4a.alloc(32, 14),
+        now: 1_700_000_000_000n,
+        replyMode: 'SURB_REQUIRED'
+      }
     default:
       return base(type)
   }
@@ -228,6 +245,16 @@ function validEvent(type) {
         publicKey: b4a.alloc(32, 11),
         seq: 1n,
         value: b4a.from('routed mutable')
+      }
+    case 'presence-published':
+      return { ...base(type), publicKeys: [b4a.alloc(32, 16)], revision: 1n }
+    case 'presence-state':
+      return {
+        ...base(type),
+        present: true,
+        period: 19_675n,
+        revision: 1n,
+        descriptor: b4a.from('blinded presence')
       }
     case 'nat-armed':
       return base(type, 'guard', 2)
@@ -699,7 +726,9 @@ test('exact command and event registries are frozen and all schemas reject extra
     'nat-stats',
     'immutable-put',
     'mutable-put',
-    'mutable-get'
+    'mutable-get',
+    'presence-publish',
+    'presence-resolve'
   ])
   t.alike(EVENTS, [
     'configured',
@@ -728,7 +757,9 @@ test('exact command and event registries are frozen and all schemas reject extra
     'nat-started',
     'nat-stats',
     'stored-routed',
-    'mutable-value'
+    'mutable-value',
+    'presence-published',
+    'presence-state'
   ])
   t.ok(Object.isFrozen(COMMANDS))
   t.ok(Object.isFrozen(EVENTS))

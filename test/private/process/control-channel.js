@@ -46,7 +46,9 @@ const COMMANDS = Object.freeze([
   'nat-stats',
   'immutable-put',
   'mutable-put',
-  'mutable-get'
+  'mutable-get',
+  'presence-publish',
+  'presence-resolve'
 ])
 
 const EVENTS = Object.freeze([
@@ -76,7 +78,9 @@ const EVENTS = Object.freeze([
   'nat-started',
   'nat-stats',
   'stored-routed',
-  'mutable-value'
+  'mutable-value',
+  'presence-published',
+  'presence-state'
 ])
 
 const ROLES = Object.freeze([
@@ -802,7 +806,24 @@ const COMMAND_FIELDS = Object.freeze({
   'nat-stats': BASE_FIELDS,
   'immutable-put': Object.freeze([...BASE_FIELDS, 'value']),
   'mutable-put': Object.freeze([...BASE_FIELDS, 'seed', 'seq', 'value']),
-  'mutable-get': Object.freeze([...BASE_FIELDS, 'publicKey'])
+  'mutable-get': Object.freeze([...BASE_FIELDS, 'publicKey']),
+  // Gate D presence over the routed record commands. `now` is the coordinator's
+  // wall time, so both ends derive the same publication periods.
+  'presence-publish': Object.freeze([
+    ...BASE_FIELDS,
+    'descriptor',
+    'now',
+    'readerSecret',
+    'revision',
+    'seed'
+  ]),
+  'presence-resolve': Object.freeze([
+    ...BASE_FIELDS,
+    'identityPublicKey',
+    'now',
+    'readerSecret',
+    'replyMode'
+  ])
 })
 const EVENT_FIELDS = Object.freeze({
   configured: BASE_FIELDS,
@@ -902,7 +923,9 @@ const EVENT_FIELDS = Object.freeze({
     'strayReceived'
   ]),
   'stored-routed': Object.freeze([...BASE_FIELDS, 'target']),
-  'mutable-value': Object.freeze([...BASE_FIELDS, 'publicKey', 'seq', 'value'])
+  'mutable-value': Object.freeze([...BASE_FIELDS, 'publicKey', 'seq', 'value']),
+  'presence-published': Object.freeze([...BASE_FIELDS, 'publicKeys', 'revision']),
+  'presence-state': Object.freeze([...BASE_FIELDS, 'descriptor', 'period', 'present', 'revision'])
 })
 // Every DHT role reports exactly which records it holds: the digests of its stored
 // immutable values and the targets of its stored mutable records, sorted and unique,
@@ -1141,6 +1164,28 @@ function validateCommand(message, context) {
       break
     case 'mutable-get':
       if (common.role !== 'endpoint' || !fixed(message.publicKey, 32)) invalid()
+      break
+    case 'presence-publish':
+      if (
+        common.role !== 'endpoint' ||
+        !fixed(message.seed, 32) ||
+        !fixed(message.readerSecret, 32) ||
+        !uint64(message.revision, true) ||
+        message.revision > 0xffff_ffffn ||
+        !uint64(message.now, true) ||
+        !boundedBytes(message.descriptor, 814, true)
+      )
+        invalid()
+      break
+    case 'presence-resolve':
+      if (
+        common.role !== 'endpoint' ||
+        !fixed(message.identityPublicKey, 32) ||
+        !fixed(message.readerSecret, 32) ||
+        !uint64(message.now, true) ||
+        (message.replyMode !== 'CORRELATED' && message.replyMode !== 'SURB_REQUIRED')
+      )
+        invalid()
       break
   }
   return message
@@ -1402,6 +1447,26 @@ function validateEvent(message, context) {
         !fixed(message.publicKey, 32) ||
         !uint64(message.seq, true) ||
         !boundedBytes(message.value, 895, true)
+      )
+        invalid()
+      break
+    case 'presence-published':
+      if (
+        common.role !== 'endpoint' ||
+        !sortedDigestArray(message.publicKeys) ||
+        message.publicKeys.length < 1 ||
+        message.publicKeys.length > 2 ||
+        !uint64(message.revision, true)
+      )
+        invalid()
+      break
+    case 'presence-state':
+      if (
+        common.role !== 'endpoint' ||
+        typeof message.present !== 'boolean' ||
+        !uint64(message.period, false) ||
+        !uint64(message.revision, true) ||
+        !boundedBytes(message.descriptor, 814, false)
       )
         invalid()
       break

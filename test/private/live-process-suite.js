@@ -6,6 +6,7 @@ const b4a = require('b4a')
 const { digestTestIsolatedAddressTuple } = require('../../lib/private/dht-exit-test-topology-grant')
 const { deriveDhtExitPeerId } = require('../../lib/private/dht-exit-destination-table')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
+const { deriveBlindedPublicKey, publishPeriods } = require('../../lib/private/blinded-presence')
 
 const { createCoherentTestClock } = require('./coherent-clock')
 const { createProcessConfigAuditor } = require('./process/config-auditor')
@@ -748,6 +749,61 @@ function registerLiveProcessSuite(launch) {
         surbExit.correlatedFrameCount,
         correlatedBefore.get(surbRouting.lookupPair.exitRole) || 0,
         'SURB path adds no correlated reverse frames on the lookup exit'
+      )
+
+      // Gate D presence over the live routed record commands (decisions D10–D12): the
+      // endpoint publishes a blinded presence record on the announce branch (one
+      // mutable put per publication period) and resolves it back in required SURB
+      // reply mode, so the read's reply never travels the correlated path. The
+      // coordinator's wall time is sent with both commands so both ends derive the
+      // same periods; the storage oracle admits exactly the blinded targets.
+      const presenceSeed = b4a.alloc(32, 0x7d)
+      const presenceReader = b4a.alloc(32, 0x7e)
+      const presenceIdentity = cryptoSuite.keyPair(presenceSeed)
+      const presenceDescriptor = b4a.from(`blinded presence (${launch.runtime})`)
+      const presenceNow = BigInt(Date.now())
+      const presencePeriods = publishPeriods(Number(presenceNow))
+      const presenceKeys = presencePeriods.map((period) =>
+        deriveBlindedPublicKey(presenceIdentity.publicKey, period)
+      )
+      auditor.expectRoutedRecords({
+        mutableTargets: presenceKeys.map((key) => cryptoSuite.hash([key])),
+        valueDigests: []
+      })
+      const presenceSurbBefore = surbExit.surbHopCellCount
+      const published = await sendAndWait('endpoint', 'presence-publish', 'presence-published', {
+        seed: presenceSeed,
+        readerSecret: presenceReader,
+        revision: 1n,
+        descriptor: presenceDescriptor,
+        now: presenceNow
+      })
+      t.is(published.revision, 1n, 'presence published at revision 1')
+      t.alike(
+        published.publicKeys,
+        presenceKeys.slice().sort((left, right) => b4a.compare(left, right)),
+        'the endpoint published under exactly the blinded keys of the publication periods'
+      )
+      const resolved = await sendAndWait('endpoint', 'presence-resolve', 'presence-state', {
+        identityPublicKey: presenceIdentity.publicKey,
+        readerSecret: presenceReader,
+        now: presenceNow,
+        replyMode: 'SURB_REQUIRED'
+      })
+      t.is(resolved.present, true, 'presence resolves present over the SURB path')
+      t.is(resolved.revision, 1n, 'presence resolves at its revision')
+      t.ok(resolved.descriptor.equals(presenceDescriptor), 'presence descriptor is exact')
+      t.ok(
+        presencePeriods.includes(resolved.period),
+        'presence resolves from one of the publication periods'
+      )
+      // No rotation since the surb-get derivation, so the lookup exit is the same role;
+      // the put above grew the announce exit's count, which is why no re-derivation.
+      const presenceRoutingAfter = await routingSnapshots()
+      const presenceExit = presenceRoutingAfter.get(surbRouting.lookupPair.exitRole)
+      t.ok(
+        presenceExit.surbHopCellCount > presenceSurbBefore,
+        'the presence read was answered over the SURB path'
       )
 
       if (productionEndpointPunch) {

@@ -58,6 +58,7 @@ const {
   createRelaySurbPeelAuthority
 } = require('./wire-services')
 const { destroySurbCapabilityAuthority } = require('../../../lib/private/surb')
+const { createPresenceClient } = require('../../../lib/private/presence-client')
 
 const UDX_VERSION = require('udx-native/package.json').version
 const CODEC_VECTOR_DIGEST = b4a.from(CODEC_VECTOR_DIGEST_HEX, 'hex')
@@ -1142,6 +1143,65 @@ function mutableGet(publicKey) {
   })
 }
 
+// Gate D presence over the routed record commands. The client is created per
+// command from the coordinator's inputs and never retained: the identity seed and
+// reader secret are scenario fixtures, `now` is the coordinator's wall time so both
+// ends derive the same periods, and the reader keys are erased inside the codec.
+function presencePublish(seed, readerSecret, revision, descriptor, now) {
+  const identityKeyPair = cryptoSuite.keyPair(b4a.from(seed))
+  const ownedReader = b4a.from(readerSecret)
+  const ownedDescriptor = b4a.from(descriptor)
+  return startEndpointOperation(async (sequence) => {
+    const client = createPresenceClient({
+      controller: endpointController,
+      identityKeyPair,
+      readerSecret: ownedReader,
+      now: () => Number(now)
+    })
+    const published = await client.publishPresence({
+      descriptor: ownedDescriptor,
+      revision: Number(revision)
+    })
+    if (activeOperation === null || activeOperation.sequence !== sequence) return
+    if (!Array.isArray(published) || published.length < 1) {
+      throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+    }
+    activeOperation = null
+    const publicKeys = sortedDigests(published.map((entry) => b4a.from(entry.publicKey)))
+    await emit('presence-published', { publicKeys, revision })
+  })
+}
+
+function presenceResolve(identityPublicKey, readerSecret, now, replyMode) {
+  const ownedIdentity = b4a.from(identityPublicKey)
+  const ownedReader = b4a.from(readerSecret)
+  return startEndpointOperation(async (sequence) => {
+    const client = createPresenceClient({
+      controller: endpointController,
+      identityPublicKey: ownedIdentity,
+      readerSecret: ownedReader,
+      now: () => Number(now),
+      replyMode
+    })
+    const resolved = await client.resolvePresence()
+    if (activeOperation === null || activeOperation.sequence !== sequence) return
+    if (
+      !resolved ||
+      typeof resolved.present !== 'boolean' ||
+      !Number.isSafeInteger(resolved.revision)
+    ) {
+      throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
+    }
+    activeOperation = null
+    await emit('presence-state', {
+      present: resolved.present,
+      period: resolved.period,
+      revision: BigInt(resolved.revision),
+      descriptor: resolved.present ? resolved.descriptor : b4a.alloc(0)
+    })
+  })
+}
+
 async function cancelOperation(sequence) {
   if (
     projection.role !== 'endpoint' ||
@@ -1537,6 +1597,23 @@ async function handle(message) {
       return
     case 'mutable-get':
       mutableGet(message.publicKey)
+      return
+    case 'presence-publish':
+      presencePublish(
+        message.seed,
+        message.readerSecret,
+        message.revision,
+        message.descriptor,
+        message.now
+      )
+      return
+    case 'presence-resolve':
+      presenceResolve(
+        message.identityPublicKey,
+        message.readerSecret,
+        message.now,
+        message.replyMode
+      )
       return
     case 'cancel':
       await cancelOperation(message.operationSequence)
