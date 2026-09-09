@@ -93,17 +93,20 @@ completed engagement is identified in the project record.
   the precise underlying NAT or network cause is not established. Operator
   addresses remain outside the repository and vault.
 - Final local verification ran once, uninterrupted, with
-  `DOCKER_CONTEXT=colima-hyperdht-gates-finish bash scripts/linux-gates.sh all`.
+  `bash scripts/linux-gates.sh all`. The Docker context is not established
+  by the retained invocation evidence; do not attribute this run to the
+  separately clock-probed VM.
   All ten gates passed: Node private aggregate 1,099 tests / 19,762 assertions;
   Bare private aggregate 1,054 / 19,627; four normal/reverse process legs
   175 assertions each; two production-punch legs 180 each; namespace projection
   27; namespace live capture 185 with raw DROP zero.
-- That disposable VM was created without activating its Docker context.
-  External NTP was paused there only. A 45-second wall/monotonic probe measured
-  −0.419793 to +0.001376 ms drift; the actual capture kept the unchanged 2 ms
-  checks. The running gate container was also observed on the disposable
-  Docker context. The VM was deleted after verification. Shared services were
-  not restarted.
+- A disposable VM was separately created without activating its Docker context.
+  External NTP was paused there only. Its 45-second wall/monotonic probe
+  measured −0.419793 to +0.001376 ms drift. This probe does not establish
+  the clock behavior of the unlocated full-gate run. A later context-specific
+  container check is not evidence of that run's placement. The disposable VM
+  was deleted; shared services were not restarted. This corrects the unsupported
+  VM attribution published in `9857887`.
 - Repository-wide Prettier passed separately. Runtime-exported bounds were
   checked directly: advertisement 260–388 bytes, presence descriptor 814,
   inner route payload 1,073, outer cell 1,200. No peer-stream implementation
