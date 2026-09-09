@@ -15,8 +15,13 @@ module.exports = function observeSocketClosures(UDX, isStopping, file) {
   function millis() {
     const wall = Date.now()
     const elapsed = Number(hrtime.bigint() - monotonicStart) / 1e6
-    if (Math.abs(wall - wallStart - elapsed) > 2) {
-      throw new Error('socket close observer realtime clock changed')
+    const drift = wall - wallStart - elapsed
+    if (Math.abs(drift) > 2) {
+      // KI-18: the bound is the capture's timestamp trust, so it is not widened
+      // here; the magnitude is what a decision about VM hosts needs.
+      throw new Error(
+        `socket close observer realtime clock changed (drift ${drift.toFixed(3)} ms over ${elapsed.toFixed(0)} ms)`
+      )
     }
     return wall
   }

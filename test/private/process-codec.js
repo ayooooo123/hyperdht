@@ -115,9 +115,15 @@ function validCommand(type) {
     case 'nat-arm':
       return { ...base(type, 'guard', 2), plan: b4a.alloc(462, 9) }
     case 'immutable-put':
-      return { ...base(type), value: b4a.from('routed immutable') }
+      return { ...base(type), value: b4a.from('routed immutable'), replyMode: 'CORRELATED' }
     case 'mutable-put':
-      return { ...base(type), seed: b4a.alloc(32, 10), seq: 1n, value: b4a.from('routed mutable') }
+      return {
+        ...base(type),
+        seed: b4a.alloc(32, 10),
+        seq: 1n,
+        value: b4a.from('routed mutable'),
+        replyMode: 'CORRELATED'
+      }
     case 'mutable-get':
       return { ...base(type), publicKey: b4a.alloc(32, 11) }
     case 'presence-publish':
@@ -127,7 +133,17 @@ function validCommand(type) {
         readerSecret: b4a.alloc(32, 14),
         revision: 1n,
         descriptor: b4a.from('blinded presence'),
-        now: 1_700_000_000_000n
+        now: 1_700_000_000_000n,
+        replyMode: 'SURB_REQUIRED'
+      }
+    case 'presence-revoke':
+      return {
+        ...base(type),
+        seed: b4a.alloc(32, 13),
+        readerSecret: b4a.alloc(32, 14),
+        revision: 2n,
+        now: 1_700_000_000_000n,
+        replyMode: 'SURB_REQUIRED'
       }
     case 'presence-resolve':
       return {
@@ -728,6 +744,7 @@ test('exact command and event registries are frozen and all schemas reject extra
     'mutable-put',
     'mutable-get',
     'presence-publish',
+    'presence-revoke',
     'presence-resolve'
   ])
   t.alike(EVENTS, [

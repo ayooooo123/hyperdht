@@ -1385,6 +1385,108 @@ and 1,046 / 19,552; `b33fbe4` 1,092 / 19,689 and 1,047 / 19,554; `f71e8de`
 19,569 (process 162, punch 167, live namespace 172). Whole-repository
 Prettier passes.
 
+### Continuation checkpoint — 2026-09-09, required-mode puts and V2 allocation
+
+Continued from `0914480`, using the controller/client changes in the
+`astra/required-mode-puts` WIP (`1daff08`). Its in-process put test was not
+retained: that harness stages no announce seeds. The put proof belongs on
+the eleven-role gate.
+
+**D12 remainder.** `immutablePut(value, { replyMode })` and
+`mutablePut(keyPair, value, { seq, signMutable, replyMode })` support explicit
+`SURB_REQUIRED` behind `experimentalSurbReplies: true`. Defaults remain
+correlated. The presence client applies its configured mode to publication
+and revocation as well as resolution. Mutable-get refresh remains restricted
+to correlated mode.
+
+The required-mode hold begins before query construction and covers the
+token query, retries, and commit. Each attempt releases it in `finally`,
+including when query construction throws. The same construction/cleanup gap
+was repaired in the two get methods. A live-harness regression injects a
+construction failure, then checks the next ordinary get's actual reply path.
+Against `1daff08` it fails eight assertions because required mode remains
+held; the repaired controller passes. The regression tests failure cleanup,
+not announce-seed support or a successful in-process put.
+
+**V2 allocator defect.** The first required-mode presence publication failed
+with `TRANSPORT_UNAVAILABLE`; its preserved cause was `INVALID_ROUTE` at
+`encodeRoutedRequestV2` → `allocate`. The opt-in, off-wire fatal log now
+includes a bounded cause chain so that wrapper no longer hides the failure.
+The allocator still used the 4,706-byte reply ceiling. The existing generic
+V2 envelope ceiling is 4,910 bytes; a maximum legal immutable-put body of
+1,090 bytes plus eight descriptors produces a measured **4,839-byte**
+encoded request. These are different bounds. Allocation now covers both
+message ceilings; per-message encoding/decoding limits and the wire are
+unchanged. The size regression carries that largest put body through
+fragmentation, reassembly, and decoding. It fails with `INVALID_ROUTE`
+before the repair and passes afterward.
+
+**Live behavior proof.** The process control commands `immutable-put`,
+`mutable-put`, `presence-publish`, and `presence-revoke` carry a validated
+`replyMode`. The ordinary put steps now exercise the maximum legal values
+(895 mutable bytes and 1,023 immutable bytes) in required mode, rather than
+duplicating those writes later in the lifecycle. Both read back exactly
+and appear in the independent DHT storage snapshots. Publication and
+period-tombstone revocation also run in required mode. Resolution must first
+return the descriptor, then report absence at the tombstone's newer revision.
+Every write is measured on the announce exit, every presence read on the
+lookup exit: SURB emission increases without additional correlated frames.
+Baselines are reused only when that branch has carried no intervening
+application traffic. Learned-grant pools and protocol deadlines are unchanged.
+
+An intermediate scenario that appended extra maximum-size puts passed the
+Node process smoke (174/174) but later hit `ERR_PRIVATE_BRANCH_ROTATING` at
+113 in namespace capture, before the additional immutable put began. The
+final scenario replaces duplicate operations with the same maximum-size
+coverage and moves branch derivation before writes. No production rotation
+or admission rule was changed to accommodate the scenario.
+
+**KI-18 environment evidence.** An earlier intermediate tree passed nine
+gates together (Node 1,094/19,709; Bare 1,049/19,574; four process legs 168
+each; punch legs 173 each; namespace projection 27). Five namespace-live
+attempts failed during teardown after network change. The last three
+recorded wall/monotonic drift of −142 to −166 ms over 7.3–8.2 s, with the
+new put assertions passing before teardown. The clock diagnostics now
+include measured drift and elapsed time; neither 2 ms check was widened.
+A separate probe inside the default Colima VM observed a −171 ms change.
+Its time-sync status reported a +232 ms offset; that observation alone does
+not prove which service caused the change. Logs:
+`/tmp/hyperdht-nslive-mayfly-{1,2,3}.log`.
+
+The default VM also hosts unrelated database/proxy containers and was not
+restarted. A disposable `hyperdht-gates-mayfly` profile was created without
+changing the active Docker context or shared SSH configuration. Its first
+45-second clock probe also failed (minimum cumulative drift −1,090 ms).
+External NTP synchronization was paused only in this disposable VM. Its
+next 45-second probe passed: drift ranged from −0.628 to +0.274 ms.
+Real clocks and the 2 ms capture checks remain unchanged. The final
+ten-gate result is recorded below; intermediate passes do not count as
+final-tree convergence evidence.
+
+**Final verification.** One uninterrupted run of
+`DOCKER_CONTEXT=colima-hyperdht-gates-mayfly bash scripts/linux-gates.sh all`
+passed all ten gates on the final source/test tree, exit 0:
+
+| Gate                                                    | Result                                      |
+| ------------------------------------------------------- | ------------------------------------------- |
+| Aggregate, Node                                         | 1,094/1,094 tests; 19,730/19,730 assertions |
+| Aggregate, Bare                                         | 1,049/1,049 tests; 19,595/19,595 assertions |
+| Normal/reverse process legs, Node and Bare (four gates) | 175/175 each                                |
+| Production-punch legs, Node and Bare (two gates)        | 180/180 each                                |
+| Namespace projection                                    | 27/27                                       |
+| Namespace live capture                                  | 185/185; kernel raw DROP 0                  |
+
+The capture includes maximum-size puts, blinded presence publication,
+resolution, revocation and tombstone resolution, plus the existing complete
+lifecycle and leak oracles. Repository-wide Prettier passes. This is local
+Linux-container evidence, not a substitute for fork-native CI or external
+cryptographic review.
+
+This remains package-private and experimental. The owner-approved Gate C
+wire is not external cryptographic approval. Public required mode, peer
+streams, and the KI-4 cross-host guard-offer time contract remain open;
+this slice changes none of those boundaries.
+
 ### Subagent design handoff — 2026-09-05
 
 These are review requirements, not accepted replacement protocols:
