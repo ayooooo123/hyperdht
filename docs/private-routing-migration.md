@@ -1096,16 +1096,17 @@ rules remain unchanged. Diagnostics and documentation remain uncommitted;
 the published branch remains `0c543a4`. A repair requires a reviewed
 cross-host time contract, not an unexplained increase in the allowed bound.
 
-### Continuation checkpoint — 2026-09-07, internal model review of Gates C and D, remote run 34072979459
+### Continuation checkpoint — 2026-09-09, adjudication of the 2026-09-07 model review of Gates C and D, remote run 34072979459
 
-This continuation started from the session-3 handoff at `cb72ff8` and
-rebased onto `origin/continue-hyperdht-private-routing` at `8c404f5`
+This continuation (adjudication, fixes, gates and commit on 2026-09-09; the
+reviewer runs and the remote run below happened on 2026-09-07 UTC) started
+from the session-3 handoff at `cb72ff8` and rebased onto `origin/continue-hyperdht-private-routing` at `8c404f5`
 once the fetch showed the later Gate D rollback repair (`c0db444`,
 `b4bad01`), the link-sealing and preflight checkpoint (`0c543a4`) and the
 timing diagnostics (`8c404f5`). The coordinator diagnostic below was carried
 across as a patch; nothing else from the older tree was reapplied.
 
-**Internal model review — 2026-09-07.** The packet
+**Internal model review — reviewers ran 2026-09-07, adjudicated 2026-09-09.** The packet
 (`/tmp/hyperdht-crypto-review-packet.md`, fourteen questions over Gate C
 required SURB replies and Gate D blinded presence records; output = ranked
 findings with file:line and a run `/tmp` script) went to three read-only
@@ -1209,6 +1210,14 @@ capability expiry (frozen now): ADMITTED`); on the endpoint the SURB
   codec. A relay could already end the operation by dropping or by sending
   any invalid frame, so this closes no attacker capability; it removes the
   honest failure mode.
+- Follow-ups on the same boundary, same day: the terminal admission now
+  samples the wall clock before the entry is spent and treats a throwing or
+  non-time callback as `INVALID_ROUTE` after revoking the table, so the
+  entry's one-use open authority is revoked with it (regression: the
+  authority is already spent when revoked afterwards; it failed on the
+  committed ordering). The harness peel-authority factory passes the
+  original secret and key (the authority copies them) and clears every
+  buffer of the decoded advertisement.
 - C-6 (Fable, Low): "length in the clear on unsealed links" was written
   against the session-3 record; the link-sealing checkpoint above already
   corrected that every reverse frame is sealed by the adjacency
@@ -1275,15 +1284,14 @@ layout derived from the fixed size bounds is the next artifact; no build was
 dispatched on an unapproved wire.
 
 **Measurements.** `set -o pipefail; bash scripts/linux-gates.sh all` on the
-final tree, all ten gates, exit 0: Node aggregate **1,091 tests / 19,687
-assertions**; Bare **1,046 / 19,552**; the four normal/reverse process legs
-155 each; both production-punch legs 160 each; namespace projection 27; live
-namespace capture 165 with kernel raw DROP zero. Complete log:
-`/tmp/hyperdht-review-lane-linux-gates-final.log`. A first full run on the
-same source with an older coordinator expectation failed exactly two
-`process-control` assertions (the failure detail was pinned to `null`); the
-counts above are from the complete rerun after that expectation was
-updated, with no source edit in between. Whole-repository Prettier passes.
+final tree with no concurrent edits, all ten gates, exit 0: Node aggregate
+**1,092 tests / 19,689 assertions**; Bare **1,047 / 19,554**; the four
+normal/reverse process legs 155 each; both production-punch legs 160 each;
+namespace projection 27; live namespace capture 165 with kernel raw DROP
+zero. Complete log: `/tmp/hyperdht-review-lane-linux-gates-followup.log`.
+The first commit of this checkpoint (`5bcf9ac`) was measured the same way
+at 1,091 / 19,687 and 1,046 / 19,552 (`…-final.log`); the follow-up adds the
+admission-ordering regression. Whole-repository Prettier passes.
 
 ### Subagent design handoff — 2026-09-05
 
@@ -3410,7 +3418,7 @@ attack without bounding the attacker's share of the candidate set.
 The rule also decides whether a fault can be survived. `reserveReplacement`
 applies it against the live opposite pair and the pair being replaced, so
 in a three-plus-three pool the one spare exit must differ by subnet from the
-exit it succeeds. Run 34072979459 (the 2026-09-07 review checkpoint) placed
+exit it succeeds. Run 34072979459 (the 2026-09-09 review checkpoint) placed
 `lookup-exit-b` and `announce-exit` in one `/24` on the runners; after the
 blackhole the replacement was `ERR_INCOMPATIBLE_RELAY` and the controller
 went `UNAVAILABLE`. That is the rule failing closed, reproduced at the

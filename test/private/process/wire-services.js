@@ -682,14 +682,24 @@ function createRelaySurbPeelAuthority(options) {
     throw PrivateRouteError.INVALID_ROUTE()
   }
   const decoded = decodeRelayCapabilityAdvertisement(advertisement, { now: clocks.wallNow() })
-  return createSurbCapabilityAuthority({
-    routeSecretKey: b4a.from(routeSecretKey),
-    routeKey: b4a.from(decoded.routeEncryptionPublicKey),
-    capabilityEpoch: decoded.epoch,
-    issuedAtMs: decoded.issuedAtMs,
-    expiresAtMs: decoded.expiresAtMs,
-    wallNow: clocks.wallNow
-  })
+  try {
+    // The authority copies the secret and the key itself; passing the originals
+    // leaves no unowned copy behind.
+    return createSurbCapabilityAuthority({
+      routeSecretKey,
+      routeKey: decoded.routeEncryptionPublicKey,
+      capabilityEpoch: decoded.epoch,
+      issuedAtMs: decoded.issuedAtMs,
+      expiresAtMs: decoded.expiresAtMs,
+      wallNow: clocks.wallNow
+    })
+  } finally {
+    decoded.relayIdentity.fill(0)
+    decoded.currentDhtNodeId.fill(0)
+    decoded.reachableEndpoint.fill(0)
+    decoded.routeEncryptionPublicKey.fill(0)
+    decoded.signature.fill(0)
+  }
 }
 
 function createTailRelayActor(options) {

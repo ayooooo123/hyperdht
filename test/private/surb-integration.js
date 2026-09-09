@@ -860,3 +860,44 @@ test('failed SURB batch construction erases keys from completed slots', (t) => {
     }
   }
 })
+
+test('a failing wall clock at terminal admission leaves the open authority revocable', (t) => {
+  // The wall clock is read before the entry is spent. If it throws, the entry must
+  // still be in the table when the admission is revoked, so its one-use open
+  // authority is revoked with it instead of leaking armed.
+  const {
+    createSurbTerminalAdmission,
+    registerSurbTerminalHandle,
+    admitSurbTerminalPayload
+  } = require('../../lib/private/surb-batch')
+  const r = relay()
+  const terminal = b4a.alloc(32, 0x77)
+  const binding = bindingFor(ids())
+  const { descriptor, openAuthority } = buildSurb({
+    hops: [hopOf(r)],
+    terminalHandle: terminal,
+    replyBinding: binding,
+    now: NOW
+  })
+  const table = createSurbTerminalAdmission({
+    now: () => 1n,
+    wallNow: () => {
+      throw new Error('wall clock unavailable')
+    },
+    localDeadline: 10n
+  })
+  registerSurbTerminalHandle(table, {
+    terminalHandle: terminal,
+    openAuthority,
+    replyBinding: binding,
+    requestId: b4a.alloc(16, 1),
+    batchId: b4a.alloc(16, 2)
+  })
+  const sealed = sealSurbReply({ descriptor, replyBinding: binding, plaintext: b4a.alloc(4, 9) })
+  expectCode(
+    t,
+    () => admitSurbTerminalPayload(table, { terminalHandle: terminal, payload: sealed.payload }),
+    'INVALID_ROUTE'
+  )
+  t.absent(revokeSurbOpenAuthority(openAuthority), 'the open authority was revoked with the table')
+})
