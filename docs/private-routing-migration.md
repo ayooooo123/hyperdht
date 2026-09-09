@@ -1,10 +1,10 @@
-# Private Routing Gate 3A / Gate 3B1 Migration Record
+# Private Routing Implementation and Migration Record
 
 ## Status and scope
 
-This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
+This record covers the experimental Gate 3A substrate, the owner-approved Gate 3B1 live routing implementation through Task 17, and subsequent routed-DHT, SURB, and blinded-presence work. It is not a public API or a production anonymity surface. Gate 3A established deterministic primitives and a fake topology; Gate 3B1 and the later slices use production-code native routing owners behind package-private capabilities.
 
-Direct mode remains the only public behavior. Gate 3B1 Task 15 has a package-private required-mode controller, authenticated native route authority, routed immutable-get request/reply path, rotation, suspension, and teardown; Tasks 16 and 17 add test-only process isolation and prove that path live across eleven separate Node or Bare role processes over native UDX, and, on Linux, with every role in its own network namespace under packet capture. The root package still exposes no private-routing constructor or user-selectable required mode. A post-readiness packet-capture proof now exists for the specific properties tabulated in [Task 17 wire-level privacy evidence](#gate-3b1-task-17-wire-level-privacy-evidence). It is not a general anonymity claim: a global passive observer and timing correlation by colluding guards and exits are out of scope for v1, no cover traffic exists, and these tests do not establish suitability for protecting users.
+Direct mode remains the only public behavior. The internal controller supports authenticated live routes, immutable/mutable get and put, experimental required SURB replies, blinded presence publication/resolution/revocation, rotation, suspension, and teardown. Eleven separate Node or Bare role processes exercise these paths over native UDX; privileged Linux namespaces add the scoped [packet-capture evidence](#gate-3b1-task-17-wire-level-privacy-evidence). The root package exposes no private-routing constructor or user-selectable required mode. Peer streams are not implemented. A global passive observer and timing correlation by colluding guards and exits remain outside v1's guarantees; no cover traffic exists, and these tests do not establish suitability for protecting users.
 
 The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
 Accepted limitations that are not scheduled for repair are tracked under
@@ -18,6 +18,49 @@ internally in this fork. This remains a package-private compatibility slice: it
 adds no root public constructor, export, user-selectable required mode, or
 anonymity claim, although its internal path uses the production UDX, relay,
 final-exit, and DHT-exit owners rather than a structural or fake transport.
+
+### Current implementation
+
+The implementation checkpoint is
+[`cae9721`](https://github.com/ayooooo123/hyperdht/commit/cae9721f946b4d3b2b8adcb61b3230332371e830),
+published to `private-routing-v1` on 2026-09-09:
+
+- **Routed DHT and Gate C:** immutable/mutable get and put support explicit
+  `replyMode: 'SURB_REQUIRED'` behind `experimentalSurbReplies: true`.
+  Defaults remain correlated; mutable-get refresh cannot use required replies.
+  Required-mode holds cover query construction, retries, and commit, and are
+  released on every attempt's cleanup. SURB replies use relay-local peeling
+  through the route's own reverse relays, not an independent or mixed path.
+- **Gate D and D12:** the blinded-presence client publishes, resolves, and
+  revokes over mutable records using its configured reply mode. The live
+  scenario proves required-mode maximum-size puts, exact readback, publication,
+  and resolution to authenticated absence after a period-scoped tombstone at a
+  higher revision, without additional correlated reply frames on the relevant exit.
+- **Protocol scope:** Gate D supersedes the stable-key, plaintext-topic
+  private-storage overlay for presence. Its old object/command and storage-session
+  IDs stay reserved and rejected. Routed public `lookup`, `findPeer`,
+  `announce`, `unannounce`, and raw `query` are not v1 commands; adding them is
+  not unfinished implementation of an already approved wire.
+- **Verification:** all ten local gates passed on that source/test tree,
+  followed by native-Linux private-routing CI and the Linux/macOS/Windows build
+  matrix. See the [measurements](#gate-3b1-task-17-live-eleven-process-scenario-status)
+  and [publication evidence](#continuation-checkpoint--2026-09-09-required-mode-puts-and-v2-allocation).
+
+**Open gates:** KI-4's guard-offer cross-host time contract needs a reviewed
+repair; peer streams need a separate reviewed wire design; external
+cryptographic review and the aggregate public-controller gate remain open.
+Further remote lifecycle dispatch requires explicit owner approval.
+Hyperswarm, mobile, and PearTube integration follow those gates. KI-1
+timing/volume correlation and KI-5 operator diversity remain explicit limits;
+mixing/cover traffic is deferred and anonymous-admission Gate A is dropped.
+
+## Implementation history
+
+The checkpoints below preserve the state, measurements, failures, and decisions
+at their recorded dates and commits. Their old “remaining work” lists and
+uncommitted-state descriptions are historical, not instructions for the current
+tree. Use [Current implementation](#current-implementation) for current scope
+and open gates. Historical and rejected experiments are not accepted runtime.
 
 ### Continuation checkpoint — 2026-09-05
 
@@ -1313,6 +1356,11 @@ overrule:
   correlated acknowledgements; making puts required is the next slice and
   needs the exit's put path proven under SURB on the live gate.
 
+> **Superseded implementation status:** the
+> [2026-09-09 final checkpoint](#continuation-checkpoint--2026-09-09-required-mode-puts-and-v2-allocation)
+> completes required-mode publication and revocation. The account below records
+> the earlier read-only proof.
+
 Landed with the decision: the eleven-role scenario now publishes a blinded
 presence record from the endpoint (one mutable put per publication period,
 the coordinator's wall time carried in the command so both ends derive the
@@ -1482,12 +1530,27 @@ lifecycle and leak oracles. Repository-wide Prettier passes. This is local
 Linux-container evidence, not a substitute for fork-native CI or external
 cryptographic review.
 
+**Publication and independent CI.** The verified implementation was committed as
+`cae9721` and pushed to `private-routing-v1`. Native-Linux Private Routing
+[push run 34390828052](https://github.com/ayooooo123/hyperdht/actions/runs/34390828052)
+and [PR run 34390832966](https://github.com/ayooooo123/hyperdht/actions/runs/34390832966)
+passed, including privileged namespace capture with the unchanged clock check.
+[Build Status 34390832973](https://github.com/ayooooo123/hyperdht/actions/runs/34390832973)
+passed on Linux, macOS, and Windows. These are distinct from the local-container
+results above and do not constitute external cryptographic review. The
+disposable VM and its runtime data were deleted after verification; the shared
+database/proxy VM and active Docker context were left unchanged.
+
 This remains package-private and experimental. The owner-approved Gate C
 wire is not external cryptographic approval. Public required mode, peer
 streams, and the KI-4 cross-host guard-offer time contract remain open;
 this slice changes none of those boundaries.
 
 ### Subagent design handoff — 2026-09-05
+
+> **Historical handoff:** completed implementation work is recorded in the
+> [2026-09-09 final checkpoint](#continuation-checkpoint--2026-09-09-required-mode-puts-and-v2-allocation).
+> External cryptographic review remains open.
 
 These are review requirements, not accepted replacement protocols:
 
@@ -3763,10 +3826,12 @@ Three things were checked against that design:
   small networks.
 - **Exclusion when rebuilding.** Present. `chooseReplacementPair` takes an
   exclusion set and diversity is revalidated at commit.
-- **Which qualifying hops get chosen.** A genuine gap, open, recorded as
-  [KI-6](#ki-6-hop-selection-is-first-match-not-random). Veilid round-robins
-  among its top tier, which distributes load but stays predictable. We take the
-  first match, which is worse: it is fixed rather than merely predictable.
+- **Which qualifying hops get chosen.** The first-match gap identified in this
+  comparison is fixed under
+  [KI-6](#ki-6-hop-selection-is-first-match-not-random--fixed): initial,
+  reconnect, and replacement selection now sample uniformly within the chosen
+  valid diversity/demotion tier. The earlier comparison with Veilid's
+  predictable round-robin selection is historical, not an open first-match task.
 
 Two of Veilid's choices are deliberately not adopted. Latency-ranked selection
 prefers well-resourced relays, which is exactly what a funded adversary can most
@@ -4102,8 +4167,8 @@ surface:
 native UDX loopback. It is test infrastructure, not a public API, and carries no
 anonymity claim.
 
-On Linux the scenario passes all 136 assertions with both Node
-and Bare role children. It proves,
+At `cae9721`, the normal and reverse scenarios pass 175 assertions each with
+both Node and Bare role children. They prove,
 live and cross-process: ordered DHT role bind and the audited setup store;
 endpoint bootstrap, guard pinning, and separate lookup/announce branches built
 through authenticated adjacent links; an exact immutable get retrieved through
@@ -4113,10 +4178,12 @@ delayed-lookup cancellation; a silent native lookup-middle route-cell blackhole
 that triggers link-loss propagation and rotates the endpoint onto a fresh pair,
 followed by a second exact immutable get; exit accounting for referral probes and
 ordinary requests; endpoint suspend and resume, including a third exact immutable
-get over the rebuilt route; a terminal network change that leaves no endpoint
+get over the rebuilt route; required-mode immutable/mutable puts at their
+maximum value sizes with exact readback and independent storage snapshots;
+required-mode blinded presence publication, resolution, revocation, and
+tombstone resolution; a terminal network change that leaves no endpoint
 socket and installs no fallback edge; and ordered teardown with zero residual
-operations, resources, and queued bytes in
-every role.
+operations, resources, and queued bytes in every role.
 
 Reaching resume, rotation, and network-change required four fixture
 and owner corrections, each of which is now part of the proof:
@@ -4140,35 +4207,31 @@ The eleven-role scenarios are not part of the portable aggregate. They bind the
 configuration (KI-2), so they run from their own scripts under the Linux CI job
 while `test/private-routing.js` stays green everywhere:
 
-Counts below are a MEASUREMENT taken at one commit, not a contract. Every added test
-moves them, and a stale total quoted as current has already caused four false findings
-in this document's history - so re-measure rather than cite, and if you change a suite,
-change this table in the same pass. Measured on 2026-09-06 on the tree that
-adds the pinned sodium-native fork, Gate D records, the experimental Gate C
-integration, reflector exposure accounting, the plan-scoped remote `ready`
-bound, the routed put steps with the exact DHT storage oracle, and required
-SURB mode on the eleven-role gate. Darwin
-aggregates and remote dispatches were not re-measured in this checkpoint.
+These are measured results for the published `cae9721` source/test tree on
+2026-09-09, not protocol contracts. All ten gates passed in one uninterrupted
+run. Earlier totals remain in the dated history; documentation-only changes do
+not re-date that evidence. Native-Linux CI and the cross-platform build results
+are linked in the [publication checkpoint](#continuation-checkpoint--2026-09-09-required-mode-puts-and-v2-allocation).
 
 | Suite                              | Command                                            | Result                                             |
 | ---------------------------------- | -------------------------------------------------- | -------------------------------------------------- |
-| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 1,075/1,075 tests, 19,607/19,607 assertions, Linux |
-| Private aggregate, Bare            | `bare test/private-routing.js`                     | 1,031/1,031 tests, 19,474/19,474 assertions, Linux |
-| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 155/155 assertions, Linux                          |
-| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 155/155 assertions, Linux                          |
-| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 155/155 assertions, Linux                          |
-| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 155/155 assertions, Linux                          |
-| Eleven-role scenario, punch Node   | `bash scripts/linux-gates.sh process:node:punch`   | 160/160 assertions, Linux                          |
-| Eleven-role scenario, punch Bare   | `bash scripts/linux-gates.sh process:bare:punch`   | 160/160 assertions, Linux                          |
+| Private aggregate, Node            | `npx brittle-node test/private-routing.js`         | 1,094/1,094 tests, 19,730/19,730 assertions, Linux |
+| Private aggregate, Bare            | `bare test/private-routing.js`                     | 1,049/1,049 tests, 19,595/19,595 assertions, Linux |
+| Eleven-role scenario, Node roles   | `npm run test:private:process:node`                | 175/175 assertions, Linux                          |
+| Eleven-role scenario, Bare roles   | `npm run test:private:process:bare`                | 175/175 assertions, Linux                          |
+| Eleven-role scenario, reverse Node | `bash scripts/linux-gates.sh process:node:reverse` | 175/175 assertions, Linux                          |
+| Eleven-role scenario, reverse Bare | `bash scripts/linux-gates.sh process:bare:reverse` | 175/175 assertions, Linux                          |
+| Eleven-role scenario, punch Node   | `bash scripts/linux-gates.sh process:node:punch`   | 180/180 assertions, Linux                          |
+| Eleven-role scenario, punch Bare   | `bash scripts/linux-gates.sh process:bare:punch`   | 180/180 assertions, Linux                          |
 | Namespace projection enforcement   | `npm run test:private:namespace`                   | 27/27 assertions, privileged Linux                 |
-| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 165/165 assertions; raw DROP 0, classified ICMP 0  |
+| Namespace live route and oracles   | `npm run test:private:namespace:live`              | 185/185 assertions; raw DROP 0                     |
 
 ### Gate 3B1 Task 17 wire-level privacy evidence
 
 `test/private/live-namespace-node.js` runs the same eleven-process scenario with
 every role in its own Linux network namespace, captures IPv4 traffic on every
 veth, and checks the captured UDP bytes plus the independent kernel-drop
-counter. The final full run passes `146/146` with raw DROP zero. KI-16 records
+counter. The `cae9721` full run passes `185/185` with raw DROP zero. KI-16 records
 the approved narrow teardown classification, its three-drop native positive
 probe, and the injected ICMP echo that the gate rejects. Every UDP-specific
 assertion still covers the full capture.
@@ -4180,14 +4243,15 @@ contains exactly one destination, its guard, and no default route, so a datagram
 addressed anywhere else has no path rather than an unenforced prohibition.
 
 The scenario is the full lifecycle, including the failure paths: bootstrap,
-guard pinning, two branches, three exact immutable gets, a silent route-cell
+guard pinning, two branches, routed reads and maximum-size required puts,
+required-mode presence publication/resolution/revocation, a silent route-cell
 blackhole with lookup rotation, suspend and resume, a terminal network change,
 and ordered teardown. What the capture shows across all of it:
 
 | Observed on the wire                                                      | Assertion                                                         |
 | ------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | No datagram crossed a pair the topology forbids                           | `no datagram crosses a pair the topology forbids`                 |
-| The kernel refused nothing, so no role even addressed a forbidden pair    | `the kernel refused no packet between roles`                      |
+| No unexplained kernel drop; raw DROP was zero in this recorded run        | `every kernel drop is a proven native-close ICMP reply`           |
 | The endpoint's only destination, for the entire run, is its guard         | `the endpoint only ever sends to its guard`                       |
 | The endpoint's encoded address never appears inside a cell past its guard | `the endpoint address never travels inside a cell past its guard` |
 | No identity key, route key, MAC key or sentinel appears in any payload    | `no leak marker appears on any edge that carries route cells`     |
@@ -4206,16 +4270,16 @@ This supports a scoped claim and nothing wider. Under the
 any single guard, middle, exit or storage node may be malicious, these
 [protected properties](private-routing-v1.md#protected-properties) now have
 packet-level evidence: the endpoint has no direct send authority after
-readiness, no failure path produces direct fallback, and private-capable peers
-do not learn one another's addresses. The remaining protected properties are
-semantic and stay covered by the deterministic suites, not by capture.
+readiness, no failure path produces direct fallback, and the endpoint address
+does not travel beyond its guard. This scenario has no application peer
+streams, so it does not prove address privacy between application peers.
 
 What this is still not. Every v1
 [out-of-scope](private-routing-v1.md#out-of-scope-for-v1) item is untouched: a
 global passive observer, timing correlation by colluding guards and exits, Sybil
-resistance, and query privacy from exits. Uniform cell size removes length as a
-correlator, but the capture records timing and packet counts per edge, and
-nothing in this gate pads, batches, or adds cover traffic. An adversary watching
+resistance, and query privacy from exits. Uniform outer cell size does not hide
+timing, packet counts, or operation-specific request/reply signatures, and
+nothing in this gate pads to a constant rate, mixes, or adds cover traffic. An adversary watching
 two edges can still correlate them. That is tracked as
 [KI-1](#ki-1-routes-are-correlatable-by-timing-and-volume): a v1 design boundary
 accepted on purpose, not a test gap, and the reason this remains an
@@ -4249,17 +4313,22 @@ The following files were authored in this fork and were not migrated from the pr
 
 The Gate 3A fake authority and traversal modules remain deterministic
 conformance scaffolding and are not authorized as substitutes for the
-package-private Gate 3B1 live owners. Gate 3B1 through Task 17 now includes M3
-context derivation, authenticated adjacent links, tail/final-exit state,
-guard pinning, separate lookup/announce routes, quotas, branch rotation,
-teardown, immutable-get request/reply encoding, provenance-qualified DHT-exit
-destinations, generation invalidation, and native DHT-exit socket ownership.
+package-private Gate 3B1 live owners. Gate 3B1 and the later C/D/put slices
+include M3 context derivation, authenticated adjacent links, tail/final-exit
+state, guard pinning, separate lookup/announce routes, quotas, branch rotation,
+teardown, immutable/mutable get and put, required SURB replies, blinded presence,
+provenance-qualified DHT-exit destinations, generation invalidation, and native
+DHT-exit socket ownership.
 
 The remaining deferred scope is explicit:
 
 - traffic-analysis defences: padding to a constant rate, batching, and cover
   traffic, tracked as
   [KI-1](#ki-1-routes-are-correlatable-by-timing-and-volume);
+- peer streams, a separately reviewed wire design;
+- KI-4's cross-host guard-offer time contract and independent remote lifecycle
+  evidence under owner-approved dispatch;
+- external cryptographic review and public required-mode approval;
 - root public required-mode integration, Hyperswarm, mobile, and PearTube
   integration.
 
@@ -4295,12 +4364,13 @@ The complete Gate 3B series must implement and verify all of the following:
 Delivery Gate 3 remains open until every one of these ten items passes fork-native CI. Gate 3A completion alone does not authorize a public private-routing mode or an anonymity claim.
 
 [Gate 3B1](superpowers/specs/2026-07-18-private-routing-gate-3b1-live-immutable-get-design.md)
-is authorized as the first live vertical slice. It covers signed relay
-advertisements, bounded numeric bootstrap, stable guard pinning, separate live
-lookup/announce branches, adjacent authenticated links, endpoint-to-exit
-authentication, immutable-get request/reply codecs, provenance-qualified DHT
-destinations, generation invalidation, Node/Bare multi-process integration, and
-the privileged packet/semantic leak oracles. The announce branch is constructed
-but carries no DHT mutation in that slice. Remaining DHT commands, private
-presence, public required mode, peer streams, Hyperswarm, and mobile device
-evidence remain disabled for later separately reviewed sub-gates.
+was the first live vertical slice: signed relay advertisements, bounded numeric
+bootstrap, guard pinning, separate lookup/announce branches, authenticated
+adjacent links, endpoint-to-exit authentication, immutable-get codecs,
+provenance-qualified destinations, generation invalidation, Node/Bare process
+integration, and packet/semantic leak oracles. Its original announce branch
+carried no mutation. Subsequent slices added immutable/mutable get and put,
+experimental required SURB replies, and Gate D blinded presence including
+publication and revocation. Public required mode, peer streams, Hyperswarm,
+and mobile-device integration remain gated; see
+[Current implementation](#current-implementation).

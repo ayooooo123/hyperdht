@@ -1,6 +1,6 @@
 # Native Private Routing Gates 1–2 Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical execution plan.** Retained as provenance for the original fork-baseline and transport-seam work. The unchecked boxes and execution paths below describe that plan, not the current work queue. See the [baseline evidence](../../private-routing-baseline.md) and [current implementation and open gates](../../private-routing-migration.md#current-implementation).
 
 **Goal:** Establish reproducible private-routing fork baselines and add the generic, fail-closed request-transport seam to DHT-RPC without changing direct-mode behavior.
 

@@ -1,6 +1,6 @@
 # Private Routing Gate 3A Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents are available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical execution plan.** Gate 3A's substrate is implemented; the original checkboxes and execution paths below are retained as provenance, not current tasks. Live routing and later DHT/SURB/presence work are recorded under [current implementation and open gates](../../private-routing-migration.md#current-implementation).
 
 **Goal:** Migrate the verified fixed-cell and typed routed-DHT substrate into the HyperDHT fork and prove an internal `RoutedDHTIO` adapter can drive DHT-RPC's transport-only traversal without creating direct network authority.
 

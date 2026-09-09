@@ -1,16 +1,25 @@
 # HyperDHT Private Routing Gate 3B1: Live Routed Immutable Get
 
-**Status:** Approved design draft. The owner-approved Task 5 authenticated-M3 transport amendment incorporated on 2026-07-29 awaits owner review of this written repository revision.
+**Status (2026-07-29 design revision):** Approved design draft. The owner-approved Task 5 authenticated-M3 transport amendment incorporated on that date was recorded as awaiting owner review of this written repository revision.
 
 **Date:** 2026-07-18
 
 **Canonical protocol:** [Private Routing Protocol v1](../../private-routing-v1.md)
 
-**Migration boundary:** [Gate 3A Migration Record](../../private-routing-migration.md)
+**Migration record:** [Private Routing Implementation and Migration Record](../../private-routing-migration.md)
 
 **Implementation repository:** `ayooooo123/hyperdht`, branch `private-routing-v1`
 
 **Runtime targets:** Node and Bare
+
+**Implementation scope:** the original Gate 3B1 slice through Task 17 is
+implemented. Its immutable-get-only boundaries below describe that milestone,
+not the current command set. Later slices added immutable/mutable puts and
+gets, experimental required SURB replies, and blinded presence
+publication/resolution/revocation. See the
+[current implementation and open gates](../../private-routing-migration.md#current-implementation);
+peer streams and public required mode remain gated. This status update does not
+ratify new protocol bytes or replace external cryptographic review.
 
 ## Summary
 

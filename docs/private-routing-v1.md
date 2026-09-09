@@ -1,20 +1,29 @@
 # Native Private Routing v1
 
-**Status:** owner-approved experimental design  
+**Status:** owner-approved experimental design; public API and peer-stream sections are design targets, not shipped interfaces
 **Date:** 2026-07-16  
 **Canonical repository:** `ayooooo123/hyperdht`  
 **Related forks:** `ayooooo123/dht-rpc`, `ayooooo123/hyperswarm`,
 `ayooooo123/hyperswarm-testnet`
 
+**Implementation status (2026-09-09):** the package-private live route supports
+immutable/mutable get and put, experimental required SURB replies, and Gate D
+blinded presence publication/resolution/revocation. Direct mode is still the
+only public behavior. Peer streams, legacy-peer egress, and public private-routing
+constructors are not implemented. The July design targets below do not enable
+them. Later decisions D10–D12 select blinded presence over mutable records and
+reject routed public `lookup`, `findPeer`, `announce`, `unannounce`, and raw
+`query`. See [current implementation and open gates](private-routing-migration.md#current-implementation)
+for accepted scope and verification; external cryptographic review remains open.
+
 ## Summary
 
-Native Private Routing adds an opt-in, fail-closed routing mode to the
-Holepunch stack. A private endpoint sends DHT operations and peer streams
-through short, independently selected relay paths instead of exposing its
-network address to DHT nodes or peers. Existing Hyperswarm Noise and
-SecretStream encryption remains end to end between the actual peers. Relays
-forward fixed-size authenticated cells and do not terminate the peer's Noise
-session.
+This design targets opt-in, fail-closed routing in the Holepunch stack. DHT
+operations use short, independently selected relay branches rather than a
+direct endpoint-to-DHT path. The proposed peer-stream layer would preserve
+Hyperswarm Noise/SecretStream encryption end to end; relays would forward
+fixed-size authenticated cells without terminating the peer's Noise session.
+The package-private DHT path is implemented; peer-stream integration is not.
 
 The feature is developed in drop-in-compatible forks before any PearTube
 integration. Existing constructors, exports, package names, and direct-mode
@@ -94,7 +103,7 @@ metadata. None of these parties can decrypt a later peer-to-peer Noise stream.
 - The guard sees the endpoint address and its next hop.
 - An exit sees the routed DHT operation or the legacy peer it contacts.
 - Adjacent relays see timing, packet count, and volume.
-- DHT storage nodes see stored record keys and bounded descriptor bytes.
+- DHT storage nodes see mutable-record storage keys and opaque encrypted Gate D record bytes; record/query timing and volume remain visible.
 - A destination peer sees the remote Noise identity and plaintext delivered to
   the destination application.
 
@@ -215,6 +224,11 @@ is exposed until all low-level gates in this document pass.
 
 ## Public API
 
+Only the direct-mode examples below are available through public constructors.
+The `privacy`, `privateRouting`, and `privateRelay` examples are retained design
+targets, **not runnable privacy configuration**. No public option enables the
+package-private implementation or makes the deferred peer/egress flows available.
+
 Direct mode remains unchanged:
 
 ```js
@@ -222,7 +236,7 @@ const dht = new HyperDHT()
 const swarm = new Hyperswarm()
 ```
 
-Private routing may be enabled at the Hyperswarm level:
+Proposed Hyperswarm-level configuration (not implemented):
 
 ```js
 const swarm = new Hyperswarm({
@@ -236,7 +250,7 @@ const swarm = new Hyperswarm({
 await swarm.dht.ready()
 ```
 
-The lower-level equivalent is:
+Proposed lower-level equivalent (not implemented):
 
 ```js
 const dht = new HyperDHT({
@@ -284,27 +298,32 @@ service implicitly.
 
 ### Required-mode method contract
 
-| Surface                                                         | `required` behavior                                                                                                                          |
-| --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ready()`                                                       | Waits for private readiness, not merely socket binding. Rejects if no valid guard and routes are available.                                  |
-| `destroy()`, `suspend()`, `resume()`                            | Use the private lifecycle and erase or rebuild route authority without direct fallback.                                                      |
-| `lookup`, `announce`, `unannounce`                              | Use native address-free private presence records only.                                                                                       |
-| `immutableGet`, `immutablePut`, `mutableGet`, `mutablePut`      | Use typed routed DHT requests; mutation prepare and commit remain on one branch generation and exit.                                         |
-| `findPeer`                                                      | Returns verified private descriptors or opaque legacy-egress targets, never caller-dialable private addresses.                               |
-| `connect`                                                       | Uses a verified private descriptor, or an opaque legacy-egress target when explicitly allowed.                                               |
-| `createServer`, `listen`                                        | Maintain and publish private route descriptors; never advertise or accept a direct endpoint route.                                           |
-| `pool`, raw streams                                             | May use only a routed implementation that carries no direct address/send authority; otherwise reject with `ERR_PRIVATE_COMMAND_UNSUPPORTED`. |
-| raw `query` or unregistered commands                            | Reject unless an immutable private command policy defines codecs, bounds, cost, amplification, destination provenance, and branch class.     |
-| Hyperswarm `join`, `joinPeer`, `flush`                          | Preserve current lifecycle semantics while discovery and connection attempts remain routed.                                                  |
-| Hyperswarm `leave`, `leavePeer`, `suspend`, `resume`, `destroy` | Cancel and tear down private work with the same externally visible completion semantics as direct mode.                                      |
+The implemented package-private DHT/presence scope follows D10–D12. Peer and
+Hyperswarm rows below are deferred consumer contracts, not available methods
+on a public required-mode controller.
+
+| Surface                                                         | `required` behavior                                                                                                                                  |
+| --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ready()`                                                       | Waits for private readiness, not merely socket binding. Rejects if no valid guard and routes are available.                                          |
+| `destroy()`, `suspend()`, `resume()`                            | Use the private lifecycle and erase or rebuild route authority without direct fallback.                                                              |
+| `lookup`, `announce`, `unannounce`                              | Unsupported as routed public-DHT commands in v1. Use the package-private Gate D presence client over mutable records, not aliases for these methods. |
+| `immutableGet`, `immutablePut`, `mutableGet`, `mutablePut`      | Use typed routed DHT requests; mutation prepare and commit remain on one branch generation and exit.                                                 |
+| `findPeer`                                                      | Unsupported in v1; presence resolution is a separate client operation. A routed public-DHT read needs a versioned wire decision.                     |
+| `connect`                                                       | Deferred peer-stream design: a verified private descriptor must never grant a direct endpoint dial.                                                  |
+| `createServer`, `listen`                                        | Deferred peer-stream design: maintain private route descriptors without advertising or accepting a direct endpoint route.                            |
+| `pool`, raw streams                                             | May use only a routed implementation that carries no direct address/send authority; otherwise reject with `ERR_PRIVATE_COMMAND_UNSUPPORTED`.         |
+| raw `query` or unregistered commands                            | Unsupported in v1. Adding a routed command requires a reviewed, versioned registry change, not an untyped exit escape hatch.                         |
+| Hyperswarm `join`, `joinPeer`, `flush`                          | Deferred consumer contract: preserve lifecycle semantics while discovery and connection attempts remain routed.                                      |
+| Hyperswarm `leave`, `leavePeer`, `suspend`, `resume`, `destroy` | Deferred consumer contract: cancel and tear down private work with direct-mode completion semantics.                                                 |
 
 Existing firewall callbacks execute at the actual endpoint against the remote
 Noise public key and payload, not against an exit identity. Cancellation,
 timeout, half-close, error, and teardown propagate through the route and retain
 their ordinary stream meaning.
 
-`dht.privateRouting` exposes a read-only controller with `mode`, `ready()`,
-`status()`, and `exposureReport()`. The report contains only bounded bootstrap
+The proposed public `dht.privateRouting` property would expose a read-only
+controller with `mode`, `ready()`, `status()`, and `exposureReport()`. It is not
+present in this fork's public API. The report contains only bounded bootstrap
 contact categories, counts, timestamps, and redacted endpoint hashes; it never
 contains route keys or complete paths. Stable private errors include
 `ERR_PRIVACY_UNAVAILABLE`, `ERR_PRIVATE_GUARD_UNAVAILABLE`,
@@ -691,7 +710,7 @@ routed packet, which namespace edges alone cannot prove absent.
 
 ### Private DHT
 
-- Lookup, announce, unannounce, mutable and immutable get/put.
+- Typed immutable/mutable get and put, plus blinded presence publish/resolve/revoke over mutable records; no routed public `lookup`/`announce`/`unannounce`.
 - Client-controlled iterative traversal through typed exit requests.
 - Separate lookup and announce exits.
 - No ordinary DHT send after readiness.
@@ -773,6 +792,12 @@ for possible upstream pull requests. Fork-specific protocol changes retain
 experimental notices and their upstream license and authorship.
 
 ## Delivery Gates
+
+This is the original cross-repository delivery plan, not a current checklist.
+Later scope decisions and implementation evidence are tracked in the
+[migration record](private-routing-migration.md#current-implementation).
+Legacy-egress, peer-stream, and consumer entries below do not authorize a new
+implementation or public API merely because the DHT slice now passes its gates.
 
 1. **Fork baseline:** fork `hyperswarm-testnet`, create feature branches, and
    reproduce all unchanged upstream tests.

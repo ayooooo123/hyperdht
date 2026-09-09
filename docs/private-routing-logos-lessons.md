@@ -1,6 +1,6 @@
 # Private Routing: Lessons from the Logos Networking Stack
 
-**Status:** research notes / candidate gate items (not owner-approved)
+**Status:** research rationale with current gate status; C/D are implemented experimentally, A is dropped, B is deferred; external cryptographic review remains open
 **Date:** 2026-08-10
 **Relates to:** [`private-routing-v1.md`](./private-routing-v1.md), specifically its
 `Security Contract → Out of scope for v1` and `Active-relay adversary` sections.
@@ -10,11 +10,10 @@
 Our v1 is a low-latency onion-**circuit** design in the Tor family: pinned guard,
 3-hop path (guard → safety relay → DHT exit), fixed 1,200-byte padded cells,
 XChaCha20-Poly1305 with independent keys per direction/class/circuit/generation,
-signed relay-capability advertisements, legacy-egress exits, and a fail-closed
-`required` mode. Several mixnet lessons are **already absorbed**: fixed-size padded
-cells, layered inner AEAD (source→exit and source→destination) so no intermediate
-sees non-terminal plaintext, and route-identity/route-key separation from the stable
-Noise identity.
+signed relay-capability advertisements, and a package-private fail-closed routing
+mode. Fixed-size cells, source-to-exit inner AEAD, and route-key separation are
+implemented. Peer streams and legacy-peer egress remain unimplemented design
+targets, not properties established by these research notes.
 
 What v1 deliberately puts **out of scope** is almost exactly the problem the Logos
 networking stack (Waku-lineage libp2p mixnet + RLN) exists to solve:
@@ -32,10 +31,10 @@ Nym/Loopix and Tor v3 onion services are the upstream academic sources. Note:
 `vacp2p/zerokit` / `logos-co/mix-rln-spam-protection-plugin` (RLN) are **not** used — see
 Gate A below for why RLN is rejected.
 
-The items below kept their original value-to-disruption ordering, but that ordering was
-**revised once the deployment was pinned** as a closed hyperdht peer network with no exit
-(see each gate's status): **A is dropped**, **C is optional**, **D** and **B** remain
-forward-looking.
+The original value-to-disruption ordering is superseded. **A is dropped**;
+**C and D are implemented experimentally**; **B remains deferred**. The bounded
+DHT request-exit role exists, but it is not a generic VPN or legacy-peer egress.
+See [current implementation and open gates](private-routing-migration.md#current-implementation).
 
 ---
 
@@ -44,14 +43,12 @@ forward-looking.
 Superseded by the decision record:
 [`superpowers/specs/2026-08-10-private-routing-admission-analysis-note.md`](./superpowers/specs/2026-08-10-private-routing-admission-analysis-note.md).
 
-Short version: this protocol keeps everything inside the hyperdht peer network — there is
-no exit (that would be a separate VPN-service protocol). Admission control protects an
-exit; with none, the only abuse is volunteer-relay resource exhaustion, already bounded by
-`relay-service.js` quotas (global `MAX_RELAY_CIRCUITS`, per-neighbor cap, queue bytes;
-Sybil churn cycles slots but cannot exceed the ceiling). RLN was rejected regardless — it
-needs a zk-SNARK dependency (cannot be hand-rolled safely) and a replicated all-member
-Merkle tree (Autobase scales badly for many writers). VOPRF tokens were the no-dependency
-fallback but only protect an exit, so they are unnecessary here.
+No RLN or VOPRF admission mechanism is added. The implemented slice has bounded
+DHT request-exit operations, not arbitrary third-party proxying. Relay resource
+use is bounded by circuit and queue quotas; those limits do not eliminate Sybil
+churn or denial of service. The rejected admission proposals and their dependency
+costs remain recorded in the linked decision. Gate A is not a prerequisite for
+the deferred mixing research.
 
 ---
 
@@ -66,9 +63,10 @@ contexts, so the structure exists. This begins eroding guard↔exit timing corre
 without touching stream latency or forcing constant-rate cover on mobile (which v1
 explicitly refuses).
 
-**Where it lands.** Per-class scheduling policy in the cell scheduler; cover-traffic
-generation as a relay/endpoint policy knob defaulted off on mobile. Pairs naturally with
-**C** (SURBs make DATAGRAM responses timing-decoupled, which is what mixing needs).
+**Possible future integration.** A separately reviewed per-class scheduling and
+cover-traffic policy. Current Gate C replies use the existing reverse relays
+and route/query deadlines; SURBs alone do not provide independent routing,
+timing decoupling, or a mixing scheduler.
 
 **Risk.** This is the expensive, research-grade property. Treat as a later gate; do not
 let it bleed into the STREAM fast path. Note the CDN corollary: bulk data must never ride
@@ -78,22 +76,18 @@ the mix — mix the signaling, not the payload.
 
 ## C. SURBs (single-use reply blocks) — receiver-anonymous replies for DATAGRAM
 
-**Gap / clarification.** Connection-oriented receiver privacy is **already largely
-handled**: the bidirectional STREAM circuit carries replies back down the established
-route (per-direction keys), and `opaque-destination.js` / `destination-ref.js` /
-`redacted-responder-proof.js` / the private-responder tail-extension keep `connect` from
-leaking the destination's network address. That is a sound rendezvous-style design for
-streams. The residual reply-path gap is the **`DATAGRAM`** class — one-shot DHT-exit
-responses that have no standing circuit.
+**Implemented scope.** Gate C provides single-use replies for the package-private
+DHT get/put path, including Gate D publication and revocation. The initiator
+supplies a bounded SURB batch in an authenticated V2 request; each reply fragment
+uses a different SURB. Relays peel locally, and physical carriage remains
+link-sealed in fixed-size cells.
 
-**Borrow.** Nym/Sphinx **single-use reply blocks**: the responder attaches a SURB so a
-reply can be routed back without either side learning the other's location and without
-holding a circuit open. This decouples request/response timing (enabling **B**) and gives
-true receiver-anonymous one-shot responses.
-
-**Where it lands.** DATAGRAM reply path alongside `dht-exit-io.js` /
-`dht-exit-destination-table.js`; SURB construction bound into the existing
-source→destination inner AEAD context so a relay still cannot read or substitute it.
+The default reply path remains correlated. Explicit `SURB_REQUIRED` is gated by
+`experimentalSurbReplies: true` and never falls back to correlated replies.
+Current SURBs reuse the route's reverse relays and shared operation lifetime;
+they do not survive arbitrary forward-route teardown, add cover traffic, or
+prove general receiver anonymity. Private-peer DATAGRAMs and peer streams still
+need their own reviewed implementation.
 
 **Risk.** SURB key/epoch management; replay window interaction with the existing bounded
 64-counter DATAGRAM window. Keep SURBs single-use and epoch-bound to match current
@@ -103,24 +97,22 @@ teardown semantics.
 
 ## D. Tor-v3 blinded, epoch-rotating descriptor keys — enumeration resistance
 
-**Gap (forward-looking).** v1 admits "DHT storage nodes see stored record keys and
-bounded descriptor bytes." Route material rotates by `epoch` throughout the code, but a
-grep of `lib/private` for `blind` returns **zero hits** — there is no key-_blinding_
-primitive, only rotation. Private presence records are also not implemented at the
-current gate (Gate 3B1 is route construction), so this is guidance for when the
-`lookup`/`announce` private-presence path lands, not a present defect.
+**Implemented scope.** `lib/private/blinded-presence.js` supplies per-period key
+derivation, blinded signing, encrypted fixed-size records, and tombstones;
+`lib/private/presence-client.js` publishes, resolves, and revokes them through
+mutable DHT records. Native scalar multiplication is supplied by the pinned
+sodium-native fork, not JavaScript arithmetic.
 
-**Borrow.** Tor v3 onion-service **blinded public keys**: per-time-period key derivation
-so the storage node can hold and serve a descriptor it cannot enumerate or link across
-epochs or back to a stable identity. Rotation alone is insufficient — without blinding, a
-storage node can still correlate successive records of the same private service.
+**Borrow.** Tor v3-style blinded public keys avoid publishing the stable identity
+as the storage identifier. A separate reader credential protects the descriptor
+body. A party that already knows the stable identity can derive its period keys;
+blinding does not hide timing, volume, or that known-identity linkage.
 
-**Where it lands.** Presence-record key derivation when that gate is designed; extend the
-existing `crypto_generichash` domain-separated derivation with a per-epoch blinding factor
-over the destination's stable key. Verify against the presence-record gate before
-treating this as a required item.
-
-**Risk.** Low now (component unbuilt); design it in rather than retrofit.
+**Verification and risk.** Required-mode publication and revocation are proven
+on the live gate, including resolution to authenticated absence after a newer
+tombstone. External cryptographic review remains open. The
+[presence note](superpowers/specs/2026-08-10-private-routing-blinded-presence-keys-note.md)
+distinguishes the original derivation sketch from the accepted record transcript.
 
 ---
 
@@ -134,10 +126,11 @@ treating this as a required item.
 
 ## Suggested sequencing
 
-1. **A (RLN admission)** — closes a real abuse hole that bites the moment relays are
-   public; scoped, additive to existing advertisements/quotas.
-2. **C (DATAGRAM SURBs)** — completes receiver/reply-path privacy where the circuit model
-   doesn't already cover it.
-3. **D (blinded descriptors)** — fold into the presence-record gate design.
-4. **B (scoped mixing + cover)** — later gate; the hard, research-grade property, kept off
-   the STREAM fast path.
+1. **C and D:** implemented experimentally; preserve their external cryptographic
+   review and public-mode gates rather than reimplementing the old candidates.
+2. **Peer streams and consumer integration:** separately reviewed designs and
+   end-to-end evidence are still required.
+3. **B (scoped mixing + cover):** deferred research; not enabled by C/D alone and
+   never part of the STREAM fast path.
+
+**A remains dropped.** It is not a step in the current sequence.
