@@ -206,10 +206,23 @@ function provisionNamespaceProjection(namespace, options = {}) {
   const captures = new Map()
   let live = true
   let chained = false
+  let firewallSample = 0
+
+  function firewallStatistics() {
+    const listing = run(['iptables', '-L', names.chain, '-v', '-n', '-x'])
+    fs.writeFileSync(path.join(captureDir, `firewall-${firewallSample++}.txt`), listing)
+    return listing
+  }
 
   function teardown() {
     if (!live) return false
     live = false
+    // Preserve per-rule counts even when the scenario failed before its audit.
+    try {
+      if (chained) firewallStatistics()
+    } catch {
+      // Diagnostic failure must not prevent namespace/process cleanup.
+    }
     for (const capture of captures.values()) stopCapture(capture)
     if (chained) {
       tolerate(['iptables', '-D', 'FORWARD', '-j', names.chain])
@@ -235,18 +248,25 @@ function provisionNamespaceProjection(namespace, options = {}) {
   function stopCapture(capture) {
     if (capture.stopped) return
     capture.stopped = true
-    tolerate(['sh', '-c', `kill -INT $(cat ${capture.pidFile}) 2>/dev/null`])
-    // tcpdump flushes and closes its savefile on SIGINT; give it a bounded
-    // moment so the pcap is complete before any reader opens it.
+    if (!fs.existsSync(capture.exitFile)) {
+      tolerate(['sh', '-c', 'kill -INT "$(cat "$1")" 2>/dev/null', 'capture', capture.pidFile])
+    }
+    // The detached waiter records tcpdump's real exit status after it flushes.
     const deadline = Date.now() + 3000
-    while (Date.now() < deadline) {
-      const running = tolerate(['sh', '-c', `kill -0 $(cat ${capture.pidFile}) 2>/dev/null`])
-      if (running === null) break
+    while (!fs.existsSync(capture.exitFile) && Date.now() < deadline) {
       execFileSync('sleep', ['0.05'])
     }
-    tolerate(['sh', '-c', `kill -KILL $(cat ${capture.pidFile}) 2>/dev/null`])
+    const forcedKill = !fs.existsSync(capture.exitFile)
+    if (forcedKill) {
+      tolerate(['sh', '-c', 'kill -KILL "$(cat "$1")" 2>/dev/null', 'capture', capture.pidFile])
+    }
     tolerate(['rm', '-f', capture.pidFile])
-    tolerate(['chmod', '0644', capture.file])
+    tolerate(['chmod', '0644', capture.file, capture.logFile])
+    try {
+      fs.writeFileSync(capture.shutdownFile, JSON.stringify({ forcedKill }))
+    } catch {
+      // Retention failure must not strand the remaining capture processes.
+    }
   }
 
   try {
@@ -293,7 +313,7 @@ function provisionNamespaceProjection(namespace, options = {}) {
     // attempts a forbidden pair, so this is an independent leak signal that
     // does not depend on reading any capture.
     dropStatistics() {
-      const listing = run(['iptables', '-L', names.chain, '-v', '-n', '-x'])
+      const listing = firewallStatistics()
       let packets = 0
       for (const line of String(listing).split('\n')) {
         const fields = line.trim().split(/\s+/)
@@ -326,18 +346,29 @@ function provisionNamespaceProjection(namespace, options = {}) {
         if (captures.has(endpoint.key)) continue
         const file = path.join(captureDir, `${endpoint.key}.pcap`)
         const pidFile = path.join(captureDir, `${endpoint.key}.pid`)
+        const logFile = path.join(captureDir, `${endpoint.key}.tcpdump.log`)
+        const exitFile = path.join(captureDir, `${endpoint.key}.tcpdump.exit`)
+        const shutdownFile = path.join(captureDir, `${endpoint.key}.shutdown.json`)
         run([
           'sh',
           '-c',
-          // tcpdump is the only capture path available; -U keeps the savefile
-          // current so an interrupted run still yields complete records.
-          // stdio must be detached: execFileSync waits for the inherited pipes
-          // to close, and a backgrounded tcpdump never closes them.
-          `tcpdump -i ${endpoint.rootDevice} -s 0 -U -n -w ${file} ip </dev/null >/dev/null 2>&1 & echo $! > ${pidFile}`
+          // Detach the waiter too: execFileSync must not inherit its pipes.
+          // The pid file names tcpdump, not the waiter; SIGINT flushes the pcap
+          // and writes packet-loss statistics before wait records its status.
+          '(tcpdump -i "$1" -s 0 -U -n -w "$2" ip 2>"$4" & pid=$!; printf "%s\\n" "$pid" >"$3"; wait "$pid"; printf "%s\\n" "$?" >"$5") </dev/null >/dev/null 2>&1 &',
+          'capture',
+          endpoint.rootDevice,
+          file,
+          pidFile,
+          logFile,
+          exitFile
         ])
         captures.set(endpoint.key, {
           file,
           pidFile,
+          logFile,
+          exitFile,
+          shutdownFile,
           rootDevice: endpoint.rootDevice,
           stopped: false
         })

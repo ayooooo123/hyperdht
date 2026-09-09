@@ -93,5 +93,9 @@ jobs:
           path: |
             /tmp/pr-capture-*/*.pcap
             /tmp/pr-capture-*/*.close.json
+            /tmp/pr-capture-*/firewall-*.txt
+            /tmp/pr-capture-*/*.tcpdump.log
+            /tmp/pr-capture-*/*.tcpdump.exit
+            /tmp/pr-capture-*/*.shutdown.json
           if-no-files-found: ignore
           retention-days: 7
