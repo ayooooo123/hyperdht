@@ -1272,27 +1272,72 @@ reads without the role's stream. One of the two approved `-l 2` runs for this
 question was used; the log `/tmp/hyperdht-live-route-p11.log` holds the
 operator host's address and may be deleted by JD.
 
-**Gate 3B remainder.** The message IDs `0x0280–0x02a3` carry only size
-bounds in `protocol.js`, `routed-dht.js` and `exit-policy.js`; no body
-layout for the presence record, tombstone, lookup response, write token,
-write receipt, lookup, prepare, announce or unannounce bodies exists in the
-tree, and `parseExitCommandBody` admits the four record commands only. The
-routed `findPeer`, `lookup`, `announce`, `unannounce` and raw `query`
-commands, the required-mode `lookup`/`announce` mapping onto presence
-records, peer streams and the public required-mode gate therefore start with
-a wire body decision, which remains JD's. A design packet with a recommended
-layout derived from the fixed size bounds is the next artifact; no build was
-dispatched on an unapproved wire.
+**Gate 3B remainder: the bytes exist, and a decision was taken.** The
+message IDs `0x0280–0x02a3` (and the storage carrier `0x0050–0x0054`) are
+fully specified in the owner-approved M3 wire registry of the reviewed
+prototype (`ayooooo123/peartube` at `0305df915b6a…`, approved 2026-07-15).
+That file was referenced by the Gate 3B1 design at
+`docs/superpowers/specs/2026-07-14-native-dht-private-routing-m3-wire-registry.md`
+but was never ported; it is now in the tree verbatim (SHA-256 prefix
+`d9117d1438308446`). Its private-storage overlay (§11) signs
+`PRIVATE_PRESENCE_RECORD_V1` under the endpoint's stable Ed25519 key with
+the plaintext `topic` on the wire, stored at `hash(topic)` on
+`PRIVATE_RECORDS_V1` storage nodes reached through a signed exit storage
+session, with a five-identity quorum. Gate D (owner-approved 2026-09-06)
+replaced exactly that exposure: records are addressed by a per-period
+blinded key, the body is opaque to storage, and no stable identity or
+topic is on the wire. JD asked for the decision to be made for the goal of
+the strongest achievable anonymity; the seat decides, recorded for JD to
+overrule:
+
+- **D10.** Gate D blinded records over the DHT mutable-record commands are
+  the presence wire. The registry's `0x0280–0x02a3` objects and commands
+  and the `0x0050–0x0054` storage session are superseded for presence and
+  stay reserved and rejected (the nine-command exit-origin policy digest is
+  unchanged); `PRIVATE_RECORDS_V1` stays unused. Reason: the overlay
+  exposes the stable identity and the topic to every storage node and the
+  exit; Gate D exposes neither.
+- **D11.** No routed public `announce` / `unannounce`: they publish a
+  signed, linkable public key through the exit, which is the opposite of
+  the goal. No routed public `lookup` / `findPeer` / raw `query` in
+  protocol v1 either: they are outside the registry's nine-command
+  inventory ("commands outside the nine-entry inventory fail closed"), so
+  adding them is a protocol-version change, and the exit would learn the
+  topic. Consumers discover each other through Gate D presence resolved
+  over the route; a later public-DHT read command needs a versioned wire
+  decision from JD.
+- **D12.** Presence reads run in required SURB reply mode
+  (`createPresenceClient({ …, replyMode: 'SURB_REQUIRED' })`, threaded to
+  `controller.mutableGet`), so the resolver's reply never travels the
+  correlated path. Publication and revocation are puts whose replies are
+  correlated acknowledgements; making puts required is the next slice and
+  needs the exit's put path proven under SURB on the live gate.
+
+Landed with the decision: the eleven-role scenario now publishes a blinded
+presence record from the endpoint (one mutable put per publication period,
+the coordinator's wall time carried in the command so both ends derive the
+same periods; the DHT storage oracle admits exactly the blinded targets) and
+resolves it back in `SURB_REQUIRED` mode with the exact descriptor at
+revision 1 and a grown hop-cell count on the lookup exit
+(`presence-publish` / `presence-resolve` commands, `presence-published` /
+`presence-state` events, bounded and validated like the record commands).
+Process legs now pass **162** assertions each. Peer streams (Noise streams
+through the route) and the public required-mode gate remain design gates:
+the first needs its own reviewed design, the second the external
+cryptographic review that every checkpoint here names as open.
 
 **Measurements.** `set -o pipefail; bash scripts/linux-gates.sh all` on the
 final tree with no concurrent edits, all ten gates, exit 0: Node aggregate
-**1,092 tests / 19,692 assertions**; Bare **1,047 / 19,557**; the four
-normal/reverse process legs 155 each; both production-punch legs 160 each;
-namespace projection 27; live namespace capture 165 with kernel raw DROP
-zero. Complete log: `/tmp/hyperdht-review-lane-linux-gates-order.log`.
-The two earlier commits of this checkpoint were measured the same way
-(`5bcf9ac`: 1,091 / 19,687 and 1,046 / 19,552; `b33fbe4`: 1,092 / 19,689
-and 1,047 / 19,554). Whole-repository Prettier passes.
+**1,092 tests / 19,704 assertions**; Bare **1,047 / 19,569**; the four
+normal/reverse process legs **162** each; both production-punch legs
+**167** each; namespace projection 27; live namespace capture **172** with
+kernel raw DROP zero (the presence publish and required-mode resolve run
+inside the namespace capture too). Complete log:
+`/tmp/hyperdht-presence-linux-gates-2.log`. The earlier commits of this
+checkpoint were measured the same way (`5bcf9ac`: 1,091 / 19,687 and
+1,046 / 19,552; `b33fbe4`: 1,092 / 19,689 and 1,047 / 19,554; `f71e8de`:
+1,092 / 19,692 and 1,047 / 19,557, process 155, punch 160, live namespace
+165). Whole-repository Prettier passes.
 
 ### Subagent design handoff — 2026-09-05
 
