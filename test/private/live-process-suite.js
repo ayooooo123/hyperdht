@@ -756,7 +756,9 @@ function registerLiveProcessSuite(launch) {
       // mutable put per publication period) and resolves it back in required SURB
       // reply mode, so the read's reply never travels the correlated path. The
       // coordinator's wall time is sent with both commands so both ends derive the
-      // same periods; the storage oracle admits exactly the blinded targets.
+      // same periods; the storage oracle admits exactly the blinded targets. The
+      // proof is hop cells grew and correlated frames did not, measured on the lookup
+      // exit after the publish.
       const presenceSeed = b4a.alloc(32, 0x7d)
       const presenceReader = b4a.alloc(32, 0x7e)
       const presenceIdentity = cryptoSuite.keyPair(presenceSeed)
@@ -770,7 +772,6 @@ function registerLiveProcessSuite(launch) {
         mutableTargets: presenceKeys.map((key) => cryptoSuite.hash([key])),
         valueDigests: []
       })
-      const presenceSurbBefore = surbExit.surbHopCellCount
       const published = await sendAndWait('endpoint', 'presence-publish', 'presence-published', {
         seed: presenceSeed,
         readerSecret: presenceReader,
@@ -784,6 +785,7 @@ function registerLiveProcessSuite(launch) {
         presenceKeys.slice().sort((left, right) => b4a.compare(left, right)),
         'the endpoint published under exactly the blinded keys of the publication periods'
       )
+      const presenceBaseline = (await routingSnapshots()).get(surbRouting.lookupPair.exitRole)
       const resolved = await sendAndWait('endpoint', 'presence-resolve', 'presence-state', {
         identityPublicKey: presenceIdentity.publicKey,
         readerSecret: presenceReader,
@@ -802,8 +804,13 @@ function registerLiveProcessSuite(launch) {
       const presenceRoutingAfter = await routingSnapshots()
       const presenceExit = presenceRoutingAfter.get(surbRouting.lookupPair.exitRole)
       t.ok(
-        presenceExit.surbHopCellCount > presenceSurbBefore,
+        presenceExit.surbHopCellCount > presenceBaseline.surbHopCellCount,
         'the presence read was answered over the SURB path'
+      )
+      t.is(
+        presenceExit.correlatedFrameCount,
+        presenceBaseline.correlatedFrameCount,
+        'the presence read adds no correlated reverse frame on the lookup exit'
       )
 
       if (productionEndpointPunch) {
