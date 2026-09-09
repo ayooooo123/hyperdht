@@ -879,9 +879,11 @@ test('a failing wall clock at terminal admission leaves the open authority revoc
     replyBinding: binding,
     now: NOW
   })
+  let wallReads = 0
   const table = createSurbTerminalAdmission({
     now: () => 1n,
     wallNow: () => {
+      wallReads++
       throw new Error('wall clock unavailable')
     },
     localDeadline: 10n
@@ -894,10 +896,22 @@ test('a failing wall clock at terminal admission leaves the open authority revoc
     batchId: b4a.alloc(16, 2)
   })
   const sealed = sealSurbReply({ descriptor, replyBinding: binding, plaintext: b4a.alloc(4, 9) })
+  // An unknown handle is answered without reading the clock and without touching
+  // the table: the known entry is still admissible afterwards.
+  t.is(
+    admitSurbTerminalPayload(table, {
+      terminalHandle: b4a.alloc(32, 0x78),
+      payload: sealed.payload
+    }),
+    null,
+    'unknown handle is null'
+  )
+  t.is(wallReads, 0, 'unknown handle reads no clock')
   expectCode(
     t,
     () => admitSurbTerminalPayload(table, { terminalHandle: terminal, payload: sealed.payload }),
     'INVALID_ROUTE'
   )
+  t.is(wallReads, 1, 'the known handle read the clock once')
   t.absent(revokeSurbOpenAuthority(openAuthority), 'the open authority was revoked with the table')
 })
