@@ -54,8 +54,10 @@ const {
   blackholeRouteCells,
   createGuardProcessService,
   createProjectedCellEndpoint,
-  createProjectedLinkService
+  createProjectedLinkService,
+  createRelaySurbPeelAuthority
 } = require('./wire-services')
+const { destroySurbCapabilityAuthority } = require('../../../lib/private/surb')
 
 const UDX_VERSION = require('udx-native/package.json').version
 const CODEC_VECTOR_DIGEST = b4a.from(CODEC_VECTOR_DIGEST_HEX, 'hex')
@@ -94,6 +96,9 @@ let incomingActorPromise = null
 let incomingRearmHandle = null
 let rearming = false
 const roleActors = new Set()
+// Middle roles peel SURB hops. One authority per process: its nullifier store must
+// span every circuit this relay serves on its route key, not one facade install.
+let surbPeelAuthority = null
 let finalExitService = null
 let finalExitServicePromise = null
 let isolatedGrantPending = null
@@ -420,7 +425,8 @@ function startIncomingExtension() {
       linkService: wireService,
       observedPredecessorEndpoint,
       outgoing,
-      routeSecretKey: projection.routeSecretKey
+      routeSecretKey: projection.routeSecretKey,
+      surbCapabilityAuthority: surbPeelAuthority
     })
     return actorPromise.then(
       (actor) => {
@@ -479,6 +485,13 @@ function startIncomingExtension() {
   }
 
   if (MIDDLE_ROLES.has(projection.role)) {
+    if (surbPeelAuthority === null) {
+      surbPeelAuthority = createRelaySurbPeelAuthority({
+        advertisement: projection.advertisement,
+        routeSecretKey: projection.routeSecretKey,
+        clocks: { wallNow: runtime.wallNow }
+      })
+    }
     const routes = projection.adjacencies.slice(1).map((contact, index) => ({
       endpoint: canonicalTuple(contact.tuple),
       extensionIndex: 2,
@@ -1312,6 +1325,10 @@ async function stopOwners() {
   if (relayService !== null) {
     relayService.destroy()
     relayService = null
+  }
+  if (surbPeelAuthority !== null) {
+    destroySurbCapabilityAuthority(surbPeelAuthority)
+    surbPeelAuthority = null
   }
   state = 'CLOSED'
 }

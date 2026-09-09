@@ -13,10 +13,7 @@ const {
   createEndpointBootstrapAuthority
 } = require('../../lib/private/endpoint-bootstrap-authority')
 const { REPLY_MODE, BRANCH_CLASS, ROLE, ROUTED_ERROR } = require('../../lib/private/protocol')
-const {
-  createSurbCapabilityAuthority,
-  createSurbReplayAuthority
-} = require('../../lib/private/surb')
+const { createSurbCapabilityAuthority } = require('../../lib/private/surb')
 const {
   processRelaySurbHop,
   TEST_ONLY_RELAY_SERVICE_OBSERVER
@@ -84,7 +81,9 @@ function hopFromRecord(record) {
   }
 }
 
-function hopAuthorityFromRecord(record, now) {
+// Relays advertise wall-clock capability times; the authority reads the topology's
+// wall clock live, so an expired advertisement stops peeling without a rebuild.
+function hopAuthorityFromRecord(record, wallNow) {
   return {
     capabilityAuthority: createSurbCapabilityAuthority({
       routeSecretKey: record.routeSecretKey,
@@ -92,9 +91,9 @@ function hopAuthorityFromRecord(record, now) {
       capabilityEpoch: record.epoch,
       issuedAtMs: record.issuedAt,
       expiresAtMs: record.expiresAt,
-      now
+      wallNow,
+      maxReplayEntries: 64
     }),
-    replayAuthority: createSurbReplayAuthority({ maxEntries: 64 }),
     record
   }
 }
@@ -105,11 +104,11 @@ function hopsAndAuthoritiesFromTopology(topology) {
   // Return path: middle then guard (exit → middle → guard → endpoint)
   const middle = safety[1]
   const guard = safety[0]
-  const now = topology.clock.monotonicNow()
+  const wallNow = () => topology.clock.wallNow()
   return {
     hops: [hopFromRecord(middle), hopFromRecord(guard)],
-    middleAuth: hopAuthorityFromRecord(middle, now),
-    guardAuth: hopAuthorityFromRecord(guard, now)
+    middleAuth: hopAuthorityFromRecord(middle, wallNow),
+    guardAuth: hopAuthorityFromRecord(guard, wallNow)
   }
 }
 
@@ -132,8 +131,7 @@ function installHostedSurbReversePath(routing, exitIO, middleAuth, guardAuth) {
     try {
       const result = processRelaySurbHop({
         payload: cell,
-        capabilityAuthority: auth.capabilityAuthority,
-        replayAuthority: auth.replayAuthority
+        capabilityAuthority: auth.capabilityAuthority
       })
       if (result === null) {
         stats[side + 'Dropped']++
@@ -315,8 +313,7 @@ test('relay drops flipped-MAC hop cell without forwarding', async (t) => {
         flippedSeen = true
         const mid = processRelaySurbHop({
           payload: flipped,
-          capabilityAuthority: middleAuth.capabilityAuthority,
-          replayAuthority: middleAuth.replayAuthority
+          capabilityAuthority: middleAuth.capabilityAuthority
         })
         flipped.fill(0)
         if (mid !== null) {

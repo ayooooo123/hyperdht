@@ -279,8 +279,33 @@ test('tamper cases fail closed', (t) => {
   )
 })
 
+test('a reader-credential holder can re-seal a body; only the owner signature rejects it', (t) => {
+  // The forged body here is a genuine tombstone record: it opens under the reader key
+  // and passes every AEAD and padding check. With the descriptor's signature moved
+  // onto it, the signature check is the only thing left standing, and it must run
+  // before the body is opened.
+  const honest = encodeSigned({ descriptor: b4a.from('present'), revision: 5 })
+  const forgedBody = encodeSigned({
+    revision: 5,
+    type: RECORD_TYPE.TOMBSTONE,
+    tombstone: { scope: TOMBSTONE_SCOPE.PERIOD, target: b4a.alloc(32) }
+  })
+  const open = (value, signature) =>
+    openPresenceRecord({
+      identityPublicKey: FIXED_IDENTITY.publicKey,
+      period: 0n,
+      revision: 5,
+      readerSecret: READER,
+      value,
+      signature
+    })
+  t.is(open(forgedBody.encoded.value, forgedBody.signature).type, RECORD_TYPE.TOMBSTONE)
+  expectCode(t, () => open(forgedBody.encoded.value, honest.signature), 'ERR_AUTHENTICATION')
+  expectCode(t, () => open(honest.encoded.value, forgedBody.signature), 'ERR_AUTHENTICATION')
+})
+
 test('padding byte flip is INVALID_DESCRIPTOR after open AEAD path', (t) => {
-  // Build a record, then re-seal is impossible without a'; open a clean one and
+  // The signature, not the AEAD, stops a re-seal (see the previous test); open a clean one and
   // confirm zero-padding rule by crafting via encode with short descriptor.
   const { encoded, signature } = encodeSigned({
     descriptor: b4a.from('short'),

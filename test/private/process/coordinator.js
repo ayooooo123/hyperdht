@@ -95,6 +95,24 @@ function safeFailure(role, phase, code, detail) {
   })
 }
 
+// A phase or generation mismatch names the event that missed and the state the
+// coordinator held, so a remote run that fails there can be read without the role's
+// stream. Values are bounded and typed here; sanitizeDetail restricts the rest.
+function scalarText(value) {
+  if (typeof value === 'string') return value.slice(0, 32)
+  if (typeof value === 'bigint' || typeof value === 'number') return String(value)
+  return `<${typeof value}>`
+}
+
+function describeEventMismatch(record, message) {
+  const own = message !== null && typeof message === 'object' ? message : {}
+  return (
+    `event type=${scalarText(own.type)} generation=${scalarText(own.generation)} ` +
+    `phaseSequence=${scalarText(own.phaseSequence)}; ` +
+    `held generation=${scalarText(record.generation)} phaseSequence=${scalarText(record.phaseSequence)}`
+  )
+}
+
 // The code alone is often not enough to act on. Attach the role that failed and
 // any preserved detail so a failing run names its own cause.
 function describeFailure(failure) {
@@ -363,11 +381,18 @@ function createProcessControl(options) {
       })
       if (auditor !== null) auditor.auditEvent(record.role, message)
     } catch (err) {
-      const code =
-        err && err.code === 'PROCESS_CONFIG_INVALID'
-          ? 'PROCESS_CONFIG_INVALID'
-          : 'PROCESS_PHASE_MISMATCH'
-      fail(record.role, 'CONTROL', code)
+      // A configuration audit failure is the auditor's judgment and stays sanitized;
+      // a phase mismatch names the event that missed, which is what a remote run needs.
+      if (err && err.code === 'PROCESS_CONFIG_INVALID') {
+        fail(record.role, 'CONTROL', 'PROCESS_CONFIG_INVALID')
+      } else {
+        fail(
+          record.role,
+          'CONTROL',
+          'PROCESS_PHASE_MISMATCH',
+          describeEventMismatch(record, message)
+        )
+      }
       return
     }
     if (message.type === 'error') {
@@ -377,7 +402,12 @@ function createProcessControl(options) {
     const waiterKey = key(record.role, message.type, message.generation)
     const waiter = waiters.get(waiterKey)
     if (!waiter) {
-      fail(record.role, 'CONTROL', 'PROCESS_UNEXPECTED_EVENT')
+      fail(
+        record.role,
+        'CONTROL',
+        'PROCESS_UNEXPECTED_EVENT',
+        describeEventMismatch(record, message)
+      )
       return
     }
     if (message.type === 'isolated-grant-request') {

@@ -20,8 +20,6 @@ const {
   openSurbReply,
   revokeSurbOpenAuthority,
   createSurbCapabilityAuthority,
-  createSurbReplayAuthority,
-  destroySurbReplayAuthority,
   encodeSurbDescriptor,
   decodeSurbDescriptor,
   encodeSurbReplyBinding,
@@ -94,14 +92,15 @@ function hopOf(r) {
   }
 }
 
-function capabilityOf(r, now = NOW) {
+function capabilityOf(r, maxReplayEntries = 64) {
   return createSurbCapabilityAuthority({
     routeSecretKey: r.routeSecretKey,
     routeKey: r.routeKey,
     capabilityEpoch: r.capabilityEpoch,
     issuedAtMs: r.issuedAtMs,
     expiresAtMs: r.expiresAtMs,
-    now
+    wallNow: () => NOW,
+    maxReplayEntries
   })
 }
 
@@ -129,13 +128,8 @@ function ids(fragmentIndex = 0, fragmentCount = 1) {
 
 function roundTripOpen(relays, terminalHandle, descriptor, openAuthority, plaintext, replyBinding) {
   let msg = sealSurbReply({ descriptor, replyBinding, plaintext })
-  const replays = relays.map(() => createSurbReplayAuthority({ maxEntries: 64 }))
   for (let i = 0; i < relays.length; i++) {
-    const fwd = processSurbHop({
-      message: msg,
-      capabilityAuthority: capabilityOf(relays[i]),
-      replayAuthority: replays[i]
-    })
+    const fwd = processSurbHop({ message: msg, capabilityAuthority: capabilityOf(relays[i]) })
     const r = consumeSurbForwardingAuthority(fwd)
     if (i < relays.length - 1) {
       if (r.terminal) throw new Error('early terminal')
@@ -196,8 +190,6 @@ test('scenario 2-4 hop context substitution rejects before wrap', (t) => {
   })
   const plain = b4a.alloc(32, 7)
   const sealed = sealSurbReply({ descriptor, replyBinding: binding, plaintext: plain })
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
-
   // Wrong epoch capability
   const wrongEpoch = createSurbCapabilityAuthority({
     routeSecretKey: r.routeSecretKey,
@@ -205,25 +197,16 @@ test('scenario 2-4 hop context substitution rejects before wrap', (t) => {
     capabilityEpoch: EPOCH + 1n,
     issuedAtMs: ISSUED,
     expiresAtMs: EXPIRES,
-    now: NOW
+    wallNow: () => NOW
   })
   expectCode(
     t,
-    () =>
-      processSurbHop({
-        message: sealed,
-        capabilityAuthority: wrongEpoch,
-        replayAuthority: replay
-      }),
+    () => processSurbHop({ message: sealed, capabilityAuthority: wrongEpoch }),
     'INVALID_ROUTE'
   )
 
   // Fresh correct capability still works (scenario 1 path)
-  const good = processSurbHop({
-    message: sealed,
-    capabilityAuthority: capabilityOf(r),
-    replayAuthority: createSurbReplayAuthority({ maxEntries: 8 })
-  })
+  const good = processSurbHop({ message: sealed, capabilityAuthority: capabilityOf(r, 8) })
   t.ok(good)
 })
 
@@ -244,8 +227,7 @@ test('scenario 5 concurrent hop processing admits exactly one', (t) => {
     replyBinding: binding,
     plaintext: b4a.alloc(16, 1)
   })
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
-  const cap = capabilityOf(r)
+  const cap = capabilityOf(r, 8)
   let wins = 0
   let losses = 0
   for (let i = 0; i < 2; i++) {
@@ -257,8 +239,7 @@ test('scenario 5 concurrent hop processing admits exactly one', (t) => {
           mac: b4a.from(sealed.mac),
           payload: b4a.from(sealed.payload)
         },
-        capabilityAuthority: cap,
-        replayAuthority: replay
+        capabilityAuthority: cap
       })
       wins++
     } catch {
@@ -286,8 +267,7 @@ test('scenario 6-7 invalid MAC and replay leave store consistent', (t) => {
     replyBinding: binding,
     plaintext: b4a.alloc(8, 2)
   })
-  const replay = createSurbReplayAuthority({ maxEntries: 8 })
-  const cap = capabilityOf(r)
+  const cap = capabilityOf(r, 8)
 
   const tampered = {
     ephem: b4a.from(sealed.ephem),
@@ -301,8 +281,7 @@ test('scenario 6-7 invalid MAC and replay leave store consistent', (t) => {
     () =>
       processSurbHop({
         message: tampered,
-        capabilityAuthority: cap,
-        replayAuthority: replay
+        capabilityAuthority: cap
       }),
     'INVALID_ROUTE'
   )
@@ -310,8 +289,7 @@ test('scenario 6-7 invalid MAC and replay leave store consistent', (t) => {
   // First good use
   processSurbHop({
     message: sealed,
-    capabilityAuthority: cap,
-    replayAuthority: replay
+    capabilityAuthority: cap
   })
   // Replay
   expectCode(
@@ -324,8 +302,7 @@ test('scenario 6-7 invalid MAC and replay leave store consistent', (t) => {
           mac: b4a.from(sealed.mac),
           payload: b4a.from(sealed.payload)
         },
-        capabilityAuthority: cap,
-        replayAuthority: replay
+        capabilityAuthority: cap
       }),
     'ERR_REPLAY'
   )
@@ -335,8 +312,7 @@ test('scenario 6-7 invalid MAC and replay leave store consistent', (t) => {
 test('scenario 8 quota full fails closed', (t) => {
   const r = relay()
   const terminal = b4a.alloc(32, 4)
-  const replay = createSurbReplayAuthority({ maxEntries: 1 })
-  const cap = capabilityOf(r)
+  const cap = capabilityOf(r, 1)
 
   function one() {
     const id = ids()
@@ -356,8 +332,7 @@ test('scenario 8 quota full fails closed', (t) => {
     })
     return processSurbHop({
       message: sealed,
-      capabilityAuthority: cap,
-      replayAuthority: replay
+      capabilityAuthority: cap
     })
   }
 
@@ -803,11 +778,7 @@ test('surb batch authority seals one SURB per fragment without correlated fallba
   for (let i = 0; i < sent.length; i++) {
     const raw = tryDecodeSurbHopCell(sent[i].cell)
     const hopMsg = decodeSurbHopMessage(raw)
-    const fwd = processSurbHop({
-      message: hopMsg,
-      capabilityAuthority: capabilityOf(r),
-      replayAuthority: createSurbReplayAuthority({ maxEntries: 16 })
-    })
+    const fwd = processSurbHop({ message: hopMsg, capabilityAuthority: capabilityOf(r, 16) })
     const rslt = consumeSurbForwardingAuthority(fwd)
     t.ok(rslt.terminal)
     const plain = openSurbReply({

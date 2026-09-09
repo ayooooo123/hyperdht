@@ -60,6 +60,9 @@ function fixture(overrides = {}) {
     authority,
     contexts,
     now: overrides.now || (() => 1_000),
+    // SURB descriptors are built against the hops' advertised wall times; the fixture
+    // binds hops that expire at 10,000, so its wall clock reads the same small value.
+    wallNow: overrides.wallNow || overrides.now || (() => 1_000),
     randomBytes:
       overrides.randomBytes ||
       ((buffer) => {
