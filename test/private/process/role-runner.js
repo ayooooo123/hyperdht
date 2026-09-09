@@ -59,6 +59,7 @@ const {
 } = require('./wire-services')
 const { destroySurbCapabilityAuthority } = require('../../../lib/private/surb')
 const { createPresenceClient } = require('../../../lib/private/presence-client')
+const { TOMBSTONE_SCOPE } = require('../../../lib/private/blinded-presence')
 
 const UDX_VERSION = require('udx-native/package.json').version
 const CODEC_VECTOR_DIGEST = b4a.from(CODEC_VECTOR_DIGEST_HEX, 'hex')
@@ -1126,10 +1127,10 @@ function startEndpointOperation(run, cleanup = null) {
   }
 }
 
-function immutablePut(value) {
+function immutablePut(value, replyMode) {
   const ownedValue = b4a.from(value)
   return startEndpointOperation(async (sequence) => {
-    const reply = await endpointController.immutablePut(ownedValue)
+    const reply = await endpointController.immutablePut(ownedValue, { replyMode })
     if (activeOperation === null || activeOperation.sequence !== sequence) return
     if (!reply || !same(reply.hash, cryptoSuite.hash([ownedValue]))) {
       throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
@@ -1139,11 +1140,14 @@ function immutablePut(value) {
   })
 }
 
-function mutablePut(seed, seq, value) {
+function mutablePut(seed, seq, value, replyMode) {
   const keyPair = cryptoSuite.keyPair(b4a.from(seed))
   const ownedValue = b4a.from(value)
   return startEndpointOperation(async (sequence) => {
-    const reply = await endpointController.mutablePut(keyPair, ownedValue, { seq: Number(seq) })
+    const reply = await endpointController.mutablePut(keyPair, ownedValue, {
+      seq: Number(seq),
+      replyMode
+    })
     if (activeOperation === null || activeOperation.sequence !== sequence) return
     if (!reply || !same(reply.publicKey, keyPair.publicKey) || reply.seq !== Number(seq)) {
       throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
@@ -1170,10 +1174,12 @@ function mutableGet(publicKey) {
 // command from the coordinator's inputs and never retained: the identity seed and
 // reader secret are scenario fixtures, `now` is the coordinator's wall time so both
 // ends derive the same periods, and the reader keys are erased inside the codec.
-function presencePublish(seed, readerSecret, revision, descriptor, now) {
-  const ownedSeed = b4a.from(seed)
-  const ownedReader = b4a.from(readerSecret)
-  const ownedDescriptor = b4a.from(descriptor)
+function presenceWrite(message) {
+  const revoke = message.type === 'presence-revoke'
+  const { revision, now, replyMode } = message
+  const ownedSeed = b4a.from(message.seed)
+  const ownedReader = b4a.from(message.readerSecret)
+  const ownedDescriptor = revoke ? null : b4a.from(message.descriptor)
   return startEndpointOperation(
     async (sequence) => {
       let identityKeyPair = null
@@ -1183,12 +1189,18 @@ function presencePublish(seed, readerSecret, revision, descriptor, now) {
           controller: endpointController,
           identityKeyPair,
           readerSecret: ownedReader,
-          now: () => Number(now)
+          now: () => Number(now),
+          replyMode
         })
-        const published = await client.publishPresence({
-          descriptor: ownedDescriptor,
-          revision: Number(revision)
-        })
+        const published = revoke
+          ? await client.revokePresence({
+              revision: Number(revision),
+              scope: TOMBSTONE_SCOPE.PERIOD
+            })
+          : await client.publishPresence({
+              descriptor: ownedDescriptor,
+              revision: Number(revision)
+            })
         if (activeOperation === null || activeOperation.sequence !== sequence) return
         if (!Array.isArray(published) || published.length < 1) {
           throw Object.assign(new Error(), { code: 'PROCESS_VALUE_INVALID' })
@@ -1206,7 +1218,7 @@ function presencePublish(seed, readerSecret, revision, descriptor, now) {
     () => {
       ownedSeed.fill(0)
       ownedReader.fill(0)
-      ownedDescriptor.fill(0)
+      if (ownedDescriptor !== null) ownedDescriptor.fill(0)
     }
   )
 }
@@ -1642,22 +1654,17 @@ async function handle(message) {
       surbGet(message.target)
       return
     case 'immutable-put':
-      immutablePut(message.value)
+      immutablePut(message.value, message.replyMode)
       return
     case 'mutable-put':
-      mutablePut(message.seed, message.seq, message.value)
+      mutablePut(message.seed, message.seq, message.value, message.replyMode)
       return
     case 'mutable-get':
       mutableGet(message.publicKey)
       return
     case 'presence-publish':
-      presencePublish(
-        message.seed,
-        message.readerSecret,
-        message.revision,
-        message.descriptor,
-        message.now
-      )
+    case 'presence-revoke':
+      presenceWrite(message)
       return
     case 'presence-resolve':
       presenceResolve(
@@ -1800,10 +1807,15 @@ function traceFatal(err) {
   const target = runtime.fatalLog
   if (!target) return
   try {
-    require('fs').appendFileSync(
-      target,
-      `${projection ? projection.role : 'unknown'} ${sanitizeCode(err)}\n${(err && err.stack) || String(err)}\n\n`
-    )
+    // dht-rpc wraps a transport adapter's throw as TRANSPORT_UNAVAILABLE with the
+    // original on `cause`; without the chain the log names the wrapper only.
+    let text = `${projection ? projection.role : 'unknown'} ${sanitizeCode(err)}\n${(err && err.stack) || String(err)}\n`
+    let cause = err && err.cause
+    for (let depth = 0; cause && depth < 4; depth++) {
+      text += `caused by: ${(cause && cause.stack) || String(cause)}\n`
+      cause = cause.cause
+    }
+    require('fs').appendFileSync(target, text + '\n')
   } catch {}
 }
 

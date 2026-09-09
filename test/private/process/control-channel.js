@@ -48,6 +48,7 @@ const COMMANDS = Object.freeze([
   'mutable-put',
   'mutable-get',
   'presence-publish',
+  'presence-revoke',
   'presence-resolve'
 ])
 
@@ -804,16 +805,27 @@ const COMMAND_FIELDS = Object.freeze({
   'nat-arm': Object.freeze([...BASE_FIELDS, 'plan']),
   'nat-start': BASE_FIELDS,
   'nat-stats': BASE_FIELDS,
-  'immutable-put': Object.freeze([...BASE_FIELDS, 'value']),
-  'mutable-put': Object.freeze([...BASE_FIELDS, 'seed', 'seq', 'value']),
+  'immutable-put': Object.freeze([...BASE_FIELDS, 'replyMode', 'value']),
+  'mutable-put': Object.freeze([...BASE_FIELDS, 'replyMode', 'seed', 'seq', 'value']),
   'mutable-get': Object.freeze([...BASE_FIELDS, 'publicKey']),
   // Gate D presence over the routed record commands. `now` is the coordinator's
-  // wall time, so both ends derive the same publication periods.
+  // wall time, so both ends derive the same publication periods. `replyMode` on the
+  // puts is decision D12's remainder: a publication in required mode is answered
+  // over the SURB path like a read.
   'presence-publish': Object.freeze([
     ...BASE_FIELDS,
     'descriptor',
     'now',
     'readerSecret',
+    'replyMode',
+    'revision',
+    'seed'
+  ]),
+  'presence-revoke': Object.freeze([
+    ...BASE_FIELDS,
+    'now',
+    'readerSecret',
+    'replyMode',
     'revision',
     'seed'
   ]),
@@ -1033,6 +1045,10 @@ function fixed(value, size) {
   return bufferLength(value) === size
 }
 
+function replyMode(value) {
+  return value === 'CORRELATED' || value === 'SURB_REQUIRED'
+}
+
 function zeroBytes(value, size) {
   if (!fixed(value, size)) return false
   for (let index = 0; index < size; index++) if (value[index] !== 0) return false
@@ -1151,14 +1167,20 @@ function validateCommand(message, context) {
         invalid()
       break
     case 'immutable-put':
-      if (common.role !== 'endpoint' || !boundedBytes(message.value, 1023, true)) invalid()
+      if (
+        common.role !== 'endpoint' ||
+        !boundedBytes(message.value, 1023, true) ||
+        !replyMode(message.replyMode)
+      )
+        invalid()
       break
     case 'mutable-put':
       if (
         common.role !== 'endpoint' ||
         !fixed(message.seed, 32) ||
         !uint64(message.seq, true) ||
-        !boundedBytes(message.value, 895, true)
+        !boundedBytes(message.value, 895, true) ||
+        !replyMode(message.replyMode)
       )
         invalid()
       break
@@ -1166,6 +1188,7 @@ function validateCommand(message, context) {
       if (common.role !== 'endpoint' || !fixed(message.publicKey, 32)) invalid()
       break
     case 'presence-publish':
+    case 'presence-revoke':
       if (
         common.role !== 'endpoint' ||
         !fixed(message.seed, 32) ||
@@ -1173,7 +1196,8 @@ function validateCommand(message, context) {
         !uint64(message.revision, true) ||
         message.revision > 0xffff_ffffn ||
         !uint64(message.now, true) ||
-        !boundedBytes(message.descriptor, 814, true)
+        (type === 'presence-publish' && !boundedBytes(message.descriptor, 814, true)) ||
+        !replyMode(message.replyMode)
       )
         invalid()
       break
@@ -1183,7 +1207,7 @@ function validateCommand(message, context) {
         !fixed(message.identityPublicKey, 32) ||
         !fixed(message.readerSecret, 32) ||
         !uint64(message.now, true) ||
-        (message.replyMode !== 'CORRELATED' && message.replyMode !== 'SURB_REQUIRED')
+        !replyMode(message.replyMode)
       )
         invalid()
       break

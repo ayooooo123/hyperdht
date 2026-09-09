@@ -2,6 +2,7 @@
 
 const test = require('brittle')
 const b4a = require('b4a')
+const DHT = require('dht-rpc')
 
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const {
@@ -216,6 +217,14 @@ test('option gate refuses SURB_REQUIRED without experimentalSurbReplies', async 
       routing.immutableGet(b4a.alloc(32, 1), { replyMode: REPLY_MODE.SURB_REQUIRED })
     )
     t.is(err, 'ERR_PRIVACY_UNAVAILABLE')
+    const keyPair = cryptoSuite.keyPair(seed(201))
+    for (const operation of [
+      () => routing.mutableGet(keyPair.publicKey, { replyMode: REPLY_MODE.SURB_REQUIRED }),
+      () => routing.immutablePut(b4a.from('gated'), { replyMode: REPLY_MODE.SURB_REQUIRED }),
+      () => routing.mutablePut(keyPair, b4a.from('gated'), { replyMode: REPLY_MODE.SURB_REQUIRED })
+    ]) {
+      t.is(await code(operation()), 'ERR_PRIVACY_UNAVAILABLE')
+    }
   } finally {
     if (routing) await routing.destroy()
     if (harness) await closeLiveAuthorityHarness(harness)
@@ -276,6 +285,66 @@ test('SURB_REQUIRED live wire path returns exact value with hop cells and zero c
     t.is(after.correlatedFrameCount, 1, 'the following plain get is correlated')
     t.is(after.surbHopCellCount, hopCellsBefore, 'no hop cell for the plain get')
   } finally {
+    if (routing) await routing.destroy()
+    if (harness) await closeLiveAuthorityHarness(harness)
+  }
+})
+
+test('failed query construction releases required mode before the next ordinary request', async (t) => {
+  let routing = null
+  let harness = null
+  const originalQuery = DHT.prototype.query
+  try {
+    let captured = null
+    harness = await liveAuthorityHarness((manager, topology) => {
+      routing = makeController(213, 49213, topology.clock, true)
+      const builder = controllerIssuer.registerManager(routing, manager)
+      captured = hopsAndAuthoritiesFromTopology(topology)
+      return {
+        publishInitialPair: (h) => controllerIssuer.publishInitialPair(routing, builder, h),
+        createDhtSeedAdmission: (b, o) =>
+          controllerIssuer.createDhtSeedAdmission(routing, builder, b, o),
+        publishInitialSeedPair: (r) => controllerIssuer.publishInitialSeedPair(routing, builder, r)
+      }
+    })
+    await waitForReady(routing)
+    controllerIssuer.bindSurbReturnPath(routing, BRANCH_CLASS.LOOKUP, captured.hops)
+    installHostedSurbReversePath(routing, harness.exitIO, captured.middleAuth, captured.guardAuth)
+    const value = b4a.from('ordinary request after rejected query')
+    const target = cryptoSuite.hash([value])
+    const keyPair = cryptoSuite.keyPair(seed(214))
+    const options = { replyMode: REPLY_MODE.SURB_REQUIRED }
+    for (const [name, operation] of [
+      ['immutable get', () => routing.immutableGet(target, options)],
+      ['mutable get', () => routing.mutableGet(keyPair.publicKey, options)],
+      ['immutable put', () => routing.immutablePut(value, options)],
+      ['mutable put', () => routing.mutablePut(keyPair, value, options)]
+    ]) {
+      try {
+        DHT.prototype.query = () => {
+          throw Object.assign(new Error('query construction rejected'), {
+            code: 'TEST_QUERY_REJECTED'
+          })
+        }
+        t.is(await code(operation()), 'TEST_QUERY_REJECTED', name + ' propagates the failure')
+      } finally {
+        DHT.prototype.query = originalQuery
+      }
+      const before = TEST_ONLY_DHT_EXIT_IO_STATE.snapshot(harness.exitIO)
+      const upstream = respondOnce(harness, value)
+      const result = await routing.immutableGet(target)
+      await upstream
+      t.alike(result.value, value)
+      const after = TEST_ONLY_DHT_EXIT_IO_STATE.snapshot(harness.exitIO)
+      t.is(after.correlatedFrameCount, before.correlatedFrameCount + 1, name + ' releases the hold')
+      t.is(
+        after.surbHopCellCount,
+        before.surbHopCellCount,
+        'no required reply for the ordinary get'
+      )
+    }
+  } finally {
+    DHT.prototype.query = originalQuery
     if (routing) await routing.destroy()
     if (harness) await closeLiveAuthorityHarness(harness)
   }

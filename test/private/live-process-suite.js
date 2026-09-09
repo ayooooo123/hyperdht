@@ -654,63 +654,6 @@ function registerLiveProcessSuite(launch) {
       )
       t.ok((await resumedValueWaiting).value.equals(topology.oracle.immutableValue))
 
-      // Live announce-branch coverage. The in-process harness delivers no announce
-      // seed frames, so a routed put is exercised only here: an immutable put and a
-      // mutable put travel the announce branch to the exit that answered the
-      // announce-context query, land on the DHT roles, and read back exact over the
-      // lookup branch. Placed after every routing derivation above, because a put
-      // grows the announce exit's ordinary request count and `deriveRoutingState`
-      // tells the lookup pair apart by exactly that growth.
-      const routedValue = b4a.from(`announce-branch immutable put (${launch.runtime})`)
-      const routedTarget = cryptoSuite.hash([routedValue])
-      const mutableSeed = b4a.alloc(32, 0x5a)
-      const mutableKeyPair = cryptoSuite.keyPair(mutableSeed)
-      const mutableTarget = cryptoSuite.hash([mutableKeyPair.publicKey])
-      // The storage oracle admits exactly these two records on the DHT roles from
-      // here on; anything else a DHT role reports holding still fails the audit.
-      auditor.expectRoutedRecords({ mutableTargets: [mutableTarget], valueDigests: [routedTarget] })
-      const storedRouted = await sendAndWait('endpoint', 'immutable-put', 'stored-routed', {
-        value: routedValue
-      })
-      t.ok(storedRouted.target.equals(routedTarget), 'routed immutable put reports the value hash')
-      const routedBack = await sendAndWait('endpoint', 'immutable-get', 'value', {
-        target: storedRouted.target
-      })
-      t.ok(routedBack.value.equals(routedValue), 'announce-branch immutable put reads back exact')
-      const mutableValue = b4a.from(`announce-branch mutable put (${launch.runtime})`)
-      const storedMutable = await sendAndWait('endpoint', 'mutable-put', 'stored-routed', {
-        seed: mutableSeed,
-        seq: 1n,
-        value: mutableValue
-      })
-      t.ok(
-        storedMutable.target.equals(mutableTarget),
-        'routed mutable put reports the record target'
-      )
-      const mutableBack = await sendAndWait('endpoint', 'mutable-get', 'mutable-value', {
-        publicKey: mutableKeyPair.publicKey
-      })
-      t.is(mutableBack.seq, 1n, 'announce-branch mutable put reads back at its sequence')
-      t.ok(mutableBack.value.equals(mutableValue), 'announce-branch mutable put reads back exact')
-      // Which DHT role holds the records is the DHT's placement, not the harness's;
-      // that at least one of them reports each record is what proves the put landed.
-      const recordHolders = []
-      for (const role of ['dht-seed', 'dht-referral', 'dht-value']) {
-        recordHolders.push(await sendAndWait(role, 'snapshot', 'snapshot'))
-      }
-      t.ok(
-        recordHolders.some((snapshot) =>
-          snapshot.storedValueDigests.some((d) => d.equals(routedTarget))
-        ),
-        'a DHT role holds the routed immutable value'
-      )
-      t.ok(
-        recordHolders.some((snapshot) =>
-          snapshot.mutableRecordTargets.some((d) => d.equals(mutableTarget))
-        ),
-        'a DHT role holds the routed mutable record'
-      )
-
       // Gate C: required SURB reply path over the live eleven-role mesh.
       // Exit emits hop cells only; middle and guard peel with their own secrets;
       // endpoint admits terminals. No correlated reverse frames.
@@ -751,14 +694,98 @@ function registerLiveProcessSuite(launch) {
         'SURB path adds no correlated reverse frames on the lookup exit'
       )
 
+      // Live announce-branch coverage. The in-process harness delivers no announce
+      // seed frames, so a routed put is exercised only here: an immutable put and a
+      // mutable put travel the announce branch to the exit that answered the
+      // announce-context query, land on the DHT roles, and read back exact over the
+      // lookup branch. Placed after every routing derivation above, because a put
+      // grows the announce exit's ordinary request count and `deriveRoutingState`
+      // tells the lookup pair apart by exactly that growth.
+      const announceExitRole = surbRouting.announcePair.exitRole
+      const announceBaseline = surbRoutingAfter.get(announceExitRole)
+      const routedValue = b4a.alloc(1023, 0x5c)
+      const routedTarget = cryptoSuite.hash([routedValue])
+      const mutableSeed = b4a.alloc(32, 0x5a)
+      const mutableKeyPair = cryptoSuite.keyPair(mutableSeed)
+      const mutableTarget = cryptoSuite.hash([mutableKeyPair.publicKey])
+      // The storage oracle admits exactly these two records on the DHT roles from
+      // here on; anything else a DHT role reports holding still fails the audit.
+      auditor.expectRoutedRecords({ mutableTargets: [mutableTarget], valueDigests: [routedTarget] })
+      const storedRouted = await sendAndWait('endpoint', 'immutable-put', 'stored-routed', {
+        value: routedValue,
+        replyMode: 'SURB_REQUIRED'
+      })
+      t.ok(storedRouted.target.equals(routedTarget), 'routed immutable put reports the value hash')
+      const immutableExit = await sendAndWait(announceExitRole, 'snapshot', 'snapshot')
+      t.ok(
+        immutableExit.surbHopCellCount > announceBaseline.surbHopCellCount,
+        'the maximum immutable put was answered over the SURB path'
+      )
+      t.is(
+        immutableExit.correlatedFrameCount,
+        announceBaseline.correlatedFrameCount,
+        'the immutable put adds no correlated reverse frame on the announce exit'
+      )
+      const routedBack = await sendAndWait('endpoint', 'immutable-get', 'value', {
+        target: storedRouted.target
+      })
+      t.ok(routedBack.value.equals(routedValue), 'announce-branch immutable put reads back exact')
+      const mutableValue = b4a.alloc(895, 0x5b)
+      const storedMutable = await sendAndWait('endpoint', 'mutable-put', 'stored-routed', {
+        seed: mutableSeed,
+        seq: 1n,
+        value: mutableValue,
+        replyMode: 'SURB_REQUIRED'
+      })
+      t.ok(
+        storedMutable.target.equals(mutableTarget),
+        'routed mutable put reports the record target'
+      )
+      const mutableExit = await sendAndWait(announceExitRole, 'snapshot', 'snapshot')
+      t.ok(
+        mutableExit.surbHopCellCount > immutableExit.surbHopCellCount,
+        'the maximum mutable put was answered over the SURB path'
+      )
+      t.is(
+        mutableExit.correlatedFrameCount,
+        immutableExit.correlatedFrameCount,
+        'the mutable put adds no correlated reverse frame on the announce exit'
+      )
+      const mutableBack = await sendAndWait('endpoint', 'mutable-get', 'mutable-value', {
+        publicKey: mutableKeyPair.publicKey
+      })
+      t.is(mutableBack.seq, 1n, 'announce-branch mutable put reads back at its sequence')
+      t.ok(mutableBack.value.equals(mutableValue), 'announce-branch mutable put reads back exact')
+      // Which DHT role holds the records is the DHT's placement, not the harness's;
+      // that at least one of them reports each record is what proves the put landed.
+      const recordHolders = []
+      for (const role of ['dht-seed', 'dht-referral', 'dht-value']) {
+        recordHolders.push(await sendAndWait(role, 'snapshot', 'snapshot'))
+      }
+      t.ok(
+        recordHolders.some((snapshot) =>
+          snapshot.storedValueDigests.some((d) => d.equals(routedTarget))
+        ),
+        'a DHT role holds the routed immutable value'
+      )
+      t.ok(
+        recordHolders.some((snapshot) =>
+          snapshot.mutableRecordTargets.some((d) => d.equals(mutableTarget))
+        ),
+        'a DHT role holds the routed mutable record'
+      )
+
       // Gate D presence over the live routed record commands (decisions D10–D12): the
       // endpoint publishes a blinded presence record on the announce branch (one
-      // mutable put per publication period) and resolves it back in required SURB
-      // reply mode, so the read's reply never travels the correlated path. The
-      // coordinator's wall time is sent with both commands so both ends derive the
-      // same periods; the storage oracle admits exactly the blinded targets. The
-      // proof is hop cells grew and correlated frames did not, measured on the lookup
-      // exit after the publish.
+      // mutable put per publication period) and resolves it back over the lookup
+      // branch, both in required SURB reply mode, so neither the put's token query,
+      // its commit acknowledgement, nor the read's reply travels the correlated
+      // path. The coordinator's wall time is sent with both commands so both ends
+      // derive the same periods; the storage oracle admits exactly the blinded
+      // targets. The proof is the same on each branch's exit: hop cells grew and
+      // correlated frames did not. One round trip per exit is all a baseline needs;
+      // a full routing snapshot here is eleven round trips inside the
+      // timing-sensitive tail.
       const presenceSeed = b4a.alloc(32, 0x7d)
       const presenceReader = b4a.alloc(32, 0x7e)
       const presenceIdentity = cryptoSuite.keyPair(presenceSeed)
@@ -777,7 +804,8 @@ function registerLiveProcessSuite(launch) {
         readerSecret: presenceReader,
         revision: 1n,
         descriptor: presenceDescriptor,
-        now: presenceNow
+        now: presenceNow,
+        replyMode: 'SURB_REQUIRED'
       })
       t.is(published.revision, 1n, 'presence published at revision 1')
       t.alike(
@@ -785,8 +813,16 @@ function registerLiveProcessSuite(launch) {
         presenceKeys.slice().sort((left, right) => b4a.compare(left, right)),
         'the endpoint published under exactly the blinded keys of the publication periods'
       )
-      // One round trip to the lookup exit is all the proof needs; a full routing
-      // snapshot here is eleven round trips inside the timing-sensitive tail.
+      const publishExit = await sendAndWait(announceExitRole, 'snapshot', 'snapshot')
+      t.ok(
+        publishExit.surbHopCellCount > mutableExit.surbHopCellCount,
+        'the presence publication was answered over the SURB path'
+      )
+      t.is(
+        publishExit.correlatedFrameCount,
+        mutableExit.correlatedFrameCount,
+        'the presence publication adds no correlated reverse frame on the announce exit'
+      )
       const presenceBaseline = await sendAndWait(
         surbRouting.lookupPair.exitRole,
         'snapshot',
@@ -820,6 +856,48 @@ function registerLiveProcessSuite(launch) {
         presenceExit.correlatedFrameCount,
         presenceBaseline.correlatedFrameCount,
         'the presence read adds no correlated reverse frame on the lookup exit'
+      )
+
+      // Revocation publishes period tombstones through the same required-mode
+      // write path. Prove storage changed, rather than only checking forwarded options.
+      await sendAndWait('endpoint', 'presence-revoke', 'presence-published', {
+        seed: presenceSeed,
+        readerSecret: presenceReader,
+        revision: 2n,
+        now: presenceNow,
+        replyMode: 'SURB_REQUIRED'
+      })
+      const revokeExit = await sendAndWait(announceExitRole, 'snapshot', 'snapshot')
+      t.ok(
+        revokeExit.surbHopCellCount > publishExit.surbHopCellCount,
+        'presence revocation was answered over the SURB path'
+      )
+      t.is(
+        revokeExit.correlatedFrameCount,
+        publishExit.correlatedFrameCount,
+        'presence revocation adds no correlated reverse frame on the announce exit'
+      )
+      const absent = await sendAndWait('endpoint', 'presence-resolve', 'presence-state', {
+        identityPublicKey: presenceIdentity.publicKey,
+        readerSecret: presenceReader,
+        now: presenceNow,
+        replyMode: 'SURB_REQUIRED'
+      })
+      t.is(absent.present, false, 'revoked presence no longer resolves present')
+      t.is(absent.revision, 2n, 'the resolver observes the tombstone revision')
+      const revokeReadExit = await sendAndWait(
+        surbRouting.lookupPair.exitRole,
+        'snapshot',
+        'snapshot'
+      )
+      t.ok(
+        revokeReadExit.surbHopCellCount > presenceExit.surbHopCellCount,
+        'the tombstone read was answered over the SURB path'
+      )
+      t.is(
+        revokeReadExit.correlatedFrameCount,
+        presenceExit.correlatedFrameCount,
+        'the tombstone read adds no correlated reverse frame on the lookup exit'
       )
 
       if (productionEndpointPunch) {

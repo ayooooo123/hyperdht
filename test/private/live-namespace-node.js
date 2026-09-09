@@ -43,8 +43,11 @@ if (!namespaceProvisioningAvailable()) {
       function auditMillis() {
         const wall = Date.now()
         const elapsed = Number(hrtime.bigint() - monotonicStart) / 1e6
-        if (Math.abs(wall - wallStart - elapsed) > 2) {
-          throw new Error('namespace audit realtime clock changed')
+        const drift = wall - wallStart - elapsed
+        if (Math.abs(drift) > 2) {
+          throw new Error(
+            `namespace audit realtime clock changed (drift ${drift.toFixed(3)} ms over ${elapsed.toFixed(0)} ms)`
+          )
         }
         return wall
       }

@@ -625,6 +625,53 @@ test('scenario 18 three descriptors need multiple forward cells', (t) => {
   t.ok(complete)
 })
 
+// Eight descriptors plus a maximum immutable-put body exceed the old
+// reply-only allocation ceiling; exercise carriage through the forward profile.
+test('scenario 18b eight descriptors carry the largest registered put body', (t) => {
+  const relays = [relay()]
+  const terminal = b4a.alloc(32, 12)
+  const descriptors = []
+  for (let i = 0; i < MAX_SURB_BATCH; i++) {
+    const id = ids(i, MAX_SURB_BATCH)
+    id.surbId = b4a.alloc(16, i + 1)
+    const built = buildSurb({
+      hops: relays.map(hopOf),
+      terminalHandle: terminal,
+      replyBinding: bindingFor(id),
+      now: NOW
+    })
+    descriptors.push(withSurbId(built.descriptor, id.surbId))
+    t.teardown(() => revokeSurbOpenAuthority(built.openAuthority))
+  }
+  const body = b4a.alloc(1090, 9)
+  const v1 = encodeRoutedRequest({
+    requestId: b4a.alloc(16, 1),
+    operationClass: BRANCH_CLASS.ANNOUNCE,
+    commandId: M3_MESSAGE_ID.IMMUTABLE_PUT_V1,
+    operationBudgetMs: 1000n,
+    destination: {
+      id: b4a.alloc(32, 2),
+      handle: b4a.alloc(130, 3)
+    },
+    encodedBody: body
+  })
+  const v2 = encodeRoutedRequestV2({
+    replyMode: REPLY_MODE.SURB_REQUIRED,
+    batchId: b4a.alloc(16, 5),
+    request: v1,
+    surbDescriptors: descriptors
+  })
+  t.is(v2.byteLength, 8 + 24 + v1.byteLength + MAX_SURB_BATCH * SURB_DESCRIPTOR_SIZE)
+  const frames = fragment(v2, { randomBytes: (n) => b4a.alloc(n, 7) })
+  const reassembler = new Reassembler({ now: () => 1, epochExpiresAt: 1_000_000 })
+  let complete = null
+  for (const frame of frames) complete = reassembler.pushAuthenticated(frame)
+  const decoded = decodeRoutedRequestV2(complete)
+  t.is(decoded.surbCount, MAX_SURB_BATCH)
+  t.is(decoded.request.commandId, M3_MESSAGE_ID.IMMUTABLE_PUT_V1)
+  t.alike(decoded.request.encodedBody, body)
+})
+
 // --- Scenario 19: resource ceiling ---
 test('scenario 19 more than eight SURBs or 3936 bytes fails', (t) => {
   t.is(MAX_SURB_BATCH, 8)
