@@ -85,6 +85,7 @@ let natLinkHandle = null
 let dht = null
 let natOfferToken = null
 let natCounterToken = null
+let natArmClockSample = null
 let setupAudit = null
 let wireService = null
 let guardProcessService = null
@@ -588,7 +589,8 @@ async function createCellOwner() {
       onActor(actor) {
         roleActors.add(actor)
       },
-      onFailure: actorFailure
+      onFailure: actorFailure,
+      onDiagnostic: runtime.fatalLog ? traceGuardBranch : undefined
     })
     await guardProcessService.start()
   }
@@ -679,6 +681,16 @@ function authorizeNatLink(grant, operation, localRole) {
   })
 }
 
+function guardNatNow() {
+  const now = runtime.wallNow()
+  if (natArmClockSample !== null) {
+    if (natArmClockSample.first === null) natArmClockSample.first = now
+    natArmClockSample.last = now
+    natArmClockSample.count++
+  }
+  return now
+}
+
 async function handleNatReflect() {
   if (!projection.natTraversal || !Array.isArray(projection.natTraversal.reflectors)) {
     throw Object.assign(new Error(), { code: 'PROCESS_PROJECTION_INVALID' })
@@ -717,7 +729,7 @@ async function handleNatReflect() {
       cancel: cancelScheduled,
       epoch: projection.topologyEpoch,
       localSecretCapability: secret,
-      now: () => runtime.wallNow(),
+      now: guardNatNow,
       randomBytes,
       runId32: projection.topologyRunId,
       schedule
@@ -785,7 +797,16 @@ async function handleNatArm(plan) {
   if (natAuthority === null || natCounterToken === null) {
     throw Object.assign(new Error(), { code: 'PROCESS_PHASE_INVALID' })
   }
-  natAttempt = acceptNatPunch(natAuthority, natCounterToken, plan)
+  natArmClockSample =
+    runtime.fatalLog && guardDiagnosticCount < 32 ? { first: null, last: null, count: 0 } : null
+  try {
+    natAttempt = acceptNatPunch(natAuthority, natCounterToken, plan)
+  } catch (err) {
+    traceNatArmWindow(plan, natArmClockSample)
+    throw err
+  } finally {
+    natArmClockSample = null
+  }
   natCounterToken = null
   await emit('nat-armed')
 }
@@ -1569,6 +1590,59 @@ async function handle(message) {
     default:
       throw Object.assign(new Error(), { code: 'PROCESS_COMMAND_UNSUPPORTED' })
   }
+}
+
+let guardDiagnosticCount = 0
+
+function traceGuardBranch(stage, err, window = null) {
+  if (!runtime.fatalLog || guardDiagnosticCount >= 32) return
+  guardDiagnosticCount++
+  try {
+    let suffix = ''
+    if (err !== null) {
+      const stack = typeof err.stack === 'string' ? err.stack : ''
+      const site = /^\s+at validOffer[ (]/m.test(stack)
+        ? 'valid-offer'
+        : /^\s+at decodeOffer[ (]/m.test(stack)
+          ? 'offer-decode'
+          : 'other'
+      suffix = ` site=${site}`
+      if (
+        window !== null &&
+        typeof window.remainingMs === 'bigint' &&
+        typeof window.limitGapMs === 'bigint'
+      ) {
+        suffix += ` offer_remaining_ms=${window.remainingMs} limit_gap_ms=${window.limitGapMs}`
+      }
+    }
+    require('fs').appendFileSync(
+      runtime.fatalLog,
+      `guard branch ${stage} ${err === null ? 'OK' : sanitizeCode(err)}${suffix}\n`
+    )
+  } catch {}
+}
+
+function traceNatArmWindow(plan, sample) {
+  if (!runtime.fatalLog || guardDiagnosticCount >= 32 || sample === null || sample.first === null) {
+    return
+  }
+  guardDiagnosticCount++
+  try {
+    if (!b4a.isBuffer(plan) || plan.byteLength < 125) return
+    // Read only the two U64s after version/format, plan ID, grant digest, epoch, and run ID.
+    // These fixed-header values are diagnostic input, not authenticated by this reader.
+    const notBefore = plan.readBigUInt64BE(109)
+    const expiresAt = plan.readBigUInt64BE(117)
+    require('fs').appendFileSync(
+      runtime.fatalLog,
+      `guard nat-arm rejected-window samples=${sample.count} ` +
+        `first_offset_ms=${sample.first - notBefore} ` +
+        `last_offset_ms=${sample.last - notBefore} ` +
+        `remaining_ms=${expiresAt - sample.last} ` +
+        `sample_span_ms=${sample.last - sample.first} ` +
+        `sample_minus_system_ms=${sample.last - BigInt(Date.now())}\n`
+    )
+  } catch {}
 }
 
 // The control channel only carries a strict code, on purpose: a role must not
