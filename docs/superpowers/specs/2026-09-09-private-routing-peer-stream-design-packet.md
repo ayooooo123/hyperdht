@@ -208,7 +208,8 @@ and Linux capture with explicit negative controls for endpoint-to-guard-only
 traffic, fixed cells, plaintext leaks, and hop-by-hop ciphertext changes.
 Existing DHT capture evidence does not prove peer-stream privacy.
 
-Public required mode remains blocked on the complete aggregate gate and a
+Public required mode remains blocked on reviewed peer-stream wire, its
+implementation and verification above, the complete aggregate gate, and a
 named external human cryptographic review of the exact final source and native
 dependency revisions. Mixing/cover traffic and anonymous admission remain out
 of this work; consumer integration follows the public gate.

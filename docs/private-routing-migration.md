@@ -77,8 +77,18 @@ completed engagement is identified in the project record.
   scenarios present in `scripts/linux-gates.sh all`. Both steps are now added
   to `test-private-routing.yml`, with the same normal candidate order and
   `PR_PRODUCTION_ENDPOINT_PUNCH=1`. Both commands passed in the Linux gate
-  runner, 180 assertions each. This is local command evidence, not yet CI
-  evidence for the workflow edit.
+  runner, 180 assertions each. At `9857887`, native push run
+  [34413408100](https://github.com/ayooooo123/hyperdht/actions/runs/34413408100)
+  passed. PR run
+  [34413413038](https://github.com/ayooooo123/hyperdht/actions/runs/34413413038)
+  passed the punch steps but failed namespace capture at 184/185:
+  `ERR_TEARDOWN_ICMP: raw DROP=1, classified=0`. This failed evidence remains
+  open as KI-19; it is not a production-punch failure or an approved exception.
+  Both Private Routing runs at correction commit `819cc62`
+  ([push](https://github.com/ayooooo123/hyperdht/actions/runs/34413788764),
+  [PR](https://github.com/ayooooo123/hyperdht/actions/runs/34413792450))
+  passed; [Build Status](https://github.com/ayooooo123/hyperdht/actions/runs/34413792433)
+  also passed. These subsequent passes do not explain or erase KI-19.
 - Mixed-host run [34410082928](https://github.com/ayooooo123/hyperdht/actions/runs/34410082928)
   used `up -p -l 2` without overrides. Punch matrix 0/117; role 4
   (`lookup-exit-a`) never attached, `HOLEPUNCH_ABORTED`; driver exit 1.
@@ -107,6 +117,9 @@ completed engagement is identified in the project record.
   container check is not evidence of that run's placement. The disposable VM
   was deleted; shared services were not restarted. This corrects the unsupported
   VM attribution published in `9857887`.
+  This correction concerns this continuation's `hyperdht-gates-finish` profile,
+  not the distinct `hyperdht-gates-ki4` run reported in the earlier `74875ec`
+  checkpoint; that prior session's placement was not re-audited here.
 - Repository-wide Prettier passed separately. Runtime-exported bounds were
   checked directly: advertisement 260–388 bytes, presence descriptor 814,
   inner route payload 1,073, outer cell 1,200. No peer-stream implementation
@@ -1871,6 +1884,31 @@ The stale `/private/tmp` baseline worktree entry points to a missing directory;
 the live detached experiments are preserved without pruning that entry.
 
 ## Known issues
+
+### KI-19: one native CI capture could not reconcile a kernel drop
+
+**Status: OPEN. Cause unresolved; the strict gate correctly failed closed.**
+
+PR run `34413413038` at `9857887` reached all lifecycle and route-capture
+assertions, then failed the last assertion with raw DROP 1 and classified
+teardown ICMP 0. The drop counter was already 1 before capture shutdown.
+No undecodable frame was reported. The simultaneous push run passed.
+
+Zero classified ICMP does not mean the dropped packet was absent from the
+captures. The route oracle validates allowed host pairs, not every firewall
+port/direction tuple. An off-port UDP packet on an allowed host pair could
+pass those route assertions and still be correctly dropped. Missing captured
+ICMP or another dropped IP packet also remains possible. The log cannot
+distinguish these cases; the old workflow retained no pcaps.
+
+CI now retains the existing synthetic namespace pcaps and socket-close windows
+for seven days, including failed runs. No classifier, clock tolerance,
+firewall rule, assertion, or retry policy changed. A recurrence must be
+diagnosed from those bytes. If they are insufficient, the next evidence needed
+is per-rule firewall counts plus tcpdump shutdown statistics and exit status;
+the summed counter alone cannot distinguish the two final DROP rules.
+
+Later green runs are separate observations, not a fix or waiver for this one.
 
 ### KI-1: routes are correlatable by timing and volume
 
