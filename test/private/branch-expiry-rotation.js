@@ -37,6 +37,8 @@ const {
   issueRouteManagerBranchPhysicalLoss
 } = require('../../lib/private/route-manager')
 const { bindOpenRouteTransport } = require('../../lib/private/live-route-authority')
+const { RoutedDHTIO } = require('../../lib/private/routed-dht-io')
+const { UdxCellEndpoint } = require('../../lib/private/udx-cell-endpoint')
 const finalExitActivation = require('../../lib/private/final-exit-activation')
 const opaqueDestination = require('../../lib/private/opaque-destination')
 const openRouteHandoff = require('../../lib/private/open-route-handoff')
@@ -362,6 +364,14 @@ for (const duringRotation of [false, true]) {
     t.is(pending ? pending.branch.generation : null, 2n, 'loss starts replacement without expiry')
     t.is(routing.snapshot().lookupGeneration, 2n)
     t.is(
+      await routing.immutableGet(seed(0x62)).then(
+        () => null,
+        (err) => err.code
+      ),
+      'ERR_PRIVATE_BRANCH_ROTATING',
+      'staged ownership does not admit queries through the lost sibling'
+    )
+    t.is(
       issueRouteManagerBranchPhysicalLoss(stale),
       false,
       'retired registration cannot lose replacement'
@@ -462,4 +472,144 @@ test('rotation failure after same-branch loss does not restore ready state', asy
   }
   t.is(code, 'ERR_PRIVACY_UNAVAILABLE', 'lost branch cannot regain request authority')
   t.is(harness.topology.clock.wallNow(), NOW, 'failure does not depend on lease expiry')
+})
+
+for (const afterReady of [false, true]) {
+  test(`sibling loss ${afterReady ? 'after' : 'during'} routed readiness retains recovery ownership`, async (t) => {
+    const { harness, routing, replacements } = await lossHarness(
+      t,
+      afterReady ? 171 : 169,
+      afterReady ? 48971 : 48969
+    )
+    const manager = harness.manager
+    const lookup = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.LOOKUP)
+    const announce = createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.ANNOUNCE)
+    issueRouteManagerBranchPhysicalLoss(lookup)
+    await settle()
+
+    const originalReady = RoutedDHTIO.prototype.ready
+    const originalDestroy = RoutedDHTIO.prototype.destroy
+    let stateDuringRetirement = null
+    let injected = false
+    const injectLoss = () => {
+      if (!injected) {
+        injected = true
+        issueRouteManagerBranchPhysicalLoss(announce)
+      }
+    }
+    RoutedDHTIO.prototype.ready = function () {
+      if (afterReady) return originalReady.call(this).then(injectLoss)
+      injectLoss()
+      return originalReady.call(this)
+    }
+    RoutedDHTIO.prototype.destroy = function () {
+      if (stateDuringRetirement === null) stateDuringRetirement = routing.snapshot().state
+      return originalDestroy.call(this)
+    }
+    try {
+      replacements.push(publishReplacementBranch(harness, BRANCH_CLASS.LOOKUP, 0xd1, 0xd2))
+      await settle()
+      t.ok(injected, 'loss occurs across the asynchronous readiness boundary')
+      t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING)
+      t.is(
+        stateDuringRetirement,
+        PRIVATE_ROUTING_STATE.ROTATING,
+        'lost ownership never exposes READY while the previous transport is retiring'
+      )
+      t.is(
+        await routing.immutableGet(seed(0x63)).then(
+          () => null,
+          (err) => err.code
+        ),
+        'ERR_PRIVATE_BRANCH_ROTATING',
+        'failed readiness cannot authorize a query'
+      )
+      t.is(manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().rotations.announce.branch.generation, 2n)
+      replacements.push(publishReplacementBranch(harness, BRANCH_CLASS.ANNOUNCE, 0xe1, 0xe2))
+      await waitForReady(routing)
+      t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.READY)
+      t.is(routing.snapshot().lookupGeneration, 2n)
+      t.is(routing.snapshot().announceGeneration, 2n)
+    } finally {
+      RoutedDHTIO.prototype.ready = originalReady
+      RoutedDHTIO.prototype.destroy = originalDestroy
+    }
+  })
+}
+
+test('network change invalidates staged recovery before endpoint close completes', async (t) => {
+  const { harness, routing, replacements } = await lossHarness(t, 173, 48973)
+  const manager = harness.manager
+  issueRouteManagerBranchPhysicalLoss(
+    createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.LOOKUP)
+  )
+  issueRouteManagerBranchPhysicalLoss(
+    createRouteManagerBranchLossRegistration(manager, BRANCH_CLASS.ANNOUNCE)
+  )
+  await settle()
+
+  let enteredRetirement
+  let releaseRetirement
+  let enteredClose
+  let releaseClose
+  const retirementEntered = new Promise((resolve) => {
+    enteredRetirement = resolve
+  })
+  const retirementReleased = new Promise((resolve) => {
+    releaseRetirement = resolve
+  })
+  const closeEntered = new Promise((resolve) => {
+    enteredClose = resolve
+  })
+  const closeReleased = new Promise((resolve) => {
+    releaseClose = resolve
+  })
+  const originalDestroy = RoutedDHTIO.prototype.destroy
+  const originalClose = UdxCellEndpoint.prototype.close
+  let heldRetirement = false
+  let heldClose = false
+  let networkChange = null
+  RoutedDHTIO.prototype.destroy = function () {
+    if (heldRetirement) return originalDestroy.call(this)
+    heldRetirement = true
+    enteredRetirement()
+    return retirementReleased.then(() => originalDestroy.call(this))
+  }
+  UdxCellEndpoint.prototype.close = function () {
+    if (heldClose) return originalClose.call(this)
+    heldClose = true
+    enteredClose()
+    return closeReleased.then(() => originalClose.call(this))
+  }
+  try {
+    replacements.push(publishReplacementBranch(harness, BRANCH_CLASS.LOOKUP, 0xf1, 0xf2))
+    await retirementEntered
+    networkChange = routing.networkChanged()
+    await closeEntered
+    t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.UNAVAILABLE)
+    releaseRetirement()
+    await settle()
+    t.is(
+      manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().rotations.announce,
+      undefined,
+      'stale installation cannot start another branch while endpoint teardown is pending'
+    )
+    t.is(
+      await routing.immutableGet(seed(0x64)).then(
+        () => null,
+        (err) => err.code
+      ),
+      'ERR_PRIVACY_UNAVAILABLE'
+    )
+    releaseClose()
+    await networkChange
+    t.is(routing.snapshot().routeManager, false)
+    t.is(routing.snapshot().transportDHT, false)
+  } finally {
+    releaseRetirement()
+    releaseClose()
+    if (networkChange) await networkChange
+    RoutedDHTIO.prototype.destroy = originalDestroy
+    UdxCellEndpoint.prototype.close = originalClose
+  }
 })

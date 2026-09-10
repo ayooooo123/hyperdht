@@ -213,3 +213,90 @@ implementation and verification above, the complete aggregate gate, and a
 named external human cryptographic review of the exact final source and native
 dependency revisions. Mixing/cover traffic and anonymous admission remain out
 of this work; consumer integration follows the public gate.
+
+## Subsequent prerequisite experiments and advisory disposition
+
+The published runtime baseline advanced to `87f0499`; this historical review
+record does not authorize peer-stream implementation against it. Subsequent
+native-gate success is not evidence that the peer-stream proposals are ready.
+The current transport and semantic proposals remain unratified.
+
+The revised candidate retains two explicit fragmentation layers. A semantic
+Noise fragment contains at most 1,002 ciphertext bytes and has 71 bytes of
+envelope/metadata overhead. Its 1,073-byte maximum wire object requires
+HANDSHAKE payloads of 981 and 92 bytes. Under the candidate's explicit
+4,096-byte legacy Noise-flight compatibility cap, the five semantic wires
+are `[1073, 1073, 1073, 1073, 159]`, requiring nine reliable packets.
+The old 66-fragment claim and one-object-per-ordered-frame assumption are
+rejected. A larger otherwise valid legacy reply fails closed under this
+proposed cap; it is not full compatibility with every possible reply size.
+
+For confirmation transcripts, `completeIK1` and `completeIK2` are the raw
+Noise ciphertext returned by the corresponding `NoiseWrap.send()` calls,
+before fragmentation. Reconstruction concatenates validated ciphertext slices
+by offset and verifies the whole-ciphertext commitment. These values contain
+no semantic envelope, fragment metadata, transport wrapper, padding, length
+prefix, or digest substituted for ciphertext. In the constrained private
+profile they are exactly 101 and 53 bytes. In contrast, `completeACTIVATE`,
+`completeREADY`, and `completeACK` include their complete canonical eight-byte
+semantic envelopes and bodies, including the MAC fields within those bodies.
+Ciphertext needed by a later confirmation survives `recv()` until its final
+confirmation consumer; it is not erased prematurely.
+
+Actual `NoiseWrap.final()` produces a 64-byte handshake hash and 32-byte
+directional keys. Thus the confirmation context
+`noiseHash64 | sessionId16 | sourcePurposeDigest32 |
+destinationPurposeDigest32 | registrationCommitment32` is 176 bytes.
+The draft's 144-byte assertion failed a native constructor probe.
+Corrected Sodium/Python BLAKE2b vectors agree; READY, ACK, and ACCEPTED
+transcript lengths are respectively 1,046, 1,339, and 1,361 bytes.
+A throwaway nested-envelope reconstruction verified the 101/53-byte flights
+and the synthetic 4,096-byte bound above. These are construction/arithmetic
+checks, not production v2 decoder, state-machine, or privacy proofs.
+
+The current candidate adds route-authenticated `PRIVATE_SOURCE_RECEIPT_V2`
+(provisional ID `0x0364`, 120-byte body, 128-byte wire) after the source
+verifies `PRIVATE_ACCEPTED`. Entry verifies the exact source route,
+generation, session, accepted MAC, nonce, and receipt commitment before
+`PRIVATE_OPEN_V2` (`0x0365`). An ARQ acknowledgement is not this semantic
+receipt and does not prove endpoint MAC verification.
+
+The current transport candidate also specifies a phase-0 query, cookie
+challenge, phase-1 retry carrying the cookie, and only then the signed
+capability response and active proof. All direct datagrams are padded to
+1,200 bytes; the six-message exchange reserves 24 attempted cells in each
+physical direction at eight attempts per message. Source contacts only its
+pinned guard; guard and safety perform onward discovery. The earlier
+unauthenticated short-query/large-response proposal is rejected. This
+construction still needs production enforcement and reflection-negative
+evidence; citing v1 cookie logic alone is not proof.
+
+Native experiments now establish the legacy ownership boundary against an
+unchanged HyperDHT server: actual relayed Noise, its stock remote relay client,
+an admitted egress service using exported pair codecs, and a real
+egress-owned UDX stream. The source owns Noise/SecretStream and no native
+socket. Exact 65,536/12,345-byte transfer, closes, and either one-sided EOF
+followed by opposite-direction data pass. Earlier simultaneous-end-event
+timeouts remain recorded, not relabeled as success.
+
+SecretStream's initial raw record is 59 bytes:
+`uint24le(56) | streamIdentity32 | secretStreamHeader24`.
+An application record has three prefix bytes and ciphertext of
+`plaintextBytes + 17`; the inherited raw maximum is 16,777,218 bytes.
+An actual 1 MiB record fragmented into 977-byte chunks produced no plaintext
+after 24 chunks and first plaintext only at chunk 1,075. Therefore credits
+replenished only by application plaintext consumption would deadlock the
+proposed 24-slot window. Reserved record assembly and transport-slot release
+must be distinct from application backpressure.
+
+The interrupted transport revision has not settled per-session reset
+isolation, reciprocal startup credits, complete record/native-buffer
+ownership, noncyclic first-finalization associated data, and all control
+traffic charges. Its earlier whole-route totals are not approved budgets.
+In particular, `ceil(ciphertextBytes / 977)` is a best-packing lower bound,
+not the worst-case frame spend: one-byte DATA frames are valid. Admission
+must independently bound frames and bytes and charge credit traffic,
+retransmissions, acknowledgements, startup headers, and per-stream closure
+without terminating unrelated streams on a shared listener route.
+
+These findings preserve the implementation and external-review gates above.

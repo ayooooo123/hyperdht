@@ -2021,6 +2021,67 @@ drops are zero. Both firewall DROP rules are zero in all four snapshots.
 This is the corrected source's native acceptance, not a waiver of the earlier
 local clock failure or historical KI-19.
 
+Subsequent advisory review found that the drain wait still snapshotted registered
+queries rather than holding the complete admitted attempt. A new internal
+attempt registry now spans construction and discovery/commit gaps; active queries
+remain the cancellation registry. The exact retired record's `lost` state now
+invalidates drain/reply ownership, including loss reported after retirement.
+Destroyed or already-lost ownership is rejected before invoking the clock, while
+post-clock checks remain necessary for reentrant invalidation.
+
+The shared third safety candidate is now opt-in for rotation fixtures. The broad
+lifecycle case covers suspension alone; dedicated regressions cover valid sibling
+drain and lost-branch reply rejection. Narrow package-private issuer seams retain
+the formerly temporary supersession regression without adding a public API.
+Native Linux Node and Bare each pass 55 tests / 540 assertions across the three
+affected suites. Four mutations fail the intended regressions: waiting on query
+snapshots, removing the DHT-identity cleanup guard, removing pre-clock liveness
+checks, and removing lost-branch checks. These advisory repairs require their own
+native aggregate/process/capture acceptance before publication; the earlier
+`1ace943` acceptance does not cover this later source.
+
+Candidate `b40649e` failed native aggregate acceptance in
+[run 34433286596](https://github.com/ayooooo123/hyperdht/actions/runs/34433286596):
+`branch loss survives controller refusal` reached a destroyed manager. The newly
+strict lost-branch check correctly rejected readiness through a lost sibling, but
+generation installation treated that rejection as terminal instead of preserving
+recovery ownership. No process or capture acceptance was reached in that run.
+
+The follow-on repair distinguishes failed admission from ownership transfer.
+Rotation stages an owner without a DHT or query contexts while replacing a lost
+sibling. Exact retired-record loss is now reported after retirement without
+invalidating its replacement. Loss both during and after asynchronous readiness
+keeps `READY` unobservable through old-transport retirement. A review also found
+that unavailable teardown left its old state valid until endpoint closure; state
+now invalidates synchronously before that await.
+
+Native Linux Node and Bare each pass 67 tests / 643 assertions across the four
+affected suites. Three additional isolated-file mutations fail their retained
+regressions: omitting readiness-error recovery, omitting the post-readiness loss
+check, and restoring the late unavailable transition. The transferred retired
+owner/material are explicitly destroyed by the regression, matching existing
+ownership cleanup. The failed candidate run remains evidence; the corrected
+source still requires a new native aggregate/process/capture run.
+
+Corrected candidate `5b4a1c0` passed Node aggregate 1,119 / 19,919, Bare aggregate
+1,074 / 19,784, and all four normal/reverse process legs (175 assertions each)
+in [run 34435307484](https://github.com/ayooooo123/hyperdht/actions/runs/34435307484).
+Production-punch Node then failed 38/39 with `ERR_PRIVATE_GUARD_UNAVAILABLE`,
+about 17 ms after both first-owned punch sends and exact tuple reflections.
+The remaining punch and namespace/capture gates did not run. Prior guard traces
+share one append-only log across process legs and cannot establish which inner
+bootstrap check rejected this attempt.
+
+One native Node 22 and eight bounded, instrumented Node 24.20.0 production-punch
+probes each passed 180 assertions; they do not explain or waive the CI failure.
+The bootstrap retry boundary previously discarded its actual rejection. It now
+preserves the last rejection using the existing non-enumerable `Error.cause`
+convention, while retaining the public `ERR_PRIVATE_GUARD_UNAVAILABLE` code.
+The process harness already retains causal stacks. A native, fault-injected
+authentication rejection is absent from the old fatal chain and visible after
+this repair; that is diagnostic proof, not a reproduction of the unknown CI
+cause. Bootstrap Node and Bare contracts pass 33 tests / 347 assertions each.
+
 Later green runs are separate observations, not a fix or waiver for this one.
 
 ### KI-1: routes are correlatable by timing and volume
