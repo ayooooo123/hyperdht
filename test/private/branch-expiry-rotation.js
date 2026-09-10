@@ -569,6 +569,10 @@ test('network change invalidates staged recovery before endpoint close completes
   let heldRetirement = false
   let heldClose = false
   let networkChange = null
+  let secondNetworkChange = null
+  let secondNetworkChangeSettled = false
+  let terminalDestroy = null
+  let terminalDestroySettled = false
   RoutedDHTIO.prototype.destroy = function () {
     if (heldRetirement) return originalDestroy.call(this)
     heldRetirement = true
@@ -585,10 +589,20 @@ test('network change invalidates staged recovery before endpoint close completes
     replacements.push(publishReplacementBranch(harness, BRANCH_CLASS.LOOKUP, 0xf1, 0xf2))
     await retirementEntered
     networkChange = routing.networkChanged()
+    t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.UNAVAILABLE)
+    t.is(routing.snapshot().endpointSockets, 0, 'endpoint ownership is detached before returning')
     await closeEntered
     t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.UNAVAILABLE)
+    secondNetworkChange = routing.networkChanged().then(() => {
+      secondNetworkChangeSettled = true
+    })
     releaseRetirement()
     await settle()
+    t.is(
+      secondNetworkChangeSettled,
+      false,
+      'concurrent network change waits for the same endpoint cleanup'
+    )
     t.is(
       manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().rotations.announce,
       undefined,
@@ -601,14 +615,23 @@ test('network change invalidates staged recovery before endpoint close completes
       ),
       'ERR_PRIVACY_UNAVAILABLE'
     )
+    terminalDestroy = routing.destroy().then(() => {
+      terminalDestroySettled = true
+    })
+    await settle()
+    t.is(terminalDestroySettled, false, 'destroy waits for the endpoint cleanup already in flight')
     releaseClose()
     await networkChange
+    await secondNetworkChange
+    await terminalDestroy
     t.is(routing.snapshot().routeManager, false)
     t.is(routing.snapshot().transportDHT, false)
   } finally {
     releaseRetirement()
     releaseClose()
     if (networkChange) await networkChange
+    if (secondNetworkChange) await secondNetworkChange
+    if (terminalDestroy) await terminalDestroy
     RoutedDHTIO.prototype.destroy = originalDestroy
     UdxCellEndpoint.prototype.close = originalClose
   }
