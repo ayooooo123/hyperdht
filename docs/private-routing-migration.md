@@ -2135,9 +2135,10 @@ the endpoint loop, and overlapping `networkChanged()` calls could finish a
 second unavailable teardown while the first endpoint close remained pending.
 
 The bootstrap loop now preserves its saved normalized rejection and wraps only
-at final exhaustion. The controller publishes one retained cleanup promise,
-transitions to UNAVAILABLE before scheduling cleanup, and makes concurrent
-callers await that operation, including the OFF-state network-change path.
+at final exhaustion. The controller synchronously transitions to UNAVAILABLE
+and captures/nulls endpoint ownership, then publishes one retained cleanup
+promise before any destructor callback. Concurrent callers, including the
+OFF-state network-change path and terminal `destroy()`, await that operation.
 UNAVAILABLE is terminal for this controller; the promise is not reset to
 permit another cleanup.
 
@@ -2146,11 +2147,14 @@ rotation, authority, and SURB scenarios passed after it. The bootstrap fixture
 initially expected a raw injected transport error; the real boundary normalizes
 that error to ERR_AUTHENTICATION. Its corrected assertion requires that
 normalized error as the immediate cause, rather than another guard wrapper.
-Native Node bootstrap verification then passed34 tests/349 assertions; removal
-of a redundant two-assertion fixture-wiring test is left to final native CI.
-The retained tests exercise the actual controller and bootstrap paths, not
-source-text matches. Local evidence is `late-advisory-before.txt`,
-`late-advisory-after-node.txt`, and `late-bootstrap-after-node.txt`.
+The first shared-promise draft failed two stronger checks: immediate endpoint
+ownership detachment and terminal destruction waiting for pending endpoint
+closure. After correction, native Node verification passed97 tests/972
+assertions across bootstrap, route manager, live authority, SURB, and aggregate
+branch rotation. A redundant fixture-wiring assertion test was removed.
+The retained tests exercise actual controller/bootstrap paths, not source-text
+matches. Evidence includes `late-advisory-before.txt`,
+`late-ownership-before.txt`, and `late-advisory-final-node.txt`.
 
 The separate peer-stream prerequisite also now states explicitly that OFFER
 duplicates and timer retries share the original eight-attempt response budget.

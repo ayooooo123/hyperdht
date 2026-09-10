@@ -3,7 +3,7 @@
 **Date:** 2026-09-09
 **Runtime baseline:** `02bce1422de05c271260b1f37344d69dbe9afe23`
 **Original review baseline:** `06dc259c10d6270977d88e1bc12834d9051e1a77`
-**Status:** internal implementation-prerequisite ratification reopened pending review of the delayed OFFER-replay clarification in transport §5.1/§9. No v2 runtime or public API is enabled; implementation, native privacy acceptance, and external human cryptographic/public-release gates remain separate.
+**Status:** internal implementation prerequisite ratified, including the reviewed delayed OFFER-replay clarification in transport §5.1/§9. No v2 runtime or public API is enabled; implementation, native privacy acceptance, and external human cryptographic/public-release gates remain separate.
 
 The [ratification record](#prerequisite-ratification), [transport specification](#transport-specification), and [semantic specification](#semantic-specification) below form the current integrated specifications, subject to the status above. The intervening review record preserves rejected drafts and earlier proof boundaries as history.
 
@@ -310,7 +310,7 @@ Main accepts the integrated transport and semantic specifications below as the i
 
 The fresh-context Sol findings were dispositioned by Main, not delegated as an approval verdict. Attempts to obtain another-model review encountered the recorded provider credit failures; same-model fresh contexts are not independent-model or external-human review. No such independence is claimed.
 
-Delayed advisory reconciliation found that the earlier OFFER-replay sentence did not explicitly bind fresh class-5 sealing to the original response attempt limit. The corrected §5.1/§9 distinguishes canonical bytes, outer AEAD counters, and one shared eight-attempt budget; exact review of that correction is pending. The earlier ratification and review hashes above remain historical provenance, not approval of this unreviewed addendum.
+Delayed advisory reconciliation found that the earlier OFFER-replay sentence did not explicitly bind fresh class-5 sealing to the original response attempt limit. The corrected §5.1/§9 distinguishes canonical bytes, outer AEAD counters, and one shared eight-attempt budget. Sol reviewed exact commit `00def436785f87f8a145cdc730b1bdafa3a87d66`, document SHA-256 `d82555ba0dc9773d4f09704dc1bcd768d24d70cb3166224d1dd743b0f0c32fdf`, and returned no blocking findings in that assigned scope. Main ratifies that bounded replay contract; wire widths, purpose partitions, and physical cell/byte totals remain unchanged. The subsequent status/provenance update is Main-authored metadata, not a falsely claimed rereview. The earlier review hashes above remain historical provenance; neither this document review nor the synthetic replay model establishes v2 runtime behavior or external approval.
 
 Frozen pre-review standalone input SHA-256 values follow. The integrated specifications below supersede those inputs where final review changed ordering, binding, or memory ownership; these hashes identify provenance, not the final reviewed artifact.
 
