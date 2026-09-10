@@ -569,6 +569,8 @@ test('network change invalidates staged recovery before endpoint close completes
   let heldRetirement = false
   let heldClose = false
   let networkChange = null
+  let secondNetworkChange = null
+  let secondNetworkChangeSettled = false
   RoutedDHTIO.prototype.destroy = function () {
     if (heldRetirement) return originalDestroy.call(this)
     heldRetirement = true
@@ -587,8 +589,16 @@ test('network change invalidates staged recovery before endpoint close completes
     networkChange = routing.networkChanged()
     await closeEntered
     t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.UNAVAILABLE)
+    secondNetworkChange = routing.networkChanged().then(() => {
+      secondNetworkChangeSettled = true
+    })
     releaseRetirement()
     await settle()
+    t.is(
+      secondNetworkChangeSettled,
+      false,
+      'concurrent network change waits for the same endpoint cleanup'
+    )
     t.is(
       manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().rotations.announce,
       undefined,
@@ -603,12 +613,14 @@ test('network change invalidates staged recovery before endpoint close completes
     )
     releaseClose()
     await networkChange
+    await secondNetworkChange
     t.is(routing.snapshot().routeManager, false)
     t.is(routing.snapshot().transportDHT, false)
   } finally {
     releaseRetirement()
     releaseClose()
     if (networkChange) await networkChange
+    if (secondNetworkChange) await secondNetworkChange
     RoutedDHTIO.prototype.destroy = originalDestroy
     UdxCellEndpoint.prototype.close = originalClose
   }

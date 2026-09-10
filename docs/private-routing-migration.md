@@ -2127,6 +2127,36 @@ PR merge source, and published merge. This establishes exact source-tree
 identity; the detailed downloaded-bundle verification above is specifically
 for run `34437120378`, not a second bundle inspection.
 
+### Delayed advisory follow-up — 2026-09-10
+
+Reconciliation against the published head found two remaining runtime gaps:
+configured-endpoint exhaustion wrapped the saved guard rejection again inside
+the endpoint loop, and overlapping `networkChanged()` calls could finish a
+second unavailable teardown while the first endpoint close remained pending.
+
+The bootstrap loop now preserves its saved normalized rejection and wraps only
+at final exhaustion. The controller publishes one retained cleanup promise,
+transitions to UNAVAILABLE before scheduling cleanup, and makes concurrent
+callers await that operation, including the OFF-state network-change path.
+UNAVAILABLE is terminal for this controller; the promise is not reset to
+permit another cleanup.
+
+Both observable regressions failed before the correction. The ownership,
+rotation, authority, and SURB scenarios passed after it. The bootstrap fixture
+initially expected a raw injected transport error; the real boundary normalizes
+that error to ERR_AUTHENTICATION. Its corrected assertion requires that
+normalized error as the immediate cause, rather than another guard wrapper.
+Native Node bootstrap verification then passed34 tests/349 assertions; removal
+of a redundant two-assertion fixture-wiring test is left to final native CI.
+The retained tests exercise the actual controller and bootstrap paths, not
+source-text matches. Local evidence is `late-advisory-before.txt`,
+`late-advisory-after-node.txt`, and `late-bootstrap-after-node.txt`.
+
+The separate peer-stream prerequisite also now states explicitly that OFFER
+duplicates and timer retries share the original eight-attempt response budget.
+Fresh class-5 AEAD counters do not create fresh send allowance. This remains a
+design contract, not an implemented peer-stream privacy claim.
+
 ### KI-1: routes are correlatable by timing and volume
 
 **Status: accepted for v1. Not fixed, not scheduled in this gate.**
