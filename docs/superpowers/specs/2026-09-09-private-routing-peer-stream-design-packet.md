@@ -3,9 +3,9 @@
 **Date:** 2026-09-09
 **Runtime baseline:** `02bce1422de05c271260b1f37344d69dbe9afe23`
 **Original review baseline:** `06dc259c10d6270977d88e1bc12834d9051e1a77`
-**Status:** internal implementation prerequisite ratified by Main. No v2 runtime or public API is enabled; implementation, native privacy acceptance, and external human cryptographic/public-release gates remain separate.
+**Status:** internal implementation-prerequisite candidate; final ratification is held pending fresh-context review of this exact integrated document. No v2 runtime or public API is enabled; implementation, native privacy acceptance, and external human cryptographic/public-release gates remain separate.
 
-The [ratification](#prerequisite-ratification), [transport specification](#transport-specification), and [semantic specification](#semantic-specification) below are current. The intervening review record preserves rejected drafts and earlier proof boundaries as history; it is superseded where the ratified specification differs.
+The [ratification record](#prerequisite-ratification), [transport specification](#transport-specification), and [semantic specification](#semantic-specification) below form the current integrated candidate. The intervening review record preserves rejected drafts and earlier proof boundaries as history.
 
 JD directed the seat to own the remaining work. The choices below are the
 seat's design direction, not nine unanswered questions for JD. They do not
@@ -306,7 +306,7 @@ These findings preserve the implementation and external-review gates above.
 
 ## Prerequisite ratification
 
-Main accepts the exact transport and semantic snapshots below as the internal implementation prerequisite. This supersedes the historical rejected drafts above. It does **not** accept a v2 implementation, prove peer-stream privacy, enable public required mode, or substitute for named external human cryptographic review of the eventual exact source and native dependency revisions.
+Main's candidate verdict is to accept the exact transport and semantic snapshots below as the internal implementation prerequisite, superseding the historical rejected drafts above. Final ratification is withheld until fresh-context reviewers examine this formatted integrated document, including Main's post-handoff changes. This does **not** accept a v2 implementation, prove peer-stream privacy, enable public required mode, or substitute for named external human cryptographic review of the eventual exact source and native dependency revisions.
 
 The fresh-context Sol findings were dispositioned by Main, not delegated as an approval verdict. Attempts to obtain another-model review encountered the recorded provider credit failures; same-model fresh contexts are not independent-model or external-human review. No such independence is claimed.
 
