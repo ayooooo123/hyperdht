@@ -2008,6 +2008,19 @@ checks, 14 tests / 117 assertions. The temporary state-access loader was removed
 from the working tree; no production test hook or API was added. These two final
 corrections require a new native run before publication.
 
+Corrected commit `1ace943c3bc64824671233ad886629e9fdb0d86f` passed all ten
+native gates in [run 34423201387](https://github.com/ayooooo123/hyperdht/actions/runs/34423201387):
+Node aggregate 1,109 / 19,855, Bare aggregate 1,064 / 19,720, four normal/reverse
+process legs 175 each, two production-punch legs 180 each, namespace projection
+30, and live capture 185 with raw DROP zero. Linux and macOS formatting and
+deterministic jobs passed. Downloaded evidence contains 26 valid pcaps / 2,962
+packets, 11 valid close-window files and four complete firewall snapshots.
+Every pcap count equals its tcpdump captured count and filter-received count;
+all 26 exits are zero, no capture required a forced kill, and kernel capture
+drops are zero. Both firewall DROP rules are zero in all four snapshots.
+This is the corrected source's native acceptance, not a waiver of the earlier
+local clock failure or historical KI-19.
+
 Later green runs are separate observations, not a fix or waiver for this one.
 
 ### KI-1: routes are correlatable by timing and volume
