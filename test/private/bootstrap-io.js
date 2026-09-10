@@ -481,12 +481,6 @@ test('BootstrapIO rejects a generic datagram send and destroy object', (t) => {
   revokeRelayCandidateDirectorySink(sink)
 })
 
-test('Task4 fake transport is admitted only through the nonforgeable authority issuer', (t) => {
-  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
-  t.is(typeof issuer.createTestBootstrapUdxAuthority, 'function')
-  t.is(typeof issuer.createTestBootstrapUdxLinkReservation, 'function')
-})
-
 test('numeric configured endpoints are owned, deduplicated, and bounded to three', (t) => {
   const f = fixture()
   t.is(f.io[TEST_ONLY_BOOTSTRAP_IO_OBSERVER]().endpointCount, 2)
@@ -765,6 +759,30 @@ test('all configured endpoint failures exhaust without parallel, fallback, or DN
     } finally {
       f.cleanup()
     }
+  }
+})
+
+test('exhausted configured endpoints retain the underlying rejection without wrapper accumulation', async (t) => {
+  const rejection = new Error('guard challenge failed')
+  const f = fixture({
+    onlyGuardAdvertisement: true,
+    onSend({ request }) {
+      if (request.kind === 'active-challenge') throw rejection
+    }
+  })
+  try {
+    const error = await f.io.start().then(
+      () => null,
+      (err) => err
+    )
+    t.is(error.code, 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+    t.is(
+      error.cause.code,
+      'ERR_AUTHENTICATION',
+      'the normalized challenge failure stays immediate instead of another guard wrapper'
+    )
+  } finally {
+    f.cleanup()
   }
 })
 

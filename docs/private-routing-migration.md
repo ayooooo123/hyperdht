@@ -2127,6 +2127,40 @@ PR merge source, and published merge. This establishes exact source-tree
 identity; the detailed downloaded-bundle verification above is specifically
 for run `34437120378`, not a second bundle inspection.
 
+### Delayed advisory follow-up — 2026-09-10
+
+Reconciliation against the published head found two remaining runtime gaps:
+configured-endpoint exhaustion wrapped the saved guard rejection again inside
+the endpoint loop, and overlapping `networkChanged()` calls could finish a
+second unavailable teardown while the first endpoint close remained pending.
+
+The bootstrap loop now preserves its saved normalized rejection and wraps only
+at final exhaustion. The controller synchronously transitions to UNAVAILABLE
+and captures/nulls endpoint ownership, then publishes one retained cleanup
+promise before any destructor callback. Concurrent callers, including the
+OFF-state network-change path and terminal `destroy()`, await that operation.
+UNAVAILABLE is terminal for this controller; the promise is not reset to
+permit another cleanup.
+
+Both observable regressions failed before the correction. The ownership,
+rotation, authority, and SURB scenarios passed after it. The bootstrap fixture
+initially expected a raw injected transport error; the real boundary normalizes
+that error to ERR_AUTHENTICATION. Its corrected assertion requires that
+normalized error as the immediate cause, rather than another guard wrapper.
+The first shared-promise draft failed two stronger checks: immediate endpoint
+ownership detachment and terminal destruction waiting for pending endpoint
+closure. After correction, native Node verification passed97 tests/972
+assertions across bootstrap, route manager, live authority, SURB, and aggregate
+branch rotation. A redundant fixture-wiring assertion test was removed.
+The retained tests exercise actual controller/bootstrap paths, not source-text
+matches. Evidence includes `late-advisory-before.txt`,
+`late-ownership-before.txt`, and `late-advisory-final-node.txt`.
+
+The separate peer-stream prerequisite also now states explicitly that OFFER
+duplicates and timer retries share the original eight-attempt response budget.
+Fresh class-5 AEAD counters do not create fresh send allowance. This remains a
+design contract, not an implemented peer-stream privacy claim.
+
 ### KI-1: routes are correlatable by timing and volume
 
 **Status: accepted for v1. Not fixed, not scheduled in this gate.**
