@@ -2021,6 +2021,25 @@ drops are zero. Both firewall DROP rules are zero in all four snapshots.
 This is the corrected source's native acceptance, not a waiver of the earlier
 local clock failure or historical KI-19.
 
+Subsequent advisory review found that the drain wait still snapshotted registered
+queries rather than holding the complete admitted attempt. A new internal
+attempt registry now spans construction and discovery/commit gaps; active queries
+remain the cancellation registry. The exact retired record's `lost` state now
+invalidates drain/reply ownership, including loss reported after retirement.
+Destroyed or already-lost ownership is rejected before invoking the clock, while
+post-clock checks remain necessary for reentrant invalidation.
+
+The shared third safety candidate is now opt-in for rotation fixtures. The broad
+lifecycle case covers suspension alone; dedicated regressions cover valid sibling
+drain and lost-branch reply rejection. Narrow package-private issuer seams retain
+the formerly temporary supersession regression without adding a public API.
+Native Linux Node and Bare each pass 55 tests / 540 assertions across the three
+affected suites. Four mutations fail the intended regressions: waiting on query
+snapshots, removing the DHT-identity cleanup guard, removing pre-clock liveness
+checks, and removing lost-branch checks. These advisory repairs require their own
+native aggregate/process/capture acceptance before publication; the earlier
+`1ace943` acceptance does not cover this later source.
+
 Later green runs are separate observations, not a fix or waiver for this one.
 
 ### KI-1: routes are correlatable by timing and volume

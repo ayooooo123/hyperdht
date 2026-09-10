@@ -24,6 +24,7 @@ const {
   readLiveRoutePair,
   assertLiveRoutePairDrain,
   readRouteManagerGenerations,
+  reportRouteManagerBranchLoss,
   isRouteManager
 } = require('../../lib/private/route-manager')
 const {
@@ -1310,3 +1311,141 @@ test('RouteManager zeroizes staged teardown ID and retires on second random draw
   expectCode(t, () => issueGuardLeaseM3CellLinkTransferIssuer(fixture.guardLease), 'ERR_DESTROYED')
   await fixture.close()
 })
+
+for (const failure of ['retired-loss', 'destroyed']) {
+  test(`RouteManager drain rejects ${failure} before invoking its clock`, async (t) => {
+    let clockInvocations = 0
+    const clock = routeClock(NOW, NOW)
+    const origWallNow = clock.wallNow
+    clock.wallNow = () => {
+      clockInvocations++
+      return origWallNow()
+    }
+
+    const records = [
+      candidate(ROLE.SAFETY, 1, 2),
+      candidate(ROLE.SAFETY, 2, 3),
+      candidate(ROLE.SAFETY, 3, 4),
+      candidate(ROLE.PRIVATE, 0, 40),
+      candidate(ROLE.PRIVATE, 1, 41),
+      candidate(ROLE.PRIVATE, 2, 42),
+      candidate(ROLE.PRIVATE, 3, 43),
+      candidate(ROLE.PRIVATE, 4, 44),
+      candidate(ROLE.PRIVATE, 5, 45)
+    ]
+    const fixture = await liveTopologyFixture(
+      failure === 'retired-loss' ? 47551 : 47553,
+      failure === 'retired-loss' ? 47552 : 47554,
+      { left: '127.0.0.1', right: '127.0.0.2' },
+      { clock, records }
+    )
+    const manager = createRouteManager(managerOptions(fixture))
+    t.teardown(async () => {
+      manager.destroy()
+      await fixture.close()
+    })
+    const handoffs = Object.freeze({
+      lookup: Object.freeze({}),
+      announce: Object.freeze({}),
+      rotationLookup: Object.freeze({})
+    })
+    const materials = new Map()
+    stubOpenRouteHandoff(t, {
+      consumeOpenRouteHandoff(handoff) {
+        const material = materials.get(handoff)
+        if (!material) throw new Error('no stub material')
+        return material
+      },
+      revokeOpenRouteHandoff() {
+        return false
+      },
+      destroyOpenRouteMaterial() {
+        return true
+      }
+    })
+    t.is(manager.buildInitialPair(), false)
+    const draft = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().draft
+    const initial = draft
+    const initialLookup = openMaterial(draft.lookup, 0xa1)
+    const initialAnnounce = openMaterial(draft.announce, 0xa2)
+    initialLookup.expiresAt = NOW + 20_000n
+    initialAnnounce.expiresAt = NOW + 20_000n
+    attachEndpointOpenAuthority(initialLookup, draft.lookup, draft.absoluteDeadline)
+    attachEndpointOpenAuthority(initialAnnounce, draft.announce, draft.absoluteDeadline)
+    materials.set(handoffs.lookup, initialLookup)
+    materials.set(handoffs.announce, initialAnnounce)
+    t.is(manager.publishInitialPair({ lookup: handoffs.lookup, announce: handoffs.announce }), true)
+    for (const [branchClass, branch, material] of [
+      [BRANCH_CLASS.LOOKUP, draft.lookup, initialLookup],
+      [BRANCH_CLASS.ANNOUNCE, draft.announce, initialAnnounce]
+    ]) {
+      manager.createDhtSeedAdmission(
+        branchClass,
+        opaqueDestination.createLiveOpaqueDestinations({
+          branch: branchClass,
+          circuitId: branch.circuitId,
+          generation: branch.generation,
+          expiresAt: material.expiresAt,
+          wallNow: fixture.clock.wallNow,
+          monotonicNow: fixture.clock.monotonicNow
+        })
+      )
+    }
+    t.is(publishInitialSeeds(manager, initial, initialLookup, initialAnnounce), true)
+
+    const lease = claimLiveRoutePair(manager)
+    if (failure === 'destroyed') {
+      manager.destroy()
+      clockInvocations = 0
+      expectCode(t, () => assertLiveRoutePairDrain(lease), 'ERR_DESTROYED')
+      t.is(clockInvocations, 0, 'destroyed ownership never calls the injected clock')
+      return
+    }
+
+    // Rotate LOOKUP to generation 2
+    t.is(manager.rotate(BRANCH_CLASS.LOOKUP), false)
+    // Report physical loss for generation 1 while in rotation (before publication commits replacement)
+    t.is(reportRouteManagerBranchLoss(manager, BRANCH_CLASS.LOOKUP, 1n), true)
+    const observed = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]()
+    const replacement = openMaterial(observed.rotations.lookup.branch, 0xa7)
+    replacement.expiresAt = NOW + 10_000n
+    attachEndpointOpenAuthority(
+      replacement,
+      observed.rotations.lookup.branch,
+      observed.rotations.lookup.absoluteDeadline
+    )
+    materials.set(handoffs.rotationLookup, replacement)
+    t.is(manager.publishRotation(BRANCH_CLASS.LOOKUP, handoffs.rotationLookup), true)
+    const replacementOwner = opaqueDestination.createLiveOpaqueDestinations({
+      branch: BRANCH_CLASS.LOOKUP,
+      circuitId: observed.rotations.lookup.branch.circuitId,
+      generation: observed.rotations.lookup.branch.generation,
+      expiresAt: replacement.expiresAt,
+      wallNow: fixture.clock.wallNow,
+      monotonicNow: fixture.clock.monotonicNow
+    })
+    const replacementAdmission = manager.createDhtSeedAdmission(
+      BRANCH_CLASS.LOOKUP,
+      replacementOwner
+    )
+    opaqueDestination.stageDhtSeedAdmission(
+      replacementAdmission,
+      encodedSeedsFor(observed.rotations.lookup.branch, replacement, 0x91)
+    )
+    const replacementCommitted = opaqueDestination.commitDhtSeedAdmission(
+      opaqueDestination.sealDhtSeedAdmission(replacementAdmission)
+    )
+    t.is(
+      manager.publishRotationSeed(BRANCH_CLASS.LOOKUP, replacementCommitted.branchSeedReady),
+      true
+    )
+
+    // Generation 1 is now retired with lost = true; drain check must fail closed
+    clockInvocations = 0
+    expectCode(t, () => assertLiveRoutePairDrain(lease), 'ERR_DESTROYED')
+    t.is(clockInvocations, 0, 'lost ownership never calls the injected clock')
+
+    // Lease is now spent (revoked)
+    expectCode(t, () => assertLiveRoutePairDrain(lease), 'ERR_REPLAY')
+  })
+}

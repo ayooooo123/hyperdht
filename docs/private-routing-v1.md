@@ -611,9 +611,14 @@ continuation authority covers lazy discovery, transport retries, and the
 GET-to-PUT commit under the admitted command policies. A second outer attempt
 requires fresh `READY` admission; it cannot reuse a completed attempt's authority.
 
-Replacement construction starts without waiting for queries. Transfer and
-destruction of the previous generation wait until its queries have finished
-and their continuation authorities and reply-mode holds have been released.
+Replacement construction starts without waiting for queries. Each admitted
+attempt registers a generation hold before query construction; that hold covers
+gaps with no registered query, including discovery and GET-to-PUT transition.
+Transfer and destruction of the previous generation wait until its admitted
+attempts finish and release their continuation authorities and reply-mode holds.
+Synchronous construction failure releases the same hold in the operation's
+`finally`; the active-query registry remains a cancellation registry, not the
+attempt-lifetime oracle.
 Generation installation rechecks controller and transport ownership after drain
 and candidate readiness. A destroyed or superseded installation cannot publish
 its candidate or tear down a newer generation.
