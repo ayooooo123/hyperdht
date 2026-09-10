@@ -331,7 +331,7 @@ async function productionAuthorityFixture(t, port = 47601, options = {}) {
       records: [
         candidate(ROLE.SAFETY, 1, 2),
         candidate(ROLE.SAFETY, 2, 3),
-        candidate(ROLE.SAFETY, 3, 4),
+        ...(options && options.rotation ? [candidate(ROLE.SAFETY, 3, 4)] : []),
         candidate(ROLE.PRIVATE, 0, 40),
         candidate(ROLE.PRIVATE, 1, 41),
         candidate(ROLE.PRIVATE, 2, 42),
@@ -682,7 +682,7 @@ test('authenticated routed reply bind rejects cross-request, digest, deadline, a
   }
 })
 
-test('LiveRouteAuthority preserves authenticated replies through sibling rotation and cancellation', async (t) => {
+test('LiveRouteAuthority preserves authenticated replies through cancellation', async (t) => {
   const { authority, manager, materials, pairs, topology } = await productionAuthorityFixture(
     t,
     47611
@@ -842,21 +842,6 @@ test('LiveRouteAuthority preserves authenticated replies through sibling rotatio
   })
   const receivedFollowup = decodeRoutedRequest(await receiveRequest())
   const lateReply = await sendReply(lateRequest, b4a.from([0xbb]))
-  // This request was admitted on the unchanged lookup branch. Starting an
-  // announce replacement must not spend its pair lease before it can drain.
-  t.is(manager.rotate(BRANCH_CLASS.ANNOUNCE), false)
-  expectCode(
-    t,
-    () =>
-      authority.request({
-        branch: BRANCH_CLASS.LOOKUP,
-        destinationRef,
-        encodedRequest: followupRequest,
-        attempt: 1,
-        operationDeadlineMs: deadline
-      }),
-    'ERR_PRIVATE_BRANCH_ROTATING'
-  )
   const expectedFollowupReply = await sendReply(receivedFollowup, b4a.from([0xcc]))
   const followupResult = await followup.promise
   t.alike(followupResult.encodedReply, expectedFollowupReply)
@@ -1081,7 +1066,8 @@ test('production request refuses a zero budget or a deadline outside its own clo
 test('LiveRouteAuthority query admission token allows continuation across sibling rotation and rejects invalid tokens', async (t) => {
   const { authority, manager, materials, pairs, topology } = await productionAuthorityFixture(
     t,
-    47701
+    47701,
+    { rotation: true }
   )
   const id = b4a.alloc(32, 0xa1)
   const destinationRef = encodeDestinationRef({
@@ -1282,7 +1268,10 @@ test('LiveRouteAuthority rejects query admission revoked during drain clock call
     }
     return NOW
   }
-  const { authority, manager, topology } = await productionAuthorityFixture(t, 47635, { clock })
+  const { authority, manager, topology } = await productionAuthorityFixture(t, 47635, {
+    clock,
+    rotation: true
+  })
   const id = b4a.alloc(32, 0xd1)
   const destinationRef = encodeDestinationRef({
     id,
@@ -1452,9 +1441,10 @@ test('LiveRouteAuthority query admission rejects cross-authority, cross-branch, 
   immutableGetRequest.fill(0)
 })
 
-function publishReplacementBranch(manager, topology, branchClass, value = 0x81) {
+function publishReplacementBranch(manager, topology, branchClass, value = 0x81, onRotate = null) {
   const openRouteHandoff = require('../../lib/private/open-route-handoff')
   manager.rotate(branchClass)
+  if (typeof onRotate === 'function') onRotate()
   const key = branchClass === BRANCH_CLASS.LOOKUP ? 'lookup' : 'announce'
   const rotation = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().rotations[key]
   const branch = rotation.branch
@@ -1530,7 +1520,7 @@ test('LiveRouteAuthority old query admission token cannot revive ownership after
     authority: authority1,
     manager: manager1,
     topology
-  } = await productionAuthorityFixture(t, 47661)
+  } = await productionAuthorityFixture(t, 47661, { rotation: true })
   const id = b4a.alloc(32, 0xc1)
   const destinationRef = encodeDestinationRef({
     id,
@@ -1691,7 +1681,10 @@ test('rejected reentrant query admission does not block generation transfer', as
     }
     return NOW
   }
-  const { authority, manager, topology } = await productionAuthorityFixture(t, 47705, { clock })
+  const { authority, manager, topology } = await productionAuthorityFixture(t, 47705, {
+    clock,
+    rotation: true
+  })
   const contexts = createQueryContexts()
   const routed = new RoutedDHTIO({ authority, contexts, now: () => Number(clock.monotonicNow()) })
   let replacement = null
@@ -1719,4 +1712,231 @@ test('rejected reentrant query admission does not block generation transfer', as
     await routed.destroy()
     if (replacement) destroyM3RouteTransport(replacement.pair.right)
   }
+})
+
+test('LiveRouteAuthority allows in-flight sibling request to drain and authenticate reply during rotation', async (t) => {
+  const { authority, manager, materials, pairs, topology } = await productionAuthorityFixture(
+    t,
+    47721,
+    { rotation: true }
+  )
+  const id = b4a.alloc(32, 0xa7)
+  const destinationRef = encodeDestinationRef({
+    id,
+    handle: b4a.alloc(130, 0xa8)
+  })
+  issueLiveRouteDestination(authority, {
+    branch: BRANCH_CLASS.LOOKUP,
+    id,
+    destinationRef
+  })
+  const exitCodec = endpointCodecFor(materials.lookup)
+  const requestReassembler = new Reassembler({
+    now: () => Number(topology.clock.monotonicNow()),
+    epochExpiresAt: Number(materials.lookup.expiresAt)
+  })
+  const receiveRequest = async () => {
+    let encoded = null
+    while (encoded === null) {
+      const frame = await receiveM3RouteFrame(pairs.lookup.right)
+      const opened = exitCodec.open({ direction: DIRECTION.FORWARD }, frame)
+      frame.fill(0)
+      encoded = requestReassembler.pushAuthenticated(opened.payload)
+      opened.payload.fill(0)
+    }
+    return encoded
+  }
+  let replyOrdinal = 0
+  const sendReply = async (request, value) => {
+    const encodedResponse = encodeImmutableGetResponse({ valuePresent: true, value })
+    const encodedReply = encodeRoutedReply({
+      requestId: request.requestId,
+      commandId: request.commandId,
+      commandVersion: request.commandVersion,
+      operationClass: request.operationClass,
+      from: request.destinationEncoded,
+      errorCode: 0,
+      token: b4a.alloc(0),
+      closerNodes: [],
+      encodedResponse
+    })
+    const payloads = fragment(encodedReply, {
+      randomBytes: (size) => b4a.alloc(size, 0x80 + replyOrdinal++)
+    })
+    for (const payload of payloads) {
+      const frame = exitCodec.seal({
+        direction: DIRECTION.REVERSE,
+        class: CELL_CLASS.DATAGRAM,
+        payload
+      })
+      await sendM3RouteFrame(pairs.lookup.right, frame)
+      frame.fill(0)
+      payload.fill(0)
+    }
+    encodedResponse.fill(0)
+    return encodedReply
+  }
+
+  const budget = 3_000n
+  const deadline = topology.clock.monotonicNow() + budget
+  const target = b4a.alloc(32, 0xa9)
+  const requestPayload = encodeRoutedRequest({
+    requestId: b4a.alloc(16, 0xaa),
+    operationClass: BRANCH_CLASS.LOOKUP,
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    operationBudgetMs: budget,
+    destination: destinationRef,
+    encodedBody: target
+  })
+
+  const operation = authority.request({
+    branch: BRANCH_CLASS.LOOKUP,
+    destinationRef,
+    encodedRequest: requestPayload,
+    attempt: 1,
+    operationDeadlineMs: deadline
+  })
+  const received = decodeRoutedRequest(await receiveRequest())
+
+  t.is(manager.rotate(BRANCH_CLASS.ANNOUNCE), false)
+
+  expectCode(
+    t,
+    () =>
+      authority.request({
+        branch: BRANCH_CLASS.LOOKUP,
+        destinationRef,
+        encodedRequest: requestPayload,
+        attempt: 1,
+        operationDeadlineMs: deadline
+      }),
+    'ERR_PRIVATE_BRANCH_ROTATING'
+  )
+
+  const expectedReply = await sendReply(received, b4a.from([0xee]))
+  const result = await operation.promise
+  t.alike(result.encodedReply, expectedReply)
+
+  clearRoutedRequest(received)
+  requestPayload.fill(0)
+  expectedReply.fill(0)
+  requestReassembler.destroy()
+  exitCodec.destroy()
+  authority.destroy()
+  manager.destroy()
+})
+
+test('LiveRouteAuthority rejects drain and replies when branch fails for cause including retired records', async (t) => {
+  const { authority, manager, materials, pairs, topology } = await productionAuthorityFixture(
+    t,
+    47731,
+    { rotation: true }
+  )
+  const id = b4a.alloc(32, 0xb1)
+  const destinationRef = encodeDestinationRef({
+    id,
+    handle: b4a.alloc(130, 0xb2)
+  })
+  issueLiveRouteDestination(authority, {
+    branch: BRANCH_CLASS.LOOKUP,
+    id,
+    destinationRef
+  })
+  const exitCodec = endpointCodecFor(materials.lookup)
+  const requestReassembler = new Reassembler({
+    now: () => Number(topology.clock.monotonicNow()),
+    epochExpiresAt: Number(materials.lookup.expiresAt)
+  })
+  const receiveRequest = async () => {
+    let encoded = null
+    while (encoded === null) {
+      const frame = await receiveM3RouteFrame(pairs.lookup.right)
+      const opened = exitCodec.open({ direction: DIRECTION.FORWARD }, frame)
+      frame.fill(0)
+      encoded = requestReassembler.pushAuthenticated(opened.payload)
+      opened.payload.fill(0)
+    }
+    return encoded
+  }
+  const sendReply = async (request, value) => {
+    const encodedResponse = encodeImmutableGetResponse({ valuePresent: true, value })
+    const encodedReply = encodeRoutedReply({
+      requestId: request.requestId,
+      commandId: request.commandId,
+      commandVersion: request.commandVersion,
+      operationClass: request.operationClass,
+      from: request.destinationEncoded,
+      errorCode: 0,
+      token: b4a.alloc(0),
+      closerNodes: [],
+      encodedResponse
+    })
+    const payloads = fragment(encodedReply, {
+      randomBytes: (size) => b4a.alloc(size, 0x88)
+    })
+    for (const payload of payloads) {
+      const frame = exitCodec.seal({
+        direction: DIRECTION.REVERSE,
+        class: CELL_CLASS.DATAGRAM,
+        payload
+      })
+      await sendM3RouteFrame(pairs.lookup.right, frame)
+      frame.fill(0)
+      payload.fill(0)
+    }
+    encodedResponse.fill(0)
+    return encodedReply
+  }
+
+  const budget = 3_000n
+  const deadline = topology.clock.monotonicNow() + budget
+  const target = b4a.alloc(32, 0xb3)
+  const requestPayload = encodeRoutedRequest({
+    requestId: b4a.alloc(16, 0xb4),
+    operationClass: BRANCH_CLASS.LOOKUP,
+    commandId: M3_MESSAGE_ID.IMMUTABLE_GET_V1,
+    operationBudgetMs: budget,
+    destination: destinationRef,
+    encodedBody: target
+  })
+
+  const operation = authority.request({
+    branch: BRANCH_CLASS.LOOKUP,
+    destinationRef,
+    encodedRequest: requestPayload,
+    attempt: 1,
+    operationDeadlineMs: deadline
+  })
+  const received = decodeRoutedRequest(await receiveRequest())
+
+  const { reportRouteManagerBranchLoss } = require('../../lib/private/route-manager')
+  const { pair: replacementPair } = publishReplacementBranch(
+    manager,
+    topology,
+    BRANCH_CLASS.LOOKUP,
+    0xb5,
+    () => {
+      t.is(reportRouteManagerBranchLoss(manager, BRANCH_CLASS.LOOKUP, 1n), true)
+    }
+  )
+
+  const replyPromise = operation.promise.then(
+    () => null,
+    (err) => err
+  )
+  await sendReply(received, b4a.from([0xff]))
+
+  const error = await replyPromise
+  t.ok(error instanceof Error)
+  t.is(error && error.code, 'ERR_DESTROYED')
+
+  clearRoutedRequest(received)
+  requestPayload.fill(0)
+  requestReassembler.destroy()
+  exitCodec.destroy()
+  try {
+    destroyM3RouteTransport(replacementPair.right)
+  } catch {}
+  authority.destroy()
+  manager.destroy()
 })

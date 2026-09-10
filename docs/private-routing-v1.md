@@ -611,9 +611,14 @@ continuation authority covers lazy discovery, transport retries, and the
 GET-to-PUT commit under the admitted command policies. A second outer attempt
 requires fresh `READY` admission; it cannot reuse a completed attempt's authority.
 
-Replacement construction starts without waiting for queries. Transfer and
-destruction of the previous generation wait until its queries have finished
-and their continuation authorities and reply-mode holds have been released.
+Replacement construction starts without waiting for queries. Each admitted
+attempt registers a generation hold before query construction; that hold covers
+gaps with no registered query, including discovery and GET-to-PUT transition.
+Transfer and destruction of the previous generation wait until its admitted
+attempts finish and release their continuation authorities and reply-mode holds.
+Synchronous construction failure releases the same hold in the operation's
+`finally`; the active-query registry remains a cancellation registry, not the
+attempt-lifetime oracle.
 Generation installation rechecks controller and transport ownership after drain
 and candidate readiness. A destroyed or superseded installation cannot publish
 its candidate or tear down a newer generation.
@@ -621,6 +626,14 @@ Draining permits only the exact current branch or its owned retired predecessor;
 it cannot revive expired, lost, suspended, destroyed, or transferred ownership.
 Calls without continuation authority still require the exact current pair.
 These capabilities introduce no wire field or public API.
+
+Failed pair admission remains unusable, but the manager retains its exact
+ownership-transfer handle until transfer or explicit revocation. If a sibling is
+lost, rotation stages only route ownership, with no DHT or query contexts, while
+serially replacing the failed branch. It does not expose `READY` across either
+side of asynchronous readiness or old-transport retirement. Unavailable teardown
+invalidates controller state before awaiting endpoint closure, so a stale
+installation cannot start another replacement after teardown begins.
 
 Cold start is numerically bounded. V1 accepts only numeric IPv4 or IPv6
 bootstrap and guard endpoints and performs no DNS. `BootstrapIO` contacts at

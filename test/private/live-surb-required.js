@@ -33,6 +33,8 @@ const {
   waitFor
 } = require('./routed-dht-traversal')
 const { TEST_ONLY_DHT_EXIT_IO_STATE } = require('../../lib/private/dht-exit-io')
+const { RoutedDHTIO } = require('../../lib/private/routed-dht-io')
+const { destroyM3RouteTransport } = require('../../lib/private/m3-adjacency-runtime')
 
 const controllerIssuer = TEST_ONLY_PRIVATE_ROUTING_CONTROLLER_ISSUER
 const seed = (value) => b4a.alloc(32, value)
@@ -844,8 +846,6 @@ function publishReplacementBranch(manager, topology, branchClass, value = 0x81) 
 
 for (const [index, destroyAt] of [null, 'drain', 'ready'].entries()) {
   test(`generation installation ${destroyAt ? `cancels destroy during ${destroyAt}` : 'waits for the held commit'}`, async (t) => {
-    const { RoutedDHTIO } = require('../../lib/private/routed-dht-io')
-    const { destroyM3RouteTransport } = require('../../lib/private/m3-adjacency-runtime')
     const originalQuery = DHT.prototype.query
     const originalDestroy = DHT.prototype.destroy
     const originalReady = RoutedDHTIO.prototype.ready
@@ -986,3 +986,239 @@ for (const [index, destroyAt] of [null, 'drain', 'ready'].entries()) {
     }
   })
 }
+
+test('rotation remains blocked during admitted gap when no query registered', async (t) => {
+  let routing = null
+  let harness = null
+  let managerRef = null
+  let replacement = null
+  try {
+    harness = await liveAuthorityHarness(
+      (manager, topology) => {
+        managerRef = manager
+        routing = makeController(231, 49301, topology.clock, true)
+        const builder = controllerIssuer.registerManager(routing, manager)
+        return {
+          publishInitialPair: (h) => controllerIssuer.publishInitialPair(routing, builder, h),
+          createDhtSeedAdmission: (b, o) =>
+            controllerIssuer.createDhtSeedAdmission(routing, builder, b, o),
+          publishInitialSeedPair: (r) =>
+            controllerIssuer.publishInitialSeedPair(routing, builder, r)
+        }
+      },
+      null,
+      { serviceBranch: BRANCH_CLASS.ANNOUNCE, records: spareRecords() }
+    )
+    await waitForReady(routing)
+    const oldGeneration = routing.snapshot().lookupGeneration
+
+    const releaseAttempt = controllerIssuer.holdQueryAttempt(routing)
+    t.is(routing.snapshot().activeQueries, 0, 'no DHT query registered in activeQueries')
+
+    const sinks = controllerIssuer.sinks(routing)
+    controllerIssuer.issue(routing, sinks.lookupBranchExpiry)
+    await waitFor(() => routing.snapshot().state === PRIVATE_ROUTING_STATE.ROTATING)
+    t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING)
+
+    replacement = publishReplacementBranch(managerRef, harness.topology, BRANCH_CLASS.LOOKUP, 0x94)
+
+    // Wait for event-loop turn / microtasks
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    t.is(
+      routing.snapshot().state,
+      PRIVATE_ROUTING_STATE.ROTATING,
+      'rotation remains blocked in ROTATING'
+    )
+    t.is(routing.snapshot().activeQueries, 0, 'activeQueries is 0')
+    t.is(routing.snapshot().lookupGeneration, oldGeneration, 'generation has not advanced')
+
+    releaseAttempt()
+
+    await waitForReady(routing)
+    t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.READY, 'controller advances to READY')
+    t.is(routing.snapshot().lookupGeneration, oldGeneration + 1n, 'generation increments')
+  } finally {
+    if (routing) await routing.destroy()
+    if (harness) await closeLiveAuthorityHarness(harness)
+    if (replacement) {
+      destroyM3RouteTransport(replacement.pair.endpoint)
+      destroyM3RouteTransport(replacement.pair.exit)
+      for (const forwarder of replacement.network.forwarders) forwarder.destroy()
+    }
+  }
+})
+
+test('synchronous query-construction failure releases hold', async (t) => {
+  const originalQuery = DHT.prototype.query
+  let routing = null
+  let harness = null
+  let managerRef = null
+  let replacement = null
+  try {
+    harness = await liveAuthorityHarness(
+      (manager, topology) => {
+        managerRef = manager
+        routing = makeController(232, 49311, topology.clock, true)
+        const builder = controllerIssuer.registerManager(routing, manager)
+        return {
+          publishInitialPair: (h) => controllerIssuer.publishInitialPair(routing, builder, h),
+          createDhtSeedAdmission: (b, o) =>
+            controllerIssuer.createDhtSeedAdmission(routing, builder, b, o),
+          publishInitialSeedPair: (r) =>
+            controllerIssuer.publishInitialSeedPair(routing, builder, r)
+        }
+      },
+      null,
+      { serviceBranch: BRANCH_CLASS.ANNOUNCE, records: spareRecords() }
+    )
+    await waitForReady(routing)
+    const oldGeneration = routing.snapshot().lookupGeneration
+
+    const failure = new Error('query construction failed')
+    DHT.prototype.query = function () {
+      throw failure
+    }
+
+    const value = b4a.from('sync construction failure value')
+    const target = cryptoSuite.hash([value])
+    let queryError = null
+    try {
+      await routing.immutableGet(target)
+    } catch (err) {
+      queryError = err
+    }
+    t.is(queryError, failure, 'construction error is preserved')
+    t.is(routing.snapshot().activeQueries, 0, 'activeQueries is 0')
+
+    DHT.prototype.query = originalQuery
+
+    const sinks = controllerIssuer.sinks(routing)
+    controllerIssuer.issue(routing, sinks.lookupBranchExpiry)
+    await waitFor(() => routing.snapshot().state === PRIVATE_ROUTING_STATE.ROTATING)
+
+    replacement = publishReplacementBranch(managerRef, harness.topology, BRANCH_CLASS.LOOKUP, 0x95)
+
+    await waitForReady(routing)
+    t.is(
+      routing.snapshot().state,
+      PRIVATE_ROUTING_STATE.READY,
+      'subsequent rotation is not blocked'
+    )
+    t.is(routing.snapshot().lookupGeneration, oldGeneration + 1n, 'generation advanced')
+  } finally {
+    DHT.prototype.query = originalQuery
+    if (routing) await routing.destroy()
+    if (harness) await closeLiveAuthorityHarness(harness)
+    if (replacement) {
+      destroyM3RouteTransport(replacement.pair.endpoint)
+      destroyM3RouteTransport(replacement.pair.exit)
+      for (const forwarder of replacement.network.forwarders) forwarder.destroy()
+    }
+  }
+})
+
+test('superseded generation installation cannot destroy the current owner', async (t) => {
+  let routing = null
+  let harness = null
+  let managerRef = null
+  let replacement = null
+  const originalReady = RoutedDHTIO.prototype.ready
+  const originalDestroy = RoutedDHTIO.prototype.destroy
+  let previousDht = null
+  let newerDestroyed = false
+  const newerDht = {
+    async destroy() {
+      newerDestroyed = true
+    }
+  }
+  try {
+    harness = await liveAuthorityHarness(
+      (manager, topology) => {
+        managerRef = manager
+        routing = makeController(233, 49321, topology.clock, true)
+        const builder = controllerIssuer.registerManager(routing, manager)
+        return {
+          publishInitialPair: (h) => controllerIssuer.publishInitialPair(routing, builder, h),
+          createDhtSeedAdmission: (b, o) =>
+            controllerIssuer.createDhtSeedAdmission(routing, builder, b, o),
+          publishInitialSeedPair: (r) =>
+            controllerIssuer.publishInitialSeedPair(routing, builder, r)
+        }
+      },
+      null,
+      { serviceBranch: BRANCH_CLASS.ANNOUNCE, records: spareRecords() }
+    )
+    await waitForReady(routing)
+
+    const sinks = controllerIssuer.sinks(routing)
+    controllerIssuer.issue(routing, sinks.lookupBranchExpiry)
+    await waitFor(() => routing.snapshot().state === PRIVATE_ROUTING_STATE.ROTATING)
+    t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING)
+
+    let readyEntered = false
+    let resolveReadyHook = null
+    const readyHookPromise = new Promise((resolve) => {
+      resolveReadyHook = resolve
+    })
+    let releaseReady = null
+    const readyReleasePromise = new Promise((resolve) => {
+      releaseReady = resolve
+    })
+    let resolveDestroyHook = null
+    const destroyHookPromise = new Promise((resolve) => {
+      resolveDestroyHook = resolve
+    })
+
+    RoutedDHTIO.prototype.ready = async function () {
+      await originalReady.call(this)
+      readyEntered = true
+      resolveReadyHook()
+      await readyReleasePromise
+    }
+
+    RoutedDHTIO.prototype.destroy = async function () {
+      try {
+        return await originalDestroy.call(this)
+      } finally {
+        resolveDestroyHook()
+      }
+    }
+
+    replacement = publishReplacementBranch(managerRef, harness.topology, BRANCH_CLASS.LOOKUP, 0x96)
+
+    await readyHookPromise
+    t.is(readyEntered, true, 'old install is suspended inside routed.ready')
+
+    // Current DHT identity changes while old install is in flight (supersession)
+    // A controlled identity substitution exercises the real asynchronous install
+    // catch path, without constructing a second socket or competing installer.
+    previousDht = controllerIssuer.swapTransportDHT(routing, newerDht)
+
+    // Unblock the old install
+    releaseReady()
+    await destroyHookPromise
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    // Verify that because state.transportDHT !== oldDht, enterUnavailable was NOT called
+    t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING, 'must not call enterUnavailable')
+    t.is(managerRef.ready(), true, 'manager remains ready')
+    t.is(newerDestroyed, false, 'stale cleanup cannot destroy the current transport')
+    t.is(controllerIssuer.swapTransportDHT(routing, previousDht), newerDht)
+    previousDht = null
+  } finally {
+    RoutedDHTIO.prototype.ready = originalReady
+    RoutedDHTIO.prototype.destroy = originalDestroy
+    if (previousDht) {
+      controllerIssuer.swapTransportDHT(routing, previousDht)
+      await previousDht.destroy()
+    }
+    if (routing) await routing.destroy()
+    if (harness) await closeLiveAuthorityHarness(harness)
+    if (replacement) {
+      destroyM3RouteTransport(replacement.pair.endpoint)
+      destroyM3RouteTransport(replacement.pair.exit)
+      for (const forwarder of replacement.network.forwarders) forwarder.destroy()
+    }
+  }
+})
