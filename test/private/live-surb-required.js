@@ -3,6 +3,8 @@
 const test = require('brittle')
 const b4a = require('b4a')
 const DHT = require('dht-rpc')
+const { COMMANDS } = require('../../lib/constants')
+const Persistent = require('../../lib/persistent')
 
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const {
@@ -330,6 +332,7 @@ test('failed query construction releases required mode before the next ordinary 
       } finally {
         DHT.prototype.query = originalQuery
       }
+      t.is(routing.snapshot().activeQueries, 0, name + ' activeQueries cleaned up')
       const before = TEST_ONLY_DHT_EXIT_IO_STATE.snapshot(harness.exitIO)
       const upstream = respondOnce(harness, value)
       const result = await routing.immutableGet(target)
@@ -564,3 +567,422 @@ test('SURB_REQUIRED oversize has no correlated frames and no hop cells', async (
     if (harness) await closeLiveAuthorityHarness(harness)
   }
 })
+
+test('admitted query GET -> commit continues during sibling rotation with captured context, and new logical query is rejected', async (t) => {
+  let routing = null
+  let harness = null
+  const originalQuery = DHT.prototype.query
+  try {
+    let captured = null
+    harness = await liveAuthorityHarness(
+      (manager, topology) => {
+        routing = makeController(221, 49241, topology.clock, true)
+        const builder = controllerIssuer.registerManager(routing, manager)
+        captured = hopsAndAuthoritiesFromTopology(topology)
+        return {
+          publishInitialPair: (h) => controllerIssuer.publishInitialPair(routing, builder, h),
+          createDhtSeedAdmission: (b, o) =>
+            controllerIssuer.createDhtSeedAdmission(routing, builder, b, o),
+          publishInitialSeedPair: (r) =>
+            controllerIssuer.publishInitialSeedPair(routing, builder, r)
+        }
+      },
+      null,
+      { serviceBranch: BRANCH_CLASS.ANNOUNCE, records: spareRecords() }
+    )
+    await waitForReady(routing)
+    controllerIssuer.bindSurbReturnPath(routing, BRANCH_CLASS.LOOKUP, captured.hops)
+    installHostedSurbReversePath(routing, harness.exitIO, captured.middleAuth, captured.guardAuth)
+
+    const value = b4a.from('admitted query commit during rotation')
+    const target = cryptoSuite.hash([value])
+
+    let getStarted = false
+    let resolveGet = null
+    const getWait = new Promise((r) => {
+      resolveGet = r
+    })
+
+    DHT.prototype.query = function (queryTarget, queryOpts) {
+      const q = originalQuery.call(this, queryTarget, queryOpts)
+      if (queryTarget.command === COMMANDS.IMMUTABLE_GET && queryOpts.commit) {
+        getStarted = true
+        resolveGet()
+      }
+      return q
+    }
+
+    let putPromise = null
+    try {
+      putPromise = routing.immutablePut(value)
+      await getWait
+      t.is(getStarted, true)
+
+      // Trigger sibling rotation on LOOKUP branch while PUT's GET is in flight
+      const sinks = controllerIssuer.sinks(routing)
+      controllerIssuer.issue(routing, sinks.lookupBranchExpiry)
+      await waitFor(() => routing.snapshot().state === PRIVATE_ROUTING_STATE.ROTATING)
+
+      // Controller is now ROTATING
+      t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING)
+
+      // New logical query during rotation MUST be rejected
+      const otherTarget = cryptoSuite.hash([b4a.from('other target')])
+      t.is(await code(routing.immutableGet(otherTarget)), 'ERR_PRIVATE_BRANCH_ROTATING')
+
+      // Satisfy GET query from fake upstream DHT node (index 1 after bootstrap probe)
+      await waitFor(() => harness.fakeSocket.sends.length >= 2)
+      const send = harness.fakeSocket.sends[1]
+      harness.fakeSocket.message(dhtResponseFor(send.packet, 2, seed(0x31)), {
+        host: send.host || '8.8.8.8',
+        port: send.port || 49737
+      })
+
+      // Satisfy commit PUT query from fake upstream DHT node (index 2)
+      await waitFor(() => harness.fakeSocket.sends.length >= 3)
+      const putSend = harness.fakeSocket.sends[2]
+      harness.fakeSocket.message(dhtResponseFor(putSend.packet, 0), {
+        host: putSend.host || '8.8.8.8',
+        port: putSend.port || 49737
+      })
+      const result = await putPromise
+      t.alike(result.hash, target)
+    } finally {
+      DHT.prototype.query = originalQuery
+    }
+  } finally {
+    DHT.prototype.query = originalQuery
+    if (routing) await routing.destroy()
+    if (harness) await closeLiveAuthorityHarness(harness)
+  }
+})
+
+test('async sign cannot admit after rotation or destroy', async (t) => {
+  let routing = null
+  let harness = null
+  try {
+    harness = await liveAuthorityHarness(
+      (manager, topology) => {
+        routing = makeController(222, 49251, topology.clock, true)
+        const builder = controllerIssuer.registerManager(routing, manager)
+        const captured = hopsAndAuthoritiesFromTopology(topology)
+        return {
+          publishInitialPair: (h) => controllerIssuer.publishInitialPair(routing, builder, h),
+          createDhtSeedAdmission: (b, o) =>
+            controllerIssuer.createDhtSeedAdmission(routing, builder, b, o),
+          publishInitialSeedPair: (r) =>
+            controllerIssuer.publishInitialSeedPair(routing, builder, r)
+        }
+      },
+      null,
+      { records: spareRecords() }
+    )
+    await waitForReady(routing)
+
+    const keyPair = cryptoSuite.keyPair(seed(222))
+    const value = b4a.from('test async sign cannot admit')
+
+    // Case A: rotate during signMutable
+    let signCalledA = false
+    const rotatingSign = async (seq, val, kp) => {
+      signCalledA = true
+      const sinks = controllerIssuer.sinks(routing)
+      controllerIssuer.issue(routing, sinks.lookupBranchExpiry)
+      await waitFor(() => routing.snapshot().state === PRIVATE_ROUTING_STATE.ROTATING)
+      t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING)
+      return Persistent.signMutable(seq, val, kp)
+    }
+
+    t.is(
+      await code(routing.mutablePut(keyPair, value, { signMutable: rotatingSign })),
+      'ERR_PRIVATE_BRANCH_ROTATING'
+    )
+    t.is(signCalledA, true)
+  } finally {
+    if (routing) await routing.destroy()
+    if (harness) await closeLiveAuthorityHarness(harness)
+  }
+
+  // Case B: destroy during signMutable
+  let routing2 = null
+  let harness2 = null
+  try {
+    harness2 = await liveAuthorityHarness((manager, topology) => {
+      routing2 = makeController(223, 49253, topology.clock, true)
+      const builder = controllerIssuer.registerManager(routing2, manager)
+      const captured = hopsAndAuthoritiesFromTopology(topology)
+      return {
+        publishInitialPair: (h) => controllerIssuer.publishInitialPair(routing2, builder, h),
+        createDhtSeedAdmission: (b, o) =>
+          controllerIssuer.createDhtSeedAdmission(routing2, builder, b, o),
+        publishInitialSeedPair: (r) => controllerIssuer.publishInitialSeedPair(routing2, builder, r)
+      }
+    })
+    await waitForReady(routing2)
+
+    const keyPair = cryptoSuite.keyPair(seed(223))
+    const value = b4a.from('test destroy during sign')
+    let signCalledB = false
+    const destroyingSign = async (seq, val, kp) => {
+      signCalledB = true
+      await routing2.destroy()
+      return Persistent.signMutable(seq, val, kp)
+    }
+
+    t.is(
+      await code(routing2.mutablePut(keyPair, value, { signMutable: destroyingSign })),
+      'ERR_DESTROYED'
+    )
+    t.is(signCalledB, true)
+  } finally {
+    if (routing2) await routing2.destroy()
+    if (harness2) await closeLiveAuthorityHarness(harness2)
+  }
+})
+
+function spareRecords() {
+  const { candidate } = require('./live-topology-fixture')
+  return [
+    candidate(ROLE.SAFETY, 1, 2),
+    candidate(ROLE.SAFETY, 2, 3),
+    candidate(ROLE.SAFETY, 3, 4),
+    candidate(ROLE.PRIVATE, 0, 40),
+    candidate(ROLE.PRIVATE, 1, 41),
+    candidate(ROLE.PRIVATE, 2, 42)
+  ]
+}
+
+function publishReplacementBranch(manager, topology, branchClass, value = 0x81) {
+  const openRouteHandoff = require('../../lib/private/open-route-handoff')
+  const {
+    createBranchNetwork,
+    openMaterialFor,
+    routeTransportPair
+  } = require('./routed-dht-traversal')
+  const finalExitActivation = require('../../lib/private/final-exit-activation')
+  const opaqueDestination = require('../../lib/private/opaque-destination')
+  const { TEST_ONLY_ROUTE_MANAGER_OBSERVER } = require('../../lib/private/route-manager')
+  const { bindOpenRouteTransport } = require('../../lib/private/live-route-authority')
+  const TEST_ONLY_ENDPOINT_DHT_EXIT_OPEN_ISSUER = Symbol.for(
+    'hyperdht-private-routes/test-only-endpoint-dht-exit-open-issuer'
+  )
+  const TEST_ONLY_BRANCH_SEED_READY_ISSUER = Symbol.for(
+    'hyperdht-private-routes/test-only-branch-seed-ready-issuer'
+  )
+
+  const key = branchClass === BRANCH_CLASS.LOOKUP ? 'lookup' : 'announce'
+  const rotation = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]().rotations[key]
+  const branch = rotation.branch
+  const guardIdentity = topology.records.find((record) => record.role === ROLE.SAFETY).identity
+  const network = createBranchNetwork(branch, guardIdentity, topology.clock, [], value)
+  const created = openMaterialFor(branch, value + 1)
+  const pair = routeTransportPair(branch, network, topology.clock)
+  created.material.endpointOpenAuthority = finalExitActivation[
+    TEST_ONLY_ENDPOINT_DHT_EXIT_OPEN_ISSUER
+  ].create({
+    branchClass,
+    branchId: branch.branchId,
+    circuitId: branch.circuitId,
+    generation: branch.generation,
+    exitIdentity: branch.exit.identity,
+    finalTranscriptDigest: created.finalTranscriptDigest,
+    expiresAt: created.material.expiresAt,
+    absoluteDeadline: rotation.absoluteDeadline,
+    controlKey: b4a.alloc(32, value + 12),
+    controlNoncePrefix: b4a.alloc(16, value + 13)
+  })
+  bindOpenRouteTransport(created.material, {
+    transport: pair.endpoint,
+    finalTranscriptDigest: created.finalTranscriptDigest
+  })
+  const handoff = Object.freeze({})
+  const original = {
+    consumeOpenRouteHandoff: openRouteHandoff.consumeOpenRouteHandoff,
+    revokeOpenRouteHandoff: openRouteHandoff.revokeOpenRouteHandoff,
+    destroyOpenRouteMaterial: openRouteHandoff.destroyOpenRouteMaterial
+  }
+  Object.assign(openRouteHandoff, {
+    consumeOpenRouteHandoff(h) {
+      if (h !== handoff) return original.consumeOpenRouteHandoff(h)
+      return created.material
+    },
+    revokeOpenRouteHandoff(h) {
+      if (h !== handoff) return original.revokeOpenRouteHandoff(h)
+      return true
+    },
+    destroyOpenRouteMaterial() {
+      return true
+    }
+  })
+  try {
+    manager.publishRotation(branchClass, handoff)
+  } finally {
+    Object.assign(openRouteHandoff, original)
+  }
+  const owner = opaqueDestination.createLiveOpaqueDestinations({
+    branch: branchClass,
+    circuitId: branch.circuitId,
+    generation: branch.generation,
+    expiresAt: created.material.expiresAt,
+    wallNow: topology.clock.wallNow,
+    monotonicNow: topology.clock.monotonicNow
+  })
+  manager.createDhtSeedAdmission(branchClass, owner)
+  manager.publishRotationSeed(
+    branchClass,
+    opaqueDestination[TEST_ONLY_BRANCH_SEED_READY_ISSUER].create({
+      branchClass,
+      branchId: branch.branchId,
+      circuitId: branch.circuitId,
+      generation: branch.generation,
+      exitIdentity: branch.exit.identity,
+      expiresAt: created.material.expiresAt
+    })
+  )
+  return { pair, created, network }
+}
+
+for (const [index, destroyAt] of [null, 'drain', 'ready'].entries()) {
+  test(`generation installation ${destroyAt ? `cancels destroy during ${destroyAt}` : 'waits for the held commit'}`, async (t) => {
+    const { RoutedDHTIO } = require('../../lib/private/routed-dht-io')
+    const { destroyM3RouteTransport } = require('../../lib/private/m3-adjacency-runtime')
+    const originalQuery = DHT.prototype.query
+    const originalDestroy = DHT.prototype.destroy
+    const originalReady = RoutedDHTIO.prototype.ready
+    let routing = null
+    let harness = null
+    let managerRef = null
+    let replacement = null
+    let putOutcome = null
+    let readyDestruction = null
+    try {
+      let queryDHT = null
+      let latePublication = false
+      harness = await liveAuthorityHarness(
+        (manager, topology) => {
+          managerRef = manager
+          routing = makeController(225 + index, 49271 + index * 2, topology.clock, true)
+          const builder = controllerIssuer.registerManager(routing, manager)
+          return {
+            publishInitialPair: (h) => controllerIssuer.publishInitialPair(routing, builder, h),
+            createDhtSeedAdmission: (b, o) =>
+              controllerIssuer.createDhtSeedAdmission(routing, builder, b, o),
+            publishInitialSeedPair: (r) =>
+              controllerIssuer.publishInitialSeedPair(routing, builder, r)
+          }
+        },
+        null,
+        { serviceBranch: BRANCH_CLASS.ANNOUNCE, records: spareRecords() }
+      )
+      await waitForReady(routing)
+      const oldGeneration = routing.snapshot().lookupGeneration
+      const value = b4a.from('held commit installation drain')
+      const target = cryptoSuite.hash([value])
+      let queryCount = 0
+      let commitCount = 0
+      let resolveCommit = null
+      const commitWait = new Promise((resolve) => {
+        resolveCommit = resolve
+      })
+      DHT.prototype.query = function (queryTarget, queryOpts) {
+        queryDHT = this
+        queryCount++
+        const commit = queryOpts.commit
+        queryOpts.commit = function (reply, dht) {
+          commitCount++
+          resolveCommit()
+          return commit.call(this, reply, dht)
+        }
+        return originalQuery.call(this, queryTarget, queryOpts)
+      }
+      DHT.prototype.destroy = function (...args) {
+        const snapshot = routing.snapshot()
+        if (this !== queryDHT && snapshot.state === PRIVATE_ROUTING_STATE.DESTROYED) {
+          latePublication ||=
+            snapshot.transportDHT || snapshot.routedDHTIO || snapshot.liveRouteAuthority
+        }
+        return originalDestroy.apply(this, args)
+      }
+      if (destroyAt === 'ready') {
+        RoutedDHTIO.prototype.ready = function () {
+          return Promise.resolve(originalReady.call(this)).then(async () => {
+            readyDestruction = routing.destroy()
+            await readyDestruction
+          })
+        }
+      }
+      putOutcome = routing.immutablePut(value).then(
+        (result) => ({ result }),
+        (error) => ({ error })
+      )
+      await waitFor(() => harness.fakeSocket.sends.length >= 2)
+      const get = harness.fakeSocket.sends[1]
+      harness.fakeSocket.message(dhtResponseFor(get.packet, 2, seed(0x32)), {
+        host: get.host,
+        port: get.port
+      })
+      await commitWait
+      controllerIssuer.issue(routing, controllerIssuer.sinks(routing).lookupBranchExpiry)
+      await waitFor(() => routing.snapshot().state === PRIVATE_ROUTING_STATE.ROTATING)
+      replacement = publishReplacementBranch(
+        managerRef,
+        harness.topology,
+        BRANCH_CLASS.LOOKUP,
+        0x91
+      )
+      // All queued pairReady microtasks run before this next event-loop turn.
+      // A check in the publication turn would not exercise installation at all.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      t.is(routing.snapshot().state, PRIVATE_ROUTING_STATE.ROTATING)
+      t.is(routing.snapshot().lookupGeneration, oldGeneration, 'held commit prevents transfer')
+      t.is(routing.snapshot().activeQueries, 1)
+      if (destroyAt === 'drain') {
+        await routing.destroy()
+        const outcome = await putOutcome
+        t.ok(outcome.error instanceof Error, 'unacknowledged commit cannot succeed')
+      } else {
+        await waitFor(() => harness.fakeSocket.sends.length >= 3)
+        const put = harness.fakeSocket.sends[2]
+        harness.fakeSocket.message(dhtResponseFor(put.packet, 0), {
+          host: put.host,
+          port: put.port
+        })
+        const outcome = await putOutcome
+        if (outcome.error) throw outcome.error
+        t.alike(outcome.result.hash, target)
+        if (destroyAt === 'ready') {
+          await waitFor(() => readyDestruction !== null)
+          await readyDestruction
+        } else {
+          await waitForReady(routing)
+          t.is(routing.snapshot().lookupGeneration, oldGeneration + 1n)
+        }
+      }
+      if (destroyAt !== null) {
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        const stopped = routing.snapshot()
+        t.is(stopped.state, PRIVATE_ROUTING_STATE.DESTROYED)
+        t.is(stopped.transportDHT, false, 'no late DHT publication')
+        t.is(stopped.routedDHTIO, false, 'no late IO publication')
+        t.is(stopped.liveRouteAuthority, false, 'no late authority publication')
+        t.is(await code(routing.immutableGet(target)), 'ERR_DESTROYED')
+        t.is(latePublication, false, 'a destroyed controller never publishes a candidate transport')
+      }
+      t.is(routing.snapshot().activeQueries, 0)
+      t.is(queryCount, 1, 'one logical attempt')
+      t.is(commitCount, 1, 'one physical commit')
+    } finally {
+      DHT.prototype.query = originalQuery
+      DHT.prototype.destroy = originalDestroy
+      RoutedDHTIO.prototype.ready = originalReady
+      if (routing) await routing.destroy()
+      if (putOutcome) await putOutcome
+      if (harness) await closeLiveAuthorityHarness(harness)
+      if (replacement) {
+        destroyM3RouteTransport(replacement.pair.endpoint)
+        destroyM3RouteTransport(replacement.pair.exit)
+        for (const forwarder of replacement.network.forwarders) forwarder.destroy()
+      }
+    }
+  })
+}

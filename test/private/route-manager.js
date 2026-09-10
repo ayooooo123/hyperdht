@@ -19,6 +19,10 @@ const {
   createFinalExitActivationFactory,
   createRouteExtensionFactory,
   createRouteManager,
+  claimLiveRoutePair,
+  claimRotatedLiveRoutePair,
+  readLiveRoutePair,
+  assertLiveRoutePairDrain,
   readRouteManagerGenerations,
   isRouteManager
 } = require('../../lib/private/route-manager')
@@ -836,6 +840,8 @@ test('RouteManager rotates one branch make-before-break under signed expiry cap'
   const initialAnnounce = openMaterial(initial.announce, 0xf1)
   initialLookup.expiresAt = NOW + 20_000n
   initialAnnounce.expiresAt = NOW + 20_000n
+  attachEndpointOpenAuthority(initialLookup, initial.lookup, initial.absoluteDeadline)
+  attachEndpointOpenAuthority(initialAnnounce, initial.announce, initial.absoluteDeadline)
   materials.set(handoffs.initialLookup, initialLookup)
   materials.set(handoffs.initialAnnounce, initialAnnounce)
   stubOpenRouteHandoff(t, {
@@ -861,11 +867,30 @@ test('RouteManager rotates one branch make-before-break under signed expiry cap'
     }),
     true
   )
+  for (const [branchClass, branch, material] of [
+    [BRANCH_CLASS.LOOKUP, initial.lookup, initialLookup],
+    [BRANCH_CLASS.ANNOUNCE, initial.announce, initialAnnounce]
+  ]) {
+    manager.createDhtSeedAdmission(
+      branchClass,
+      opaqueDestination.createLiveOpaqueDestinations({
+        branch: branchClass,
+        circuitId: branch.circuitId,
+        generation: branch.generation,
+        expiresAt: material.expiresAt,
+        wallNow: fixture.clock.wallNow,
+        monotonicNow: fixture.clock.monotonicNow
+      })
+    )
+  }
   t.is(publishInitialSeeds(manager, initial, initialLookup, initialAnnounce), true)
   const oldLookupCapability = manager.branchCapability(BRANCH_CLASS.LOOKUP)
+  const lease = claimLiveRoutePair(manager)
   const announceCapability = manager.branchCapability(BRANCH_CLASS.ANNOUNCE)
 
   t.is(manager.rotate(BRANCH_CLASS.LOOKUP), false)
+  expectCode(t, () => readLiveRoutePair(lease), 'ERR_PRIVATE_BRANCH_ROTATING')
+  assertLiveRoutePairDrain(lease)
   const observed = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]()
   t.is(observed.status, 'ROTATING')
   t.is(observed.ready, true)
@@ -904,7 +929,15 @@ test('RouteManager rotates one branch make-before-break under signed expiry cap'
     opaqueDestination.sealDhtSeedAdmission(replacementAdmission)
   )
   t.is(manager.publishRotationSeed(BRANCH_CLASS.LOOKUP, replacementCommitted.branchSeedReady), true)
-  t.is(destroyed[0], initialLookup)
+  t.is(destroyed.includes(initialLookup), false, 'the leased predecessor is retained for draining')
+  expectCode(t, () => readLiveRoutePair(lease), 'ERR_PRIVATE_BRANCH_ROTATING')
+  assertLiveRoutePairDrain(lease)
+  const rotated = claimRotatedLiveRoutePair(manager, BRANCH_CLASS.LOOKUP)
+  expectCode(t, () => readLiveRoutePair(lease), 'ERR_REPLAY')
+  expectCode(t, () => assertLiveRoutePairDrain(lease), 'ERR_REPLAY')
+  t.is(readLiveRoutePair(rotated.lease).lookup.material.generation, 2n)
+  opaqueDestination.destroyLiveOpaqueDestinations(rotated.retired.owner)
+  openRouteHandoff.destroyOpenRouteMaterial(rotated.retired.material)
   t.alike(readRouteManagerGenerations(manager), {
     lookupGeneration: 2n,
     announceGeneration: 1n
@@ -923,6 +956,9 @@ test('RouteManager rotates one branch make-before-break under signed expiry cap'
   )
   t.is(extraOne.destroy(), true)
   t.is(extraTwo.destroy(), true)
+  clock.advance(Number(replacement.expiresAt - NOW))
+  expectCode(t, () => assertLiveRoutePairDrain(rotated.lease), 'ERR_DESTROYED')
+  expectCode(t, () => readLiveRoutePair(rotated.lease), 'ERR_REPLAY')
 
   t.is(manager.destroy(), true)
   t.is(destroyed.length, 3)
