@@ -627,6 +627,14 @@ it cannot revive expired, lost, suspended, destroyed, or transferred ownership.
 Calls without continuation authority still require the exact current pair.
 These capabilities introduce no wire field or public API.
 
+Failed pair admission remains unusable, but the manager retains its exact
+ownership-transfer handle until transfer or explicit revocation. If a sibling is
+lost, rotation stages only route ownership, with no DHT or query contexts, while
+serially replacing the failed branch. It does not expose `READY` across either
+side of asynchronous readiness or old-transport retirement. Unavailable teardown
+invalidates controller state before awaiting endpoint closure, so a stale
+installation cannot start another replacement after teardown begins.
+
 Cold start is numerically bounded. V1 accepts only numeric IPv4 or IPv6
 bootstrap and guard endpoints and performs no DNS. `BootstrapIO` contacts at
 most three configured bootstrap endpoints sequentially and actively

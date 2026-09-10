@@ -2040,6 +2040,29 @@ checks, and removing lost-branch checks. These advisory repairs require their ow
 native aggregate/process/capture acceptance before publication; the earlier
 `1ace943` acceptance does not cover this later source.
 
+Candidate `b40649e` failed native aggregate acceptance in
+[run 34433286596](https://github.com/ayooooo123/hyperdht/actions/runs/34433286596):
+`branch loss survives controller refusal` reached a destroyed manager. The newly
+strict lost-branch check correctly rejected readiness through a lost sibling, but
+generation installation treated that rejection as terminal instead of preserving
+recovery ownership. No process or capture acceptance was reached in that run.
+
+The follow-on repair distinguishes failed admission from ownership transfer.
+Rotation stages an owner without a DHT or query contexts while replacing a lost
+sibling. Exact retired-record loss is now reported after retirement without
+invalidating its replacement. Loss both during and after asynchronous readiness
+keeps `READY` unobservable through old-transport retirement. A review also found
+that unavailable teardown left its old state valid until endpoint closure; state
+now invalidates synchronously before that await.
+
+Native Linux Node and Bare each pass 67 tests / 643 assertions across the four
+affected suites. Three additional isolated-file mutations fail their retained
+regressions: omitting readiness-error recovery, omitting the post-readiness loss
+check, and restoring the late unavailable transition. The transferred retired
+owner/material are explicitly destroyed by the regression, matching existing
+ownership cleanup. The failed candidate run remains evidence; the corrected
+source still requires a new native aggregate/process/capture run.
+
 Later green runs are separate observations, not a fix or waiver for this one.
 
 ### KI-1: routes are correlatable by timing and volume

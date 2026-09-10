@@ -1404,8 +1404,6 @@ for (const failure of ['retired-loss', 'destroyed']) {
 
     // Rotate LOOKUP to generation 2
     t.is(manager.rotate(BRANCH_CLASS.LOOKUP), false)
-    // Report physical loss for generation 1 while in rotation (before publication commits replacement)
-    t.is(reportRouteManagerBranchLoss(manager, BRANCH_CLASS.LOOKUP, 1n), true)
     const observed = manager[TEST_ONLY_ROUTE_MANAGER_OBSERVER]()
     const replacement = openMaterial(observed.rotations.lookup.branch, 0xa7)
     replacement.expiresAt = NOW + 10_000n
@@ -1440,12 +1438,17 @@ for (const failure of ['retired-loss', 'destroyed']) {
       true
     )
 
-    // Generation 1 is now retired with lost = true; drain check must fail closed
+    t.is(reportRouteManagerBranchLoss(manager, BRANCH_CLASS.LOOKUP, 1n), true)
+    t.ok(manager.branchCapability(BRANCH_CLASS.LOOKUP), 'retired loss preserves replacement')
     clockInvocations = 0
     expectCode(t, () => assertLiveRoutePairDrain(lease), 'ERR_DESTROYED')
     t.is(clockInvocations, 0, 'lost ownership never calls the injected clock')
 
-    // Lease is now spent (revoked)
+    // Admission is spent, but recovery still owns the exact pair for transfer.
     expectCode(t, () => assertLiveRoutePairDrain(lease), 'ERR_REPLAY')
+    const rotated = claimRotatedLiveRoutePair(manager, BRANCH_CLASS.LOOKUP)
+    t.is(readLiveRoutePair(rotated.lease).lookup.material, replacement)
+    opaqueDestination.destroyLiveOpaqueDestinations(rotated.retired.owner)
+    openRouteHandoff.destroyOpenRouteMaterial(rotated.retired.material)
   })
 }
