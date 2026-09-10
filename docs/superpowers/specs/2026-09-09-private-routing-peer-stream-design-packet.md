@@ -3,7 +3,7 @@
 **Date:** 2026-09-09
 **Runtime baseline:** `02bce1422de05c271260b1f37344d69dbe9afe23`
 **Original review baseline:** `06dc259c10d6270977d88e1bc12834d9051e1a77`
-**Status:** internal implementation-prerequisite candidate; final ratification is held pending fresh-context review of this exact integrated document. No v2 runtime or public API is enabled; implementation, native privacy acceptance, and external human cryptographic/public-release gates remain separate.
+**Status:** internal implementation-prerequisite candidate; final ratification is held pending review of the final commitment-input clarification. No v2 runtime or public API is enabled; implementation, native privacy acceptance, and external human cryptographic/public-release gates remain separate.
 
 The [ratification record](#prerequisite-ratification), [transport specification](#transport-specification), and [semantic specification](#semantic-specification) below form the current integrated candidate. The intervening review record preserves rejected drafts and earlier proof boundaries as history.
 
@@ -306,7 +306,7 @@ These findings preserve the implementation and external-review gates above.
 
 ## Prerequisite ratification
 
-Main's candidate verdict is to accept the exact transport and semantic snapshots below as the internal implementation prerequisite, superseding the historical rejected drafts above. Final ratification is withheld until fresh-context reviewers examine this formatted integrated document, including Main's post-handoff changes. This does **not** accept a v2 implementation, prove peer-stream privacy, enable public required mode, or substitute for named external human cryptographic review of the eventual exact source and native dependency revisions.
+Both review lanes report no blocking findings in their assigned scopes on corrected commit `af8e014c5f10b33c1c7038456813117509260339`, exact document SHA-256 `d05a264f499cad84b1277654bcb0cf3096d450d510bc24f4722ccea0c458f2cd`. [Native run34444531538](https://github.com/ayooooo123/hyperdht/actions/runs/34444531538) passed all three jobs. Main holds final ratification pending review of the final clarification that the tail transcript digest is an input to the distinct routed-candidate commitment, not that commitment itself. This does **not** accept a v2 implementation, prove peer-stream privacy, enable public required mode, or substitute for named external human cryptographic review of the eventual exact source and native dependency revisions.
 
 The fresh-context Sol findings were dispositioned by Main, not delegated as an approval verdict. Attempts to obtain another-model review encountered the recorded provider credit failures; same-model fresh contexts are not independent-model or external-human review. No such independence is claimed.
 
@@ -563,7 +563,7 @@ The complete v2 tail-control transcript T is exactly290 bytes:
 
 Each field comes from the matching authenticated LINK_OFFER/advertisement and the exact accepted tuple, never from a later callback or another extension. Successor signs the redacted proof's `admittedLimitsDigest` only after reserving R and authenticating the complete signed LINK_OFFER, including F and C. Current tail compares the proof against its retained accepted tuple; source independently reconstructs the same digest from its retained EXTEND_REQUEST tuple before accepting EXTENDED. A changed partition or commitment therefore fails before tail publication. Source and successor construct byte-identical T; no successor needs hidden direct-bootstrap proof bytes.
 
-`tailControlTranscriptDigest = H("hyperdht-private-routes/m3/tail-control/transcript-digest/v2", T290)`. This is the exact digest in TAIL_READY, the next routed-candidate commitment, and the purpose preTranscript. Every one of the eight tail-control/tail-finalize labels in §4.3 uses complete T290, not its digest, as the `transcript` in the KDF: `u16be(labelLength) | label | u32be(2) | u32be(290) | T290`, keyed by the matching source-tail X25519 shared secret32. Final-exit handoff moves the exact extension2 T290 and its derived material once. Subsequent purpose-specific KDFs use their explicitly named pre/final transcripts and are not silently substituted for T.
+`tailControlTranscriptDigest = H("hyperdht-private-routes/m3/tail-control/transcript-digest/v2", T290)`. This digest is serialized in TAIL_READY and the purpose preTranscript. It is an input to the next routed-candidate commitment defined in §3.3, not the commitment itself; that distinct hash also binds the discovery request, advertisement, active response, authority nonce, and times. Every one of the eight tail-control/tail-finalize labels in §4.3 uses complete T290, not its digest, as the `transcript` in the KDF: `u16be(labelLength) | label | u32be(2) | u32be(290) | T290`, keyed by the matching source-tail X25519 shared secret32. Final-exit handoff moves the exact extension2 T290 and its derived material once. Subsequent purpose-specific KDFs use their explicitly named pre/final transcripts and are not silently substituted for T.
 
 ### 5. Purpose binding and both confirmations
 
