@@ -2063,6 +2063,25 @@ owner/material are explicitly destroyed by the regression, matching existing
 ownership cleanup. The failed candidate run remains evidence; the corrected
 source still requires a new native aggregate/process/capture run.
 
+Corrected candidate `5b4a1c0` passed Node aggregate 1,119 / 19,919, Bare aggregate
+1,074 / 19,784, and all four normal/reverse process legs (175 assertions each)
+in [run 34435307484](https://github.com/ayooooo123/hyperdht/actions/runs/34435307484).
+Production-punch Node then failed 38/39 with `ERR_PRIVATE_GUARD_UNAVAILABLE`,
+about 17 ms after both first-owned punch sends and exact tuple reflections.
+The remaining punch and namespace/capture gates did not run. Prior guard traces
+share one append-only log across process legs and cannot establish which inner
+bootstrap check rejected this attempt.
+
+One native Node 22 and eight bounded, instrumented Node 24.20.0 production-punch
+probes each passed 180 assertions; they do not explain or waive the CI failure.
+The bootstrap retry boundary previously discarded its actual rejection. It now
+preserves the last rejection using the existing non-enumerable `Error.cause`
+convention, while retaining the public `ERR_PRIVATE_GUARD_UNAVAILABLE` code.
+The process harness already retains causal stacks. A native, fault-injected
+authentication rejection is absent from the old fatal chain and visible after
+this repair; that is diagnostic proof, not a reproduction of the unknown CI
+cause. Bootstrap Node and Bare contracts pass 33 tests / 347 assertions each.
+
 Later green runs are separate observations, not a fix or waiver for this one.
 
 ### KI-1: routes are correlatable by timing and volume
