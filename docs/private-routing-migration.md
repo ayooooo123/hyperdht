@@ -2084,6 +2084,49 @@ cause. Bootstrap Node and Bare contracts pass 33 tests / 347 assertions each.
 
 Later green runs are separate observations, not a fix or waiver for this one.
 
+#### Later accepted runtime candidate
+
+Candidate `f81aff5ea01a7021d4fc9cd7340b32f1890fab07` passed all three jobs in
+[native run 34437120378](https://github.com/ayooooo123/hyperdht/actions/runs/34437120378),
+including Linux/macOS deterministic checks and all ten live Linux gates.
+The tested merge source was `e670c493ccaf2e5c3ea57909590db66ccc2dea7f`.
+[PR #54](https://github.com/ayooooo123/hyperdht/pull/54) published these repairs as
+merge `02bce1422de05c271260b1f37344d69dbe9afe23`; the canonical checkout was
+fast-forwarded to that merge without changing public required-mode gates.
+
+| Gate                                                | Observed acceptance                                    |
+| --------------------------------------------------- | ------------------------------------------------------ |
+| Node aggregate                                      | 1,119 tests / 19,919 assertions                        |
+| Bare aggregate                                      | 1,074 tests / 19,784 assertions                        |
+| Node/Bare normal and reverse-candidate process legs | 175 assertions each                                    |
+| Node/Bare production-punch legs                     | 180 assertions each                                    |
+| Privileged namespace projection                     | 30 assertions                                          |
+| Privileged namespace live/capture                   | 185 assertions; raw DROP 0, classified teardown ICMP 0 |
+
+[Capture artifact 10136630727](https://github.com/ayooooo123/hyperdht/actions/runs/34437120378/artifacts/10136630727)
+contains 119 files. A separate downloaded-bundle scan verified all 26 PCAPs:
+2,942 complete records, captured counts matching tcpdump logs, no truncated
+records, all tcpdump exits 0, all shutdown records `forcedKill=false`, and no
+kernel capture drops. All four firewall snapshots report raw DROP 0; all eleven
+endpoint-close JSON files parse. Uploaded ZIP SHA-256:
+`a7f39e5fe2c6ceae6e24e89590f365ddcbc881b09532f0155c1d3db7b02c3ae7`.
+The per-file digest manifest and scan results are retained as
+`local://native-34437120378-verification.json` in the ownership session.
+
+This is acceptance of the later exact runtime source, not an explanation or
+waiver of run `34435307484`. Its discarded inner error remains unavailable;
+further causal diagnosis requires a newly captured failure or that missing
+original evidence. No v2 peer-stream implementation, external cryptographic
+approval, or public-mode approval is implied.
+
+The automatic post-merge workflow also passed:
+[run 34439259570](https://github.com/ayooooo123/hyperdht/actions/runs/34439259570).
+GitHub's commit objects report the identical tree
+`c5aaa6c5b3b5fa1a85ff06d958c0602519787a46` for the accepted candidate, tested
+PR merge source, and published merge. This establishes exact source-tree
+identity; the detailed downloaded-bundle verification above is specifically
+for run `34437120378`, not a second bundle inspection.
+
 ### KI-1: routes are correlatable by timing and volume
 
 **Status: accepted for v1. Not fixed, not scheduled in this gate.**
