@@ -1980,6 +1980,34 @@ A throwaway real-process fault smoke killed one owned tcpdump with SIGKILL,
 observed retained exit status 137, and verified namespace cleanup. This proves
 nonzero capture exits are recorded, not replaced with a successful default.
 
+Review-branch commit `8fc1611` passed all ten native gates in
+[run 34421683563](https://github.com/ayooooo123/hyperdht/actions/runs/34421683563)
+before publication. Its downloaded bundle parsed 26 pcaps / 2,765 packets,
+11 close-window files and four firewall snapshots. All 26 real capture exits
+were zero, none required SIGKILL, and the kernel-drop statistics were zero.
+However, retained statistics exposed a separate shutdown defect: for example,
+the endpoint reported 323 packets captured versus 428 received by its filter.
+Zero kernel buffer exhaustion does not prove that tcpdump processed every
+received packet; its [counter and buffering semantics](https://www.tcpdump.org/manpages/tcpdump.1.html)
+distinguish these observations.
+
+A real delivered-final-packet reproduction retained 0/1 packets on both endpoint
+and guard captures, despite both filters receiving the packet and reporting no
+kernel drops. The permanent projection regression failed 28/30. Capture startup
+now uses `--immediate-mode` as well as `-U`: kernel delivery is immediate and
+processed packet output is flushed, rather than leaving final packets buffered
+when SIGINT stops capture. The reproduction retains 1/1 on both interfaces and the
+projection gate passes 30/30. This fixes the demonstrated capture omission; it
+does not establish the cause of the artifact-less historical KI-19 failure.
+
+An injected supersession smoke also found that installation failure cleanup
+checked the expected phase and manager but not the previous DHT identity. It
+destroyed the superseding owner and its real route manager. Cleanup now mirrors
+the exact ownership check; the same smoke passes together with the controller
+checks, 14 tests / 117 assertions. The temporary state-access loader was removed
+from the working tree; no production test hook or API was added. These two final
+corrections require a new native run before publication.
+
 Later green runs are separate observations, not a fix or waiver for this one.
 
 ### KI-1: routes are correlatable by timing and volume

@@ -190,6 +190,18 @@ test('namespace projection is enforced by the kernel and observable by capture',
     const exitReceived = await exitReceive
     t.is(exitReceived, null, 'endpoint cannot reach a lookup exit directly')
 
+    // A delivered final packet must survive capture shutdown, not remain in
+    // the kernel's capture buffer despite a zero dropped-by-kernel count.
+    const finalPayload = Buffer.from('c3'.repeat(24), 'hex')
+    const finalReceive = receiveProbe(provision, GUARD, 4000)
+    await settle(250)
+    sendProbe(provision, ENDPOINT, GUARD, finalPayload)
+    t.alike(
+      await finalReceive,
+      finalPayload,
+      'guard receives the final datagram before capture stops'
+    )
+
     const captures = provision.stopCapture()
     const byKey = new Map(captures.map((capture) => [capture.key, capture.file]))
 
@@ -203,6 +215,15 @@ test('namespace projection is enforced by the kernel and observable by capture',
     t.ok(
       guardCapture.datagrams.some((datagram) => contains(datagram.payload, allowedPayload)),
       'capture observes the allowed endpoint-to-guard datagram'
+    )
+    t.ok(
+      guardCapture.datagrams.some((datagram) => contains(datagram.payload, finalPayload)),
+      'guard capture retains the final delivered datagram'
+    )
+    const endpointCapture = readPcap(byKey.get(String(ENDPOINT)))
+    t.ok(
+      endpointCapture.datagrams.some((datagram) => contains(datagram.payload, finalPayload)),
+      'endpoint capture retains the final delivered datagram'
     )
 
     const exitCapture = readPcap(byKey.get(String(LOOKUP_EXIT_A)))

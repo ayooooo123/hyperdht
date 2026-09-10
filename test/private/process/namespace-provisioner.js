@@ -353,9 +353,10 @@ function provisionNamespaceProjection(namespace, options = {}) {
           'sh',
           '-c',
           // Detach the waiter too: execFileSync must not inherit its pipes.
-          // The pid file names tcpdump, not the waiter; SIGINT flushes the pcap
-          // and writes packet-loss statistics before wait records its status.
-          '(tcpdump -i "$1" -s 0 -U -n -w "$2" ip 2>"$4" & pid=$!; printf "%s\\n" "$pid" >"$3"; wait "$pid"; printf "%s\\n" "$?" >"$5") </dev/null >/dev/null 2>&1 &',
+          // Immediate delivery avoids leaving received packets in the kernel
+          // capture buffer at shutdown. -U flushes each processed packet to disk;
+          // SIGINT writes statistics before the waiter records the real status.
+          '(tcpdump --immediate-mode -i "$1" -s 0 -U -n -w "$2" ip 2>"$4" & pid=$!; printf "%s\\n" "$pid" >"$3"; wait "$pid"; printf "%s\\n" "$?" >"$5") </dev/null >/dev/null 2>&1 &',
           'capture',
           endpoint.rootDevice,
           file,
