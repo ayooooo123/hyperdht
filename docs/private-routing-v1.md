@@ -604,6 +604,24 @@ OFF -> BOOTSTRAPPING -> GUARD_PINNED -> READY -> ROTATING
 - Shutdown closes Hyperswarm and DHT activity before destroying routes and
   zeroizing owned secrets.
 
+Routed DHT query admission is distinct from generation draining. Each attempt
+must enter in `READY`, after any asynchronous signing, and capture its DHT,
+route authority, and command contexts together. Its opaque, local-only
+continuation authority covers lazy discovery, transport retries, and the
+GET-to-PUT commit under the admitted command policies. A second outer attempt
+requires fresh `READY` admission; it cannot reuse a completed attempt's authority.
+
+Replacement construction starts without waiting for queries. Transfer and
+destruction of the previous generation wait until its queries have finished
+and their continuation authorities and reply-mode holds have been released.
+Generation installation rechecks controller and transport ownership after drain
+and candidate readiness. A destroyed or superseded installation cannot publish
+its candidate or tear down a newer generation.
+Draining permits only the exact current branch or its owned retired predecessor;
+it cannot revive expired, lost, suspended, destroyed, or transferred ownership.
+Calls without continuation authority still require the exact current pair.
+These capabilities introduce no wire field or public API.
+
 Cold start is numerically bounded. V1 accepts only numeric IPv4 or IPv6
 bootstrap and guard endpoints and performs no DNS. `BootstrapIO` contacts at
 most three configured bootstrap endpoints sequentially and actively

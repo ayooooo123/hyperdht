@@ -1918,9 +1918,61 @@ Diagnostic follow-up local evidence (2026-09-09): the explicitly selected
 `colima` context passed namespace projection, 27/27. Its live scenario failed
 before the capture audit at 111/112, during presence revocation:
 `TRANSPORT_UNAVAILABLE` → `ROUTE_UNAVAILABLE` → `ERR_REPLAY` at
-`readLiveRoutePair` (`route-manager.js:1139`, already-spent lease). The reason
-that lease was spent is not established; this is separate from KI-19, and no
-routing fix is claimed. The failed live scenario was not retried locally.
+`readLiveRoutePair` (`route-manager.js:1139`, already-spent lease). Native
+process runs [34415658161](https://github.com/ayooooo123/hyperdht/actions/runs/34415658161)
+and [34415661996](https://github.com/ayooooo123/hyperdht/actions/runs/34415661996)
+failed at the same operation before namespace provisioning.
+
+The routing regression is separate from KI-19. The controller starts replacement
+construction before draining the old DHT queries, but the live-pair reader spent
+the old lease as soon as a sibling rotation draft existed. A deterministic
+authenticated-reply regression fails there before the ownership repair. Splitting
+strict new-work admission from exact current-or-retired reply ownership passes
+the focused manager/authority checks (30 tests / 358 assertions).
+
+That partial repair is not accepted as the completed routing fix: a subsequent
+explicit-`colima` Node process run still failed presence revocation at 111/112,
+now with `ERR_PRIVATE_BRANCH_ROTATING` at transport-request admission. An admitted
+DHT query can issue discovery, retries, and a commit PUT after rotation starts.
+Those continuations need query-scoped authority, not unconditional admission of
+new work on an old generation.
+
+The completed local repair mints opaque, per-attempt continuation capabilities
+under strict `READY` admission. Unique transport contexts retain the existing
+identity-branded command policies and carry that local capability through
+discovery, retries, and commit. Async signing precedes admission. Rotation
+constructs its replacement immediately, then waits for the old queries to finish
+and release their reply-mode holds and capabilities before transferring ownership.
+Expiry, revocation, suspension, destruction, and transfer still fail closed.
+
+The explicit-`colima` eleven-role Node scenario now passes 175/175, including
+presence revocation. Focused manager/authority/IO checks pass 75 tests / 664
+assertions; controller continuation and installation checks pass 13 / 111.
+Removing admission rollback after callback reentry makes the transfer regression
+fail with `ERR_PRIVACY_UNAVAILABLE`; restoring it passes. No wire, public API,
+retry budget, clock check, or capture classifier changed. Final ten-gate and
+native-CI acceptance remain pending.
+
+The cancellation regression found transient candidate publication after controller
+destruction during candidate readiness; eventual cleanup prevented the stronger
+persistent-leak allegation from reproducing. Exact generation ownership is now
+rechecked after query drain and candidate readiness, before publication. Cancelled
+installations clean only their candidates, without invalidating a newer or
+destroying generation. The publication regression failed before these guards and
+passes with them. Removing the drain wait makes the held-commit regression fail
+after its explicit event-loop barrier. Neither mutation was left in the source.
+
+The frozen explicit-`colima` full-log run passed nine gates: Node aggregate
+1,109 tests / 19,855 assertions, Bare aggregate 1,064 / 19,720, normal and reverse
+process legs 175 assertions each, production-punch legs 180 each, and namespace
+projection 27. Live namespace passed presence revocation and tombstone checks,
+then failed 120/121 during network-change cleanup: the socket-close observer
+measured realtime drift of -115.580, -115.576, and -116.407 ms in three roles.
+That is a recorded KI-18 clock failure, not an admission failure or capture
+classifier waiver. No bound was changed and this run is not ten-gate acceptance.
+An earlier asynchronous tool result retained only 50 KB of output, omitting
+middle gate totals; its retained namespace 185/185 result is not substituted for
+the failed full-log run. Native Linux acceptance remains required.
 
 A separate projection smoke with a host-mounted evidence directory passed
 27/27 and retained per-rule counters plus all 13 tcpdump logs/status files.
