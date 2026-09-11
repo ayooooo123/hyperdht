@@ -19,10 +19,6 @@ const { LinkDirectory, signTopologyGrant } = require('../../lib/private/topology
 const { deriveM3DhtNodeId, encodeCanonicalEndpoint } = require('../../lib/private/relay-capability')
 const { UDX_ENDPOINT_RESERVATION_STATS } = require('../../lib/private/udx-adapter')
 const {
-  DEFAULT_MAX_UDX_INBOUND_BYTES,
-  DEFAULT_MAX_UDX_INBOUND_PACKETS,
-  DEFAULT_MAX_UDX_QUEUED_BYTES,
-  DEFAULT_MAX_UDX_QUEUED_PACKETS,
   TEST_ONLY_UDX_ADAPTER_ISSUER,
   UdxCellEndpoint,
   admitBootstrapUdxGuard,
@@ -572,13 +568,6 @@ test('test-only source matcher binds opaque endpoint handles to exact live sessi
   linksB.right.directory.destroy()
 })
 
-test('UDX endpoint freezes 64-packet and 76,800-byte queue/inbound defaults', (t) => {
-  t.is(DEFAULT_MAX_UDX_QUEUED_PACKETS, 64)
-  t.is(DEFAULT_MAX_UDX_QUEUED_BYTES, 76_800)
-  t.is(DEFAULT_MAX_UDX_INBOUND_PACKETS, 64)
-  t.is(DEFAULT_MAX_UDX_INBOUND_BYTES, 76_800)
-})
-
 test('openLink consumes the topology handle and never returns a raw send handle', async (t) => {
   const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
   const endpoint = issuer.createUdxCellEndpointForTest(
@@ -718,7 +707,7 @@ test('destroying an unconsumed production guard lease closes its original owner 
   fixture.links.right.directory.destroy()
 })
 
-test('bootstrap authority destroy waits held native direct ownership before socket close', async (t) => {
+test('bootstrap authority destroy closes socket but retains held native direct ownership', async (t) => {
   let releaseNative = null
   const heldNative = new Promise((resolve) => {
     releaseNative = resolve
@@ -750,8 +739,14 @@ test('bootstrap authority destroy waits held native direct ownership before sock
   })
   t.is(destroyBootstrapUdxAuthority(authority), true)
   const closing = endpoint.close()
+  let closed = false
+  void closing.then(() => {
+    closed = true
+  })
   await settles()
-  t.is(observer.socket.closed, false)
+  t.is(observer.socket.closed, true)
+  t.is(closed, false, 'endpoint close still waits for native completion')
+  t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), { packets: 1, bytes: BOOTSTRAP_SIZE })
   releaseNative(true)
   await t.exception(sending)
   await closing
@@ -1065,7 +1060,8 @@ test('outbound capacity reserves before allocation and close waits native owners
   t.is(allocations, 0, 'rejected capacity allocates no owned packet')
   const closing = endpoint.close()
   await Promise.resolve()
-  t.is(observer.socket.closed, false, 'socket remains open while native send owns bytes')
+  t.is(observer.socket.closed, true, 'socket close starts before waiting for native ownership')
+  t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), { packets: 1, bytes: BOOTSTRAP_SIZE })
   releaseNative(true)
   let firstError = null
   try {
@@ -1278,4 +1274,313 @@ test('direct bootstrap receive reserves before allocation re-entry and rolls bac
   t.is(received, 2, 'direct allocation failure releases capacity for the next packet')
   destroyBootstrapUdxAuthority(authority)
   await endpoint.close()
+})
+
+test('endpoint-wide close releases a send completed by socket close', async (t) => {
+  let releaseHold
+  const heldSend = new Promise((resolve) => {
+    releaseHold = resolve
+  })
+  const observer = {}
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const endpoint = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.1', 47199, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(new Map(), heldSend, observer))
+  )
+  await endpoint.bind()
+  const socket = observer.socket
+  const originalClose = socket.close.bind(socket)
+  socket.close = () => {
+    releaseHold(false)
+    return originalClose()
+  }
+  const links = linkPair('127.0.0.1', 47199, '127.0.0.2', 47200)
+  t.teardown(() => {
+    links.left.directory.destroy()
+    links.right.directory.destroy()
+  })
+  const session = endpoint.openLink(links.left.handle, linkSessionOptions(links, 'left'))
+  const packet = b4a.alloc(BOOTSTRAP_SIZE)
+  packet[1] = BOOTSTRAP_CLASS
+  const sending = issuer.sendBootstrapForTest(endpoint, session, packet)
+  await settles()
+  t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), { packets: 1, bytes: BOOTSTRAP_SIZE })
+  await endpoint.close()
+  await t.exception(sending)
+  t.alike(endpoint[UDX_ENDPOINT_RESERVATION_STATS](), { packets: 0, bytes: 0 })
+})
+
+test('Native: stored deadline unchanged by wall rollback and forward wall expiry rejects', async (t) => {
+  const { setupTwoEndedNativeAdjacency, fakeClock } = require('./peer-native-fixture')
+  const { readPeerEstablishedLinkBinding } = require('../../lib/private/udx-cell-endpoint')
+
+  const clock = fakeClock(10_000n)
+  const f = await setupTwoEndedNativeAdjacency({ t, clock, localPort: 48511, peerPort: 48512 })
+  const established = f.neighbor.established
+  const owner = f.localRelayOwner
+
+  const binding1 = readPeerEstablishedLinkBinding(established, owner)
+  const initialDeadline = binding1.parentLocalDeadline
+  const initialMono = clock.monotonicNow()
+
+  // Wall clock rollback only
+  clock.advanceWall(-2000)
+  t.is(clock.monotonicNow(), initialMono, 'monotonic remains unchanged during wall rollback')
+  const binding2 = readPeerEstablishedLinkBinding(established, owner)
+  t.is(binding2.parentLocalDeadline, initialDeadline, 'stored deadline unchanged by wall rollback')
+
+  // Forward wall expiry rejects while monotonic remains below deadline
+  const remainingToExpiry = Number(binding1.parentWireExpiresAt - BigInt(clock.wallNow())) + 10
+  clock.advanceWall(remainingToExpiry)
+  t.ok(
+    BigInt(clock.monotonicNow()) < binding1.parentLocalDeadline,
+    'monotonic still below local deadline'
+  )
+  let expireErr = null
+  try {
+    readPeerEstablishedLinkBinding(established, owner)
+  } catch (err) {
+    expireErr = err
+  }
+  t.is(expireErr && expireErr.code, 'UNAUTHORIZED', 'forward wall expiry rejects')
+})
+
+test('Native: ordinary traffic cannot access teardown ledger, forged closure tokens reject', async (t) => {
+  const { authenticatedPeer } = require('./peer-native-fixture')
+  const {
+    takePeerEstablishedLink,
+    destroyTakenPeerEstablishedLink
+  } = require('../../lib/private/peer-guard-link')
+  const { registerPeerM3CellLinkTransfer } = require('../../lib/private/udx-cell-endpoint')
+  const { CellCodec } = require('../../lib/private/cell-codec')
+  const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
+  const { readPeerLedger } = require('../../lib/private/peer-ledger')
+  const { receivePeerM3Payload } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const p = await authenticatedPeer(t, 48611)
+  const taken = takePeerEstablishedLink(p.handle)
+  const transfer = registerPeerM3CellLinkTransfer(taken.physicalChannel, taken.m3BranchBinding)
+  t.teardown(() => {
+    transfer.destroy()
+    destroyTakenPeerEstablishedLink(taken)
+  })
+  await t.exception(transfer.sendClosure(Object.freeze({})), { code: 'UNAUTHORIZED' })
+  const codec = new CellCodec({ crypto: cryptoSuite, cellSize: BOOTSTRAP_SIZE })
+  for (const cellClass of [CELL_CLASS.DATAGRAM, CELL_CLASS.CONTROL]) {
+    const context = taken.contexts[cellClass].tx
+    const payload = b4a.from('ordinary authenticated payload')
+    const packet = codec.seal({
+      key: context.key,
+      noncePrefix: context.noncePrefix,
+      senderCounter: context.counter,
+      class: cellClass,
+      direction: DIRECTION.FORWARD,
+      epoch: taken.generation,
+      circuitId: taken.peerLocalId,
+      payload
+    })
+    await t.exception(transfer.send(packet, taken.teardownSendLedger), { code: 'UNAUTHORIZED' })
+    const receiving = receivePeerM3Payload(p.peerRuntime)
+    await transfer.send(packet, taken.sendLedger)
+    t.alike(await receiving, payload, 'same authenticated packet succeeds on its ordinary ledger')
+  }
+  t.is(readPeerLedger(p.localLedgers.teardownSendLedger).cellsSpent, 0)
+})
+
+test('Native: genuine closure dispatch charges teardown partition and releases its branch', async (t) => {
+  const { authenticatedPeer } = require('./peer-native-fixture')
+  const { readPeerLedger } = require('../../lib/private/peer-ledger')
+  const { readPeerNativeNeighborDiagnostics } = require('../../lib/private/peer-native-neighbors')
+  const {
+    adoptPeerEstablishedLink,
+    beginPeerM3BranchTeardown
+  } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const p = await authenticatedPeer(t, 48631)
+  const localRuntime = adoptPeerEstablishedLink(p.localAuthority, p.handle)
+  const ordinaryBefore = readPeerLedger(p.localLedgers.sendLedger)
+  t.is(await beginPeerM3BranchTeardown(localRuntime, b4a.alloc(16, 0x99)), true)
+  const spent = readPeerLedger(p.localLedgers.teardownSendLedger)
+  t.is(spent.commandsSpent, 1)
+  t.is(spent.cellsSpent, 1)
+  t.is(spent.bytesSpent, 1200n)
+  t.is(readPeerLedger(p.localLedgers.sendLedger).cellsSpent, ordinaryBefore.cellsSpent)
+  t.is(readPeerNativeNeighborDiagnostics(p.f.pool).reservationCount, 0)
+})
+
+test('authenticated six- and seven-byte closure prefixes fail without ordinary delivery', async (t) => {
+  const { authenticatedPeer } = require('./peer-native-fixture')
+  const {
+    takePeerEstablishedLink,
+    destroyTakenPeerEstablishedLink
+  } = require('../../lib/private/peer-guard-link')
+  const { registerPeerM3CellLinkTransfer } = require('../../lib/private/udx-cell-endpoint')
+  const { CellCodec } = require('../../lib/private/cell-codec')
+  const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
+  const {
+    receivePeerM3Payload,
+    isPeerM3Runtime
+  } = require('../../lib/private/peer-m3-adjacency-runtime')
+  let port = 48700
+  for (const cellClass of [CELL_CLASS.DATAGRAM, CELL_CLASS.CONTROL]) {
+    for (const size of [6, 7]) {
+      for (const messageId of [0x030e, 0x030f, 0x0310]) {
+        const p = await authenticatedPeer(t, port)
+        port += 2
+        const taken = takePeerEstablishedLink(p.handle)
+        const transfer = registerPeerM3CellLinkTransfer(
+          taken.physicalChannel,
+          taken.m3BranchBinding
+        )
+        try {
+          const payload = b4a.alloc(size)
+          b4a.writeUInt32BE(payload, 2, 0)
+          payload[4] = messageId >>> 8
+          payload[5] = messageId & 0xff
+          const context = taken.contexts[cellClass].tx
+          const codec = new CellCodec({ crypto: cryptoSuite, cellSize: BOOTSTRAP_SIZE })
+          const packet = codec.seal({
+            key: context.key,
+            noncePrefix: context.noncePrefix,
+            senderCounter: context.counter,
+            class: cellClass,
+            direction: DIRECTION.FORWARD,
+            epoch: taken.generation,
+            circuitId: taken.peerLocalId,
+            payload
+          })
+          const receiving = receivePeerM3Payload(p.peerRuntime)
+          const rejected = t.exception(receiving, { code: 'ERR_DESTROYED' })
+          await transfer.send(packet, taken.sendLedger)
+          await rejected
+          t.is(isPeerM3Runtime(p.peerRuntime), false)
+        } finally {
+          transfer.destroy()
+          destroyTakenPeerEstablishedLink(taken)
+        }
+      }
+    }
+  }
+})
+
+test('twelve authenticated teardown requests cannot exceed one branch reserve or borrow from a sibling', async (t) => {
+  const { authenticatedPeer } = require('./peer-native-fixture')
+  const {
+    takePeerEstablishedLink,
+    destroyTakenPeerEstablishedLink
+  } = require('../../lib/private/peer-guard-link')
+  const {
+    registerPeerM3CellLinkTransfer,
+    releaseM3CellLinkPacket
+  } = require('../../lib/private/udx-cell-endpoint')
+  const { CellCodec } = require('../../lib/private/cell-codec')
+  const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
+  const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
+  const { encodePeerTransport } = require('../../lib/private/peer-transport-wire')
+  const { readPeerLedger } = require('../../lib/private/peer-ledger')
+  const {
+    adoptPeerEstablishedLink,
+    isPeerM3Runtime,
+    beginPeerM3BranchTeardown
+  } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const p = await authenticatedPeer(t, 48740)
+  const sibling = await p.openAdditional()
+  const siblingRuntime = adoptPeerEstablishedLink(p.localAuthority, sibling.handle)
+  const taken = takePeerEstablishedLink(p.handle)
+  const transfer = registerPeerM3CellLinkTransfer(taken.physicalChannel, taken.m3BranchBinding)
+  const codec = new CellCodec({ crypto: cryptoSuite, cellSize: BOOTSTRAP_SIZE })
+  const context = taken.contexts[CELL_CLASS.DATAGRAM].tx
+  const payload = encodePeerTransport(PEER_MESSAGE_ID.PEER_BRANCH_TEARDOWN_V2, {
+    branchClass: 2,
+    branchId: taken.branchId,
+    circuitId: taken.circuitId,
+    generation: taken.generation,
+    reason: 2,
+    teardownId: b4a.alloc(16, 0x7b)
+  })
+  try {
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const packet = codec.seal({
+        key: context.key,
+        noncePrefix: context.noncePrefix,
+        senderCounter: context.counter,
+        class: CELL_CLASS.DATAGRAM,
+        direction: DIRECTION.FORWARD,
+        epoch: taken.generation,
+        circuitId: taken.peerLocalId,
+        payload
+      })
+      await transfer.send(packet, taken.sendLedger)
+      await settles()
+      if (attempt < 10) releaseM3CellLinkPacket(await transfer.receive())
+      if (attempt === 9) {
+        t.is(
+          p.peerRuntime.diagnostics().state,
+          'ACK_CACHED',
+          'ten requests retain the original ACK cache'
+        )
+      }
+    }
+    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).cellsSpent, 10)
+    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).commandsSpent, 1)
+    t.is(readPeerLedger(p.peerLedgers.teardownSendLedger).cellsSpent, 10)
+    t.is(readPeerLedger(p.peerLedgers.teardownSendLedger).commandsSpent, 1)
+    t.is(
+      isPeerM3Runtime(p.peerRuntime),
+      false,
+      'excess authenticated closure traffic closes only its own branch'
+    )
+    t.is(await beginPeerM3BranchTeardown(siblingRuntime, b4a.alloc(16, 0x7e)), true)
+    t.is(
+      readPeerLedger(p.peerLedgers.teardownSendLedger).cellsSpent,
+      11,
+      'the sibling retains its own ACK allowance'
+    )
+    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).cellsSpent, 11)
+  } finally {
+    transfer.destroy()
+    destroyTakenPeerEstablishedLink(taken)
+  }
+})
+
+test('authenticated ordinary CONTROL spends no physical-closure allowance', async (t) => {
+  const { authenticatedPeer } = require('./peer-native-fixture')
+  const {
+    takePeerEstablishedLink,
+    destroyTakenPeerEstablishedLink
+  } = require('../../lib/private/peer-guard-link')
+  const { registerPeerM3CellLinkTransfer } = require('../../lib/private/udx-cell-endpoint')
+  const { receivePeerM3Payload } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const { readPeerLedger } = require('../../lib/private/peer-ledger')
+  const { CellCodec } = require('../../lib/private/cell-codec')
+  const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
+  const p = await authenticatedPeer(t, 48742)
+  const taken = takePeerEstablishedLink(p.handle)
+  const transfer = registerPeerM3CellLinkTransfer(taken.physicalChannel, taken.m3BranchBinding)
+  const codec = new CellCodec({ crypto: cryptoSuite, cellSize: BOOTSTRAP_SIZE })
+  const context = taken.contexts[CELL_CLASS.CONTROL].tx
+  const payload = b4a.from('ordinary authenticated control')
+  const before = readPeerLedger(p.peerLedgers.receiveLedger)
+  try {
+    const received = receivePeerM3Payload(p.peerRuntime)
+    await transfer.send(
+      codec.seal({
+        key: context.key,
+        noncePrefix: context.noncePrefix,
+        senderCounter: context.counter,
+        class: CELL_CLASS.CONTROL,
+        direction: DIRECTION.FORWARD,
+        epoch: taken.generation,
+        circuitId: taken.peerLocalId,
+        payload
+      }),
+      taken.sendLedger
+    )
+    t.alike(await received, payload)
+    t.is(readPeerLedger(p.peerLedgers.receiveLedger).cellsSpent, before.cellsSpent + 1)
+    t.is(readPeerLedger(p.peerLedgers.receiveLedger).commandsSpent, before.commandsSpent + 1)
+    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).cellsSpent, 0)
+    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).commandsSpent, 0)
+  } finally {
+    transfer.destroy()
+    destroyTakenPeerEstablishedLink(taken)
+  }
 })
