@@ -2,6 +2,7 @@
 
 const test = require('brittle')
 const b4a = require('b4a')
+const sodium = require('sodium-universal')
 
 const { BOOTSTRAP_SIZE, BootstrapEnvelopeCodec } = require('../../lib/private/bootstrap-envelope')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
@@ -37,7 +38,11 @@ const {
   createBootstrapUdxGuardSessionOptions,
   isGuardLeaseMaterial,
   openBootstrapUdxGuard,
-  pinBootstrapUdxGuard
+  pinBootstrapUdxGuard,
+  registerPeerDirectResponder,
+  destroyPeerDirectResponderRegistration,
+  takePeerDirectRequesterTransport,
+  destroyPeerDirectRequesterTransport
 } = endpointModule
 const { revokeGuardReconnectAuthority } = require('../../lib/private/guard-reconnect-authority')
 const {
@@ -49,12 +54,53 @@ const {
   issueGuardLeaseM3CellLinkTransferIssuer,
   openGuardBranch,
   suspendGuardLease,
+  createPeerGuardPhysicalReservation,
+  exchangePeerGuardLink,
+  destroyPeerGuardPhysicalReservation,
+  createPeerGuardBootstrapTransport,
   MAX_GUARD_LEASE_BRANCH_SLOTS
 } = require('../../lib/private/guard-lease')
+const {
+  createPeerBootstrapResponder,
+  destroyPeerBootstrapResponder,
+  discoverPeerCandidate,
+  takePeerActiveCandidate,
+  destroyPeerActiveCandidate
+} = require('../../lib/private/peer-direct-bootstrap')
+const {
+  createPeerRelayOwner,
+  destroyPeerRelayOwner,
+  readPeerRelayOwner
+} = require('../../lib/private/peer-capability')
+const { createPeerLedger, readPeerLedger } = require('../../lib/private/peer-ledger')
+const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
+const { encodePeerTransport } = require('../../lib/private/peer-transport-wire')
 const { createM3CellLinkTransferIssuer, registerM3CellLinkTransfer } = endpointModule
 const guardLink = require('../../lib/private/guard-link')
 const { createIndexZeroGuardLinkResponder } = guardLink
 const { destroyTailControlSession } = require('../../lib/private/tail-control')
+const {
+  openPeerGuardLink,
+  createPeerLinkResponder,
+  destroyPeerLinkResponder
+} = require('../../lib/private/peer-guard-link')
+const {
+  createPeerM3AdjacencyAuthority,
+  adoptPeerEstablishedLink,
+  sendPeerM3Payload,
+  receivePeerM3Payload,
+  beginPeerM3BranchTeardown
+} = require('../../lib/private/peer-m3-adjacency-runtime')
+const {
+  fakeClock,
+  sequence,
+  nativeGuardAdvertisement,
+  pinnedMaterialFixture,
+  leaseOptions,
+  closeFixture,
+  peerBranchLedgers,
+  peerGuardFixture
+} = require('./peer-native-fixture')
 const TEST_ONLY_M3_ESTABLISHED_ISSUER = Symbol.for(
   'hyperdht-private-routes/test-only-m3-established-issuer'
 )
@@ -69,405 +115,226 @@ function safetyIdentity(start = 100) {
   throw new Error('missing safety identity')
 }
 
-function nativeGuardAdvertisement(fixture) {
-  const route = cryptoSuite.encryptionKeyPair(seed(121))
-  const endpoint = encodeCanonicalEndpoint({
-    addressFamily: 4,
-    addressBytes: b4a.from(fixture.rightHost.split('.').map(Number)),
-    port: fixture.rightPort
-  })
-  const signed = signRelayCapabilityAdvertisement(
-    {
-      relayIdentity: fixture.links.b.publicKey,
-      currentDhtNodeId: deriveM3DhtNodeId(endpoint),
-      reachableEndpoint: endpoint,
-      routeEncryptionPublicKey: route.publicKey,
-      capabilityMask: 1,
-      minimumProtocolVersion: 1,
-      maximumProtocolVersion: 1,
-      cellSize: 1200,
-      maxCellPayload: 1146,
-      contextEnvelopeSize: 1101,
-      routeFrameSize: 1100,
-      maxRoutePayload: 1073,
-      datagramReplayWindow: 64,
-      maxConcurrentCircuits: 8,
-      capacityClass: CAPACITY_CLASS.SMALL,
-      maxCellsPerCircuit: 100,
-      maxBytesPerCircuit: 100_000,
-      maxCommandsPerCircuit: 10,
-      idleTimeoutMs: 30_000,
-      maxQueuedBytes: 65_536,
-      epoch: 7n,
-      issuedAtMs: 1_000n,
-      expiresAtMs: 60_000n,
-      providerServicePolicyEntries: providerServicePolicyForCapabilities(1)
-    },
-    fixture.links.b.secretKey
-  )
-  const advertisement = encodeRelayCapabilityAdvertisement(signed)
-  return {
-    advertisement,
-    advertisementDigest: digestRelayCapabilityAdvertisement(advertisement, { now: 1_000n }),
-    endpoint,
-    route
-  }
-}
-function linkPair(hostA, portA, hostB, portB) {
-  const authority = cryptoSuite.keyPair(seed(90))
-  const a = cryptoSuite.keyPair(seed(91))
-  const b = safetyIdentity(92)
-  const runId32 = seed(93)
-  const grant = signTopologyGrant(
-    {
-      version: PROTOCOL_VERSION,
-      format: 0,
-      grantId32: seed(94),
-      endpointA: {
-        identity32: a.publicKey,
-        role: TOPOLOGY_ROLE.SOURCE,
-        host: hostA,
-        port: portA,
-        operations: LINK_OPERATION.INITIATE
-      },
-      endpointB: {
-        identity32: b.publicKey,
-        role: TOPOLOGY_ROLE.SAFETY_GUARD,
-        host: hostB,
-        port: portB,
-        operations: LINK_OPERATION.ACCEPT
-      },
-      epoch: 7n,
-      notBefore: 0n,
-      expiresAt: 60_000n,
-      runId32
-    },
-    authority.secretKey
-  )
-  const make = (local, peer, localRole, peerRole, operation) => {
-    const directory = new LinkDirectory({
-      localIdentity32: local.publicKey,
-      localRole,
-      authorityPublicKey: authority.publicKey,
-      epoch: 7n,
-      runId32,
-      now: () => 1n,
-      schedule: setTimeout,
-      cancel: clearTimeout,
-      onClose() {}
-    })
-    const digest32 = directory.add(grant)
-    const handle = directory.authorize({
-      digest32,
-      operation,
-      localIdentity32: local.publicKey,
-      localRole,
-      peerIdentity32: peer.publicKey,
-      peerRole,
-      epoch: 7n,
-      runId32
-    })
-    return { directory, handle }
-  }
-  return {
-    left: make(a, b, TOPOLOGY_ROLE.SOURCE, TOPOLOGY_ROLE.SAFETY_GUARD, LINK_OPERATION.INITIATE),
-    right: make(b, a, TOPOLOGY_ROLE.SAFETY_GUARD, TOPOLOGY_ROLE.SOURCE, LINK_OPERATION.ACCEPT),
-    a,
-    b
-  }
-}
-
-class FakeSocket {
-  constructor(network, observer = null) {
-    this.network = network
-    this.observer = observer
-    this.listeners = new Map()
-    this.host = null
-    this.port = null
-    this.closed = false
-    this.closeCalls = 0
-  }
-  on(name, listener) {
-    const values = this.listeners.get(name) || new Set()
-    values.add(listener)
-    this.listeners.set(name, values)
-  }
-  off(name, listener) {
-    const values = this.listeners.get(name)
-    if (values) values.delete(listener)
-  }
-  emit(name, ...args) {
-    for (const listener of this.listeners.get(name) || []) listener(...args)
-  }
-  bind(port, host) {
-    this.port = port
-    this.host = host
-    this.network.set(`${host}:${port}`, this)
-    return true
-  }
-  send(packet, port, host) {
-    const peer = this.network.get(`${host}:${port}`)
-    if (!peer) return false
-    queueMicrotask(() =>
-      peer.emit('message', b4a.from(packet), { host: this.host, port: this.port })
-    )
-    return true
-  }
-  close() {
-    this.closeCalls++
-    this.closed = true
-    this.network.delete(`${this.host}:${this.port}`)
-    if (this.observer) this.observer.events.push(['close', this])
-    return true
-  }
-}
-
-function fakeFactory(network, observer = {}) {
-  return () => ({
-    create() {
-      return {
-        createSocket() {
-          const socket = new FakeSocket(network, observer)
-          observer.socket = socket
-          if (!observer.sockets) observer.sockets = []
-          if (!observer.events) observer.events = []
-          observer.sockets.push(socket)
-          observer.events.push(['create', socket])
-          return socket
-        }
-      }
-    }
-  })
-}
-
-function options(host, port, overrides = {}) {
-  return {
-    host,
-    port,
-    onBootstrap() {},
-    onCell() {},
-    onLinkFailure() {},
-    ...overrides
-  }
-}
 
 async function settles() {
   await Promise.resolve()
   await Promise.resolve()
 }
 
-function sequence(first) {
-  let value = first
-  return (size) => b4a.alloc(size, value++)
-}
 
-function linkSessionOptions(links, side, deadline = 10_000) {
-  const now = () => 1
-  const responderStatic = cryptoSuite.encryptionKeyPair(seed(98))
-  const common = {
-    circuitId: b4a.alloc(16, 0x51),
-    epoch: 7n,
-    initiatorIdentity: links.a.publicKey,
-    responderIdentity: links.b.publicKey,
-    initiatorLocalId: b4a.alloc(16, 0x52),
-    responderLocalId: b4a.alloc(16, 0x53),
-    expiresAt: 60_000n
+test('A0 rejects a candidate from another grant without consuming the original authority', async (t) => {
+  const clock = fakeClock()
+  const original = await peerGuardFixture(t, 47601, 47602, { clock })
+  const other = await peerGuardFixture(t, 47601, 47602, { clock, grantId32: seed(95) })
+  const candidate = await original.discover()
+  const rejectedLedgers = peerBranchLedgers()
+  let error = null
+  try {
+    await other.open(candidate, rejectedLedgers)
+  } catch (err) {
+    error = err
   }
-  const initiate = side === 'left'
-  return {
-    mode: initiate ? 'initiate' : 'accept',
-    codec: new BootstrapEnvelopeCodec({
-      linkHandle: initiate ? links.left.handle : links.right.handle,
-      localIdentitySecretKey: initiate ? links.a.secretKey : links.b.secretKey,
-      padding: sequence(initiate ? 0x81 : 0x91)
-    }),
-    linkSetup: createLinkSetupAuthority({
-      now,
-      randomBytes: sequence(initiate ? 0x61 : 0x71)
-    }),
-    setup: initiate
-      ? {
-          ...common,
-          responderStaticKey: responderStatic.publicKey,
-          initiatorIdentitySecretKey: links.a.secretKey
-        }
-      : {
-          ...common,
-          responderStaticSecretKey: responderStatic.secretKey,
-          responderIdentitySecretKey: links.b.secretKey
-        },
-    now,
-    schedule: setTimeout,
-    cancel: clearTimeout,
-    randomBytes: sequence(initiate ? 1 : 11),
-    absoluteDeadline: deadline,
-    signedExpiry: 60_000,
-    authorizedExpiry: 60_000
-  }
-}
-
-async function pinnedMaterialFixture(leftPort, rightPort, fixtureOptions = {}) {
-  const network = new Map()
-  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
-  const rightHost = fixtureOptions.native === true ? '127.0.0.1' : '127.0.0.2'
-  const links = linkPair('127.0.0.1', leftPort, rightHost, rightPort)
-  const leftObserver = {}
-  let leftSession = null
-  let rightSession = null
-  let rightBootstrapHandler = null
-  const leftEndpointOptions = {
-    ...options('127.0.0.1', leftPort),
-    onBootstrap(packet, handle) {
-      if (leftSession) return leftSession.receive(packet, handle)
-    }
-  }
-  const left =
-    fixtureOptions.native === true
-      ? new UdxCellEndpoint(leftEndpointOptions)
-      : issuer.createUdxCellEndpointForTest(
-          leftEndpointOptions,
-          issuer.createTestUdxAdapterAuthority(fakeFactory(network, leftObserver))
-        )
-  const rightEndpointOptions = {
-    ...options(rightHost, rightPort),
-    onBootstrap(packet, handle) {
-      if (rightBootstrapHandler) return rightBootstrapHandler(packet, handle)
-      if (rightSession) return rightSession.receive(packet, handle)
-    }
-  }
-  const right =
-    fixtureOptions.native === true
-      ? new UdxCellEndpoint(rightEndpointOptions)
-      : issuer.createUdxCellEndpointForTest(
-          rightEndpointOptions,
-          issuer.createTestUdxAdapterAuthority(fakeFactory(network))
-        )
-  let rightAuthority = null
-  if (fixtureOptions.native === true) {
-    rightAuthority = createBootstrapUdxAuthority({
-      endpoint: right,
-      configuredEndpoints: [{ host: '127.0.0.1', port: leftPort }],
-      localSecretCapability: createLocalIdentitySecretCapability({
-        localIdentity: links.b.publicKey,
-        localSecretKey: links.b.secretKey
-      }),
-      maxProspectiveGuards: 1,
-      monotonicDeadline: 10_000
-    })
-    bindBootstrapUdxOperation(rightAuthority, 10_000, Object.freeze({}))
-  }
-  await left.bind()
-  await right.bind()
-  const authority = createBootstrapUdxAuthority({
-    endpoint: left,
-    configuredEndpoints: [{ host: rightHost, port: rightPort }],
-    localSecretCapability: createLocalIdentitySecretCapability({
-      localIdentity: links.a.publicKey,
-      localSecretKey: links.a.secretKey
-    }),
-    maxProspectiveGuards: 3,
-    monotonicDeadline: 10_000
-  })
-  bindBootstrapUdxOperation(authority, 10_000, Object.freeze({}))
-  const admission = admitBootstrapUdxGuard(authority, {
-    identity: links.b.publicKey,
-    host: rightHost,
-    port: rightPort
-  })
-  const leftOptions = linkSessionOptions(links, 'left')
-  const sessionOptions = createBootstrapUdxGuardSessionOptions(
-    authority,
-    admission,
-    links.left.handle,
-    {
-      circuitId: leftOptions.setup.circuitId,
-      epoch: leftOptions.setup.epoch,
-      initiatorLocalId: leftOptions.setup.initiatorLocalId,
-      responderLocalId: leftOptions.setup.responderLocalId,
-      expiresAt: leftOptions.setup.expiresAt,
-      responderStaticKey: leftOptions.setup.responderStaticKey,
-      now: leftOptions.now,
-      handleNow: leftOptions.now,
-      wallNow: leftOptions.now,
-      schedule: leftOptions.schedule,
-      cancel: leftOptions.cancel,
-      randomBytes: leftOptions.randomBytes,
-      absoluteDeadline: leftOptions.absoluteDeadline,
-      signedExpiry: leftOptions.signedExpiry
-    }
+  t.is(
+    error && error.code,
+    'INVALID_ROUTE',
+    'same identity, endpoint, epoch and clock cannot substitute a different grant'
   )
-  leftSession = openBootstrapUdxGuard(authority, admission, links.left.handle, sessionOptions)
-  rightSession = right.openLink(links.right.handle, linkSessionOptions(links, 'right'))
-  const established = await leftSession.open()
-  if (fixtureOptions.pin === false) {
-    return {
-      left,
-      right,
-      leftObserver,
-      links,
-      rightPort,
-      rightSession,
-      authority,
-      admission,
-      established
-    }
-  }
-  return {
-    left,
-    right,
-    leftObserver,
-    links,
-    rightHost,
-    rightPort,
-    rightSession,
-    rightAuthority,
-    installDynamicRightSession(handle, setup) {
-      const acceptOptions = linkSessionOptions(links, 'right')
-      acceptOptions.codec = new BootstrapEnvelopeCodec({
-        linkHandle: handle,
-        localIdentitySecretKey: links.b.secretKey,
-        padding: sequence(0x91)
-      })
-      acceptOptions.setup = setup
-      rightSession = right.openLink(handle, acceptOptions)
-    },
-    receiveRight(packet) {
-      return rightSession.receive(packet)
-    },
-    inspectRightSession() {
-      const module = require('../../lib/private/link-bootstrap-session')
-      return rightSession[module.TEST_ONLY_LINK_BOOTSTRAP_SESSION_OBSERVER]()
-    },
-    material: pinBootstrapUdxGuard(authority, admission, established),
-    setRightBootstrapHandler(handler) {
-      rightBootstrapHandler = handler
-    }
-  }
-}
+  t.is(
+    readPeerLedger(rejectedLedgers.sendLedger).cellsSpent,
+    0,
+    'cross-grant rejection publishes no OFFER'
+  )
+  t.is(
+    readPeerLedger(rejectedLedgers.sendLedger).cellsReserved,
+    0,
+    'rejected admission releases its reservation'
+  )
+  const runtime = adoptPeerEstablishedLink(original.localAuthority, await original.open(candidate))
+  const payload = b4a.alloc(1100, 0x81)
+  const received = receivePeerM3Payload(original.guardRuntime)
+  await sendPeerM3Payload(runtime, payload)
+  t.alike(
+    await received,
+    payload,
+    'original candidate remains consumable under its exact pinned grant'
+  )
+  t.is(await beginPeerM3BranchTeardown(runtime, b4a.alloc(16, 0x82)), true)
+})
 
-function leaseOptions(fixture, overrides = {}) {
-  return {
-    guardLeaseMaterial: fixture.material,
-    pinnedGuard: {
-      identity32: fixture.links.b.publicKey,
-      endpoint: { host: '127.0.0.2', port: fixture.rightPort }
-    },
-    wallNow: () => 1_000,
-    monotonicNow: () => 10_000,
-    setTimer: setTimeout,
-    clearTimer: clearTimeout,
-    guardLossSink: Object.freeze({}),
-    ...overrides
+test('A0 retires pending admission at the candidate original deadline, not a fresh OFFER deadline', async (t) => {
+  const setup = await peerGuardFixture(t, 47611, 47612)
+  const candidate = await setup.discover()
+  setup.clock.advance(4800)
+  const socket = setup.fixture.rightObserver.socket
+  const send = socket.send
+  const held = []
+  socket.send = function (packet, port, host) {
+    held.push({ packet: b4a.from(packet), port, host })
+    return true
   }
-}
+  const localLedgers = peerBranchLedgers()
+  const opening = Promise.resolve(setup.open(candidate, localLedgers)).then(
+    (handle) => ({ handle }),
+    (error) => ({ error })
+  )
+  await new Promise(setImmediate)
+  t.is(held.length, 1, 'genuine signed ACCEPT is delayed at the native wire boundary')
+  setup.clock.advance(201)
+  const outcome = await Promise.race([
+    opening,
+    new Promise((resolve) => setTimeout(() => resolve({ stalled: true }), 100))
+  ])
+  t.ok(
+    outcome.error instanceof require('../../lib/private/errors').PrivateRouteError,
+    'pending A0 rejects at D0 expiry while its requested deadline is still in the future'
+  )
+  socket.send = send
+  for (const item of held) send.call(socket, item.packet, item.port, item.host)
+  await new Promise(setImmediate)
+  setup.clock.advance(2000)
+  await new Promise(setImmediate)
+  t.is(
+    readPeerLedger(localLedgers.sendLedger).cellsSpent,
+    1,
+    'expired candidate cannot authorize another OFFER retry'
+  )
+  t.is(
+    readPeerLedger(localLedgers.sendLedger).cellsReserved,
+    0,
+    'failed admission releases its ordinary child'
+  )
+  const fresh = await setup.discover()
+  const runtime = adoptPeerEstablishedLink(setup.localAuthority, await setup.open(fresh))
+  const payload = b4a.alloc(1100, 0x83)
+  const received = receivePeerM3Payload(runtime)
+  await sendPeerM3Payload(setup.guardRuntime, payload)
+  t.alike(await received, payload, 'fresh discovery still admits on the same pinned physical guard')
+  t.is(await beginPeerM3BranchTeardown(runtime, b4a.alloc(16, 0x84)), true)
+})
 
-async function closeFixture(fixture) {
-  if (fixture.rightAuthority) endpointModule.destroyBootstrapUdxAuthority(fixture.rightAuthority)
-  await fixture.rightSession.close()
-  await fixture.right.close()
-  fixture.links.left.directory.destroy()
-  fixture.links.right.directory.destroy()
-}
+test('A0 native established lifetime survives the consumed candidate setup deadline', async (t) => {
+  const setup = await peerGuardFixture(t, 47621, 47622, { native: true })
+  const candidate = await setup.discover()
+  setup.clock.advance(4800)
+  const runtime = adoptPeerEstablishedLink(setup.localAuthority, await setup.open(candidate))
+  setup.clock.advance(250)
+  const payload = b4a.alloc(1100, 0x85)
+  const forward = receivePeerM3Payload(setup.guardRuntime)
+  await sendPeerM3Payload(runtime, payload)
+  t.alike(await forward, payload)
+  const reverse = receivePeerM3Payload(runtime)
+  await sendPeerM3Payload(setup.guardRuntime, payload)
+  t.alike(
+    await reverse,
+    payload,
+    'candidate expiry constrains setup, not the established negotiated lifetime'
+  )
+  t.is(await beginPeerM3BranchTeardown(runtime, b4a.alloc(16, 0x86)), true)
+})
+
+test('A0 reserves exact directional children, rolls back failed admission and preserves its sibling', async (t) => {
+  const setup = await peerGuardFixture(t, 47631, 47632, { native: true })
+  const parents = peerBranchLedgers(3)
+  const first = adoptPeerEstablishedLink(
+    setup.localAuthority,
+    await setup.open(await setup.discover(), {
+      ...parents,
+      forwardLimits: { ...setup.limits, idleTimeoutMs: 31000 }
+    })
+  )
+  const firstPeer = setup.guardRuntime
+  t.is(
+    readPeerLedger(parents.sendLedger).cellsReserved,
+    19,
+    'A0 reserves twenty ordinary cells and spends its first OFFER'
+  )
+  t.is(
+    readPeerLedger(parents.teardownSendLedger).cellsReserved,
+    10,
+    'closure owns a disjoint exact child'
+  )
+  const before = Object.values(parents).map(readPeerLedger)
+  const peerBefore = Object.values(setup.peerLedgers).map(readPeerLedger)
+  for (const override of [
+    { reverseLimits: { ...setup.limits, idleTimeoutMs: 31000 } },
+    { forwardLimits: { ...setup.limits, expiresAt: 60001n } }
+  ]) {
+    let error = null
+    try {
+      await setup.open(await setup.discover(), override)
+    } catch (err) {
+      error = err
+    }
+    t.is(
+      error && error.code,
+      'UNAUTHORIZED',
+      'reverse advertisement and forward parent bounds are enforced'
+    )
+  }
+  const insufficient = {
+    ...peerBranchLedgers(),
+    receiveLedger: createPeerLedger({ cells: 19, bytes: 22800n, commands: 20 })
+  }
+  const rollback = Object.values(insufficient).map(readPeerLedger)
+  let error = null
+  try {
+    await setup.open(await setup.discover(), insufficient)
+  } catch (err) {
+    error = err
+  }
+  t.is(error && error.code, 'INVALID_ROUTE')
+  t.alike(
+    Object.values(insufficient).map(readPeerLedger),
+    rollback,
+    'partial receive failure returns the earlier send reservation'
+  )
+  t.alike(Object.values(parents).map(readPeerLedger), before)
+  t.alike(
+    Object.values(setup.peerLedgers).map(readPeerLedger),
+    peerBefore,
+    'rejected A0 admissions send no OFFER or allocate responder commands'
+  )
+  const second = adoptPeerEstablishedLink(
+    setup.localAuthority,
+    await setup.open(await setup.discover(), parents)
+  )
+  const secondPeer = setup.guardRuntime
+  const payload = b4a.alloc(1100, 0x87)
+  let delivered = true
+  for (let attempt = 0; attempt < 19; attempt++) {
+    const received = receivePeerM3Payload(firstPeer)
+    await sendPeerM3Payload(first, payload)
+    delivered &&= b4a.equals(await received, payload)
+  }
+  t.is(
+    delivered,
+    true,
+    'the admitted forward profile is usable despite exceeding the source advertisement idle maximum'
+  )
+  error = null
+  try {
+    await sendPeerM3Payload(first, payload)
+  } catch (err) {
+    error = err
+  }
+  t.is(
+    error && error.code,
+    'ROUTE_UNAVAILABLE',
+    'the first A0 cannot borrow spare parent or sibling capacity'
+  )
+  t.is(await beginPeerM3BranchTeardown(first, b4a.alloc(16, 0x88)), true)
+  const forward = receivePeerM3Payload(secondPeer)
+  await sendPeerM3Payload(second, payload)
+  t.alike(await forward, payload, 'first-branch release preserves the sibling forward partition')
+  const reverse = receivePeerM3Payload(second)
+  await sendPeerM3Payload(secondPeer, payload)
+  t.alike(await reverse, payload)
+  t.is(await beginPeerM3BranchTeardown(second, b4a.alloc(16, 0x89)), true)
+  t.is(
+    Object.values(parents).every((ledger) => readPeerLedger(ledger).cellsReserved === 0),
+    true
+  )
+})
 
 test('GuardLease consumes the opaque BootstrapIO pinned guard transfer shape', async (t) => {
   const fixture = await pinnedMaterialFixture(47225, 47226)
@@ -874,4 +741,443 @@ test('GuardLease opens an authenticated native index-zero tail over the pinned g
     destroyGuardLease(lease)
     await closeFixture(fixture)
   }
+})
+
+test('Peer physical exchange clears exchanging on sync throw after reservation admit', async (t) => {
+  const wall = 1_000n
+  let monoCalls = 0
+  let tripAfter = Number.POSITIVE_INFINITY
+  const fixture = await pinnedMaterialFixture(47301, 47302)
+  const lease = createGuardLease(
+    leaseOptions(fixture, {
+      wallNow: () => wall,
+      // Outer exchange precheck must see mono < deadline; downstream options.now() must see mono >= deadline.
+      monotonicNow: () => {
+        monoCalls++
+        return monoCalls > tripAfter ? 11_000n : 10_000n
+      },
+      setTimer: () => Object.freeze({}),
+      clearTimer: () => {}
+    })
+  )
+  const reservation = createPeerGuardPhysicalReservation(lease, {
+    absoluteDeadline: 11_000n
+  })
+  const limits = {
+    cellSize: 1200,
+    maxCells: 8,
+    maxBytes: 9600,
+    maxCommands: 8,
+    idleTimeoutMs: 1000,
+    expiresAt: 2000n
+  }
+  const exchangeOptions = {
+    offer: encodePeerTransport(
+      PEER_MESSAGE_ID.PEER_LINK_OFFER_V2,
+      {
+        advertisementDigest: seed(1),
+        initiatorIdentity: fixture.links.a.publicKey,
+        responderIdentity: fixture.links.b.publicKey,
+        initiatorRole: 0,
+        responderRole: 1,
+        branchClass: 2,
+        branchId: b4a.alloc(16, 1),
+        circuitId: b4a.alloc(16, 2),
+        generation: 1n,
+        extensionIndex: 0,
+        initiatorLinkEphemeralPublicKey: seed(3),
+        clientTailEphemeralPublicKey: seed(4),
+        clientNonce: seed(5),
+        payloadParametersDigest: seed(6),
+        requestedLimits: limits,
+        offerDeadline: 2000n,
+        initiatorForwardLimits: limits,
+        candidateAuthorityCommitment: b4a.alloc(32)
+      },
+      b4a.alloc(64)
+    ),
+    generation: 1n,
+    absoluteDeadline: 11_000n,
+    sendLedger: createPeerLedger({ cells: 8, bytes: 9600n, commands: 1 }),
+    receiveLedger: createPeerLedger({ cells: 8, bytes: 9600n, commands: 1 })
+  }
+  // Next mono sample is outer precheck (still under deadline); the one after is exchangeSharedGuardPeerBranch now().
+  tripAfter = monoCalls + 1
+  let err = null
+  try {
+    exchangePeerGuardLink(reservation, exchangeOptions)
+  } catch (e) {
+    err = e
+  }
+  t.ok(err)
+  t.is(err instanceof require('../../lib/private/errors').PrivateRouteError, true)
+  t.is(err.code, 'ERR_PRIVACY_UNAVAILABLE')
+  // Catch path destroyed reservation; not stranded exchanging.
+  t.is(destroyPeerGuardPhysicalReservation(reservation), false)
+  let reuse = null
+  try {
+    exchangePeerGuardLink(reservation, exchangeOptions)
+  } catch (e) {
+    reuse = e
+  }
+  t.is(reuse && reuse.code, 'UNAUTHORIZED')
+  destroyGuardLease(lease)
+  await closeFixture(fixture)
+})
+
+test('Peer guard bootstrap transport is single-live-owner per lease', async (t) => {
+  const fixture = await pinnedMaterialFixture(47311, 47312)
+  const lease = createGuardLease(leaseOptions(fixture))
+  const { destroyPeerDirectRequesterTransport } = endpointModule
+
+  const first = createPeerGuardBootstrapTransport(lease)
+  t.ok(first)
+
+  let secondErr = null
+  try {
+    createPeerGuardBootstrapTransport(lease)
+  } catch (err) {
+    secondErr = err
+  }
+  t.is(secondErr && secondErr.code, 'UNAUTHORIZED')
+
+  t.is(destroyPeerDirectRequesterTransport(first), true)
+
+  const third = createPeerGuardBootstrapTransport(lease)
+  t.ok(third)
+  t.is(third === first, false)
+  t.is(destroyPeerDirectRequesterTransport(third), true)
+
+  destroyGuardLease(lease)
+  await closeFixture(fixture)
+})
+
+test('genuine native established+lease guarded D0 six-packet discover', async (t) => {
+  const fixture = await pinnedMaterialFixture(47401, 47402, { native: true })
+  const lease = createGuardLease(
+    leaseOptions(fixture, {
+      pinnedGuard: {
+        identity32: fixture.links.b.publicKey,
+        endpoint: { host: '127.0.0.1', port: fixture.rightPort }
+      },
+      wallNow: () => 1_000n,
+      monotonicNow: () => 10_000n,
+      setTimer: setTimeout,
+      clearTimer: clearTimeout
+    })
+  )
+
+  // Far-end guard runs v2 bootstrap responder with the same identity as the pin.
+  const route = cryptoSuite.encryptionKeyPair(seed(201))
+  const clockIdentity = Object.freeze({ wallNow: () => 1_000n, monotonicNow: () => 10_000n })
+  const guardOwner = createPeerRelayOwner({
+    endpoint: fixture.right,
+    identityKeyPair: {
+      publicKey: fixture.links.b.publicKey,
+      secretKey: fixture.links.b.secretKey
+    },
+    routeKeyPair: route,
+    advertisementFields: {
+      relayIdentity32: fixture.links.b.publicKey,
+      currentDhtNodeId32: deriveM3DhtNodeId(
+        encodeCanonicalEndpoint({
+          addressFamily: 4,
+          addressBytes: b4a.from([127, 0, 0, 1]),
+          port: fixture.rightPort
+        })
+      ),
+      reachableEndpoint: { host: '127.0.0.1', port: fixture.rightPort },
+      routeEncryptionPublicKey32: route.publicKey,
+      capabilityMask: 9,
+      minimumVersion: 2,
+      maximumVersion: 2,
+      datagramReplayWindow: 64,
+      maxConcurrentCircuits: 8,
+      capacityClass: 0,
+      maxCells: 100,
+      maxBytes: 100000,
+      maxCommands: 10,
+      idleTimeoutMs: 30000,
+      maxQueuedBytes: 65536,
+      epoch: 7n,
+      issuedAt: 1_000n,
+      expiresAt: 60_000n,
+      policyCount: 0
+    },
+    clockIdentity,
+    wallNow: () => 1_000n,
+    monotonicNow: () => 10_000n,
+    setTimer: setTimeout,
+    clearTimer: clearTimeout
+  })
+  const responder = createPeerBootstrapResponder(guardOwner)
+  const registration = registerPeerDirectResponder(fixture.right, responder)
+
+  // Single-live bootstrap transport slot.
+  const transport = createPeerGuardBootstrapTransport(lease)
+  let dup = null
+  try {
+    createPeerGuardBootstrapTransport(lease)
+  } catch (err) {
+    dup = err
+  }
+  t.is(dup && dup.code, 'UNAUTHORIZED')
+
+  const ledger = createPeerLedger({ cells: 64, bytes: 64n * 1200n, commands: 0 })
+  const candidatePromise = discoverPeerCandidate(transport, {
+    ledger,
+    requestedMask: 9,
+    randomTarget: b4a.alloc(32, 0xa1),
+    maximumResults: 1
+  })
+
+  // Real timers drive the six-packet COOKIE/CAPS/ACTIVE exchange on native UDX.
+  const candidate = await candidatePromise
+  t.is(candidate.kind, 'peerActiveCandidate')
+  let wrongKindRejected = false
+  try {
+    takePeerActiveCandidate(candidate, { expectedKind: 'candidate' })
+  } catch (err) {
+    wrongKindRejected = err.code === 'INVALID_ROUTE'
+  }
+  t.ok(wrongKindRejected, 'pinned guard discovery cannot satisfy neighbor provenance')
+  const taken = takePeerActiveCandidate(candidate, {
+    expectedKind: 'guard',
+    expectedIdentity32: fixture.links.b.publicKey,
+    expectedEpoch: 7n
+  })
+  t.alike(taken.identity32, fixture.links.b.publicKey)
+  t.is(taken.kind, 'guard')
+  const digestDomain = b4a.from('hyperdht-private-routes/m3/active-challenge-response-digest/v2')
+  const digestDomainLength = b4a.alloc(2)
+  digestDomainLength.writeUInt16BE(digestDomain.byteLength)
+  const expectedDigest = b4a.alloc(32)
+  sodium.crypto_generichash(
+    expectedDigest,
+    b4a.concat([digestDomainLength, digestDomain, taken.activeResponse312])
+  )
+  t.alike(taken.activeResponseDigest, expectedDigest)
+  t.is(b4a.isBuffer(taken.grantDigest), true)
+  t.is(b4a.isBuffer(taken.runId), true)
+  t.is(typeof taken.operations, 'number')
+
+  const snap = readPeerLedger(ledger)
+  t.ok(snap.cellsSpent >= 3)
+
+  t.is(destroyPeerActiveCandidate(candidate), true)
+  destroyPeerDirectResponderRegistration(registration)
+  destroyPeerBootstrapResponder(responder)
+  destroyPeerRelayOwner(guardOwner)
+  destroyGuardLease(lease)
+  await closeFixture(fixture)
+})
+test('negative canonical-packet send regressions over native UDX established+lease boundary', async (t) => {
+  const UDX = require('udx-native')
+  const bootstrap = require('../../lib/private/peer-direct-bootstrap')
+  const { encodePeerObject, PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
+  const { PrivateRouteError } = require('../../lib/private/errors')
+  const originalTakeBinding = bootstrap.takePeerBootstrapResponderBinding
+  let nativeReplySend = null
+  bootstrap.takePeerBootstrapResponderBinding = function (...args) {
+    const binding = originalTakeBinding(...args)
+    return Object.freeze({
+      receive(packet, endpoint, sendReply) {
+        nativeReplySend = sendReply
+        return binding.receive(packet, endpoint, sendReply)
+      },
+      destroy: binding.destroy
+    })
+  }
+  const origCreateSocket = UDX.prototype.createSocket
+  const createdSockets = []
+
+  UDX.prototype.createSocket = function (...args) {
+    const sock = origCreateSocket.apply(this, args)
+    sock._sendCount = 0
+    const origSend = sock.send
+    sock.send = function (...sendArgs) {
+      sock._sendCount++
+      return origSend.apply(this, sendArgs)
+    }
+    createdSockets.push(sock)
+    return sock
+  }
+
+  t.teardown(() => {
+    UDX.prototype.createSocket = origCreateSocket
+    bootstrap.takePeerBootstrapResponderBinding = originalTakeBinding
+  })
+
+  const fixture = await pinnedMaterialFixture(47403, 47404, { native: true })
+  const lease = createGuardLease(
+    leaseOptions(fixture, {
+      pinnedGuard: {
+        identity32: fixture.links.b.publicKey,
+        endpoint: { host: '127.0.0.1', port: fixture.rightPort }
+      },
+      wallNow: () => 1_000n,
+      monotonicNow: () => 10_000n,
+      setTimer: setTimeout,
+      clearTimer: clearTimeout
+    })
+  )
+
+  const route = cryptoSuite.encryptionKeyPair(seed(202))
+  const clockIdentity = Object.freeze({ wallNow: () => 1_000n, monotonicNow: () => 10_000n })
+  const guardOwner = createPeerRelayOwner({
+    endpoint: fixture.right,
+    identityKeyPair: {
+      publicKey: fixture.links.b.publicKey,
+      secretKey: fixture.links.b.secretKey
+    },
+    routeKeyPair: route,
+    advertisementFields: {
+      relayIdentity32: fixture.links.b.publicKey,
+      currentDhtNodeId32: deriveM3DhtNodeId(
+        encodeCanonicalEndpoint({
+          addressFamily: 4,
+          addressBytes: b4a.from([127, 0, 0, 1]),
+          port: fixture.rightPort
+        })
+      ),
+      reachableEndpoint: { host: '127.0.0.1', port: fixture.rightPort },
+      routeEncryptionPublicKey32: route.publicKey,
+      capabilityMask: 9,
+      minimumVersion: 2,
+      maximumVersion: 2,
+      datagramReplayWindow: 64,
+      maxConcurrentCircuits: 8,
+      capacityClass: 0,
+      maxCells: 100,
+      maxBytes: 100000,
+      maxCommands: 10,
+      idleTimeoutMs: 30000,
+      maxQueuedBytes: 65536,
+      epoch: 7n,
+      issuedAt: 1_000n,
+      expiresAt: 60_000n,
+      policyCount: 0
+    },
+    clockIdentity,
+    wallNow: () => 1_000n,
+    monotonicNow: () => 10_000n,
+    setTimer: setTimeout,
+    clearTimer: clearTimeout
+  })
+  const responder = createPeerBootstrapResponder(guardOwner)
+  const registration = registerPeerDirectResponder(fixture.right, responder)
+  t.teardown(async () => {
+    destroyPeerDirectResponderRegistration(registration)
+    destroyPeerBootstrapResponder(responder)
+    destroyPeerRelayOwner(guardOwner)
+    destroyGuardLease(lease)
+    await closeFixture(fixture)
+  })
+
+  const transport = createPeerGuardBootstrapTransport(lease)
+  const requesterTransport = takePeerDirectRequesterTransport(transport)
+
+  t.ok(createdSockets.length >= 2, 'fixture created native UDX sockets')
+  const leftSocket = createdSockets[0]
+  const rightSocket = createdSockets[1]
+
+  const queryBody = b4a.alloc(110)
+  queryBody.writeUInt32BE(9, 0)
+  queryBody.fill(0x31, 4, 36)
+  queryBody.fill(0x32, 36, 68)
+  queryBody[68] = 1
+  const query = bootstrap.wrapDirectRpcPacket(
+    encodePeerObject({
+      messageId: PEER_MESSAGE_ID.PEER_CAPS_QUERY_V2,
+      body: queryBody
+    })
+  )
+  const cookieReceived = new Promise((resolve) => {
+    requesterTransport.onPacket((packet) => resolve(b4a.from(packet)))
+  })
+  await requesterTransport.send(query)
+  const reply = await cookieReceived
+  const initialLeftSends = leftSocket._sendCount
+  const initialRightSends = rightSocket._sendCount
+
+  function malformedPackets(canonical, wrongDirection, mutateScalar) {
+    const magic = b4a.from(canonical)
+    magic.writeUInt16BE(0xd302, 0)
+    const padding = b4a.from(canonical)
+    padding[4 + padding.readUInt16BE(2)] = 0xff
+    const version = b4a.from(canonical)
+    version.writeUInt32BE(1, 4)
+    const geometry = b4a.from(canonical)
+    geometry.writeUInt16BE(geometry.readUInt16BE(10) - 1, 10)
+    const scalar = b4a.from(canonical)
+    mutateScalar(scalar)
+    return [
+      ['magic', magic],
+      ['padding', padding],
+      ['version', version],
+      ['direction', wrongDirection],
+      ['geometry', geometry],
+      ['scalar', scalar]
+    ]
+  }
+  const directions = [
+    [
+      'requester',
+      requesterTransport.send,
+      malformedPackets(query, reply, (packet) => {
+        packet[80] = 2
+      })
+    ],
+    [
+      'responder',
+      nativeReplySend,
+      malformedPackets(reply, query, (packet) => {
+        packet.fill(0, 44, 52)
+      })
+    ]
+  ]
+  for (const [direction, send, packets] of directions) {
+    for (const [fault, packet] of packets) {
+      let error = null
+      try {
+        await send(packet)
+      } catch (err) {
+        error = err
+      }
+      t.ok(error instanceof PrivateRouteError, direction + ' rejects ' + fault)
+      t.is(
+        leftSocket._sendCount,
+        initialLeftSends,
+        'no requester native send for ' + direction + '/' + fault
+      )
+      t.is(
+        rightSocket._sendCount,
+        initialRightSends,
+        'no responder native send for ' + direction + '/' + fault
+      )
+    }
+  }
+  requesterTransport.destroy()
+  const freshTransport = createPeerGuardBootstrapTransport(lease)
+
+  // 6. Canonical positive exchange still works and increases send counts on both real sockets
+  const ledger = createPeerLedger({ cells: 64, bytes: 64n * 1200n, commands: 0 })
+  const candidatePromise = discoverPeerCandidate(freshTransport, {
+    ledger,
+    requestedMask: 9,
+    randomTarget: b4a.alloc(32, 0xa2),
+    maximumResults: 1
+  })
+  const candidate = await candidatePromise
+  t.is(candidate.kind, 'peerActiveCandidate')
+  t.ok(
+    leftSocket._sendCount > initialLeftSends,
+    'canonical positive exchange produced native send attempts on requester socket'
+  )
+  t.ok(
+    rightSocket._sendCount > initialRightSends,
+    'canonical positive exchange produced native send attempts on responder socket'
+  )
+
+  t.is(destroyPeerActiveCandidate(candidate), true)
 })

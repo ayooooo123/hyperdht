@@ -4888,3 +4888,452 @@ experimental required SURB replies, and Gate D blinded presence including
 publication and revocation. Public required mode, peer streams, Hyperswarm,
 and mobile-device integration remain gated; see
 [Current implementation](#current-implementation).
+
+## Package-private v2 adjacency integration checkpoint
+
+The v2 neighbor pool now consumes explicit caller-authorized link handles and
+owns separate finite service and close ledgers. Both endpoints can complete
+native A1/A2 adjacency setup without an unaccounted peer-side session.
+Authenticated adjacent payloads and immediate DATAGRAM teardown use their
+respective ordinary and teardown partitions. The current integration checks
+cover fixed parent deadlines, timer rearming, accept waiter cancellation,
+one-shot binding cleanup, and authenticated truncated closure rejection.
+
+CREATE and CREATED both enforce their owned operation deadline at native
+dispatch; a failed send cannot publish establishment. Responder adjacency
+lifetimes use the admitted expiry and parent bounds, not the short OFFER
+attempt deadline. Shared-neighbor verification keeps a second branch usable
+after the first branch's ACK cache expires. Authenticated DESTROY retries stop
+at eight, and duplicate TEARDOWN requests share the original ten-ACK allowance.
+
+Initiator and responder ledger inputs are finite ordinary and physical-closure
+parent budgets. Admission reserves four branch-owned children before OFFER or
+ACCEPT publication; exact OFFER replay reuses its original reply ledger.
+The negotiated directional totals include physical closure, as in the v2 specification's
+§8.3 algebra: the ordinary child excludes ten cells,12,000 bytes, and one
+command, while its disjoint physical-closure child owns exactly those amounts.
+Failed admission rolls back partial reservations. Ownership moves with the
+authenticated native binding, and destruction releases only unspent capacity;
+already charged work is never refunded. Ordinary CONTROL reception charges the
+ordinary receive child, not the physical-closure child.
+
+Reverse limits fit the authenticated responder advertisement. Forward limits
+fit the initiator's reservation and parent expiry at index zero, or its own
+current-tail advertisement at indices one and two. Index-zero candidate
+consumption now matches the live reservation's identity, endpoint, epoch,
+advertisement, grant digest, run ID, operations and clock before consumption.
+Its original candidate deadline narrows the Native exchange, retries and
+issuer handoff; original wire expiry also bounds the signed OFFER.
+Independent review of that repair remains incomplete. The responder checks forward
+geometry, its receive reservation and parent expiry, not its advertisement's
+reverse-send maxima. Signed concurrency is reserved before callbacks and
+released with native branch ownership, not response-cache expiry.
+
+Setup receive ownership survives native issuer-to-runtime transfer. Actual
+arrivals spend cells and bytes; authenticated retransmissions do not allocate
+another command. Invalid ACCEPT/proof signatures do not consume the eight
+authenticated-attempt allowance or authorize branch destruction. A signed
+conflict or ninth authenticated arrival closes only its original logical
+branch using DESTROY, rather than falsely reporting physical carrier loss.
+Changed signed OFFERs cannot allocate another owner for an existing logical
+tuple. Cache pressure cannot evict a live branch; reclamation requires both
+the original setup deadline and release of native branch ownership.
+
+The first exact late setup arrival is accounted before setup authority is
+retired. This does not shorten an established branch's negotiated lifetime.
+Real Darwin `udx-native` A1/A2 probes cover signed OFFER/ACCEPT/proof conflicts,
+ninth arrivals, invalid signatures, late duplicates and sibling payloads.
+An isolated probe lowering only the cache capacity to two additionally checks
+live-row preservation, refusal of a third admission and expired-row reuse.
+Before the A0 correction, the affected Node24 suite passed372 tests and6835
+assertions. After that correction, the focused guard/peer carrier/runtime run
+passes45 tests and328 assertions. Cross-grant and delayed-ACCEPT regressions
+fail under deliberate removed-binding and rebased-deadline mutations.
+A real Darwin `udx-native` A0 also exchanges1,100-byte payloads both ways
+after its consumed candidate's setup deadline and completes acknowledged teardown.
+Ordinary correctness findings now have different-model Opus/Fable review and
+Main's adjudication. Security review remains blocked by the provider's lack of
+prepaid credit. These checks are not full route, cryptographic or privacy acceptance.
+Final integrated verification on the unmodified source, including the A0
+correction, passes375 tests and6849 assertions. The temporary A0 mutation
+preload was removed after its negative checks; no review gate is waived.
+
+Delayed advisory reconciliation adds a real Native A0 quota regression:
+forward authority is independent of the source advertisement, reverse limits
+fit the guard advertisement, parent expiry is enforced, partial reservation
+failure publishes no OFFER, and exhaustion/release cannot spend a sibling's
+partition. The latest affected Node24 run passes376 tests and6864 assertions.
+The corrected shared-responder mutation disables root ownership release as
+well as child reservation; the sibling-spend assertion itself still fails.
+
+Real A1/A2 probes additionally use an actual signed concurrency limit of two.
+A changed signed OFFER against an adopted runtime, or its ninth authenticated
+OFFER, retires both original halves, releases all four child reservations,
+and frees an admission slot for another genuine branch. The existing sibling
+and replacement both exchange1,100-byte payloads in each direction.
+Neither setup deadlines nor ten-cell closure partitions were enlarged.
+The forwarding cache test retains its full original5,000ms horizon, including
+the1,000ms spent awaiting downstream drain. Bootstrap callers already reject
+fulfilled-but-false Native sends before establishing either endpoint.
+These are proof improvements, not independent-review or release approval.
+
+The twelve-request closure regression retains all twelve fresh-authenticated
+arrivals: the first ten retain the original ACK cache, excess closure traffic
+fails its own branch without additional ACK allowance, and a genuine sibling
+retains its own teardown capacity. The raw sender releases received ACK packet
+ownership rather than accidentally filling the native receive queue.
+
+Endpoint-wide shutdown initiates native socket close before awaiting outstanding
+send completions; packet ownership is retained until those completions settle.
+This is not per-branch cancellation. `udx-native` 1.20.7 exposes no per-send
+cancellation API, and closing a shared socket for one branch is not permitted.
+Its `trySend` path also retains packet storage and is not a replacement.
+
+This checkpoint does not complete v2 tail extension, purpose finalization,
+stream admission, private registration/rendezvous, legacy egress/controller
+integration, or Linux privacy acceptance. External human cryptographic review
+and public required-mode approval remain separate gates.
+
+### 2026-09-11 owner lifetime and admission correction
+
+Responder construction now requires a synchronous adoption callback. Acceptance
+requires the exact newly established link's live runtime, then rechecks responder
+and binding destruction before row publication. Callback failure reaches the
+existing Native setup-failure owner; it cannot leave an untaken silent admission.
+The signed concurrency cap is shared by every responder instance for one relay
+owner. Releasing one responder does not reset still-owned Native admissions.
+
+The Native cap regression uses two responder instances and three independently
+authenticated physical bindings. Its third open times out while two slots are
+occupied; that local timeout is not an authenticated rejection reason. No third
+runtime is created and the source reservation is released. Following the original
+five-second ACK-cache retirement, the same third binding admits a fresh branch,
+with bidirectional traffic on both it and the surviving sibling.
+
+The direct responder regression retains ninth/changed OFFER accounting,
+cross-binding tombstones, late-arrival accounting, and allocation-command
+non-refund. It now adopts real runtimes and explicitly observes branch-local
+revocation. Binding-only destruction is covered separately. Real host-native
+callback regressions cover unrelated-runtime returns, responder destruction,
+and throws after adoption; each checks callback execution, failed-owner release,
+and surviving sibling traffic.
+
+Guard leases detach taken physical reservations and remove issuers through the
+existing Native release hook. Three real Darwin A0 open/data/teardown cycles
+return both retained counts to zero. This does not establish the unresolved
+lifetime completion-allocation or native per-send cancellation contracts.
+
+`narrowPeerReservations` atomically shrinks existing pending ledger/storage
+reservations without rebasing spent work or returning descendant-owned quota.
+Taken storage cannot shrink. The complete caller-owned descriptor snapshot
+normalizes revoked-Proxy failures before live quota validation or mutation.
+This primitive is not completed purpose finalization.
+
+After formatting, the affected Node24 suite passes383/383 tests and6967/6967
+assertions, exit0 in14.17seconds (`artifact://697`). Counterfactuals fail for
+per-instance caps, unrelated-runtime acceptance, omitted destruction checks,
+retained guard reservations/issuers, ordinary array-length access, and unnormalized
+revoked-Proxy errors. A first destruction mutant removing only one of two checks
+correctly survived; removing both exposes a live failed owner. The first guard
+reservation mutant had an ambiguous anchor and did not execute the scenario;
+its corrected transfer-specific mutant fails at the retained reservation count.
+
+Verified probe sources are archived under `local://hyperdht-advisory-proofs/`:
+admission preload SHA256 `f89e49c31a738d4814cae8ba27cd5590de95e684cfef5c9da9d1a4c1883fa288`;
+guard churn SHA256 `932e377c79af4c522276aa4c8340cfb9f47429970022ebf720f593d03f594f93`.
+Restore their original `.tmp-peer-admission-mutant.cjs` and
+`.tmp-peer-guard-churn.cjs` filenames into the checkout to rerun relative imports.
+No commit, public activation, full-v2, Linux privacy, or cryptographic acceptance
+is implied. Tail discovery metadata, canonical advertisement transfer, and atomic
+drained handoff remain the next integration work.
+
+### 2026-09-11 tail metadata and discovery deadline integration
+
+`readPeerActiveCandidateFacts` publishes copied, non-consuming authenticated
+candidate facts only while the original owned wire/local deadlines remain live.
+Authenticated establishment now retains advertisement260 and moves it with the
+tail secret and T290 into both source/guard tail owners; final-exit material
+still has exactly twelve fields. The focused adjacency/bootstrap/guard suite
+passes53/53 tests and376/376 assertions. A genuine Darwin Native A0 smoke proves
+the advertisement/transcript move, survival after runtime closure, and rejection
+of consumed, reentrantly destroyed, and wire-expired candidate fact reads.
+The smoke source is archived at
+`local://hyperdht-advisory-proofs/.tmp-peer-tail-metadata.cjs`, SHA256
+`d1e0cb3bb8fafc6d6abcb917b1e2a5161dc6a1e182785ea46bfc17a7c78d9274`,
+and removed from the checkout.
+
+`createPeerCandidateLocator(owner, advertisement, deadlineBounds)` accepts an
+optional exact own-data snapshot `{ clockIdentity, wireExpiresAt, localDeadline }`.
+Bounds only narrow the advertisement wire expiry, its original clock-matched
+local projection, and the projection of the narrowed wire expiry. Accessors,
+clock mismatches, expired bounds, and reentrant owner revocation reject.
+The existing Native direct transport copies both bounded facts unchanged.
+The focused locator suite passes6/6 tests and102/102 assertions after formatting;
+Fable independently reviewed this reported blocker with no remaining bounded gap.
+
+Transport copying alone did not finish candidate publication: the ACTIVE
+challenge previously omitted the transport wire cap. Its authenticated expiry
+now freezes the minimum of transport, cookie and advertisement expiries, and
+the existing local projection uses that same frozen value. A regression checks
+both published deadlines and the expiry in the authenticated ACTIVE response;
+the focused direct bootstrap suite passes15/15 tests and72/72 assertions.
+This further reported flag has been sent to Fable. Full affected-suite proof
+after these changes remains pending; the earlier383/6967 result is a baseline,
+not verification of this new integration.
+
+Independent Gemini/high workers own Native neighbor discovery and v2 tail
+control; Main owns the closed activation dispatch and atomic drained carrier
+transfer. Existing carrier phase promotion from an incoming outer class and
+timer lifetime gaps were independently flagged by Fable and remain integration
+work, not accepted behavior. No public activation, full-v2, Linux privacy,
+security funding waiver, or cryptographic acceptance is implied.
+
+### 2026-09-11 tail correction and Native discovery transaction checkpoint
+
+Fable subsequently accepted the bounded signed-ACTIVE expiry correction.
+The initial tail worker completion was rejected: independent Opus review found
+an out-of-scope proof variable, unbounded readiness wait, incomplete initiator
+proof, discovery/lifecycle leaks, asymmetric-expiry rejection, signer mismatch,
+notification ownership gaps, and missing retained-storage reservations.
+The recovered earlier flow test used fake authority and was not counted as
+Native evidence. A new four-node Native fixture and genuine activation claims
+are present but have not yet been run.
+
+The tail correction moved from rate-limited Fable to explicitly pinned
+Opus5/max, owning only `peer-tail-control.js`. Main added the runtime-side
+synchronous final-carrier authorization scope and closed v1/v2 tail-brand
+dispatch for generic final activation. These edits remain unverified.
+
+Main rewrote Native discovery as a single 24-cell/28,800-byte transaction,
+captured the authenticated advertisement handle at provisioning, preserved the
+original projected wire deadline, normalized request snapshots before
+reservation, and added requester-destruction notification to settle pending
+discovery. New regressions exercise real Native cancellation and reuse,
+pool destruction, projected expiry, and clock-callback rollback; no passing
+result is claimed before the writer barrier.
+
+A further specification check found that local class6 readiness must coexist
+with class5 OFFER/ACCEPT retries during sentinel confirmation. That correction,
+including carrier-owned deadline/timer cleanup, was handed to a separate
+Opus5/max writer. Another fresh Opus review examines the corrected discovery
+transaction read-only. Main retains acceptance and final runtime verification.
+The earlier383/6967 affected-suite result remains baseline only. All existing
+external and Native dependency blockers remain; no commit or public activation.
+
+Native discovery verification now passes52/52 tests and369/369 assertions
+(`artifact://716`, first command). It includes actual Native in-flight close,
+same-source requester reuse over the preserved shared socket, timer-count
+retirement, pool destruction, original wire projection, descriptor rejection,
+and post-reservation clock failure/reentrant pool destruction rollback.
+The rollback fixture initially allocated only24 service cells even though
+provisioning spends that same ledger; it now allows40, enough for one discovery
+but never two, so a leaked first24-cell reservation prevents replacement.
+The independent discovery reviewer accepted the corrected transaction and
+withdrew its initial speculative findings. Production pool reservations are
+mandatory inputs; the helper's20-cell fixture default is not a production default.
+
+The second command in artifact716 failed immediately in tail destruction:
+`clearTailKeys` existed but was not exported by `peer-crypto.js`. Main exported
+that existing helper. Subsequent Native-tail execution exposed fixture-only
+role/epoch mismatches: safety and guard advertisements were verified as terminal,
+and the four-node advertisement/grant epoch differed from the pinned A0 epoch7.
+Those bindings now match; session setup derives its default epoch from its
+actual link handle. The descriptor privacy test no longer asserts an unrelated
+initial phase. Tail integration remains unaccepted and under direct Native
+diagnosis; these corrections are not a passing tail result.
+
+The finite direct Native smoke now completes A0, authenticated DIRECTORY D1,
+A1 TAIL_READY, authenticated SUPPLIED D2, and A2 FINAL_EXIT_READY in0.34s.
+It uses real Native endpoints and opaque authorities throughout. This is tail
+construction proof only; final activation and encrypted carrier testing follow.
+The four-node fixture was also missing safety/terminal direct responders, and
+its guard/safety parent budgets reserved only one adjacency while each owns two.
+Registered the actual responders and allocated exactly two branch budgets at
+those intermediate nodes.
+
+Source fixes replace an undefined candidate timer variable with the stored
+record deadline and separate short-lived candidate admission from admitted
+branch lifetime. Different-model Opus review accepted those changes, while
+flagging timer reentrancy and a direction-specific bound refinement. Main also
+corrected successor local lifetime to project signed READY under the retained
+parent deadline rather than inheriting the spent discovery admission deadline.
+
+The previous tail publication waited for all eight EXTENDED attempts, consuming
+most of readiness's two-second window, and left an old receive waiter attached.
+The actual second-discovery probe then lost its first request and the safety
+runtime expired before the retry. Publication now follows the first dispatched
+EXTENDED, pauses the old consumer during installation, and retains bounded
+byte-frozen retries through a genuine moved-predecessor forwarding capability.
+Native forwarding requires no old consumer waiters and erases consumed payloads
+after synchronous sealing. The two-extension smoke passes with that cutover;
+replay, timer, final-carrier and full-suite verification remain pending.
+
+Independent fixture review accepted the authentication/epoch/budget corrections
+but flagged borrowed-owner destruction, unawaited source socket closure, late
+teardown registration, and unreleased tail owners. Those findings remain open.
+
+### 2026-09-11 genuine final-carrier and lost-reply checkpoint
+
+The tail suite now passes 13/13 tests and 108/108 assertions on Node24. Genuine
+Darwin Native A0/D1/A1/D2/A2 carriage reaches both registered final activation
+owners, moves each final carrier once, retains identical authenticated T290, and
+transports ciphertext authenticated with the opposite end's finalize keys in
+both directions. The exact final material remains twelve fields. This proves
+tail construction and final carriage, not purpose negotiation or peer streams.
+
+An authenticated fake-adapter loss regression drops the first EXTENDED datagram,
+observes the old tail already in FORWARDING, recovers its byte-frozen response
+from the original retry allowance, and completes the second extension through
+that same forwarder. The clock continues driving readiness retries; no deadline
+or attempt allowance is enlarged. The earlier focused tail/guard-lease/neighbor
+run passed 61/61 tests and 435/435 assertions. The 383/6967 full-suite result
+remains a baseline, not verification of this integration.
+
+Fixture cleanup now registers ownership before asynchronous setup, rolls back
+partial failure, preserves borrowed signer overrides, destroys tail owners, and
+awaits both source and responder socket closure. A real Native smoke verifies
+late descriptor failure, port reuse, borrowed signer survival, and zero retained
+bytes in all four tail pools. Two timers initially flagged after close belong
+to the mandatory bounded Native DESTROY train; eight 500ms clock advances retire
+them. Immediate cancellation would suppress a protocol obligation and was not
+implemented.
+
+Fresh different-model Opus review accepts the moved receive pump, authenticated
+cached reply, bounded helper and payload erasure. It also found a missing
+monotonic deadline check before forwarding publication and an upstream-loss
+cause that incorrectly suppressed DESTROY on the surviving successor. Main
+applied both corrections; targeted fault proofs remain pending. Timer/final-take
+review and class-aware purpose integration continue. No full-v2, security,
+Linux privacy, external-human or public-release acceptance is implied.
+
+### 2026-09-11 bounded tail ownership and early-finalization checkpoint
+
+The post-format expanded Node24 suite passes 504/504 tests and 7974/7974
+assertions, exit0 in14.87seconds (artifact775). It includes all peer tests,
+bootstrap/guard ownership tests, and the affected v1 M3, final-exit and tail
+regressions. This supersedes the383/6967 baseline for this integrated source;
+it is not full-v2 or Linux privacy acceptance.
+
+Genuine Darwin Native carriage now proves that early class5 frames survive
+terminal carrier transfer in arrival order. The original blanket shared-queue
+check returned ERR_BUSY and permanently stranded an already-arrived frame.
+Both transfer checks now use the same bounded queue predicate. A live receive
+waiter and pre-transfer class6 still refuse the move. Forged authorization
+neither consumes nor erases queued tail traffic. Only after the genuine final
+authorization succeeds does callback-free in-place compaction erase obsolete
+class1 payloads and retain class5 payload objects without copying. The receive
+path shares the same DATAGRAM/1101-byte classifier. No queue capacity, attempt
+allowance, material field, clock bound or activation authority was enlarged.
+
+The generic v2 carrier bridge now exposes explicit local activation,
+class-preserving receive, explicit class5 retry sending and the original frozen
+clock tuple. Both receive APIs consume the same one-shot reservation. Native
+checks cover incoming class6 not promoting the reverse sender, class5 retries
+after local class6 activation, and expiry retiring pending receive/timer work.
+Class6 test keys are separate deterministic test-only domains; these checks
+do not implement or prove OFFER/ACCEPT or sentinel negotiation.
+
+Authenticated late READY now rejects at the original operation deadline even
+when timer callbacks have not fired. A genuine Native reentrant source clock
+previously resurrected completion and retained678 caller bytes; the repair
+returns ERR_DESTROYED and retains0. Tentative readiness train/envelope ownership
+also releases on clock-triggered destruction. Synchronous250ms/2000ms timer
+callbacks cannot reinstall retired handles.
+
+The pre-forward-publication deadline probe keeps the guard in TAIL_READY after
+late Native-send settlement; removing only that guard publishes FORWARDING.
+Actual Native upstream physical loss now sends the surviving successor's
+authenticated closure, spends its closure partition and emits no false
+physical-loss notification for that still-live leg. Different-model Opus
+reviews accepted these repairs and the final-carrier classification design;
+Main retains the verdict.
+
+Verified throwaway sources were archived verbatim under
+`local://hyperdht-advisory-proofs/` and removed from the checkout:
+
+- `.tmp-peer-tail-probe.cjs`: SHA256 `04765d6e77cdc049e8aa4682bc7cbe9a54f91894f91ecbc5c0f4295d54383564`.
+- `.tmp-peer-fixture-cleanup.cjs`: SHA256 `305debbbafc2c218ef42502907abeb50f289b2d5367745d60d2d1726aa161e87`.
+- `.tmp-peer-ready-clock.cjs`: SHA256 `d4d6d553a7561aaff8981e540ea752a76086831821228af8f52fb839b15577ec`.
+- `.tmp-peer-publication-clock.cjs`: SHA256 `f14358e21c1e5d2127475139d855f5cc9bbe232ba9b6a2f84907a3ead1e252ff`.
+
+JD requested a workaround for cyber risk flags. Catalog checks found only the
+two permitted CyberKimi/CyberGLM routes on their previously unfunded shared
+Adverserial backend and neither model on the alternate OrcaRouter catalog.
+Ordinary correctness review and local Native regression evidence keep
+implementation moving; neither substitutes for the blocked security review.
+No task was disguised to evade risk controls, no model funding status was
+reclassified as approval, and no authentication or release gate was disabled.
+Purpose finalization, streams, semantic services, controller integration,
+native cancellation/lifetime bounds and external approval remain open.
+
+### 2026-09-11 frozen external security-review handoff
+
+A held actual-Native receive exposed a second carrier boundary: class1 arriving
+after the synchronous drain consumed a carrier reader with INVALID_ROUTE.
+The candidate now installs a write-once post-authorization admission mode and
+erases only valid late class1 after inbound accounting and closure interception.
+The held packet now resumes with a carrier reader pending without consuming
+that reader.
+
+The independent producer review then exposed premature TAIL_READY2 cancellation
+on terminal take. A new Native regression immediately takes the terminal
+carrier, closes its old tail owner, and loses the first READY2 upstream.
+Before the repair it reports source ERR_PRIVACY_UNAVAILABLE and prematurely
+available duty storage. The candidate transfers the existing train, sealed
+envelope, remaining attempts, original deadline and reservation to Native.
+Ancestor session storage stays reserved if its old owner closes before the duty
+ends. This regression now completes source verification and reclaims the
+terminal tail storage after duty/material release.
+
+Current focused verification passes39/39 tests and321/321 assertions, exit0
+in1.82seconds (artifact783). The expanded affected suite passes505/505 tests
+and7982/7982 assertions, exit0 in14.83seconds (artifact789). The latest duty
+transfer has not received a final independent security verdict, and its final
+edits have not been formatter-verified.
+
+At JD's request, source is frozen for an external security agent:
+
+- `review-bundles/hyperdht-private-peer-v2-security-review.zip`:1792138bytes;
+  SHA256 `efd01631e600f78db1269317a38f39fceb5637a283e6c726ed4e16ee30896ab3`.
+- `review-bundles/REVIEW_PROMPT.md`: standalone task, also included in the ZIP.
+-303 source/test/build/specification files;311 total archive members including
+  the prompt, manifest, dependency metadata and captured verification evidence.
+- ZIP CRC, every payload SHA256, manifest counts, safe relative member paths,
+  and equality of standalone/bundled prompts verified.
+- No `.git`, installed binaries, environment credentials, generated credential
+  artifacts, vault pages or agent conversations included. Synthetic test
+  fixtures remain. The bundle's migration document is a pre-handoff historical
+  snapshot; the bundled prompt and verification metadata describe its code.
+
+The handoff requests concrete findings, a minimal unified diff and exact
+verification evidence. Dedicated setup-security review, Native cancellation
+and completion-state bounds, full-v2 integration, Linux privacy and external
+human/public approval remain open. No commit, push or public activation.
+
+### 2026-09-11 authorized review-branch publication
+
+JD explicitly requested committing and pushing the current work to a branch.
+Publication targets `origin/implement-private-peer-v2`, not a merge to main or
+public-required-mode activation. All pending implementation, tests, package
+changes, specifications and review deliverables are included. Four local
+`.omo/run-continuation/` session records are excluded from publication.
+
+The pre-commit affected Node24 suite passes505/505 tests and7982/7982 assertions
+(exit0,15.05seconds), covering `peer-*.js`, link bootstrap, UDX endpoint, guard
+lease/link/reconnect, endpoint/bootstrap authority, M3, final-exit and tail
+control. This is not a full npm/Bare/Linux/privacy acceptance claim. Source is
+preserved as the reviewed candidate rather than silently formatted or repaired.
+
+The review ZIP remains byte-identical at SHA256
+`efd01631e600f78db1269317a38f39fceb5637a283e6c726ed4e16ee30896ab3`.
+The separately published `activation-material-probe.cjs` and
+`activation-material-finding.txt` document commit accepting changed parent
+deadline, owner or clock metadata under controlled internal fault injection.
+That expected-rejection probe fails; normal caller/remote exploitability is
+not established. This publication does not fix or waive that finding.
+
+The earlier blanket work pause was incorrect: a frozen ZIP does not block
+independent checkout work. Independent tasks are reopened; only the actual
+external neighbor/tail and setup review, native cancellation/completion bounds,
+historical punch diagnosis and human/public approval dependencies remain
+blocked. No external security or full-v2 verdict is asserted by this commit.

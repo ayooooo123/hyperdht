@@ -149,7 +149,9 @@ function fixture({
   initiatorClaim = null,
   commonEpoch = 9n,
   drop = false,
-  dropFirstRight = false
+  dropFirstRight = false,
+  onCancel = null,
+  onNow = null
 } = {}) {
   const time = clock(start)
   const authority = cryptoSuite.keyPair(seed(250))
@@ -240,9 +242,15 @@ function fixture({
     [UDX_LINK_CLOSE]() {}
   })
   const sessionOptions = {
-    now: time.now,
+    now: () => {
+      if (onNow) onNow()
+      return time.now()
+    },
     schedule: time.schedule,
-    cancel: time.cancel,
+    cancel: (id) => {
+      time.cancel(id)
+      if (onCancel) onCancel()
+    },
     absoluteDeadline,
     signedExpiry,
     authorizedExpiry
@@ -520,6 +528,157 @@ test('abort after CREATE dispatch sends authenticated cancellation and tombstone
   t.is(f.leftSession.state, 'TOMBSTONE')
   t.is(f.rightSession.state, 'TOMBSTONE')
   t.ok(f.leftPackets.length >= 2, 'CREATE and LINK_CANCEL crossed the endpoint')
+  await f.leftSession.close()
+  await f.rightSession.close()
+  f.left.value.destroy()
+  f.right.value.destroy()
+})
+
+test('accept wait direct close/failure ownership and genuine install', async (t) => {
+  const f1 = fixture()
+  let modeErr = null
+  try {
+    await f1.leftSession.waitAccepted()
+  } catch (err) {
+    modeErr = err
+  }
+  t.is(modeErr && modeErr.code, 'CIRCUIT_STATE', 'rejects when called on initiate mode')
+
+  const waiting1 = f1.rightSession.waitAccepted()
+  let secondErr = null
+  try {
+    await f1.rightSession.waitAccepted()
+  } catch (err) {
+    secondErr = err
+  }
+  t.is(secondErr && secondErr.code, 'CIRCUIT_STATE', 'one waiter owner enforced')
+
+  const closeP = f1.rightSession.close()
+  let closeErr = null
+  try {
+    await waiting1
+  } catch (err) {
+    closeErr = err
+  }
+  t.is(
+    closeErr && closeErr.code,
+    'ROUTE_UNAVAILABLE',
+    'close directly rejects pending accept waiter'
+  )
+  await closeP
+
+  let postCloseErr = null
+  try {
+    await f1.rightSession.waitAccepted()
+  } catch (err) {
+    postCloseErr = err
+  }
+  t.is(
+    postCloseErr && postCloseErr.code,
+    'ROUTE_UNAVAILABLE',
+    'waitAccepted after close rejects immediately'
+  )
+  await f1.leftSession.close()
+  f1.left.value.destroy()
+  f1.right.value.destroy()
+
+  const f2 = fixture({ absoluteDeadline: 2_000, signedExpiry: 60_000, drop: true })
+  const waiting2 = f2.rightSession.waitAccepted()
+  f2.time.advance(2_001)
+  let expireErr = null
+  try {
+    await waiting2
+  } catch (err) {
+    expireErr = err
+  }
+  t.is(
+    expireErr && expireErr.code,
+    'ROUTE_UNAVAILABLE',
+    'expiry directly rejects pending accept waiter'
+  )
+  t.is(f2.rightSession.state, 'TOMBSTONE', 'session is tombstoned upon expiry')
+  await f2.leftSession.close()
+  await f2.rightSession.close()
+  f2.left.value.destroy()
+  f2.right.value.destroy()
+
+  const f3 = fixture()
+  const waiter3 = f3.rightSession.waitAccepted()
+  const opener3 = f3.leftSession.open()
+  const [leftEst, rightEst] = await Promise.all([opener3, waiter3])
+  t.ok(rightEst, 'waitAccepted resolves with genuine established handle')
+  t.is(f3.rightSession.established, rightEst, 'matches session.established')
+  t.is(f3.rightSession.state, 'OPEN')
+  let secondCallErr = null
+  try {
+    await f3.rightSession.waitAccepted()
+  } catch (err) {
+    secondCallErr = err
+  }
+  t.is(
+    secondCallErr && secondCallErr.code,
+    'CIRCUIT_STATE',
+    'second call after OPEN rejects because one waiter owner is strictly enforced'
+  )
+  await f3.leftSession.close()
+  await f3.rightSession.close()
+  f3.left.value.destroy()
+  f3.right.value.destroy()
+})
+
+test('accept close retains one completion through throwing cancellation reentry', async (t) => {
+  let armed = false
+  let nestedClose = null
+  const f = fixture({
+    onCancel() {
+      if (!armed) return
+      armed = false
+      nestedClose = f.rightSession.close()
+      throw new Error('cancel failed after reentry')
+    }
+  })
+  let outcome = 'pending'
+  void f.rightSession.waitAccepted().then(
+    () => {
+      outcome = 'accepted'
+    },
+    () => {
+      outcome = 'rejected'
+    }
+  )
+  armed = true
+  const closing = f.rightSession.close()
+  await closing.catch(() => {})
+  await Promise.resolve()
+  t.is(outcome, 'rejected')
+  t.is(nestedClose, closing)
+  t.is(f.rightSession.established, null)
+  await f.leftSession.close()
+  f.left.value.destroy()
+  f.right.value.destroy()
+})
+
+test('accept clock revocation cannot publish a stranded waiter', async (t) => {
+  let armed = false
+  const f = fixture({
+    onNow() {
+      if (!armed) return
+      armed = false
+      void f.rightSession.close()
+    }
+  })
+  armed = true
+  let outcome = 'pending'
+  void f.rightSession.waitAccepted().then(
+    () => {
+      outcome = 'accepted'
+    },
+    () => {
+      outcome = 'rejected'
+    }
+  )
+  await new Promise((resolve) => setImmediate(resolve))
+  t.is(outcome, 'rejected')
   await f.leftSession.close()
   await f.rightSession.close()
   f.left.value.destroy()
