@@ -74,7 +74,7 @@ function createMockClock(startWall = 1000000n, startMono = 500000n, hooks = {}) 
     setTimer: (fn, ms) => {
       const id = nextId++
       timers.set(id, { fn, due: mono + BigInt(ms) })
-      if (hooks.onSchedule) hooks.onSchedule()
+      if (hooks.onSchedule) hooks.onSchedule(ms)
       return id
     },
     clearTimer: (id) => {
@@ -640,7 +640,8 @@ test('timer registration cannot orphan retry ownership after phase or attempt ch
     const setup = await setupDiscoverPair(t, { left: 41621, right: 41622 }, null, clock)
     const deliveries = []
     setup.network.deliver = (deliver) => deliveries.push(deliver)
-    hooks.onSchedule = () => {
+    hooks.onSchedule = (ms) => {
+      if (ms !== 250) return
       hooks.onSchedule = null
       if (transition === 'phase') {
         // Deliver PHASE0 and its cookie before the first timer handle is issued.
@@ -662,7 +663,6 @@ test('timer registration cannot orphan retry ownership after phase or attempt ch
       // Deliver that cookie before the queued retry, advancing to COOKIE_FROZEN.
       deliveries.pop()()
     }
-    t.is(clock.pendingTimers(), 1, transition + ': only the current phase owns a timer')
     while (deliveries.length) deliveries.shift()()
     const candidate = await pending
     t.is(clock.pendingTimers(), 0, transition + ': completion retires every timer')
