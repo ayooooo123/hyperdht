@@ -5296,7 +5296,7 @@ At JD's request, source is frozen for an external security agent:
 - `review-bundles/hyperdht-private-peer-v2-security-review.zip`:1792138bytes;
   SHA256 `efd01631e600f78db1269317a38f39fceb5637a283e6c726ed4e16ee30896ab3`.
 - `review-bundles/REVIEW_PROMPT.md`: standalone task, also included in the ZIP.
--303 source/test/build/specification files;311 total archive members including
+  -303 source/test/build/specification files;311 total archive members including
   the prompt, manifest, dependency metadata and captured verification evidence.
 - ZIP CRC, every payload SHA256, manifest counts, safe relative member paths,
   and equality of standalone/bundled prompts verified.
@@ -5430,3 +5430,176 @@ includes the two clock-boundary fixes, two Native regressions and this record;
 local `.omo` state and session-local report/probe files remain excluded.
 The affected implementation was verified after formatting:507/507 tests,
 7988/7988 assertions. The frozen review ZIP and prompt remain unchanged.
+
+### 2026-09-11 Astra routing continuation — review gate unavailable
+
+Two GPT-6-Astra dispatches were attempted for the architecture and integration packets. Both stopped at the provider credit gate before producing output. No Astra review text is preserved, so no ownership conclusion is attributed to those runs. Relay source and tests remain byte-identical; no RelayService edit was retained.
+
+The retained local package-private crypto slice is `lib/private/peer-crypto.js`: strict X25519 shared-secret validation through `cryptoSuite.keyAgreement`, exact OFFER-body preTranscript and purposeTranscript framing, separate pre-MAC and route KDF domains, MAC16 computation and constant-time verification, purpose/offer/accept/confirmation/final transcript digests, and explicit key erasure. `test/private/peer-crypto.js` covers deterministic vectors, agreement symmetry, false/low-order rejection, forgery rejection, mutation binding, and erasure.
+
+This is not stateful purpose finalization, peer streams, semantic services, controller integration, Native cancellation/lifetime completion, Linux privacy evidence, external human cryptographic review, security approval, or public activation. The missing approved production peer endpoint owner remains the next runtime blocker.
+
+Verification correction: the purpose-MAC regression explicitly covers the 64-byte `PEER_ROUTE_REJECT_V2` header body; reliable ACK sentinels have no object MAC suffix. The focused Node result is 11/11 tests and 138/138 assertions; the focused Bare result is also 11/11 and 138/138. The private aggregate now imports the suite and passes 1,147/1,147 tests and 20,223/20,223 assertions.
+
+### 2026-09-11 package-private purpose owner and peer transport slice
+
+The local implementation now has a package-private `lib/private/peer-purpose-owner.js`
+with source and terminal state machines for OFFER, ACCEPT or REJECT, authenticated
+replay handling, two reliable sentinel trains, bounded retry, projected deadlines,
+resource rollback/transfer, pre-shared-secret erasure, and active-route expiry.
+The owner keeps the route inaccessible until the terminal class-6 sentinel send has
+been accepted. Scheduler faults and uncertain native send results destroy or retry
+the owner instead of being treated as normal exhaustion.
+
+Active owners with explicit stream callbacks now bind `PeerReliableLanes` only after
+sentinel activation. The transport facade keeps DATA and CONTROL ARQ separate,
+continues the receive pump after activation, rejects snapshot-zero ACKs outside the
+sentinel path, and requires strict boolean admission decisions. Physical send
+attempts charge one directional cell and 1,200 bytes when route resources exist;
+receive paths do not charge remote traffic, and terminal ACCEPT allocation charges
+the one accepted command.
+
+Focused owner verification passes 10/10 tests and 71/71 assertions. Focused crypto
+verification remains 11/11 and 138/138; reliable lanes remain 35/35 and 674/674.
+The private aggregate then passed 1,157/1,157 tests and 20,294/20,294 assertions.
+The package-private owner has no public export. Semantic services, endpoint/controller
+integration, Native cancellation/lifetime bounds, Linux privacy evidence, external
+human review, and public activation remain blocked. Astra architecture and
+integration dispatches stopped at HTTP 402 before producing review text.
+
+### 2026-09-12 purpose owner correction and cross-runtime evidence
+
+The package-private owner correction slice now requires carrier fulfillment to
+resolve to the exact boolean `true`; synchronous or asynchronous false results
+retry or destroy without publishing ACTIVE. Physical route accounting occurs
+only after synchronous sealing succeeds and immediately before the carrier
+attempt. Construction failure erases partial key material, removes the owner
+registry entry, and releases reserved resources. Optional nonce inputs accept
+only own data properties, so accessor execution cannot reach secret handling.
+Negotiated expiry and limits now use the componentwise minimum and project the
+same expiry through both source and terminal active deadlines.
+
+The regression set covers dropped first OFFER, ACCEPT, and sentinel attempts,
+asymmetric expiry and resource limits, authenticated REJECT parent-ledger
+spending, exact carrier acceptance, bidirectional DATA/CONTROL stream
+callbacks, and callback-snapshot immutability after activation. No new
+physical carrier file was added; the route carrier remains the existing
+M3-adjacency/guard-lease/UDX endpoint path.
+
+Focused `peer-purpose-owner` verification passes 14/14 tests and 105/105
+assertions on both Node and Bare. Focused crypto remains 11/11 and 138/138;
+reliable lanes remain 35/35 and 674/674. The Node private aggregate passes
+1,250/1,250 tests and 22,758/22,758 assertions. The corresponding Bare
+focused peer suites pass: protocol 4/4 and 1,083/1,083, semantic wire 5/5
+and 155/155, reliable lanes 35/35 and 674/674, M3 context 11/11 and 129/129,
+ledger 12/12 and 215/215, adjacency runtime 22/22 and 174/174, purpose owner
+14/14 and 105/105, and crypto 11/11 and 138/138. The full Bare aggregate
+reaches existing native test 863, then its next live route setup fails with
+`ROUTE_UNAVAILABLE` in `udx-cell-endpoint.js` and exits 134; this is not
+evidence against the focused peer slice.
+
+Relay source and tests remain byte-identical. The owner and stream code remain
+package-private with no public activation path. Semantic services,
+endpoint/controller ownership, Native cancellation/completion bounds, Linux
+privacy evidence, external human cryptographic review, and public activation
+remain blocked.
+
+### 2026-09-12 staged-constructor transaction correction
+
+A follow-up review found that the earlier constructor transaction began after
+identity and staged secret copies. The owner now places identity copying,
+final-key copying, callback snapshots, deadline projection, resource
+reservation, and source preparation under one cleanup transaction. `identity`
+and `finalKeys` also erase partial results when a later field fails. The
+regression covers malformed circuit/query/final-key fields, a clock scheduler
+fault, zeroed staged copies, and zero resource reservations.
+
+Focused `peer-purpose-owner` verification now passes 15/15 tests and 125/125
+assertions on both Node and Bare. The updated Node private aggregate passes
+1,251/1,251 tests and 22,778/22,778 assertions (artifact 189). A fresh Bare
+private aggregate passes 1,206/1,206 tests and 22,643/22,643 assertions
+(artifact 191). This replaces the earlier pre-correction aggregate counts.
+Relay files remain byte-identical; package-private ownership and the public
+activation gates are unchanged.
+
+### 2026-09-12 handshake staging transaction correction
+
+The owner staging transaction now keeps source OFFER-body transfer, terminal
+OFFER and REJECT wire copies, and ACCEPT derivation buffers inside guarded
+cleanup paths. `prepareSource` erases its local body when transfer fails;
+`handleAccept` erases staged body, wire, purpose, nonce, digest, and derived
+keys on derivation failure; `handleOffer` and `cacheReject` do not retain
+initial copies before their cleanup boundary. The regression forces a source
+pre-shared-secret failure and observes every staged ACCEPT buffer zeroed, with
+source reservations released.
+
+Focused `peer-purpose-owner` verification passes 16/16 tests and 135/135
+assertions on both Node and Bare. The current Node private aggregate passes
+1,252/1,252 tests and 22,788/22,788 assertions; the current Bare private
+aggregate passes 1,207/1,207 tests and 22,653/22,653 assertions. Relay files
+remain byte-identical. The owner and stream slice remains package-private;
+semantic services, endpoint/controller ownership, Native cancellation and
+completion bounds, Linux privacy evidence, external human cryptographic
+review, and public activation remain blocked.
+
+### 2026-09-12 exact-carrier and staging-harness correction
+
+The exact-`true` carrier regression now checks the terminal's
+`TERMINAL_SENTINEL_PENDING` state and rejected `route()` before advancing the
+retry clock; a later 250 ms advance permits activation. ACCEPT handling no
+longer aliases `state.responseWire`; terminal ACCEPT sends use
+`state.acceptWire` directly.
+The raw-secret `TEST_ONLY_PEER_PURPOSE_OBSERVER` seam was removed; staging cleanup is tested
+only through narrow test-harness sodium/allocation fault instrumentation for
+the local ACCEPT body, ACCEPT wire copies, and purpose transcript. The
+pre-shared erasure regression likewise uses harness-only allocation tracking.
+
+Native `peer-m3-adjacency-runtime` is no longer registered by the portable
+`test/private-routing.js` aggregate. It remains a dedicated platform suite:
+Bare focused adjacency passes 22/22 tests and 174/174 assertions. Bare focused
+peer verification passes crypto 11/11 and 138/138, protocol 4/4 and
+1,083/1,083, semantic wire 5/5 and 155/155, reliable lanes 35/35 and 674/674,
+M3 context 11/11 and 129/129, ledger 12/12 and 215/215, and purpose owner
+16/16 and 142/142. The owner passes 16/16 and 142/142 on Node as well.
+
+The current Node portable private aggregate passes 1,230/1,230 tests and
+22,621/22,621 assertions. The preceding Bare run reached 843 tests, then
+aborted at existing native live test 844 while binding a UDX route:
+`ROUTE_UNAVAILABLE` from `udx-cell-endpoint.js` through
+`test/private/native-adjacent-fixture.js`. That transient environment/native
+live setup stop is superseded by the passing rerun below and was not a failure
+in the focused peer suites. Relay files remain byte-identical. Semantic
+services, endpoint/controller ownership, Native
+cancellation/completion bounds, Linux privacy evidence, external human
+cryptographic review, and public activation remain blocked.
+
+### 2026-09-12 Bare portable aggregate rerun
+
+A fresh Bare execution after the ACCEPT wire ownership correction passes
+1,185/1,185 tests and 22,486/22,486 assertions. This supersedes the
+immediately preceding environment stop at test 843 before native live test
+844; this run completes without `ROUTE_UNAVAILABLE`. The Node portable
+aggregate remains 1,230/1,230 tests and 22,621/22,621 assertions. Focused
+owner and dedicated adjacency counts remain 16/16 and 142/142 on Bare and
+22/22 and 174/174 respectively. Relay files remain byte-identical; semantic
+services, endpoint/controller ownership, Native cancellation/completion
+bounds, Linux privacy evidence, external human cryptographic review, and
+public activation remain blocked.
+
+### 2026-09-12 aggregate registration and decoder cleanup
+
+The portable aggregate again registers `peer-m3-adjacency-runtime`. The owner
+now clears `decoded.body` and `decoded.authSuffix` after finalize and route
+dispatch, and the pre-shared erasure test tracks both returned agreement
+buffers plus the terminal's retained state copy; it checks both direct
+agreement outputs and the terminal owner-held copy after sentinel
+authentication. The staging regression also checks decoded 260-byte bodies
+for zeroization.
+
+With adjacency registered, the Node private aggregate passes 1,252/1,252
+tests and 22,800/22,800 assertions. Bare passes 1,207/1,207 tests and
+22,665/22,665 assertions. Focused owner verification passes 16/16 tests and
+147/147 assertions on both runtimes. Relay files remain byte-identical.
+Semantic services, endpoint/controller ownership, Native
+cancellation/completion bounds, Linux privacy evidence, external human
+cryptographic review, and public activation remain blocked.
