@@ -99,54 +99,10 @@ const FIXTURES = [
 
 test('peer v2 envelopes emit the fixed registry wire identifiers', (t) => {
   const expectedIds = [
-    0x0300,
-    0x0301,
-    0x0302,
-    0x0303,
-    0x0304,
-    0x0305,
-    0x0306,
-    0x0307,
-    0x0308,
-    0x0309,
-    0x030a,
-    0x030b,
-    0x030c,
-    0x030d,
-    0x030e,
-    0x030f,
-    0x0310,
-    0x0311,
-    0x0312,
-    0x0313,
-    0x0314,
-    0x0315,
-    0x0316,
-    0x0317,
-    0x0318,
-    0x0319,
-    0x031a,
-    0x031b,
-    0x031c,
-    0x031d,
-    0x031e,
-    0x031f,
-    0x0340,
-    0x0341,
-    0x0342,
-    0x0343,
-    0x0344,
-    0x0345,
-    0x0346,
-    0x0347,
-    0x0349,
-    0x034a,
-    0x034b,
-    0x0360,
-    0x0361,
-    0x0362,
-    0x0363,
-    0x0364,
+    0x0300, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0307, 0x0308, 0x0309, 0x030a, 0x030b,
+    0x030c, 0x030d, 0x030e, 0x030f, 0x0310, 0x0311, 0x0312, 0x0313, 0x0314, 0x0315, 0x0316, 0x0317,
+    0x0318, 0x0319, 0x031a, 0x031b, 0x031c, 0x031d, 0x031e, 0x031f, 0x0340, 0x0341, 0x0342, 0x0343,
+    0x0344, 0x0345, 0x0346, 0x0347, 0x0349, 0x034a, 0x034b, 0x0360, 0x0361, 0x0362, 0x0363, 0x0364,
     0x0365
   ]
   for (let index = 0; index < FIXTURES.length; index++) {
@@ -156,7 +112,10 @@ test('peer v2 envelopes emit the fixed registry wire identifiers', (t) => {
       body: b4a.alloc(bodyBytes),
       authSuffix: b4a.alloc(suffixBytes)
     })
-    t.alike(encoded.subarray(0, 8), wire(2, expectedIds[index], bodyBytes, suffixBytes).subarray(0, 8))
+    t.alike(
+      encoded.subarray(0, 8),
+      wire(2, expectedIds[index], bodyBytes, suffixBytes).subarray(0, 8)
+    )
   }
 })
 
@@ -197,7 +156,13 @@ test('peer v2 envelope accepts every declared body and suffix boundary', (t) => 
       }
     }
 
-    expectInvalid(t, () => encodePeerObject({ messageId, body: b4a.alloc(minimumBodyBytes), authSuffix: b4a.alloc(suffixBytes + 1) }))
+    expectInvalid(t, () =>
+      encodePeerObject({
+        messageId,
+        body: b4a.alloc(minimumBodyBytes),
+        authSuffix: b4a.alloc(suffixBytes + 1)
+      })
+    )
     expectInvalid(t, () => decodePeerObject(wire(2, messageId, minimumBodyBytes, suffixBytes + 1)))
   }
 })
@@ -230,7 +195,13 @@ test('peer v2 envelope rejects v1, reserved, unknown, and trailing layouts', (t)
   expectInvalid(t, () => decodePeerObject(wrongBodyLength))
   expectInvalid(t, () => decodePeerObject(b4a.concat([valid, b4a.from([0])])))
 
-  expectInvalid(t, () => encodePeerObject({ messageId: PEER_MESSAGE_ID.PEER_OPEN_V2, body: b4a.alloc(88), authSuffix: b4a.alloc(1) }))
+  expectInvalid(t, () =>
+    encodePeerObject({
+      messageId: PEER_MESSAGE_ID.PEER_OPEN_V2,
+      body: b4a.alloc(88),
+      authSuffix: b4a.alloc(1)
+    })
+  )
 })
 
 test('peer v2 decoder retains owned fields and uses intrinsic buffer operations', (t) => {
@@ -249,8 +220,12 @@ test('peer v2 decoder retains owned fields and uses intrinsic buffer operations'
   t.is(decoded.authSuffix[0], 0x62)
 
   const valid = encodePeerObject({ messageId: PEER_MESSAGE_ID.PEER_OPEN_V2, body })
-  expectInvalid(t, () => decodePeerObject(forgedByteLength(b4a.concat([valid, b4a.alloc(1)]), valid.byteLength)))
-  expectInvalid(t, () => decodePeerObject(forgedByteLength(b4a.from(valid.subarray(0, -1)), valid.byteLength)))
+  expectInvalid(t, () =>
+    decodePeerObject(forgedByteLength(b4a.concat([valid, b4a.alloc(1)]), valid.byteLength))
+  )
+  expectInvalid(t, () =>
+    decodePeerObject(forgedByteLength(b4a.from(valid.subarray(0, -1)), valid.byteLength))
+  )
   t.alike(decodePeerObject(overriddenSubarray(b4a.from(valid))).body, body)
 
   let reads = 0

@@ -105,30 +105,41 @@ function sampleRedactedProof() {
 function sampleLinkReply(index) {
   const proof = sampleRedactedProof()
   proof.fields.extensionIndex = index
-  const accept = encodePeerTransport(PEER_MESSAGE_ID.PEER_LINK_ACCEPT_V2, {
-    offerDigest: b4a.alloc(32, 12),
-    advertisementDigest: proof.fields.responderAdvertisementDigest,
-    responderIdentity: proof.fields.responderIdentity,
-    observedPredecessorEndpoint: b4a.alloc(19, 13),
-    responderLinkEphemeralPublicKey: b4a.alloc(32, 14),
-    admittedLimits: makeLimits({ expiresAt: proof.fields.expiresAt }),
-    acceptedAt: 500n,
-    acceptNonce: b4a.alloc(32, 15)
-  }, b4a.alloc(64, 16))
+  const accept = encodePeerTransport(
+    PEER_MESSAGE_ID.PEER_LINK_ACCEPT_V2,
+    {
+      offerDigest: b4a.alloc(32, 12),
+      advertisementDigest: proof.fields.responderAdvertisementDigest,
+      responderIdentity: proof.fields.responderIdentity,
+      observedPredecessorEndpoint: b4a.alloc(19, 13),
+      responderLinkEphemeralPublicKey: b4a.alloc(32, 14),
+      admittedLimits: makeLimits({ expiresAt: proof.fields.expiresAt }),
+      acceptedAt: 500n,
+      acceptNonce: b4a.alloc(32, 15)
+    },
+    b4a.alloc(64, 16)
+  )
   return {
     accept,
     proof,
     proofWire: encodePeerTransport(
-      PEER_MESSAGE_ID.PEER_REDACTED_RESPONDER_PROOF_V2, proof.fields, proof.authSuffix
+      PEER_MESSAGE_ID.PEER_REDACTED_RESPONDER_PROOF_V2,
+      proof.fields,
+      proof.authSuffix
     )
   }
 }
 
 function sampleSemanticFirstHeader(id, bodyBytes) {
   const hdr = b4a.alloc(8)
-  hdr[0] = 0; hdr[1] = 0; hdr[2] = 0; hdr[3] = 2 // version 2
-  hdr[4] = id >>> 8; hdr[5] = id & 0xff
-  hdr[6] = bodyBytes >>> 8; hdr[7] = bodyBytes & 0xff
+  hdr[0] = 0
+  hdr[1] = 0
+  hdr[2] = 0
+  hdr[3] = 2 // version 2
+  hdr[4] = id >>> 8
+  hdr[5] = id & 0xff
+  hdr[6] = bodyBytes >>> 8
+  hdr[7] = bodyBytes & 0xff
   return hdr
 }
 
@@ -653,9 +664,7 @@ test('reject reliablePacket routeId mismatch', (t) => {
     completeNestedObject: openWire
   }
 
-  expectInvalid(t, () =>
-    encodePeerTransport(PEER_MESSAGE_ID.PEER_RELIABLE_PACKET_V2, packetFields)
-  )
+  expectInvalid(t, () => encodePeerTransport(PEER_MESSAGE_ID.PEER_RELIABLE_PACKET_V2, packetFields))
 })
 
 test('reject reliablePacket lane flags mismatch for DATA', (t) => {
@@ -678,9 +687,7 @@ test('reject reliablePacket lane flags mismatch for DATA', (t) => {
     completeNestedObject: dataWire
   }
 
-  expectInvalid(t, () =>
-    encodePeerTransport(PEER_MESSAGE_ID.PEER_RELIABLE_PACKET_V2, packetFields)
-  )
+  expectInvalid(t, () => encodePeerTransport(PEER_MESSAGE_ID.PEER_RELIABLE_PACKET_V2, packetFields))
 })
 
 test('reject FIN offset/seq zero vs MAX inconsistency', (t) => {
@@ -737,7 +744,10 @@ test('reject malformed HANDSHAKE FIRST and second fragments', (t) => {
 
   // FIRST fragment with invalid version in header
   const badHeader = b4a.alloc(10, 0)
-  badHeader[0] = 0; badHeader[1] = 0; badHeader[2] = 0; badHeader[3] = 1; // version 1
+  badHeader[0] = 0
+  badHeader[1] = 0
+  badHeader[2] = 0
+  badHeader[3] = 1 // version 1
   const badHeaderPayload = {
     common: makeCommon(),
     semanticObjectOffset: 0,
@@ -809,10 +819,14 @@ test('link reply rejects spliced identity, advertisement and expiry before retur
     { responderAdvertisementDigest: b4a.alloc(32, 99) },
     { expiresAt: sample.proof.fields.expiresAt - 1n }
   ]) {
-    const proof = encodePeerTransport(PEER_MESSAGE_ID.PEER_REDACTED_RESPONDER_PROOF_V2, {
-      ...sample.proof.fields,
-      ...replacement
-    }, sample.proof.authSuffix)
+    const proof = encodePeerTransport(
+      PEER_MESSAGE_ID.PEER_REDACTED_RESPONDER_PROOF_V2,
+      {
+        ...sample.proof.fields,
+        ...replacement
+      },
+      sample.proof.authSuffix
+    )
     expectInvalid(t, () => encodePeerLinkReply(sample.accept, proof, 1))
     expectInvalid(t, () => decodePeerLinkReply(b4a.concat([sample.accept, proof]), 1))
   }

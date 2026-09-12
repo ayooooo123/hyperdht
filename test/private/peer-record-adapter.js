@@ -289,10 +289,9 @@ class FakeSecretStream extends Duplex {
     this.writeInputs.push(data)
     const record = applicationRecord(data, 0x61)
     this.rawStream.write(record)
-    this.rawStream.flush().then(
-      (drained) => callback(drained ? null : new Error('Raw stream did not drain')),
-      callback
-    )
+    this.rawStream
+      .flush()
+      .then((drained) => callback(drained ? null : new Error('Raw stream did not drain')), callback)
   }
 
   _final(callback) {
@@ -384,20 +383,14 @@ async function primeInboundHeader(bound) {
   const header = headerRecord(0x22)
   const consumed = bound.adapter.consumeCiphertext(header)
   if (consumed !== header.byteLength) throw new Error('Header was not consumed atomically')
-  await waitFor(
-    function () {
-      return bound.secret.inboundRecords.length === before + 1
-    },
-    'inbound header delivery'
-  )
-  await waitFor(
-    function () {
-      return bound.state.inboundReleases.some(function (entry) {
-        return entry.kind === 'header'
-      })
-    },
-    'inbound header release'
-  )
+  await waitFor(function () {
+    return bound.secret.inboundRecords.length === before + 1
+  }, 'inbound header delivery')
+  await waitFor(function () {
+    return bound.state.inboundReleases.some(function (entry) {
+      return entry.kind === 'header'
+    })
+  }, 'inbound header release')
 }
 
 function feedRecord(adapter, record) {
@@ -405,7 +398,8 @@ function feedRecord(adapter, record) {
   while (offset < record.byteLength) {
     const end = Math.min(record.byteLength, offset + MAX_DATA_FRAGMENT_BYTES)
     const consumed = adapter.consumeCiphertext(record.subarray(offset, end))
-    if (consumed <= 0) throw new Error('Record admission became blocked while assembling one record')
+    if (consumed <= 0)
+      throw new Error('Record admission became blocked while assembling one record')
     offset += consumed
   }
   return offset
@@ -544,9 +538,11 @@ test('record-boundary crossing returns a charged remainder until the facade tran
 
   const secondReading = readOne(bound.facade)
   await waitFor(function () {
-    return bound.state.inboundReleases.filter(function (entry) {
-      return entry.kind === 'application'
-    }).length === 1
+    return (
+      bound.state.inboundReleases.filter(function (entry) {
+        return entry.kind === 'application'
+      }).length === 1
+    )
   }, 'first plaintext ownership transfer')
 
   const secondConsumed = bound.adapter.consumeCiphertext(frame.subarray(firstConsumed))
@@ -571,9 +567,11 @@ test('zero, tiny, and maximum inbound records retain per-record weight and exact
 
   const tinyReading = readOne(bound.facade)
   await waitFor(function () {
-    return bound.state.inboundReleases.filter(function (entry) {
-      return entry.kind === 'application'
-    }).length === 1
+    return (
+      bound.state.inboundReleases.filter(function (entry) {
+        return entry.kind === 'application'
+      }).length === 1
+    )
   }, 'zero-record ownership transfer')
 
   const tinyRecord = applicationRecordOfSize(1, 0x73)
@@ -585,9 +583,11 @@ test('zero, tiny, and maximum inbound records retain per-record weight and exact
 
   const maxReading = readOne(bound.facade)
   await waitFor(function () {
-    return bound.state.inboundReleases.filter(function (entry) {
-      return entry.kind === 'application'
-    }).length === 2
+    return (
+      bound.state.inboundReleases.filter(function (entry) {
+        return entry.kind === 'application'
+      }).length === 2
+    )
   }, 'tiny-record ownership transfer')
 
   const maximum = applicationRecordOfSize(MAX_PLAINTEXT_BYTES, 0x6d)
@@ -652,9 +652,11 @@ test('blocked pipe retention remains stable after fresh admission and terminal d
   const expected = b4a.from(retained)
 
   await waitFor(function () {
-    return bound.state.inboundReleases.filter(function (entry) {
-      return entry.kind === 'application'
-    }).length === 1
+    return (
+      bound.state.inboundReleases.filter(function (entry) {
+        return entry.kind === 'application'
+      }).length === 1
+    )
   }, 'capacity transfer while sink callback is pending')
   t.is(sink.callbacks.length, 1)
 
@@ -699,9 +701,12 @@ test('destroy from inside a data callback never erases the delivered plaintext',
     return retained !== null && bound.state.failures.length === 1
   }, 'destroy from data callback')
   t.alike(retained, expected)
-  t.is(bound.state.inboundReleases.filter(function (entry) {
-    return entry.kind === 'application'
-  }).length, 1)
+  t.is(
+    bound.state.inboundReleases.filter(function (entry) {
+      return entry.kind === 'application'
+    }).length,
+    1
+  )
   t.is(bound.state.failures.length, 1, 'failure callback called exactly once')
   t.is(failureCount, 1, 'no duplicate failure invocation occurred')
 })
@@ -831,7 +836,11 @@ test('plaintext writes accept the exact maximum and reject one byte more before 
   const rejected = await error
   t.is(rejected instanceof PrivateRouteError, true)
   t.is(rejected.code, QUOTA_ERROR.code)
-  t.is(oversized.secret.writeInputs.length, 0, 'oversized plaintext never reaches SecretStream.write')
+  t.is(
+    oversized.secret.writeInputs.length,
+    0,
+    'oversized plaintext never reaches SecretStream.write'
+  )
 })
 
 test('copied or offset-shifted plaintext fails the ownership binding', async function (t) {
@@ -846,9 +855,12 @@ test('copied or offset-shifted plaintext fails the ownership binding', async fun
   t.is(feedRecord(bound.adapter, record), record.byteLength)
   await t.exception(reading, RECORDS_UNAVAILABLE)
   t.is(bound.state.failures.length, 1)
-  t.is(bound.state.inboundReleases.filter(function (entry) {
-    return entry.kind === 'application'
-  }).length, 1)
+  t.is(
+    bound.state.inboundReleases.filter(function (entry) {
+      return entry.kind === 'application'
+    }).length,
+    1
+  )
 })
 
 test('binding is exact, private to one SecretStream/raw pair, and one-shot', async function (t) {
@@ -1059,7 +1071,8 @@ async function sendPeerToFacade(pair, plaintext) {
   }, 'peer application record emitted')
   const rawRecord = pair.peerOutbound[beforeLen]
   const consumed = feedRecord(pair.adapter, rawRecord)
-  if (consumed !== rawRecord.byteLength) throw new Error('Application record was not consumed atomically')
+  if (consumed !== rawRecord.byteLength)
+    throw new Error('Application record was not consumed atomically')
   return rawRecord
 }
 
@@ -1113,14 +1126,20 @@ test('native SecretStream roundtrip application records with exact unpooled back
     return pair.peerOutbound.length >= 3
   }, 'second record emitted by peer')
   const raw2 = pair.peerOutbound[2]
-  t.is(pair.adapter.consumeCiphertext(raw2.subarray(0, 50)), 0, 'admission blocked while prior plaintext is held')
+  t.is(
+    pair.adapter.consumeCiphertext(raw2.subarray(0, 50)),
+    0,
+    'admission blocked while prior plaintext is held'
+  )
 
   // Next read demand transfers capacity and admits second record on fresh backing
   const reading2 = readOne(pair.facade)
   await waitFor(function () {
-    return pair.state.inboundReleases.filter(function (entry) {
-      return entry.kind === 'application'
-    }).length === 1
+    return (
+      pair.state.inboundReleases.filter(function (entry) {
+        return entry.kind === 'application'
+      }).length === 1
+    )
   }, 'prior plaintext capacity transferred')
 
   t.is(feedRecord(pair.adapter, raw2), raw2.byteLength)
@@ -1184,9 +1203,12 @@ test('native SecretStream destroy while holding plaintext preserves caller-retai
 
   t.alike(plain, snapshot, 'caller-visible backing is never zeroed or mutated on destroy')
   t.alike(pair.facadeErrors, [failure], 'native teardown reports the original facade error once')
-  t.is(pair.state.inboundReleases.filter(function (entry) {
-    return entry.kind === 'application'
-  }).length, 1)
+  t.is(
+    pair.state.inboundReleases.filter(function (entry) {
+      return entry.kind === 'application'
+    }).length,
+    1
+  )
 })
 
 test('native empty and maximum records transfer capacity without reusing retained backing', async function (t) {
@@ -1221,9 +1243,11 @@ test('native empty and maximum records transfer capacity without reusing retaine
 
     const reading2 = readOne(pair.facade)
     await waitFor(function () {
-      return pair.state.inboundReleases.filter(function (entry) {
-        return entry.kind === 'application'
-      }).length >= 1
+      return (
+        pair.state.inboundReleases.filter(function (entry) {
+          return entry.kind === 'application'
+        }).length >= 1
+      )
     }, 'first record capacity transferred')
 
     await sendPeerToFacade(pair, payload2)
@@ -1235,5 +1259,4 @@ test('native empty and maximum records transfer capacity without reusing retaine
     pair.facade.destroy()
     t.alike(plain1, snapshot1, 'next-record delivery and destroy preserve the retained bytes')
   }
-
 })

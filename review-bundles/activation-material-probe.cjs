@@ -42,9 +42,24 @@ async function main() {
 
   const scenarios = [
     ['unchanged', () => {}],
-    ['localDeadline', (material) => { material.localDeadline += 1000n }],
-    ['tailControl', (material) => { material.tailControl = Object.freeze({}) }],
-    ['clockIdentity', (material) => { material.clockIdentity = Object.freeze({}) }]
+    [
+      'localDeadline',
+      (material) => {
+        material.localDeadline += 1000n
+      }
+    ],
+    [
+      'tailControl',
+      (material) => {
+        material.tailControl = Object.freeze({})
+      }
+    ],
+    [
+      'clockIdentity',
+      (material) => {
+        material.clockIdentity = Object.freeze({})
+      }
+    ]
   ]
   const results = []
   for (let index = 0; index < scenarios.length; index++) {
@@ -97,12 +112,20 @@ async function main() {
       for (const close of cleanup.reverse()) await close()
     }
   }
-  console.log(JSON.stringify({
-    instrumentation: 'one hook between genuine prepare and commit; no authority fabrication; no disk source edits',
-    transport: 'actual udx-native sockets; fixture fake clock',
-    limitation: 'internal fault-injection proof; not evidence that an ordinary caller can intercept this synchronous boundary',
-    results
-  }, null, 2))
+  console.log(
+    JSON.stringify(
+      {
+        instrumentation:
+          'one hook between genuine prepare and commit; no authority fabrication; no disk source edits',
+        transport: 'actual udx-native sockets; fixture fake clock',
+        limitation:
+          'internal fault-injection proof; not evidence that an ordinary caller can intercept this synchronous boundary',
+        results
+      },
+      null,
+      2
+    )
+  )
   assert.equal(results[0].accepted, true, 'unchanged control must commit')
   assert.equal(
     results.slice(1).every((result) => !result.accepted),
@@ -111,10 +134,12 @@ async function main() {
   )
 }
 
-main().catch((error) => {
-  console.error(error)
-  process.exitCode = 1
-}).finally(() => {
-  Module.prototype._compile = originalCompile
-  delete globalThis[hookKey]
-})
+main()
+  .catch((error) => {
+    console.error(error)
+    process.exitCode = 1
+  })
+  .finally(() => {
+    Module.prototype._compile = originalCompile
+    delete globalThis[hookKey]
+  })
