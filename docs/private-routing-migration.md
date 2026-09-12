@@ -5337,3 +5337,96 @@ independent checkout work. Independent tasks are reopened; only the actual
 external neighbor/tail and setup review, native cancellation/completion bounds,
 historical punch diagnosis and human/public approval dependencies remain
 blocked. No external security or full-v2 verdict is asserted by this commit.
+
+### 2026-09-11 discovery retirement and runtime clock continuation
+
+Independent checkout work continued after WIP publication `b3b3a9e`; the
+external review ZIP and standalone prompt were not edited.
+
+- `awaitControlObject` now normalizes a thrown owned monotonic clock to
+  `ERR_PRIVACY_UNAVAILABLE`. A genuine Native discovery fault probe previously
+  exposed the injected raw error; after the fix it rejects with the public
+  privacy error and retires the source tail.
+- Authenticated discovery completion is sampled before response publication:
+  the Native probe advances wall time from1000 to1100 after reading genuine
+  candidate facts and observes `verifiedAt=1100`. Moving the sample before
+  completion produces1000 and fails the same assertion.
+- A permanent Native regression expires a retained candidate, rediscovers on
+  the same source tail, rejects the old handle, and admits a branch whose45000
+  wire expiry survives its1200 candidate admission expiry. Removing candidate
+  retirement fails rediscovery; substituting candidate expiry for advertisement
+  expiry fails the isolated regression at extension admission.
+- A separate held-result probe retires the responder before delivering its
+  genuine authenticated candidate. The late candidate loses authority, the
+  guard's retained-tail pool returns to zero, the source rejects `ERR_DESTROYED`,
+  and a fresh discovery succeeds on the same still-live Native neighbor pool.
+  Removing the late-candidate destroy call fails the authority assertion.
+  Reuse is checked before advancing the clock to expire the source operation,
+  not after also expiring the provisioned neighbor.
+- `checkRuntimeTime` now rechecks `state.cleared` after invoking the owned clock.
+  A permanent genuine Native test destroys that same runtime from its clock
+  callback. Before the fix, diagnostics returned after destruction; afterward,
+  the current operation throws `ERR_DESTROYED`. This is callback reentrancy
+  proof, not an ordinary remote exploitability claim.
+
+After formatting only the three changed JavaScript files, the affected Node24
+suite passes507/507 tests and7988/7988 assertions, exit0 in14.66seconds
+(`artifact://828`). This includes the two new regressions, existing two-extension
+Native flow, synchronous250/2000ms scheduler rejection, delayed authenticated
+READY rejection, and terminal residual READY2 ownership. It does not establish
+full npm/Bare/Linux/privacy acceptance or external security approval.
+
+Throwaway probe sources remain outside the checkout in session-local evidence:
+
+- `peer-discovery-clock-probe.cjs`:
+  `d8f43cf0e03f24ea195f62e4ac62f05d14fd89d75ee001ede5be7b65a64b2643`.
+- `peer-discovery-mutant.cjs`:
+  `965688d0c37c05f3897110e530d51c1d00f65db824b7e0b510ca24cc80a44616`.
+- `peer-discovery-late-probe.cjs`:
+  `6f160a8b9a95e668e1de5bdfb768260a4177866698c9d52dbcccee2be5db9004`.
+
+These are in-memory fault injections with genuine authority, not alternate
+production implementations. The activation metadata finding and external
+approval gates remain open. This continuation is not yet committed or pushed.
+
+### 2026-09-11 supplied V12 report intake
+
+JD supplied an886479-byte V12 export against `b3b3a9e`, SHA256
+`781e4aad0b670bfc121cddd1e2937e8328d4c6fa4a346e2f955bfd1e8e3f4b95`.
+All62 unique finding IDs are indexed and separately tracked:19 Medium,
+35 Low and8 Informational;28 are labelled Invalid and34 Unreviewed by V12.
+The34 Unreviewed entries each contain a PoC;31 entries contain proposed patches.
+Those labels and supplied outputs are report claims, not local acceptance.
+
+The findings cite core HyperDHT, server, CLI and testnet code. Only274673 cites
+`lib/private/`, specifically `surb.js`; its consumption check still uses strict
+`now > state.expiresAtMs` in the current checkout. This source observation is
+not a fresh execution of the supplied proof.
+
+None of the findings names the requested peer-tail, peer adjacency runtime,
+native-neighbor, direct-bootstrap or final-activation review targets. The report
+therefore does not provide the scoped ownership/authentication evidence requested
+by the frozen prompt. Absence of a finding is not evidence that a module was
+audited or found secure. The external v2 review gate remains open.
+
+Intake priority is fixed-width target disclosure274926, handshake resource
+admission274909, UDP address validation274915, SURB expiry274673, and the
+overlapping lifecycle/socket-cleanup groups. No uploaded setup script, PoC or
+patch was executed or applied during intake. Complete machine-readable inventory
+and scope disposition are retained as session-local
+`v12-security-scan-index.json` and `v12-security-scan-intake.json`.
+
+### V12 intake correction and continuation publication
+
+The earlier count of34 supplied PoCs counted section headings, not executable
+test bodies. The export contains31 embedded test cases. Findings274915,
+274919 and274921 have PoC headings without test bodies;274915 explicitly says
+its PoC could not be executed. Supplied validation output is not local proof.
+Three reviewed reproductions were prepared outside the checkout but have not
+been run. No V12 remediation patch has been applied.
+
+JD requested committing and pushing the current continuation. Publication
+includes the two clock-boundary fixes, two Native regressions and this record;
+local `.omo` state and session-local report/probe files remain excluded.
+The affected implementation was verified after formatting:507/507 tests,
+7988/7988 assertions. The frozen review ZIP and prompt remain unchanged.
