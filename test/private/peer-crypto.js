@@ -14,6 +14,18 @@ const {
   createPeerAdjacencyTranscript,
   derivePeerAdjacencyKeys,
   clearPeerAdjacencyKeys,
+  createPeerPurposePreTranscript,
+  createPeerPurposeTranscript,
+  derivePeerPurposeSharedSecret,
+  computePeerPurposeMac,
+  verifyPeerPurposeMac,
+  derivePeerPurposeKeys,
+  clearPeerPurposeKeys,
+  digestPeerPurposeOffer,
+  digestPeerPurposeAccept,
+  createPeerPurposeDigest,
+  digestPeerPurposeConfirmation,
+  createPeerPurposeFinalTranscript,
   computePeerConfirmation,
   verifyPeerConfirmation
 } = require('../../lib/private/peer-crypto')
@@ -158,10 +170,7 @@ test('derivePeerKey uses the exact v2 framing and independent output32', (t) => 
   sodium.crypto_generichash(expected, expectedInput, sharedSecret)
   t.alike(derivePeerKey(sharedSecret, label, transcript), expected)
   t.is(derivePeerKey(sharedSecret, label, transcript).byteLength, 32)
-  t.unlike(
-    derivePeerKey(sharedSecret, 'peer-test-kdf/other-v2', transcript),
-    expected
-  )
+  t.unlike(derivePeerKey(sharedSecret, 'peer-test-kdf/other-v2', transcript), expected)
 })
 
 function referenceConfirmation(options) {
@@ -344,11 +353,23 @@ test('confirmation rejects accessors, unknown labels, wrong widths, and reentry'
 })
 
 test('peer crypto rejects malformed transcript, limits, and confirmation keys', (t) => {
-  expectCode(t, () => digestPeerLimits(b4a.alloc(25), FORWARD_LIMITS, CANDIDATE_COMMITMENT), 'INVALID_ROUTE')
-  expectCode(t, () => createPeerTailTranscript({ ...TAIL_FIELDS, extensionIndex: 3 }), 'INVALID_ROUTE')
+  expectCode(
+    t,
+    () => digestPeerLimits(b4a.alloc(25), FORWARD_LIMITS, CANDIDATE_COMMITMENT),
+    'INVALID_ROUTE'
+  )
+  expectCode(
+    t,
+    () => createPeerTailTranscript({ ...TAIL_FIELDS, extensionIndex: 3 }),
+    'INVALID_ROUTE'
+  )
   expectCode(t, () => derivePeerTailKeys(b4a.alloc(31), b4a.alloc(290)), 'INVALID_KEY')
   expectCode(t, () => derivePeerTailKeys(b4a.alloc(32), b4a.alloc(289)), 'INVALID_ROUTE')
-  expectCode(t, () => derivePeerKey(b4a.alloc(32), 'x'.repeat(0x10000), b4a.alloc(0)), 'INVALID_ROUTE')
+  expectCode(
+    t,
+    () => derivePeerKey(b4a.alloc(32), 'x'.repeat(0x10000), b4a.alloc(0)),
+    'INVALID_ROUTE'
+  )
   expectCode(t, () => hashPeer('x'.repeat(0x10000), []), 'INVALID_ROUTE')
 
   const base = confirmationOptions()
@@ -430,20 +451,50 @@ function referenceDerivePeerKey(sharedSecret, label, transcript, protocolVersion
   return output
 }
 
-function referenceAdjacencyKeys(sharedSecret, completeOffer, completeAccept, cellClass, protocolVersion = 2) {
+function referenceAdjacencyKeys(
+  sharedSecret,
+  completeOffer,
+  completeAccept,
+  cellClass,
+  protocolVersion = 2
+) {
   const prefix = b4a.from('hyperdht-private-routes/link/created/v2', 'utf8')
-  const offerDigest = referenceHashPeer('hyperdht-private-routes/m3/link-offer-digest/v2', [completeOffer])
-  const acceptDigest = referenceHashPeer('hyperdht-private-routes/m3/link-accept-digest/v2', [completeAccept])
+  const offerDigest = referenceHashPeer('hyperdht-private-routes/m3/link-offer-digest/v2', [
+    completeOffer
+  ])
+  const acceptDigest = referenceHashPeer('hyperdht-private-routes/m3/link-accept-digest/v2', [
+    completeAccept
+  ])
   const transcript = b4a.alloc(104)
   transcript.set(prefix, 0)
   transcript.set(offerDigest, 39)
   transcript.set(acceptDigest, 71)
   transcript[103] = cellClass
 
-  const fKey = referenceDerivePeerKey(sharedSecret, 'hyperdht-private-routes/kdf/v2/forward-key', transcript, protocolVersion)
-  const rKey = referenceDerivePeerKey(sharedSecret, 'hyperdht-private-routes/kdf/v2/reverse-key', transcript, protocolVersion)
-  const fNonce = referenceDerivePeerKey(sharedSecret, 'hyperdht-private-routes/kdf/v2/forward-nonce', transcript, protocolVersion)
-  const rNonce = referenceDerivePeerKey(sharedSecret, 'hyperdht-private-routes/kdf/v2/reverse-nonce', transcript, protocolVersion)
+  const fKey = referenceDerivePeerKey(
+    sharedSecret,
+    'hyperdht-private-routes/kdf/v2/forward-key',
+    transcript,
+    protocolVersion
+  )
+  const rKey = referenceDerivePeerKey(
+    sharedSecret,
+    'hyperdht-private-routes/kdf/v2/reverse-key',
+    transcript,
+    protocolVersion
+  )
+  const fNonce = referenceDerivePeerKey(
+    sharedSecret,
+    'hyperdht-private-routes/kdf/v2/forward-nonce',
+    transcript,
+    protocolVersion
+  )
+  const rNonce = referenceDerivePeerKey(
+    sharedSecret,
+    'hyperdht-private-routes/kdf/v2/reverse-nonce',
+    transcript,
+    protocolVersion
+  )
 
   return {
     transcript,
@@ -514,7 +565,11 @@ test('v2 adjacency KDF rejects zero shared secret, wrong widths, non-adjacency c
   expectCode(t, () => derivePeerAdjacencyKeys(secret, offer, b4a.alloc(284), 0), 'INVALID_ROUTE')
   expectCode(t, () => derivePeerAdjacencyKeys(secret, offer, accept, 1), 'INVALID_ROUTE')
   expectCode(t, () => derivePeerAdjacencyKeys(secret, offer, accept, 3), 'INVALID_ROUTE')
-  expectCode(t, () => createPeerAdjacencyTranscript(b4a.alloc(432), b4a.alloc(285), 1), 'INVALID_ROUTE')
+  expectCode(
+    t,
+    () => createPeerAdjacencyTranscript(b4a.alloc(432), b4a.alloc(285), 1),
+    'INVALID_ROUTE'
+  )
 
   // Late derivation failure erasure test
   const originalFinal = sodium.crypto_generichash_final
@@ -538,4 +593,295 @@ test('v2 adjacency KDF rejects zero shared secret, wrong widths, non-adjacency c
   for (const out of outputs) {
     t.ok(allZero(out), 'partial output is erased on failure')
   }
+})
+
+function purposeFixture() {
+  const offerBody = sequence(0x20, 212)
+  const offerHeaderBody = b4a.alloc(220)
+  offerHeaderBody[0] = 0
+  offerHeaderBody[1] = 0
+  offerHeaderBody[2] = 0
+  offerHeaderBody[3] = 2
+  offerHeaderBody[4] = 0x03
+  offerHeaderBody[5] = 0x11
+  offerHeaderBody[6] = 0
+  offerHeaderBody[7] = 212
+  offerHeaderBody.set(offerBody, 8)
+
+  const acceptBody = sequence(0x40, 260)
+  const acceptHeaderBody = b4a.alloc(268)
+  acceptHeaderBody[0] = 0
+  acceptHeaderBody[1] = 0
+  acceptHeaderBody[2] = 0
+  acceptHeaderBody[3] = 2
+  acceptHeaderBody[4] = 0x03
+  acceptHeaderBody[5] = 0x12
+  acceptHeaderBody[6] = 1
+  acceptHeaderBody[7] = 4
+  acceptHeaderBody.set(acceptBody, 8)
+
+  const preFields = {
+    tailControlTranscriptDigest: sequence(0x01, 32),
+    terminalAdvertisementDigest: sequence(0x21, 32),
+    queryNonce: sequence(0x41, 32),
+    clientEphemeralPublicKey: sequence(0x61, 32),
+    terminalRoutePublicKey: sequence(0x81, 32),
+    offerBody
+  }
+  const preTranscript = createPeerPurposePreTranscript(preFields)
+  const sharedSecret = sequence(0xa1, 32)
+  const preSourceMacKey = derivePeerKey(
+    sharedSecret,
+    'hyperdht-private-routes/kdf/v2/peer-route/pre/source-mac',
+    preTranscript
+  ).subarray(0, 16)
+  const preTerminalMacKey = derivePeerKey(
+    sharedSecret,
+    'hyperdht-private-routes/kdf/v2/peer-route/pre/terminal-mac',
+    preTranscript
+  ).subarray(0, 16)
+  const offerMac = computePeerPurposeMac(preSourceMacKey, offerHeaderBody)
+  const completeOffer = b4a.concat([offerHeaderBody, offerMac])
+  const acceptMac = computePeerPurposeMac(preTerminalMacKey, acceptHeaderBody)
+  const completeAccept = b4a.concat([acceptHeaderBody, acceptMac])
+  const purposeTranscript = createPeerPurposeTranscript(preTranscript, completeOffer, acceptBody)
+
+  return {
+    offerBody,
+    offerHeaderBody,
+    completeOffer,
+    acceptBody,
+    acceptHeaderBody,
+    completeAccept,
+    preTranscript,
+    purposeTranscript,
+    sharedSecret
+  }
+}
+
+test('v2 purpose transcript, MACs, agreement, and route KDFs match independent framing', (t) => {
+  const fixture = purposeFixture()
+  const expectedPre = b4a.concat([
+    uint16(Buffer.byteLength('hyperdht-private-routes/m3/peer-route-prepurpose/v2')),
+    b4a.from('hyperdht-private-routes/m3/peer-route-prepurpose/v2'),
+    uint32(2),
+    sequence(0x01, 32),
+    sequence(0x21, 32),
+    sequence(0x41, 32),
+    sequence(0x61, 32),
+    sequence(0x81, 32),
+    fixture.offerBody
+  ])
+  t.alike(fixture.preTranscript, expectedPre)
+  t.alike(
+    fixture.purposeTranscript,
+    b4a.concat([fixture.preTranscript, fixture.completeOffer, fixture.acceptBody])
+  )
+
+  t.ok(
+    verifyPeerPurposeMac(
+      derivePeerKey(
+        fixture.sharedSecret,
+        'hyperdht-private-routes/kdf/v2/peer-route/pre/source-mac',
+        fixture.preTranscript
+      ).subarray(0, 16),
+      fixture.offerHeaderBody,
+      fixture.completeOffer.subarray(-16)
+    )
+  )
+  t.ok(
+    verifyPeerPurposeMac(
+      derivePeerKey(
+        fixture.sharedSecret,
+        'hyperdht-private-routes/kdf/v2/peer-route/pre/terminal-mac',
+        fixture.preTranscript
+      ).subarray(0, 16),
+      fixture.acceptHeaderBody,
+      fixture.completeAccept.subarray(-16)
+    )
+  )
+
+  const rejectHeaderBody = b4a.alloc(72)
+  rejectHeaderBody.set(uint32(2), 0)
+  rejectHeaderBody[4] = 0x03
+  rejectHeaderBody[5] = 0x13
+  rejectHeaderBody[6] = 0
+  rejectHeaderBody[7] = 64
+  rejectHeaderBody.set(sequence(0x60, 64), 8)
+  const rejectKeyMaterial = derivePeerKey(
+    fixture.sharedSecret,
+    'hyperdht-private-routes/kdf/v2/peer-route/pre/terminal-mac',
+    fixture.preTranscript
+  )
+  const rejectKey = rejectKeyMaterial.subarray(0, 16)
+  const rejectMac = computePeerPurposeMac(rejectKey, rejectHeaderBody)
+  t.ok(verifyPeerPurposeMac(rejectKey, rejectHeaderBody, rejectMac))
+  rejectMac.fill(0)
+  rejectKeyMaterial.fill(0)
+  rejectHeaderBody.fill(0)
+
+  const keys = derivePeerPurposeKeys(
+    fixture.sharedSecret,
+    fixture.preTranscript,
+    fixture.purposeTranscript
+  )
+  const expectedForward = derivePeerKey(
+    fixture.sharedSecret,
+    'hyperdht-private-routes/kdf/v2/peer-route/forward-key',
+    fixture.purposeTranscript
+  )
+  const expectedReverse = derivePeerKey(
+    fixture.sharedSecret,
+    'hyperdht-private-routes/kdf/v2/peer-route/reverse-key',
+    fixture.purposeTranscript
+  )
+  t.alike(keys.forwardKey, expectedForward)
+  t.alike(keys.preSourceMacKey, b4a.from('b6b47d6e1decbee8bd245159a9839098', 'hex'))
+  t.alike(keys.preTerminalMacKey, b4a.from('fca4b5f20b27a180e18624234859fe22', 'hex'))
+  t.alike(
+    keys.forwardKey,
+    b4a.from('f013048edbf4bb121167b9768320b5f5dc5b01dad902195aa14edea12807dc5b', 'hex')
+  )
+  t.alike(
+    keys.reverseKey,
+    b4a.from('bedf0810f498277863cb2ed3c0a381377a7b89ee9a0ab213120f99e087c338ea', 'hex')
+  )
+  t.alike(keys.forwardNoncePrefix, b4a.from('bcfef037702da0f74f5ddf48bb9efd6f', 'hex'))
+  t.alike(keys.reverseNoncePrefix, b4a.from('fd220087ff3d9ae37ecd7c33d6b526ee', 'hex'))
+  t.alike(keys.reverseKey, expectedReverse)
+  t.alike(
+    keys.preSourceMacKey,
+    derivePeerKey(
+      fixture.sharedSecret,
+      'hyperdht-private-routes/kdf/v2/peer-route/pre/source-mac',
+      fixture.preTranscript
+    ).subarray(0, 16)
+  )
+  t.is(keys.forwardNoncePrefix.byteLength, 16)
+  t.is(keys.reverseNoncePrefix.byteLength, 16)
+  t.unlike(keys.preSourceMacKey, keys.preTerminalMacKey)
+  t.unlike(keys.forwardKey, keys.reverseKey)
+
+  clearPeerPurposeKeys(keys)
+  t.ok(allZero(keys.forwardKey))
+  t.ok(allZero(keys.preSourceMacKey))
+})
+
+test('v2 purpose agreement rejects low-order inputs and MAC forgery', (t) => {
+  const alicePublic = b4a.alloc(32)
+  const aliceSecret = b4a.alloc(32)
+  const bobPublic = b4a.alloc(32)
+  const bobSecret = b4a.alloc(32)
+  sodium.crypto_box_seed_keypair(alicePublic, aliceSecret, sequence(0x11, 32))
+  sodium.crypto_box_seed_keypair(bobPublic, bobSecret, sequence(0x51, 32))
+
+  const aliceShared = derivePeerPurposeSharedSecret(aliceSecret, bobPublic)
+  const bobShared = derivePeerPurposeSharedSecret(bobSecret, alicePublic)
+  t.alike(aliceShared, bobShared)
+  t.absent(allZero(aliceShared))
+
+  expectCode(t, () => derivePeerPurposeSharedSecret(aliceSecret, b4a.alloc(32)), 'INVALID_KEY')
+  expectCode(t, () => derivePeerPurposeSharedSecret(b4a.alloc(31), bobPublic), 'INVALID_KEY')
+
+  const originalScalarmult = sodium.crypto_scalarmult
+  sodium.crypto_scalarmult = () => false
+  try {
+    expectCode(t, () => derivePeerPurposeSharedSecret(aliceSecret, bobPublic), 'INVALID_KEY')
+  } finally {
+    sodium.crypto_scalarmult = originalScalarmult
+  }
+
+  const fixture = purposeFixture()
+  const sourceKey = derivePeerKey(
+    fixture.sharedSecret,
+    'hyperdht-private-routes/kdf/v2/peer-route/pre/source-mac',
+    fixture.preTranscript
+  ).subarray(0, 16)
+  const forged = b4a.from(fixture.completeOffer.subarray(-16))
+  forged[0] ^= 1
+  t.absent(verifyPeerPurposeMac(sourceKey, fixture.offerHeaderBody, forged))
+  expectCode(t, () => computePeerPurposeMac(sourceKey, b4a.alloc(8)), 'INVALID_ROUTE')
+})
+
+test('v2 purpose and final digests bind every negotiated field and direction', (t) => {
+  const fixture = purposeFixture()
+  const digestFields = {
+    tailControlTranscriptDigest: sequence(0x01, 32),
+    terminalAdvertisementDigest: sequence(0x21, 32),
+    routeId: sequence(0x10, 16),
+    circuitId: sequence(0x20, 16),
+    generation: 3n,
+    purpose: 2,
+    sourceDirection: 0,
+    offerDigest: digestPeerPurposeOffer(fixture.completeOffer),
+    acceptDigest: digestPeerPurposeAccept(fixture.completeAccept),
+    admittedForwardCells: 11,
+    admittedForwardBytes: 12000n,
+    admittedForwardCommands: 13,
+    admittedReverseCells: 17,
+    admittedReverseBytes: 18000n,
+    admittedReverseCommands: 19,
+    admittedMaxStreams: 2,
+    admittedReceiveFrames: 23,
+    admittedReceiveBytes: 24000,
+    admittedSemanticOwnedBytes: 25000,
+    admittedMaxQueuedBytes: 26000,
+    offerNonce: sequence(0x60, 16),
+    acceptNonce: sequence(0x70, 16)
+  }
+  const purposeDigest = createPeerPurposeDigest(digestFields)
+  t.alike(
+    digestFields.offerDigest,
+    b4a.from('fc128d276e5871c1e0a7351ad192db38be3d0a8d839a5a201e0f4adf35c63cf7', 'hex')
+  )
+  t.alike(
+    digestFields.acceptDigest,
+    b4a.from('1091e932c0a5f3afa6872b6bb78be2a7f0cecbfc988547daec78141a84633b0b', 'hex')
+  )
+  const changed = createPeerPurposeDigest({
+    ...digestFields,
+    admittedReverseBytes: digestFields.admittedReverseBytes + 1n
+  })
+  t.unlike(purposeDigest, changed)
+  t.alike(
+    purposeDigest,
+    b4a.from('7129808f0223eb417786f67478ed204b3045d8dbf01c18c2a60e79608c6dd7ae', 'hex')
+  )
+
+  const sourceBody = sequence(0x91, 64)
+  const terminalBody = sequence(0x91, 64)
+  const sourceConfirmDigest = digestPeerPurposeConfirmation('source', sourceBody)
+  const terminalConfirmDigest = digestPeerPurposeConfirmation('terminal', terminalBody)
+  t.unlike(sourceConfirmDigest, terminalConfirmDigest)
+  t.alike(
+    sourceConfirmDigest,
+    b4a.from('1e6051cbb098f255192fcbe13310323fb9b77c2cc82883fcbdae279d69f3392e', 'hex')
+  )
+  t.alike(
+    terminalConfirmDigest,
+    b4a.from('49c3b11522c6bcbc95c4e82136951432fb8b8130d4395d23226e498507d5cda5', 'hex')
+  )
+  const finalDigest = createPeerPurposeFinalTranscript({
+    tailControlTranscriptDigest: digestFields.tailControlTranscriptDigest,
+    purposeDigest,
+    offerDigest: digestFields.offerDigest,
+    acceptDigest: digestFields.acceptDigest,
+    sourceConfirmDigest,
+    terminalConfirmDigest
+  })
+  t.alike(
+    finalDigest,
+    b4a.from('57edc09c02cc467d18de3965875afdca2725c85b7b3ac85b3d9f45864f487006', 'hex')
+  )
+  t.unlike(
+    finalDigest,
+    createPeerPurposeFinalTranscript({
+      tailControlTranscriptDigest: digestFields.tailControlTranscriptDigest,
+      purposeDigest: changed,
+      offerDigest: digestFields.offerDigest,
+      acceptDigest: digestFields.acceptDigest,
+      sourceConfirmDigest,
+      terminalConfirmDigest
+    })
+  )
 })
