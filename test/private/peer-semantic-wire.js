@@ -235,47 +235,63 @@ test('semantic v2 fixed objects use exact envelope and body lengths', (t) => {
       },
       88
     ],
-    [PEER_MESSAGE_ID.PRIVATE_READY_V2, {
-      sessionId: bytes(16, 1),
-      activateCommitment: bytes(32, 2),
-      destinationCircuitId: bytes(16, 3),
-      destinationGeneration: 4n,
-      destinationNonce: bytes(32, 5),
-      ik1Digest: bytes(32, 6),
-      ik2Digest: bytes(32, 7),
-      expiresAtUnixMs: 8n,
-      maxFrames: 9,
-      maxBytes: 10n,
-      readyMac: bytes(32, 11)
-    }, 220],
-    [PEER_MESSAGE_ID.PRIVATE_ACK_V2, {
-      sessionId: bytes(16, 1),
-      activateCommitment: bytes(32, 2),
-      readyMac: bytes(32, 3),
-      sourceCircuitId: bytes(16, 4),
-      sourceGeneration: 5n,
-      sourceNonce: bytes(32, 6),
-      destinationNonce: bytes(32, 7),
-      ik2Digest: bytes(32, 8),
-      ackMac: bytes(32, 9)
-    }, 232],
-    [PEER_MESSAGE_ID.PRIVATE_ACCEPTED_V2, {
-      sessionId: bytes(16, 1),
-      activateCommitment: bytes(32, 2),
-      readyMac: bytes(32, 3),
-      ackMac: bytes(32, 4),
-      destinationCircuitId: bytes(16, 5),
-      destinationGeneration: 6n,
-      acceptedMac: bytes(32, 7)
-    }, 168],
-    [PEER_MESSAGE_ID.PRIVATE_SOURCE_RECEIPT_V2, {
-      sessionId: bytes(16, 1),
-      acceptedMac: bytes(32, 2),
-      sourceCircuitId: bytes(16, 3),
-      sourceGeneration: 4n,
-      receiptNonce: bytes(16, 5),
-      receiptMac: bytes(32, 6)
-    }, 120],
+    [
+      PEER_MESSAGE_ID.PRIVATE_READY_V2,
+      {
+        sessionId: bytes(16, 1),
+        activateCommitment: bytes(32, 2),
+        destinationCircuitId: bytes(16, 3),
+        destinationGeneration: 4n,
+        destinationNonce: bytes(32, 5),
+        ik1Digest: bytes(32, 6),
+        ik2Digest: bytes(32, 7),
+        expiresAtUnixMs: 8n,
+        maxFrames: 9,
+        maxBytes: 10n,
+        readyMac: bytes(32, 11)
+      },
+      220
+    ],
+    [
+      PEER_MESSAGE_ID.PRIVATE_ACK_V2,
+      {
+        sessionId: bytes(16, 1),
+        activateCommitment: bytes(32, 2),
+        readyMac: bytes(32, 3),
+        sourceCircuitId: bytes(16, 4),
+        sourceGeneration: 5n,
+        sourceNonce: bytes(32, 6),
+        destinationNonce: bytes(32, 7),
+        ik2Digest: bytes(32, 8),
+        ackMac: bytes(32, 9)
+      },
+      232
+    ],
+    [
+      PEER_MESSAGE_ID.PRIVATE_ACCEPTED_V2,
+      {
+        sessionId: bytes(16, 1),
+        activateCommitment: bytes(32, 2),
+        readyMac: bytes(32, 3),
+        ackMac: bytes(32, 4),
+        destinationCircuitId: bytes(16, 5),
+        destinationGeneration: 6n,
+        acceptedMac: bytes(32, 7)
+      },
+      168
+    ],
+    [
+      PEER_MESSAGE_ID.PRIVATE_SOURCE_RECEIPT_V2,
+      {
+        sessionId: bytes(16, 1),
+        acceptedMac: bytes(32, 2),
+        sourceCircuitId: bytes(16, 3),
+        sourceGeneration: 4n,
+        receiptNonce: bytes(16, 5),
+        receiptMac: bytes(32, 6)
+      },
+      120
+    ],
     [PEER_MESSAGE_ID.PRIVATE_OPEN_V2, fixedFields(), 216]
   ]
 
@@ -314,11 +330,7 @@ test('semantic noise fragments enforce canonical 1,002-byte geometry and 4,096-b
   t.is(fragment(1002, 0, 1002).byteLength, 1073)
   t.is(fragment(4096, 4, 88).byteLength, 159)
 
-  expectCode(
-    t,
-    () => fragment(4097, 0, 1002),
-    'INVALID_ROUTE'
-  )
+  expectCode(t, () => fragment(4097, 0, 1002), 'INVALID_ROUTE')
   expectCode(
     t,
     () =>
@@ -373,7 +385,11 @@ test('semantic v2 rejects reserved IDs, v1 envelopes, trailing bytes, and non-da
       return bytes(16, 1)
     }
   })
-  expectCode(t, () => encodePeerSemantic(PEER_MESSAGE_ID.LEGACY_RESOLVE_V2, accessorFields), 'INVALID_ROUTE')
+  expectCode(
+    t,
+    () => encodePeerSemantic(PEER_MESSAGE_ID.LEGACY_RESOLVE_V2, accessorFields),
+    'INVALID_ROUTE'
+  )
   t.is(getterReads, 0)
 })
 

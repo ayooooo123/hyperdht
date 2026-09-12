@@ -115,12 +115,10 @@ function safetyIdentity(start = 100) {
   throw new Error('missing safety identity')
 }
 
-
 async function settles() {
   await Promise.resolve()
   await Promise.resolve()
 }
-
 
 test('A0 rejects a candidate from another grant without consuming the original authority', async (t) => {
   const clock = fakeClock()

@@ -95,7 +95,8 @@ test('Physical Carrier: one-shot physical issuer take and reservation teardown',
   const sendLedger = createPeerLedger({ cells: 10, bytes: 12000n, commands: 10 })
   expectCode(
     t,
-    () => exchangePeerGuardLink(fakeReservation, { offer: b4a.alloc(10), generation: 1n, sendLedger }),
+    () =>
+      exchangePeerGuardLink(fakeReservation, { offer: b4a.alloc(10), generation: 1n, sendLedger }),
     'UNAUTHORIZED'
   )
   t.is(destroyPeerGuardPhysicalReservation(fakeReservation), false)
@@ -105,7 +106,11 @@ test('Physical Carrier: v2 carrier adoption in m3-adjacency-runtime and v1 teard
   const owner = Object.freeze({})
   expectCode(t, () => takeM3RouteTransport(owner), 'INVALID_ROUTE')
   const invalidCarrier = Object.freeze({ sendFrame() {} })
-  expectCode(t, () => takeM3RouteTransport({ [Symbol.for('test-carrier')]: invalidCarrier }), 'INVALID_ROUTE')
+  expectCode(
+    t,
+    () => takeM3RouteTransport({ [Symbol.for('test-carrier')]: invalidCarrier }),
+    'INVALID_ROUTE'
+  )
 })
 test('Physical Carrier: direct candidate requester transport provenance variant', (t) => {
   const fakeLocator = Object.freeze({})
@@ -164,9 +169,17 @@ test('Physical Carrier: forged clock owner and foreign locator cannot mint direc
     () => createPeerPinnedGuardDirectTransport(fakeEstablishedHandle(), Object.freeze({})),
     'UNAUTHORIZED'
   )
-  expectCode(t, () => createPeerCandidateDirectTransport(Object.freeze({}), Object.freeze({})), 'UNAUTHORIZED')
+  expectCode(
+    t,
+    () => createPeerCandidateDirectTransport(Object.freeze({}), Object.freeze({})),
+    'UNAUTHORIZED'
+  )
   expectCode(t, () => takePeerDirectRequesterTransport(Object.freeze({})), 'UNAUTHORIZED')
-  expectCode(t, () => registerPeerDirectResponder(Object.freeze({}), Object.freeze({})), 'UNAUTHORIZED')
+  expectCode(
+    t,
+    () => registerPeerDirectResponder(Object.freeze({}), Object.freeze({})),
+    'UNAUTHORIZED'
+  )
   t.is(destroyPeerDirectResponderRegistration(Object.freeze({})), false)
 })
 
@@ -175,13 +188,15 @@ test('Physical Carrier: exchangePeerGuardLink rejects foreign reservation withou
   const sendLedger = createPeerLedger({ cells: 10, bytes: 12000n, commands: 10 })
   expectCode(
     t,
-    () => exchangePeerGuardLink(fakeReservation, { offer: b4a.alloc(16), generation: 1n, sendLedger }),
+    () =>
+      exchangePeerGuardLink(fakeReservation, { offer: b4a.alloc(16), generation: 1n, sendLedger }),
     'UNAUTHORIZED'
   )
   // Second call still unauthorized (not permanently exchanging on missing state).
   expectCode(
     t,
-    () => exchangePeerGuardLink(fakeReservation, { offer: b4a.alloc(16), generation: 1n, sendLedger }),
+    () =>
+      exchangePeerGuardLink(fakeReservation, { offer: b4a.alloc(16), generation: 1n, sendLedger }),
     'UNAUTHORIZED'
   )
   // Rejects missing sendLedger
@@ -202,4 +217,3 @@ test('Physical Carrier: readPeerGuardPhysicalReservation returns null for unknow
 test('Physical Carrier: createPeerGuardBootstrapTransport rejects foreign lease', (t) => {
   expectCode(t, () => createPeerGuardBootstrapTransport(Object.freeze({})), 'UNAUTHORIZED')
 })
-

@@ -322,7 +322,11 @@ test('encodePeerContextEnvelope and decodePeerContextEnvelope round-trip and ret
 
   // Mutating input envelope MUST NOT alter returned frame copy
   env5[10] ^= 0xff
-  t.not(dec5.frame[9], env5[10], 'decoded frame is an owned copy, independent of input envelope mutation')
+  t.not(
+    dec5.frame[9],
+    env5[10],
+    'decoded frame is an owned copy, independent of input envelope mutation'
+  )
 
   const env6 = encodePeerContextEnvelope(6, frame)
   t.is(env6.byteLength, 1101)
@@ -370,7 +374,10 @@ test('native false authentication result rejects and erases plaintext before par
   }
   t.is(returned, null, 'unauthenticated plaintext is never returned')
   t.is(error && error.code, 'INVALID_ROUTE')
-  t.ok(attemptedPlaintext && attemptedPlaintext.every((byte) => byte === 0), 'failed plaintext is erased')
+  t.ok(
+    attemptedPlaintext && attemptedPlaintext.every((byte) => byte === 0),
+    'failed plaintext is erased'
+  )
 })
 test('v2 contextClass 1 associated data freezes exact vector and rejects invalid metadata', (t) => {
   const branchId = sequence(0x10, 16)
@@ -396,10 +403,36 @@ test('v2 contextClass 1 associated data freezes exact vector and rejects invalid
   t.is(ad[45], 1)
   t.alike(ad.subarray(46, 54), b4a.from([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x12]))
 
-  expectInvalid(t, () => encodePeerTailControlAD({ branchId: b4a.alloc(15), circuitId, generation, direction, counter: wireCounter }))
-  expectInvalid(t, () => encodePeerTailControlAD({ branchId, circuitId: b4a.alloc(15), generation, direction, counter: wireCounter }))
-  expectInvalid(t, () => encodePeerTailControlAD({ branchId, circuitId, generation: 0n, direction, counter: wireCounter }))
-  expectInvalid(t, () => encodePeerTailControlAD({ branchId, circuitId, generation, direction: 2, counter: wireCounter }))
+  expectInvalid(t, () =>
+    encodePeerTailControlAD({
+      branchId: b4a.alloc(15),
+      circuitId,
+      generation,
+      direction,
+      counter: wireCounter
+    })
+  )
+  expectInvalid(t, () =>
+    encodePeerTailControlAD({
+      branchId,
+      circuitId: b4a.alloc(15),
+      generation,
+      direction,
+      counter: wireCounter
+    })
+  )
+  expectInvalid(t, () =>
+    encodePeerTailControlAD({
+      branchId,
+      circuitId,
+      generation: 0n,
+      direction,
+      counter: wireCounter
+    })
+  )
+  expectInvalid(t, () =>
+    encodePeerTailControlAD({ branchId, circuitId, generation, direction: 2, counter: wireCounter })
+  )
 })
 
 test('v2 contextClass 1 ordered-only frame sealing, opening, counter encoding, and odd-counter rejection', (t) => {

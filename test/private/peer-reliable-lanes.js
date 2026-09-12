@@ -6,7 +6,10 @@ const b4a = require('b4a')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
 const { encodePeerSemantic } = require('../../lib/private/peer-semantic-wire')
-const { encodePeerTransport, decodePeerTransport } = require('../../lib/private/peer-transport-wire')
+const {
+  encodePeerTransport,
+  decodePeerTransport
+} = require('../../lib/private/peer-transport-wire')
 const {
   PeerReliableLanes,
   LANE_DATA,
@@ -79,8 +82,7 @@ function makeInboundDataNested(opts = {}) {
   const localDirection = opts.localDirection === undefined ? 0 : opts.localDirection
   return makeDataNested({
     ...opts,
-    direction:
-      opts.direction === undefined ? inboundDirection(localDirection) : opts.direction
+    direction: opts.direction === undefined ? inboundDirection(localDirection) : opts.direction
   })
 }
 
@@ -391,11 +393,7 @@ test('trySend validates the complete nested object and route before reservation'
   malformed[48] = 0
   malformed[49] = 7
   expectCode(t, () => lanes.trySend(malformed), 'INVALID_ROUTE')
-  expectCode(
-    t,
-    () => lanes.trySend(makeDataNested({ routeId: routeId(0x22) })),
-    'INVALID_ROUTE'
-  )
+  expectCode(t, () => lanes.trySend(makeDataNested({ routeId: routeId(0x22) })), 'INVALID_ROUTE')
 
   // Neither rejected caller input consumes a sequence, slot, attempt, or route lifetime.
   t.alike(lanes.trySend(makeDataNested({ routeId: rid })), {
@@ -448,9 +446,7 @@ test('DATA0 lost then out-of-order 1..boundary with selective slot release', asy
   // Sender side: keep DATA0 lost while bitmap ACKs free slots up to the remote horizon.
   state.transmits.length = 0
   for (let sequence = 0; sequence < DATA_SEND_SLOTS; sequence++) {
-    const sent = lanes.trySend(
-      makeDataNested({ routeId: rid, position: BigInt(sequence) * 8n })
-    )
+    const sent = lanes.trySend(makeDataNested({ routeId: rid, position: BigInt(sequence) * 8n }))
     t.alike(sent, { lane: LANE_DATA, sequence: BigInt(sequence) })
   }
   t.is(packetsOnly(state.transmits).length, DATA_SEND_SLOTS)
@@ -462,9 +458,7 @@ test('DATA0 lost then out-of-order 1..boundary with selective slot release', asy
 
   const secondBatchEnd = DATA_SEND_SLOTS * 2 - 2
   for (let sequence = DATA_SEND_SLOTS; sequence <= secondBatchEnd; sequence++) {
-    const sent = lanes.trySend(
-      makeDataNested({ routeId: rid, position: BigInt(sequence) * 8n })
-    )
+    const sent = lanes.trySend(makeDataNested({ routeId: rid, position: BigInt(sequence) * 8n }))
     t.is(sent.sequence, BigInt(sequence))
   }
 
@@ -474,9 +468,7 @@ test('DATA0 lost then out-of-order 1..boundary with selective slot release', asy
   await Promise.resolve()
 
   for (let sequence = secondBatchEnd + 1; sequence < DATA_REORDER; sequence++) {
-    const sent = lanes.trySend(
-      makeDataNested({ routeId: rid, position: BigInt(sequence) * 8n })
-    )
+    const sent = lanes.trySend(makeDataNested({ routeId: rid, position: BigInt(sequence) * 8n }))
     t.is(sent.sequence, BigInt(sequence))
   }
 
@@ -581,9 +573,7 @@ test('bitmap rebasing drop and cumulative regression rejected', (t) => {
 
   // ACK cum=0
   t.is(
-    lanes.receive(
-      peerAck({ routeId: rid, dataCumulative: 0n, dataBitmap: 0n, ackSnapshot: 1 })
-    ),
+    lanes.receive(peerAck({ routeId: rid, dataCumulative: 0n, dataBitmap: 0n, ackSnapshot: 1 })),
     true
   )
   t.is(state.acked.length, 1)
@@ -653,10 +643,7 @@ test('purpose3 exclusive registration control slot', async (t) => {
     t.ok(r, 'control slot ' + i)
   }
   // 8th non-reg should backpressure (exclusive reserved)
-  t.is(
-    lanes.trySend(makeCreditNested({ routeId: rid, streamId: 100n, direction: 1 })),
-    null
-  )
+  t.is(lanes.trySend(makeCreditNested({ routeId: rid, streamId: 100n, direction: 1 })), null)
 
   // Registration stream1 OPEN can still use its exclusive slot.
   const reg = makeRegistrationOpenNested({ routeId: rid })
@@ -733,7 +720,12 @@ test('ACK snapshot closes before UINT32 wrap and stops revoked delivery', (t) =>
 
 test('timer callback after destroy does not revive state', (t) => {
   const copies = []
-  const { lanes, state, clock: c, routeId: rid } = createLanes({
+  const {
+    lanes,
+    state,
+    clock: c,
+    routeId: rid
+  } = createLanes({
     transmitImpl: (buf) => {
       copies.push(b4a.from(buf))
       return Promise.resolve(true)
@@ -750,7 +742,11 @@ test('timer callback after destroy does not revive state', (t) => {
 test('failed native callback remains attempt-spent and retries original bytes', async (t) => {
   let failOnce = true
   const copies = []
-  const { lanes, clock: c, routeId: rid } = createLanes({
+  const {
+    lanes,
+    clock: c,
+    routeId: rid
+  } = createLanes({
     transmitImpl: (buf) => {
       copies.push(b4a.from(buf))
       if (failOnce) {
@@ -874,11 +870,7 @@ test('slot limits enforce DATA 24 and CONTROL 8 backpressure', (t) => {
   t.is(lanes.trySend(makeDataNested({ routeId: rid, position: 9999n })), null)
 
   for (let i = 0; i < CTRL_SEND_SLOTS; i++) {
-    t.ok(
-      lanes.trySend(
-        makeOpenNested({ routeId: rid, streamId: BigInt(3 + i * 2) })
-      )
-    )
+    t.ok(lanes.trySend(makeOpenNested({ routeId: rid, streamId: BigInt(3 + i * 2) })))
   }
   t.is(lanes.trySend(makeOpenNested({ routeId: rid, streamId: 201n })), null)
   lanes.destroy()
@@ -1056,7 +1048,12 @@ test('new identity rejects nested message IDs outside stream set', (t) => {
 
 test('RTO reaches eight attempts and two-second deadline while native Promise never resolves', (t) => {
   const copies = []
-  const { lanes, state, clock: c, routeId: rid } = createLanes({
+  const {
+    lanes,
+    state,
+    clock: c,
+    routeId: rid
+  } = createLanes({
     transmitImpl: (buf) => {
       copies.push(b4a.from(buf))
       // Never settles — RTO must still fire from attempt start.
@@ -1080,7 +1077,12 @@ test('RTO reaches eight attempts and two-second deadline while native Promise ne
 test('slow native settlement after newer attempt is inert', async (t) => {
   const resolvers = []
   const copies = []
-  const { lanes, clock: c, routeId: rid, state } = createLanes({
+  const {
+    lanes,
+    clock: c,
+    routeId: rid,
+    state
+  } = createLanes({
     transmitImpl: (buf) => {
       copies.push(b4a.from(buf))
       return new Promise((resolve) => {
@@ -1106,7 +1108,12 @@ test('slow native settlement after newer attempt is inert', async (t) => {
 test('late settlement and cancelled timer after slot reuse are inert', async (t) => {
   const copies = []
   const resolvers = []
-  const { lanes, state, clock: c, routeId: rid } = createLanes({
+  const {
+    lanes,
+    state,
+    clock: c,
+    routeId: rid
+  } = createLanes({
     transmitImpl: (buf) => {
       copies.push(b4a.from(buf))
       return new Promise((resolve) => {
@@ -1117,10 +1124,7 @@ test('late settlement and cancelled timer after slot reuse are inert', async (t)
 
   const first = lanes.trySend(makeDataNested({ routeId: rid, position: 0n }))
   t.alike(first, { lane: LANE_DATA, sequence: 0n })
-  t.is(
-    lanes.receive(peerAck({ routeId: rid, dataCumulative: 0n, ackSnapshot: 1 })),
-    true
-  )
+  t.is(lanes.receive(peerAck({ routeId: rid, dataCumulative: 0n, ackSnapshot: 1 })), true)
 
   const second = lanes.trySend(makeDataNested({ routeId: rid, position: 8n }))
   t.alike(second, { lane: LANE_DATA, sequence: 1n })
@@ -1146,7 +1150,11 @@ test('late settlement and cancelled timer after slot reuse are inert', async (t)
 test('late native settlement after destroy does not revive or pin state', async (t) => {
   let resolveNative = null
   let borrowedBuf = null
-  const { lanes, state, routeId: rid } = createLanes({
+  const {
+    lanes,
+    state,
+    routeId: rid
+  } = createLanes({
     transmitImpl: (buf) => {
       borrowedBuf = buf
       const copy = b4a.from(buf)
@@ -1180,7 +1188,11 @@ test('late native settlement after destroy does not revive or pin state', async 
 test('slot quarantine on ACK while send Promise is pending avoids mutating borrowed bytes', async (t) => {
   let resolveFirst = null
   let firstBuf = null
-  const { lanes, state, routeId: rid } = createLanes({
+  const {
+    lanes,
+    state,
+    routeId: rid
+  } = createLanes({
     transmitImpl: (buf) => {
       const copy = b4a.from(buf)
       state.transmits.push(copy)
@@ -1255,8 +1267,11 @@ test('native thenable access cannot escape or strand sender capacity', (t) => {
         if (!sent) break
         lanes.receive(peerAck({ routeId: rid, dataCumulative: BigInt(i), ackSnapshot: i + 1 }))
       }
-      t.alike(lastSent, { lane: LANE_DATA, sequence: BigInt(DATA_SEND_SLOTS) },
-        'ACKed capacity is reusable beyond the complete sender window')
+      t.alike(
+        lastSent,
+        { lane: LANE_DATA, sequence: BigInt(DATA_SEND_SLOTS) },
+        'ACKed capacity is reusable beyond the complete sender window'
+      )
       if (!throwsOnRead) t.ok(receiverPreserved, 'then receiver is preserved')
       t.is(reads, DATA_SEND_SLOTS + 1, 'each native result is inspected exactly once')
     } finally {
@@ -1268,7 +1283,11 @@ test('native thenable access cannot escape or strand sender capacity', (t) => {
 test('ACK newer snapshot while previous native Promise pending', async (t) => {
   const ackResolvers = []
   const ackSnapshots = []
-  const { lanes, state, routeId: rid } = createLanes({
+  const {
+    lanes,
+    state,
+    routeId: rid
+  } = createLanes({
     transmitImpl: (buf) => {
       const copy = b4a.from(buf)
       state.transmits.push(copy)
@@ -1485,7 +1504,9 @@ test('outbound OPEN DATA HANDSHAKE use localDirection; inbound use localDirectio
     t.ok(lanes.trySend(makeDataNested({ routeId: rid, direction: localDirection })))
     t.ok(lanes.trySend(makeOpenNested({ routeId: rid, direction: localDirection })))
     t.ok(
-      lanes.trySend(makeAppHandshakeNested({ routeId: rid, direction: localDirection, streamId: 3n }))
+      lanes.trySend(
+        makeAppHandshakeNested({ routeId: rid, direction: localDirection, streamId: 3n })
+      )
     )
     expectCode(
       t,
