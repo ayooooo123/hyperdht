@@ -15,7 +15,7 @@
 // deadline past the bound and fails authentication. It is rare, load dependent,
 // and it does not reproduce on a fast host.
 //
-// `test/private/process/runtime-clock.js` already solves this for the role
+// `lib/private/runtime-clock.js` already solves this for the role
 // runtimes by deriving both readings from a single cached sample. This is the
 // same guarantee for in-process tests, and it stays in the `Date.now()` domain
 // so it does not change any value a test observes.

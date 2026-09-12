@@ -13,7 +13,7 @@ Built on top of [dht-rpc](https://github.com/mafintosh/dht-rpc).
 The Hyperswarm DHT uses a series of holepunching techniques to make sure connectivity works on most networks,
 and is mainly used to facilitate finding and connecting to peers using end to end encrypted Noise streams.
 
-> **Experimental fork note:** This branch contains package-private live routing, immutable/mutable DHT get and put, experimental required SURB replies, and blinded presence publication/resolution/revocation. See [current implementation and open gates](docs/private-routing-migration.md#current-implementation); the [v1 design](docs/private-routing-v1.md) also contains unimplemented public and peer-stream targets. Direct mode remains the only public behavior. These internals are not a production anonymity surface, and external cryptographic review remains open.
+> **ALPHA fork API:** Explicitly acknowledged `privateRouting` now enables fail-closed, routed immutable/mutable DHT get and put. Direct mode is unchanged when that option is absent. This remains **alpha/beta, not production anonymity**, until **both Linux privacy evidence and external human cryptographic review** are complete. The peer semantic/controller modules, blinded presence, and experimental SURB replies remain internal; there is no proven public peer route-owner integration or private Hyperswarm support. See the [public alpha contract and deferred surfaces](docs/private-routing-v1.md#public-api).
 
 ## Usage
 
@@ -59,6 +59,77 @@ socket.on('open', function () {
 // pipe it somewhere like any duplex stream
 process.stdin.pipe(socket).pipe(process.stdout)
 ```
+
+### ALPHA private DHT records
+
+Use explicitly configured private-relay bootstrap endpoints, not the ordinary
+public DHT bootstrap servers. The relays must already run the compatible private
+protocol and provide enough valid, diverse routes; construction alone does not
+establish readiness.
+
+```js
+const dht = new DHT({
+  privateRouting: {
+    release: 'alpha',
+    acknowledgeAlpha: true,
+    mode: 'required',
+    bootstrapEndpoints: [{ host: '127.0.0.1', port: 49001 }],
+    host: '127.0.0.1',
+    port: 49002
+    // Optional NAT mapping: advertisedHost and advertisedPort, supplied together.
+  }
+})
+
+try {
+  await dht.ready() // Rejects unless the private guard and both routes are ready.
+  const { hash } = await dht.immutablePut(Buffer.from('experimental record'))
+  const record = await dht.immutableGet(hash)
+  console.log(record.value)
+} finally {
+  await dht.destroy()
+}
+```
+
+The loopback example requires a compatible private relay at `127.0.0.1:49001`;
+it does not start one. Every configuration field must be an own data property
+on an ordinary object. The exact fields above are required; only the advertised
+pair is optional. Supply one to three distinct numeric-IP bootstrap endpoints
+with `{ host, port }`, numeric bind/advertised hosts, and ports 1–65535. Hostnames,
+accessors, inherited fields, unknown fields, `mode: 'off'`, and legacy-egress
+toggles are rejected. Omit `privateRouting` entirely for direct mode.
+
+In required mode, ordinary DHT network options (including `bootstrap`, `nodes`,
+`udx`, and `requestTransport`) are not read or forwarded. There is no direct
+bootstrap, query, connection, or failure fallback. An optional top-level
+`keyPair` (or `seed`) supplies local identity; authority consumption copies its
+secret rather than erasing the caller's buffer.
+
+`dht.privateRouting` is read-only and frozen:
+
+- `release === 'alpha'`, `mode === 'required'`.
+- `ready()` waits for private readiness, like `dht.ready()` and
+  `dht.fullyBootstrapped()`. Readiness cannot be reused after loss or suspension.
+- `status()` returns the controller state (`OFF`, `BOOTSTRAPPING`,
+  `GUARD_PINNED`, `BUILDING`, `READY`, `ROTATING`, `SUSPENDED`, `UNAVAILABLE`,
+  or `DESTROYED`).
+- `exposureReport()` returns frozen, bounded bootstrap-contact entries with
+  categories, counts, bigint millisecond timestamps, outcomes, and salted,
+  redacted endpoint hashes. No keys, raw addresses, or complete paths.
+
+`immutableGet`, `immutablePut`, `mutableGet`, and `mutablePut` use the private
+controller. Immutable values are limited to 1023 bytes; mutable values to
+895 bytes. Results carry opaque routed destinations, not direct dial addresses.
+Call `ready()` before records. Suspension stops record work; resume must rebuild
+private routes. Local network-interface changes revoke route ownership and
+leave the instance unavailable; create a new instance after that failure.
+`destroy()` cancels pending readiness/work and joins private teardown.
+
+`lookup`, `announce`, `unannounce`, `lookupAndUnannounce`, `findPeer`, `connect`,
+`createServer`, `pool`, raw streams, raw `query`/`request`, `findNode`, `ping`,
+`delayedPing`, local-address validation, and plugins reject with
+`ERR_PRIVATE_COMMAND_UNSUPPORTED`. No public peer streams, server listening,
+Hyperswarm private discovery, or legacy-egress switch are offered. The peer
+examples elsewhere in this README describe **direct mode only**.
 
 ## API
 

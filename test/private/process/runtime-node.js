@@ -1,6 +1,6 @@
 'use strict'
 
-const { createCoherentClock } = require('./runtime-clock')
+const { createCoherentClock } = require('../../../lib/private/runtime-clock')
 
 const clock = createCoherentClock(
   () => process.hrtime.bigint(),

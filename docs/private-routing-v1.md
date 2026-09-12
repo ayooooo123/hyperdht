@@ -1,20 +1,29 @@
 # Native Private Routing v1
 
-**Status:** owner-approved experimental design; public API and peer-stream sections are design targets, not shipped interfaces
+**Status:** public DHT-record ALPHA API; peer/Hyperswarm integration remains internal/deferred
 **Date:** 2026-07-16  
 **Canonical repository:** `ayooooo123/hyperdht`  
 **Related forks:** `ayooooo123/dht-rpc`, `ayooooo123/hyperswarm`,
 `ayooooo123/hyperswarm-testnet`
 
-**Implementation status (2026-09-09):** the package-private live route supports
-immutable/mutable get and put, experimental required SURB replies, and Gate D
-blinded presence publication/resolution/revocation. Direct mode is still the
-only public behavior. Peer streams, legacy-peer egress, and public private-routing
-constructors are not implemented. The July design targets below do not enable
-them. Later decisions D10–D12 select blinded presence over mutable records and
-reject routed public `lookup`, `findPeer`, `announce`, `unannounce`, and raw
-`query`. See [current implementation and open gates](private-routing-migration.md#current-implementation)
-for accepted scope and verification; external cryptographic review remains open.
+**Implementation status (2026-09-12):** the public HyperDHT constructor now
+activates immutable/mutable get and put through the existing private bootstrap
+authority and routing controller, with explicit alpha acknowledgement and
+fail-closed `required` mode. Direct mode remains unchanged when the option is
+absent. Experimental required SURB replies and blinded presence remain internal.
+The new peer semantic services and endpoint/controller modules are internal:
+there is **no proven public peer route-owner integration**, private peer-stream
+API, legacy-peer egress API, or Hyperswarm private API.
+
+This release must remain **alpha/beta, not production anonymity**, until **both**
+deferred gates are complete: **Linux privacy evidence** and **external human
+cryptographic review**. Local Node/Bare tests do not satisfy either gate. The
+remaining July peer/egress design targets do not enable those surfaces. Later
+decisions D10–D12 select blinded presence over mutable records and reject routed
+public `lookup`, `findPeer`, `announce`, `unannounce`, and raw `query`. See the
+[migration record](private-routing-migration.md#current-implementation) for the
+historical internal implementation and open gates; the public alpha contract
+below supersedes its earlier public-activation status.
 
 ## Summary
 
@@ -23,27 +32,25 @@ operations use short, independently selected relay branches rather than a
 direct endpoint-to-DHT path. The proposed peer-stream layer would preserve
 Hyperswarm Noise/SecretStream encryption end to end; relays would forward
 fixed-size authenticated cells without terminating the peer's Noise session.
-The package-private DHT path is implemented; peer-stream integration is not.
+The public DHT-record alpha path is implemented; public peer-stream integration is not.
 
 The feature is developed in drop-in-compatible forks before any PearTube
 integration. Existing constructors, exports, package names, and direct-mode
-behavior remain unchanged when private routing is absent or explicitly off.
-Private routing is experimental and must not be represented as production
-anonymity before the complete testnet gates and an external security review
-pass.
+behavior remain unchanged when private routing is absent.
+Explicit `privateRouting` accepts only acknowledged alpha `required` mode.
+The release stays alpha/beta until Linux privacy evidence and external human
+cryptographic review are both complete; neither gate is claimed by this slice.
 
 ## Compatibility Contract
 
 - Existing DHT-RPC, HyperDHT, and Hyperswarm behavior is the default.
 - Private routing is enabled only through an explicit option.
-- Initial modes are `off` and `required`; there is no `preferred` mode.
+- The public alpha accepts only `required`; omit the option for direct mode.
 - `required` mode never silently retries through a direct transport.
 - Existing package names and exports remain unchanged in the forks.
-- A private client may connect anonymously to an unchanged public peer through
-  a legacy-egress exit.
-- Two private-capable peers use destination-selected private routes.
-- Relaying is separately enabled on public nodes and is off by default on
-  clients, including mobile clients.
+- Legacy-peer egress and destination-selected private peer streams remain
+  internal/deferred, not public compatibility guarantees.
+- The public alpha does not implicitly or explicitly start a relay service.
 - UDX remains unchanged until packet-oracle evidence demonstrates that a
   required invariant cannot be enforced above it.
 
@@ -52,6 +59,9 @@ can be proposed upstream. Privacy-specific path selection, wire formats, and
 cryptography remain explicitly experimental in the forks.
 
 ## Security Contract
+
+This section specifies protocol goals, not a production privacy certification.
+Peer and legacy-egress statements below describe deferred public integration.
 
 After a guard is pinned, a `required`-mode endpoint sends packets only to that
 guard. DHT nodes, DHT exits, legacy peers, and private peers do not observe the
@@ -204,11 +214,11 @@ HyperDHT is the canonical protocol owner. It contains:
 
 ### `hyperswarm`
 
-Hyperswarm exposes the ergonomic `privacy` option and applies it consistently
-to discovery and peer connections. In `required` mode it prohibits direct
-connection races, hole punching, direct retries, and relay-to-direct upgrades.
-It preserves existing Noise identity, connection events, firewall semantics,
-and stream behavior.
+The proposed Hyperswarm `privacy` option remains deferred. It would need to
+apply consistently to discovery and peer connections, prohibit direct races,
+hole punching, retries, and relay-to-direct upgrades, and preserve Noise
+identity, firewall, and stream semantics. The HyperDHT DHT-record alpha does
+not establish any of those consumer guarantees.
 
 ### `hyperswarm-testnet`
 
@@ -224,10 +234,11 @@ is exposed until all low-level gates in this document pass.
 
 ## Public API
 
-Only the direct-mode examples below are available through public constructors.
-The `privacy`, `privateRouting`, and `privateRelay` examples are retained design
-targets, **not runnable privacy configuration**. No public option enables the
-package-private implementation or makes the deferred peer/egress flows available.
+The public alpha supports **DHT records only** through the exact constructor
+below. It uses `createEndpointBootstrapAuthority` and
+`createPrivateRoutingController` internally; neither raw authority nor
+controller is exported on the public instance. Peer semantic/controller modules
+remain internal and have no proven public route-owner integration.
 
 Direct mode remains unchanged:
 
@@ -236,45 +247,58 @@ const dht = new HyperDHT()
 const swarm = new Hyperswarm()
 ```
 
-Proposed Hyperswarm-level configuration (not implemented):
-
-```js
-const swarm = new Hyperswarm({
-  privacy: {
-    mode: 'required',
-    allowLegacyEgress: true,
-    capabilityStore
-  }
-})
-
-await swarm.dht.ready()
-```
-
-Proposed lower-level equivalent (not implemented):
+Implemented ALPHA DHT-record configuration:
 
 ```js
 const dht = new HyperDHT({
   privateRouting: {
+    release: 'alpha',
+    acknowledgeAlpha: true,
     mode: 'required',
-    allowLegacyEgress: true,
-    capabilityStore
+    bootstrapEndpoints: [{ host: '127.0.0.1', port: 49001 }],
+    host: '127.0.0.1',
+    port: 49002
+    // Optional: advertisedHost and advertisedPort, supplied as a pair.
   }
 })
 
-const swarm = new Hyperswarm({ dht })
+try {
+  await dht.ready()
+  const { hash } = await dht.immutablePut(Buffer.from('alpha record'))
+  const result = await dht.immutableGet(hash)
+} finally {
+  await dht.destroy()
+}
 ```
 
-If both `privacy` and an injected `dht` are provided, Hyperswarm validates that
-the injected instance satisfies the requested policy. It must not silently
-construct or select another DHT.
+The example needs an already-running compatible private relay at the configured
+loopback address and enough valid relay diversity. Ordinary HyperDHT public
+bootstrap nodes are not private relay bootstraps. Construction starts private
+bootstrap asynchronously; binding a socket is not readiness.
 
-`allowLegacyEgress: true` requires a durable `capabilityStore` implementing
-asynchronous `get(noisePublicKey)`, `put(noisePublicKey, record)`, and
-`delete(noisePublicKey, signedTombstone)` operations. Construction rejects
-without it. Node, Bare, Android, and iOS adapters must persist atomically in an
-application-private location and survive process restart.
+`privateRouting` itself must be an own data property. Its value must be an
+ordinary object containing exactly `release: 'alpha'`, `acknowledgeAlpha: true`,
+`mode: 'required'`, `bootstrapEndpoints`, `host`, and `port`, with only the
+optional `advertisedHost`/`advertisedPort` pair additionally accepted. All fields
+are own data properties; symbols, accessors, inherited fields, unknown fields,
+partial advertised pairs, and ambiguous acknowledgement are rejected.
+`bootstrapEndpoints` is an ordinary dense array of one to three distinct exact
+`{ host, port }` objects. Hosts must be numeric IP addresses and ports must be
+integers from 1 through 65535; no hostname/DNS fallback is available.
 
-Relay service configuration is explicit and separate from client privacy:
+The required-mode constructor never reads or forwards direct network options
+such as `bootstrap`, `nodes`, `host`, `port`, `udx`, `udxFactory`, `socket`,
+`outboundPolicy`, or `requestTransport` from the outer options. Only top-level
+own-data `keyPair` or `seed` supplies local identity; secret material is copied
+before authority consumption, preserving caller buffers on success and failure.
+The parent DHT uses transport-only policy with a rejecting raw-command boundary;
+the four typed record methods use the controller's generation-owned transport.
+
+There is **no `allowLegacyEgress` toggle**, `capabilityStore` option, injected
+authority, public private peer stream, or public Hyperswarm `privacy` integration.
+These are not runnable alternatives to the alpha constructor.
+
+Proposed relay service configuration (internal/deferred, **not implemented as a public constructor**):
 
 ```js
 const relay = new HyperDHT({
@@ -298,9 +322,9 @@ service implicitly.
 
 ### Required-mode method contract
 
-The implemented package-private DHT/presence scope follows D10–D12. Peer and
-Hyperswarm rows below are deferred consumer contracts, not available methods
-on a public required-mode controller.
+The DHT-record rows are the implemented public alpha contract. Blinded presence,
+peer streams, and Hyperswarm remain internal/deferred; they must not be inferred
+from DHT-record readiness.
 
 | Surface                                                         | `required` behavior                                                                                                                                  |
 | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -309,28 +333,50 @@ on a public required-mode controller.
 | `lookup`, `announce`, `unannounce`                              | Unsupported as routed public-DHT commands in v1. Use the package-private Gate D presence client over mutable records, not aliases for these methods. |
 | `immutableGet`, `immutablePut`, `mutableGet`, `mutablePut`      | Use typed routed DHT requests; mutation prepare and commit remain on one branch generation and exit.                                                 |
 | `findPeer`                                                      | Unsupported in v1; presence resolution is a separate client operation. A routed public-DHT read needs a versioned wire decision.                     |
-| `connect`                                                       | Deferred peer-stream design: a verified private descriptor must never grant a direct endpoint dial.                                                  |
-| `createServer`, `listen`                                        | Deferred peer-stream design: maintain private route descriptors without advertising or accepting a direct endpoint route.                            |
-| `pool`, raw streams                                             | May use only a routed implementation that carries no direct address/send authority; otherwise reject with `ERR_PRIVATE_COMMAND_UNSUPPORTED`.         |
+| `connect`                                                       | Rejects with `ERR_PRIVATE_COMMAND_UNSUPPORTED`; peer semantics/controller are internal, without proven public route-owner integration.               |
+| `createServer`, `listen`                                        | `createServer` rejects with `ERR_PRIVATE_COMMAND_UNSUPPORTED`; there is no required-mode public server or `listen` surface.                          |
+| `pool`, raw streams                                             | Rejects with `ERR_PRIVATE_COMMAND_UNSUPPORTED`; no public peer transport is activated.                                                               |
 | raw `query` or unregistered commands                            | Unsupported in v1. Adding a routed command requires a reviewed, versioned registry change, not an untyped exit escape hatch.                         |
 | Hyperswarm `join`, `joinPeer`, `flush`                          | Deferred consumer contract: preserve lifecycle semantics while discovery and connection attempts remain routed.                                      |
 | Hyperswarm `leave`, `leavePeer`, `suspend`, `resume`, `destroy` | Deferred consumer contract: cancel and tear down private work with direct-mode completion semantics.                                                 |
 
-Existing firewall callbacks execute at the actual endpoint against the remote
-Noise public key and payload, not against an exit identity. Cancellation,
-timeout, half-close, error, and teardown propagate through the route and retain
-their ordinary stream meaning.
+`lookupAndUnannounce`, raw `request`, `findNode`, `ping`, `delayedPing`,
+local-address validation, and plugins also reject with
+`ERR_PRIVATE_COMMAND_UNSUPPORTED`. The parent has no direct DHT socket,
+bootstrap, routing table, or direct query fallback. Immutable values are bounded
+at 1023 bytes and mutable values at 895 bytes. Results retain the controller's
+opaque destinations rather than exposing direct dial addresses. Public alpha
+record replies use correlated mode; the SURB opt-in remains internal.
 
-The proposed public `dht.privateRouting` property would expose a read-only
-controller with `mode`, `ready()`, `status()`, and `exposureReport()`. It is not
-present in this fork's public API. The report contains only bounded bootstrap
-contact categories, counts, timestamps, and redacted endpoint hashes; it never
-contains route keys or complete paths. Stable private errors include
-`ERR_PRIVACY_UNAVAILABLE`, `ERR_PRIVATE_GUARD_UNAVAILABLE`,
-`ERR_PRIVATE_ROUTE_LOST`, `ERR_PRIVATE_ROUTE_ROTATING`,
-`ERR_PRIVATE_COMMAND_UNSUPPORTED`, `ERR_PRIVATE_RELAY_BUSY`,
-`ERR_PRIVATE_DESCRIPTOR_INVALID`, `ERR_PRIVATE_DOWNGRADE`,
-`ERR_PRIVATE_CAPABILITY_STORE_FULL`, and `ERR_PRIVATE_AUTHENTICATION`.
+`dht.privateRouting` is a non-writable, non-configurable property containing a
+frozen facade: `release: 'alpha'`, `mode: 'required'`, `ready()`, `status()`,
+and `exposureReport()`. `status()` returns the controller state (`OFF`,
+`BOOTSTRAPPING`, `GUARD_PINNED`, `BUILDING`, `READY`, `ROTATING`, `SUSPENDED`,
+`UNAVAILABLE`, or `DESTROYED`). All three public readiness methods
+(`dht.ready()`, `dht.fullyBootstrapped()`, and facade `ready()`) check private
+readiness, not a previously resolved direct or private bootstrap promise.
+
+The exposure report is a frozen, bounded array for the current initial
+bootstrap attempt or most recently completed bootstrap/reconnect. Each frozen
+entry contains only `phase`, `contactCategory`, `redactedEndpoint`,
+`firstAttemptMs`, `lastAttemptMs`, `attemptCount`, and `outcome`. Timestamps
+are bigint milliseconds; endpoint hashes are salted and redacted. No route keys,
+raw endpoints, or complete paths are exposed. Redacted evidence survives
+failure and teardown; during reconnect the prior report remains until transfer.
+
+Suspension revokes record admission and waits for private teardown; resume
+must rebuild privately. Local network-interface changes revoke private
+ownership and leave the instance `UNAVAILABLE`, without direct retries.
+Destroy cancels outstanding readiness and record work and joins teardown.
+Destroyed methods reject `ERR_DESTROYED`; unavailable records/readiness reject
+`ERR_PRIVACY_UNAVAILABLE`, rotating branches reject
+`ERR_PRIVATE_BRANCH_ROTATING`, and unsupported public commands always reject
+`ERR_PRIVATE_COMMAND_UNSUPPORTED`, including after destruction. Bootstrap
+failure can also report `ERR_PRIVATE_GUARD_UNAVAILABLE`.
+
+The ordinary peer firewall, cancellation, timeout, half-close, and stream
+contracts elsewhere in this design are deferred public integration goals,
+not behavior offered by the DHT-record alpha.
 
 ## Architecture
 
@@ -827,6 +873,10 @@ experimental notices and their upstream license and authorship.
 This is the original cross-repository delivery plan, not a current checklist.
 Later scope decisions and implementation evidence are tracked in the
 [migration record](private-routing-migration.md#current-implementation).
+The public DHT-record alpha is now activated separately from those historical
+targets. It remains alpha/beta until **both Linux privacy evidence and external
+human cryptographic review** are complete. Neither gate is waived by public
+activation, passing scoped Node/Bare tests, or the internal peer modules.
 Legacy-egress, peer-stream, and consumer entries below do not authorize a new
 implementation or public API merely because the DHT slice now passes its gates.
 

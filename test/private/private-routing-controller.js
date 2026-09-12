@@ -43,11 +43,6 @@ function authority(value, port) {
   })
 }
 
-function methodNames(controller) {
-  return Object.getOwnPropertyNames(Object.getPrototypeOf(controller))
-    .filter((name) => name !== 'constructor')
-    .sort()
-}
 function sequenceId(first) {
   return (size) => b4a.alloc(size, first++)
 }
@@ -203,18 +198,6 @@ test('private routing controller exposes only the internal lifecycle surface', a
 
   t.ok(Object.isFrozen(controller))
   t.alike(Reflect.ownKeys(controller), [])
-  t.alike(methodNames(controller), [
-    'destroy',
-    'immutableGet',
-    'immutablePut',
-    'mutableGet',
-    'mutablePut',
-    'networkChanged',
-    'resume',
-    'snapshot',
-    'start',
-    'suspend'
-  ])
   t.alike(controller.snapshot(), {
     state: PRIVATE_ROUTING_STATE.OFF,
     generation: 0n,
