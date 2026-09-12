@@ -9,11 +9,11 @@ on:
   push:
     branches:
       - main
-      - private-routing-v1
+      - implement-private-peer-v2
   pull_request:
     branches:
       - main
-      - private-routing-v1
+      - implement-private-peer-v2
 
 jobs:
   deterministic:
