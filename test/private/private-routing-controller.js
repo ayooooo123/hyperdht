@@ -23,6 +23,7 @@ const {
 } = require('../../lib/private/route-manager')
 const openRouteHandoff = require('../../lib/private/open-route-handoff')
 const opaqueDestination = require('../../lib/private/opaque-destination')
+const bootstrapIO = require('../../lib/private/bootstrap-io')
 const { liveTopologyFixture } = require('./live-topology-fixture')
 
 const seed = (value) => b4a.alloc(32, value)
@@ -495,6 +496,92 @@ test('destroy during teardown joins cancellation and reaches zero-state', async 
     t.is(snapshot.handles, 0)
     t.is(snapshot.callbacks, 0)
   } finally {
+    if (fixture) await fixture.close()
+  }
+})
+
+test('failed resume settles concurrent readiness before and after destroy', async (t) => {
+  const reconnectFactory = Symbol.for('hyperdht-private-routes/reconnect-bootstrap-io-factory')
+  const createReconnectBootstrapIO = bootstrapIO[reconnectFactory]
+  const reconnectStarted = deferred()
+  const reconnectResult = deferred()
+  void reconnectResult.promise.catch(() => {})
+  const failure = PrivateRouteError.ERR_PRIVATE_GUARD_UNAVAILABLE()
+  let fixture
+  try {
+    fixture = await readySuspendFixture(t, 48161, {
+      trace: [],
+      async teardownOpenRouteMaterial() {
+        return true
+      },
+      destroyOpenRouteMaterial() {
+        return true
+      }
+    })
+    const { controller } = fixture
+    await controller.suspend()
+    bootstrapIO[reconnectFactory] = (options, deadline) => {
+      const io = createReconnectBootstrapIO(options, deadline)
+      return {
+        start() {
+          reconnectStarted.resolve()
+          return reconnectResult.promise
+        },
+        destroy() {
+          return io.destroy()
+        }
+      }
+    }
+    const resumed = controller.resume().then(
+      () => null,
+      (err) => err
+    )
+    // All public readiness entry points await this same controller generation.
+    const outcomes = ['pending', 'pending', 'pending']
+    for (let index = 0; index < outcomes.length; index++) {
+      void controller.ready().then(
+        () => {
+          outcomes[index] = 'ready'
+        },
+        (err) => {
+          outcomes[index] = err.code
+        }
+      )
+    }
+    await reconnectStarted.promise
+    t.is(controller.snapshot().state, PRIVATE_ROUTING_STATE.BOOTSTRAPPING)
+    t.alike(outcomes, ['pending', 'pending', 'pending'])
+    reconnectResult.reject(failure)
+    t.is(await resumed, failure)
+    const unavailable = controller.snapshot()
+    t.is(unavailable.state, PRIVATE_ROUTING_STATE.UNAVAILABLE)
+    t.is(unavailable.routeManager, false)
+    t.is(unavailable.guardLease, false)
+    t.is(unavailable.reconnect, false)
+    t.alike(unavailable.packetEdges, [])
+    const rejected = [
+      'ERR_PRIVATE_GUARD_UNAVAILABLE',
+      'ERR_PRIVATE_GUARD_UNAVAILABLE',
+      'ERR_PRIVATE_GUARD_UNAVAILABLE'
+    ]
+    // Observe settlement without awaiting a promise that the regression orphaned.
+    t.alike(outcomes, rejected, 'all readiness waiters reject before destroy')
+    await t.exception(controller.ready(), { code: 'ERR_PRIVACY_UNAVAILABLE' })
+    const destroying = controller.destroy()
+    t.is(controller.destroy(), destroying)
+    await destroying
+    t.alike(outcomes, rejected, 'destroy cannot replace or strand the generation failure')
+    await t.exception(controller.ready(), { code: 'ERR_DESTROYED' })
+    const snapshot = controller.snapshot()
+    t.is(snapshot.state, PRIVATE_ROUTING_STATE.DESTROYED)
+    t.is(snapshot.routeManager, false)
+    t.is(snapshot.guardLease, false)
+    t.is(snapshot.reconnect, false)
+    t.is(snapshot.endpointSockets, 0)
+    t.is(snapshot.timers, 0)
+  } finally {
+    bootstrapIO[reconnectFactory] = createReconnectBootstrapIO
+    reconnectResult.reject(failure)
     if (fixture) await fixture.close()
   }
 })
