@@ -610,3 +610,47 @@ test('public resume waits for fresh private route generations and restores recor
   t.alike((await dht.immutableGet(hash)).value, value)
   t.alike(fixture.sends, [], 'public constructor retains no direct socket authority after resume')
 })
+
+test('public failed resume rejects concurrent readiness before and after destroy', async (t) => {
+  forbidDirectDHT(t)
+  const fixture = await readyFixture()
+  t.teardown(() => fixture.close())
+  const { dht, harness } = fixture
+  // No reconnect responder: the real guard reconnect deadline must reject.
+  await dht.suspend()
+  const before = harness.fakeSocket.sends.length
+  const resumed = code(() => dht.resume())
+  const readiness = Promise.all([
+    code(() => dht.ready()),
+    code(() => dht.fullyBootstrapped()),
+    code(() => dht.privateRouting.ready())
+  ])
+  t.is(dht.privateRouting.status(), 'BOOTSTRAPPING')
+  t.is(await resumed, 'ERR_PRIVATE_GUARD_UNAVAILABLE')
+  t.is(dht.privateRouting.status(), 'UNAVAILABLE')
+  let timer
+  try {
+    const outcome = await Promise.race([
+      readiness,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve('pending'), 500)
+      })
+    ])
+    t.alike(
+      outcome,
+      [
+        'ERR_PRIVATE_GUARD_UNAVAILABLE',
+        'ERR_PRIVATE_GUARD_UNAVAILABLE',
+        'ERR_PRIVATE_GUARD_UNAVAILABLE'
+      ],
+      'every public readiness waiter rejects with the reconnect failure'
+    )
+  } finally {
+    clearTimeout(timer)
+  }
+  await dht.destroy()
+  t.is(dht.privateRouting.status(), 'DESTROYED')
+  t.is(await code(() => dht.ready()), 'ERR_DESTROYED')
+  t.is(harness.fakeSocket.sends.length, before, 'failed resume never falls back to a DHT query')
+  t.alike(fixture.sends, [], 'failed resume retains no direct endpoint send authority')
+})

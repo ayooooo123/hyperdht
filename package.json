@@ -12,7 +12,7 @@
     "browser.js",
     "testnet.js",
     "bin.js",
-    "lib/**.js"
+    "lib/**/*.js"
   ],
   "imports": {
     "#private-route-process": {
