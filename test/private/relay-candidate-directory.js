@@ -2,6 +2,7 @@
 
 const test = require('brittle')
 const b4a = require('b4a')
+const { createCoherentClock } = require('../../lib/private/runtime-clock')
 
 const { moduleCacheKey: resolveModuleCacheKey } = require('./module-cache')
 
@@ -229,6 +230,25 @@ function fakeClock(start = NOW) {
     },
     jumpWall(value) {
       wall += BigInt(value)
+    }
+  }
+}
+
+function runtimeClock(start = NOW) {
+  let wall = Number(start)
+  let monotonic = 0n
+  const clock = createCoherentClock(
+    () => monotonic * 1_000_000n,
+    () => wall
+  )
+  return {
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow,
+    advanceMonotonic(value) {
+      monotonic += BigInt(value)
+    },
+    jumpWall(value) {
+      wall += Number(value)
     }
   }
 }
@@ -875,6 +895,40 @@ test('wall rollback clears directory ownership and no generation or callback sur
   )
   t.is(rolled[kInspectRelayCandidateDirectory]().identityCount, 0)
   rolled.destroy()
+})
+
+test('runtime clock preserves sample coherence and exposes wall jumps to directory revocation', async (t) => {
+  const skew = runtimeClock()
+  const initialWall = skew.wallNow()
+  const initialMonotonic = skew.monotonicNow()
+  skew.advanceMonotonic(1)
+  await Promise.resolve()
+  t.is(skew.monotonicNow() - initialMonotonic, 1n)
+  t.is(skew.wallNow() - initialWall, 1n, 'one-millisecond sample skew cannot inflate a deadline')
+
+  const forwardClock = runtimeClock()
+  const forward = install(fixture(1, 1, forwardClock))
+  forwardClock.jumpWall(40_000)
+  await Promise.resolve()
+  expectCode(
+    t,
+    () => forward.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.is(forward[kInspectRelayCandidateDirectory]().identityCount, 0)
+  forward.destroy()
+
+  const rollbackClock = runtimeClock()
+  const rollback = install(fixture(1, 1, rollbackClock))
+  rollbackClock.jumpWall(-30_001)
+  await Promise.resolve()
+  expectCode(
+    t,
+    () => rollback.reserveInitialPair({ lookupGeneration: 1n, announceGeneration: 1n }),
+    'ERR_INCOMPATIBLE_RELAY'
+  )
+  t.is(rollback[kInspectRelayCandidateDirectory]().identityCount, 0)
+  rollback.destroy()
 })
 
 test('same-identity higher epoch replaces old evidence and equivocation removes it', (t) => {

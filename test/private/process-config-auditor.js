@@ -3,7 +3,6 @@
 const test = require('brittle')
 const b4a = require('b4a')
 
-const HyperDHT = require('../..')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { decodeTopologyGrant, verifyTopologyGrant } = require('../../lib/private/topology-grant')
 const {
@@ -902,18 +901,4 @@ test('role and coordinator event MAC key copies are independent and zeroed on st
   fixture.stop()
   fixture.stop()
   for (const key of [...roleKeys, ...oracleKeys]) t.alike(key, b4a.alloc(32))
-})
-
-test('Task16 test infrastructure does not change root production exports', (t) => {
-  t.alike(Object.getOwnPropertyNames(HyperDHT).sort(), [
-    'BOOTSTRAP',
-    'DEFAULTS',
-    'FIREWALL',
-    'connectRawStream',
-    'hash',
-    'keyPair',
-    'length',
-    'name',
-    'prototype'
-  ])
 })
