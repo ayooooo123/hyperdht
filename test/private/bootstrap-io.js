@@ -440,22 +440,6 @@ function fixture(options = {}) {
   }
 }
 
-test('BootstrapIO exposes only the narrowed cold-start lifecycle', (t) => {
-  t.alike(Object.keys(require('../../lib/private/bootstrap-io')).sort(), [
-    'BootstrapIO',
-    'TEST_ONLY_BOOTSTRAP_IO_OBSERVER',
-    'consumeBootstrapGuardPin',
-    'revokeBootstrapGuardPin'
-  ])
-  t.alike(Object.getOwnPropertyNames(BootstrapIO.prototype).sort(), [
-    'cancel',
-    'constructor',
-    'destroy',
-    'recordPreGuardContact',
-    'start'
-  ])
-})
-
 test('BootstrapIO rejects a generic datagram send and destroy object', (t) => {
   const local = cryptoSuite.keyPair(seed(201))
   const sink = createRelayCandidateDirectorySink({

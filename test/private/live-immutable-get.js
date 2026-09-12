@@ -1256,3 +1256,5 @@ test('public start enters UNAVAILABLE when the hosted guard service is absent', 
     await routing.destroy()
   }
 })
+
+module.exports = { installNativeReconnectResponder }
