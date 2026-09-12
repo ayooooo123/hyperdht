@@ -205,36 +205,48 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
   let holdNextTerminalPacket = false
   let releaseHeldTail = null
   let signalHeldTail
-  const heldTail = new Promise(resolve => { signalHeldTail = resolve })
-  t.teardown(() => { if (releaseHeldTail) releaseHeldTail() })
-  const f = await interceptNativeMessages((socket, args, emit) => {
-    if (holdNextTerminalPacket && socket.address()?.port === 48303 &&
-        args[0].byteLength === 1200 && args[0][1] === CELL_CLASS.DATAGRAM) {
-      holdNextTerminalPacket = false
-      const packet = b4a.from(args[0])
-      let released = false
-      releaseHeldTail = () => {
-        if (released) return false
-        released = true
-        try {
-          emit.call(socket, 'message', packet, ...args.slice(1))
-        } finally {
-          packet.fill(0)
+  const heldTail = new Promise((resolve) => {
+    signalHeldTail = resolve
+  })
+  t.teardown(() => {
+    if (releaseHeldTail) releaseHeldTail()
+  })
+  const f = await interceptNativeMessages(
+    (socket, args, emit) => {
+      if (
+        holdNextTerminalPacket &&
+        socket.address()?.port === 48303 &&
+        args[0].byteLength === 1200 &&
+        args[0][1] === CELL_CLASS.DATAGRAM
+      ) {
+        holdNextTerminalPacket = false
+        const packet = b4a.from(args[0])
+        let released = false
+        releaseHeldTail = () => {
+          if (released) return false
+          released = true
+          try {
+            emit.call(socket, 'message', packet, ...args.slice(1))
+          } finally {
+            packet.fill(0)
+          }
+          return true
         }
-        return true
+        signalHeldTail()
+        return false
       }
-      signalHeldTail()
-      return false
-    }
-  }, () => setupFourNodeNativeFixture({
-    t,
-    native: true,
-    basePort: 48300,
-    poolCapacity: 4096,
-    onTerminalFinalReady(session) {
-      terminalSession = session
-    }
-  }))
+    },
+    () =>
+      setupFourNodeNativeFixture({
+        t,
+        native: true,
+        basePort: 48300,
+        poolCapacity: 4096,
+        onTerminalFinalReady(session) {
+          terminalSession = session
+        }
+      })
+  )
 
   // Assert Guard, Safety, and Terminal identities are pairwise distinct
   t.not(
@@ -519,7 +531,11 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
     })
     const received = receiveReservedM3RouteFrame(reserveM3RouteFrame(receiver))
     if (direction === 0) {
-      t.is(releaseHeldTail(), true, 'an actual Native tail packet resumes after transfer with a carrier reader pending')
+      t.is(
+        releaseHeldTail(),
+        true,
+        'an actual Native tail packet resumes after transfer with a carrier reader pending'
+      )
     }
     await sendM3RouteFrame(sender, frame)
     const receivedFrame = await received
@@ -811,6 +827,59 @@ test('regression: destroy during in-flight discovery cancels operations without 
       expiresAt: 50000n
     })
   }, 'subsequent discover on destroyed session throws')
+})
+
+test('expired discovery candidates release same-tail admission without shortening an admitted branch', async (t) => {
+  const clock = fakeClock()
+  const f = await setupFourNodeNativeFixture({
+    t,
+    clock,
+    native: true,
+    basePort: 49220,
+    poolCapacity: 4096
+  })
+  const { sourceTailSession } = await f.openSourceA0()
+  const expiredCandidate = await discoverPeerTailCandidate(sourceTailSession, {
+    mode: 1,
+    requestedMask: 9,
+    randomTarget32: seed(0x21),
+    expiresAt: 1100n
+  })
+
+  clock.advance(100)
+  const replacement = await discoverPeerTailCandidate(sourceTailSession, {
+    mode: 1,
+    requestedMask: 9,
+    randomTarget32: seed(0x22),
+    expiresAt: 1200n
+  })
+  const limits = {
+    cellSize: 1200,
+    maxCells: 30,
+    maxBytes: 36000,
+    maxCommands: 21,
+    idleTimeoutMs: 30000,
+    expiresAt: 45000n
+  }
+  const request = {
+    candidate: expiredCandidate,
+    forwardLimits: limits,
+    reverseLimits: limits,
+    payloadParametersDigest: seed(0x41)
+  }
+  t.exception(
+    () => extendPeerTail(sourceTailSession, request),
+    'retired candidate cannot consume its replacement'
+  )
+
+  await extendPeerTail(sourceTailSession, { ...request, candidate: replacement })
+  const admitted = readPeerTailControl(sourceTailSession)
+  t.is(admitted.extensionIndex, 1, 'replacement completes a genuine Native extension')
+  t.is(admitted.wireExpiresAt, 45000n, 'discovery expiry bounds admission, not branch lifetime')
+  clock.advance(100)
+  const surviving = readPeerTailControl(sourceTailSession)
+  t.is(surviving.phase, 'TAIL_READY', 'admitted tail remains usable at candidate expiry')
+  t.is(surviving.localDeadline, admitted.localDeadline, 'candidate expiry does not rebase the tail')
 })
 
 test('regression: legal asymmetric forward and reverse expiry bounds succeed in real native flow', async (t) => {
@@ -1173,63 +1242,104 @@ test('terminal carrier retains its original Native READY2 duty after the tail ow
   let terminalMaterial = null
   let terminalCarrier = null
   let terminalFailure = null
-  const f = await interceptNativeMessages((socket, args) => {
-    if (countFinalSourcePackets && socket.address()?.port === 48720 &&
-        args[0].byteLength === 1200 && args[0][1] === CELL_CLASS.DATAGRAM) {
-      if (++finalSourcePackets === 2) {
-        droppedReady++
-        return false
+  const f = await interceptNativeMessages(
+    (socket, args) => {
+      if (
+        countFinalSourcePackets &&
+        socket.address()?.port === 48720 &&
+        args[0].byteLength === 1200 &&
+        args[0][1] === CELL_CLASS.DATAGRAM
+      ) {
+        if (++finalSourcePackets === 2) {
+          droppedReady++
+          return false
+        }
       }
-    }
-  }, () => setupFourNodeNativeFixture({
-    t, clock, native: true, basePort: 48720, poolCapacity: 4096,
-    onTerminalFinalReady(session) {
-      try {
-        const handoff = createPeerFinalExitHandoff(session)
-        terminalActivation = claimFinalExitActivation(handoff, createFinalExitActivationClaim(handoff))
-        terminalMaterial = consumeFinalExitActivationOwner(terminalActivation)
-        const taken = takePeerTailFinalRuntime(session, terminalActivation)
-        terminalCarrier = takeM3RouteTransport(issuePeerM3RouteCarrier(taken.runtime, taken.authorization))
-        destroyPeerTailControl(session)
-      } catch (err) {
-        terminalFailure = err
-        throw err
-      }
-    }
-  }))
+    },
+    () =>
+      setupFourNodeNativeFixture({
+        t,
+        clock,
+        native: true,
+        basePort: 48720,
+        poolCapacity: 4096,
+        onTerminalFinalReady(session) {
+          try {
+            const handoff = createPeerFinalExitHandoff(session)
+            terminalActivation = claimFinalExitActivation(
+              handoff,
+              createFinalExitActivationClaim(handoff)
+            )
+            terminalMaterial = consumeFinalExitActivationOwner(terminalActivation)
+            const taken = takePeerTailFinalRuntime(session, terminalActivation)
+            terminalCarrier = takeM3RouteTransport(
+              issuePeerM3RouteCarrier(taken.runtime, taken.authorization)
+            )
+            destroyPeerTailControl(session)
+          } catch (err) {
+            terminalFailure = err
+            throw err
+          }
+        }
+      })
+  )
   t.teardown(() => {
     if (terminalCarrier) destroyM3RouteTransport(terminalCarrier)
     if (terminalActivation) destroyFinalExitActivationOwner(terminalActivation)
   })
   const { sourceTailSession, limits } = await f.openSourceA0()
   const safety = await discoverPeerTailCandidate(sourceTailSession, {
-    mode: 1, requestedMask: 9, randomTarget32: seed(0x31), expiresAt: 50000n
+    mode: 1,
+    requestedMask: 9,
+    randomTarget32: seed(0x31),
+    expiresAt: 50000n
   })
   await extendPeerTail(sourceTailSession, {
-    candidate: safety, forwardLimits: limits, reverseLimits: limits, payloadParametersDigest: seed(0x51)
+    candidate: safety,
+    forwardLimits: limits,
+    reverseLimits: limits,
+    payloadParametersDigest: seed(0x51)
   })
   const terminal = await discoverPeerTailCandidate(sourceTailSession, {
-    mode: 2, requestedMask: 11, randomTarget32: seed(0x61), expiresAt: 50000n,
+    mode: 2,
+    requestedMask: 11,
+    randomTarget32: seed(0x61),
+    expiresAt: 50000n,
     suppliedAdvertisement260: readVerifiedPeerAdvertisement(f.terminal.verifiedAd).canonicalBytes260
   })
   countFinalSourcePackets = true
   let outcome = null
   const extending = extendPeerTail(sourceTailSession, {
-    candidate: terminal, forwardLimits: limits, reverseLimits: limits, payloadParametersDigest: seed(0x71)
-  }).then(() => { outcome = 'FINAL_EXIT_READY' }, err => { outcome = err.code })
+    candidate: terminal,
+    forwardLimits: limits,
+    reverseLimits: limits,
+    payloadParametersDigest: seed(0x71)
+  }).then(
+    () => {
+      outcome = 'FINAL_EXIT_READY'
+    },
+    (err) => {
+      outcome = err.code
+    }
+  )
   for (let i = 0; i < 40 && !terminalCarrier && !terminalFailure; i++) {
-    await new Promise(resolve => setTimeout(resolve, 5))
+    await new Promise((resolve) => setTimeout(resolve, 5))
   }
   t.is(terminalFailure, null, 'terminal transfers immediately on its first READY2 dispatch')
   t.ok(terminalCarrier, 'terminal carrier exists before source completion')
   t.is(outcome, null, 'first lost READY2 has not completed the source')
   const materialBytes = Object.values(terminalMaterial).reduce(
-    (sum, value) => sum + (b4a.isBuffer(value) ? value.byteLength : 0), 0
+    (sum, value) => sum + (b4a.isBuffer(value) ? value.byteLength : 0),
+    0
   )
   let spare = null
   let refused = false
   try {
-    spare = reservePeerMemory(f.terminal.memoryPool, 'pending-readiness-capacity-probe', 4096 - materialBytes)
+    spare = reservePeerMemory(
+      f.terminal.memoryPool,
+      'pending-readiness-capacity-probe',
+      4096 - materialBytes
+    )
   } catch {
     refused = true
   } finally {
@@ -1238,15 +1348,54 @@ test('terminal carrier retains its original Native READY2 duty after the tail ow
   t.is(refused, true, 'retired tail cannot free storage still owned by its residual READY2 duty')
   for (let i = 0; i < 9; i++) {
     clock.advance(250)
-    await new Promise(resolve => setTimeout(resolve, 5))
+    await new Promise((resolve) => setTimeout(resolve, 5))
   }
   await extending
   t.is(droppedReady, 1, 'exactly the first Native READY2 was lost upstream')
-  t.is(outcome, 'FINAL_EXIT_READY', 'original remaining READY2 attempts complete source verification')
-  const reclaimed = reservePeerMemory(f.terminal.memoryPool, 'finished-readiness-capacity-probe', 4096 - materialBytes)
+  t.is(
+    outcome,
+    'FINAL_EXIT_READY',
+    'original remaining READY2 attempts complete source verification'
+  )
+  const reclaimed = reservePeerMemory(
+    f.terminal.memoryPool,
+    'finished-readiness-capacity-probe',
+    4096 - materialBytes
+  )
   releasePeerMemory(reclaimed)
   destroyFinalExitActivationOwner(terminalActivation)
   terminalActivation = null
-  t.is(readPeerMemory(f.terminal.memoryPool).reservedBytes, 0,
-    'residual duty and moved final material release all terminal tail storage')
+  t.is(
+    readPeerMemory(f.terminal.memoryPool).reservedBytes,
+    0,
+    'residual duty and moved final material release all terminal tail storage'
+  )
+})
+
+test('runtime clock reentrancy cannot return a retired runtime as usable', async (t) => {
+  const baseClock = fakeClock()
+  let onClockRead = null
+  const clock = {
+    ...baseClock,
+    monotonicNow() {
+      const callback = onClockRead
+      onClockRead = null
+      if (callback) callback()
+      return baseClock.monotonicNow()
+    }
+  }
+  const f = await setupFourNodeNativeFixture({
+    t,
+    clock,
+    native: true,
+    basePort: 49260,
+    poolCapacity: 4096
+  })
+  const { sourceRuntime } = await f.openSourceA0()
+  onClockRead = () => destroyPeerM3Runtime(sourceRuntime)
+  t.exception(
+    () => sourceRuntime.diagnostics(),
+    { code: 'ERR_DESTROYED' },
+    'destruction inside the owned clock revokes the current operation'
+  )
 })
