@@ -239,13 +239,27 @@ class HyperDHT extends DHT {
   async destroy({ force = false } = {}) {
     const routing = PRIVATE_ROUTING.get(this)
     if (routing) {
-      if (routing.interfaces) {
-        routing.interfaces.destroy()
-        routing.interfaces = null
-      }
-      // Cancel pending private bootstrap before joining parent teardown.
-      await routing.controller.destroy()
-      return super.destroy()
+      if (routing.destroyPromise !== null) return routing.destroyPromise
+      let resolveDestroy
+      routing.destroyPromise = new Promise((resolve) => {
+        resolveDestroy = resolve
+      })
+      // Publish the join before revoking bootstrap or invoking close callbacks.
+      resolveDestroy(
+        (async () => {
+          try {
+            // Revoke synchronously, before the constructor's queued bootstrap.
+            await routing.controller.destroy()
+          } finally {
+            try {
+              await closePrivateInterfaces(routing)
+            } finally {
+              await super.destroy()
+            }
+          }
+        })()
+      )
+      return routing.destroyPromise
     }
     if (!force) {
       const closing = []
@@ -791,7 +805,25 @@ function createPrivateRouting(options, opts) {
     id: rejectPrivateCommand,
     request: rejectPrivateCommand
   })
-  return { controller, transport, keyPair, interfaces: null }
+  return { controller, transport, keyPair, interfaces: null, destroyPromise: null }
+}
+
+async function closePrivateInterfaces(routing) {
+  const interfaces = routing.interfaces
+  if (interfaces === null) return
+  let onclose
+  const closed = new Promise((resolve) => {
+    onclose = resolve
+    interfaces.once('close', onclose)
+  })
+  try {
+    // A synchronous destroy return can still precede the native close event.
+    await interfaces.destroy()
+    await closed
+    routing.interfaces = null
+  } finally {
+    interfaces.removeListener('close', onclose)
+  }
 }
 
 function mapLookup(node) {

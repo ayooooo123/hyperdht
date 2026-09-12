@@ -68,10 +68,16 @@ function forbidDirectDHT(t) {
   })
 }
 
-// Observe only the socket created by the public constructor. Fixture relay/exit
-// sockets are separate owners. The native send path still runs unmodified.
+// Observe only resources created by the public constructor. Fixture relay/exit
+// resources are separate owners. The native send path still runs unmodified.
 function constructObserved(opts) {
   const sends = []
+  let interfaces = null
+  const watchNetworkInterfaces = UDX.prototype.watchNetworkInterfaces
+  UDX.prototype.watchNetworkInterfaces = function (...args) {
+    interfaces = watchNetworkInterfaces.apply(this, args)
+    return interfaces
+  }
   const createSocket = UDX.prototype.createSocket
   UDX.prototype.createSocket = function (...args) {
     const socket = createSocket.apply(this, args)
@@ -85,9 +91,10 @@ function constructObserved(opts) {
     return socket
   }
   try {
-    return { dht: new HyperDHT(opts), sends }
+    return { dht: new HyperDHT(opts), sends, interfaces }
   } finally {
     UDX.prototype.createSocket = createSocket
+    UDX.prototype.watchNetworkInterfaces = watchNetworkInterfaces
   }
 }
 
@@ -412,6 +419,62 @@ test('public required mode suppresses direct options and unsupported operations 
   t.is(await code(() => dht.resume()), 'ERR_DESTROYED')
   t.is(await code(() => dht.immutableGet(keyPair.publicKey)), 'ERR_DESTROYED')
 })
+
+for (const promiseLike of [false, true]) {
+  test(`public destroy joins native watcher close with a ${promiseLike ? 'promise-like' : 'synchronous'} return`, async (t) => {
+    forbidDirectDHT(t)
+    const { dht, sends, interfaces } = constructObserved({ privateRouting: options() })
+    const destroyInterfaces = interfaces.destroy
+    let allowClose
+    const allowed = new Promise((resolve) => {
+      allowClose = resolve
+    })
+    let closing = null
+    interfaces.destroy = function () {
+      closing = allowed.then(() => destroyInterfaces.call(this))
+      return promiseLike ? { then: closing.then.bind(closing) } : undefined
+    }
+    t.teardown(async () => {
+      allowClose()
+      if (closing) await closing
+      else await destroyInterfaces.call(interfaces)
+      await dht.destroy()
+    })
+    let watcherClosed = false
+    interfaces.once('close', () => {
+      watcherClosed = true
+    })
+    let parentCloses = 0
+    dht.on('close', () => {
+      parentCloses++
+    })
+    const completions = []
+    const first = dht.destroy().then(() => {
+      completions.push([watcherClosed, parentCloses])
+    })
+    const second = dht.destroy({ force: true }).then(() => {
+      completions.push([watcherClosed, parentCloses])
+    })
+    try {
+      await until(() => dht.privateRouting.status() === 'DESTROYED')
+      t.alike(completions, [], 'neither caller completes while the native watcher is open')
+    } finally {
+      allowClose()
+    }
+    await Promise.all([first, second])
+    t.alike(
+      completions,
+      [
+        [true, 1],
+        [true, 1]
+      ],
+      'both callers join the real watcher close and parent close event'
+    )
+    await dht.destroy()
+    t.is(parentCloses, 1, 'later destroy calls retain the completed teardown')
+    t.alike(sends, [], 'destroy-before-start never contacts an endpoint')
+  })
+}
 
 test('public readiness waits for private bootstrap and network change retains only redacted exposure', async (t) => {
   forbidDirectDHT(t)

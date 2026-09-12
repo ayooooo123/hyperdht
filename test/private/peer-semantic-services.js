@@ -288,6 +288,7 @@ async function legacyFixture(t, options = {}) {
   const session = source.service.openSession({ ...limits, expectedNoiseKey: key.publicKey })
   const lease = session.attachEndpoint(events.hooks)
   const flight = initiator.send(payload)
+  if (options.filter) h.filter = options.filter
   lease.sendHandshake(flight)
   await h.settle()
   return { h, source, terminal, events, session, lease, native, flight }
@@ -528,6 +529,115 @@ function packetInfo(record) {
   return { outer, nested, semantic }
 }
 
+function holdSourceCreditAck(held) {
+  let sequence = null
+  return (record) => {
+    if (record.from.route.purpose !== 2) return true
+    const { outer, nested } = packetInfo(record)
+    if (record.from.route.role === 'source') {
+      if (nested && nested.messageId === ID.PEER_CREDIT_V2 && nested.fields.creditEpoch === 1)
+        sequence = outer.fields.laneSequence
+    } else if (
+      outer.messageId === ID.PEER_RELIABLE_ACK_V2 &&
+      sequence !== null &&
+      outer.fields.controlCumulative !== 0xffffffffffffffffn &&
+      outer.fields.controlCumulative >= sequence
+    ) {
+      held.push(record)
+      return false
+    }
+    return true
+  }
+}
+
+test('legacy OPENED waits for cumulative acknowledgment of the semantic open flight', async (t) => {
+  const held = []
+  const f = await legacyFixture(t, {
+    filter(record) {
+      if (packetInfo(record).semantic !== ID.LEGACY_OPEN_V2) return true
+      held.push(record)
+      return false
+    }
+  })
+  t.is(f.events.opens.length, 0)
+  t.alike(f.events.resets, [])
+  t.is(
+    f.h.sent.some(({ from, wire }) => {
+      const { nested } = packetInfo({ wire })
+      return from === f.terminal && nested && nested.messageId === ID.PEER_OPENED_V2
+    }),
+    false,
+    'empty handshake queue does not permit OPENED to overtake the opening flight'
+  )
+  f.h.filter = (record) => {
+    if (record.from !== f.source || packetInfo(record).outer.messageId !== ID.PEER_RELIABLE_ACK_V2)
+      return true
+    held.push(record)
+    return false
+  }
+  f.h.queue.push(...held.splice(0))
+  await f.h.settle()
+  t.is(f.events.opens.length, 1)
+  t.is(f.lease.trySendCiphertext(fill(59, 1)), false, 'delivery alone does not release the barrier')
+  f.h.filter = null
+  f.h.queue.push(...held)
+  await f.h.settle()
+  t.is(f.lease.trySendCiphertext(fill(59, 2)), true)
+  await f.h.settle()
+  t.alike(f.native.data, [fill(59, 2)])
+  t.alike(f.events.resets, [])
+})
+
+test('private opening flights fence dependent OPENED and initial CREDIT on both routes', async (t) => {
+  const held = []
+  const f = await privateFixture(t, {
+    filter(record) {
+      if (packetInfo(record).semantic !== ID.PRIVATE_OPEN_V2) return true
+      held.push(record)
+      return false
+    }
+  })
+  t.is(f.sourceEvents.opens.length, 0)
+  t.is(f.destinationEvents.opens.length, 0)
+  t.alike(f.sourceEvents.resets, [])
+  t.alike(f.destinationEvents.resets, [])
+  f.h.filter = (record) => {
+    if (
+      (record.from !== f.source && record.from !== f.destination) ||
+      packetInfo(record).outer.messageId !== ID.PEER_RELIABLE_ACK_V2
+    )
+      return true
+    held.push(record)
+    return false
+  }
+  f.h.queue.push(...held.splice(0))
+  await f.h.settle()
+  t.is(f.sourceEvents.opens.length, 1)
+  t.is(f.destinationEvents.opens.length, 1)
+  t.is(
+    f.h.sent.some((record) => {
+      const { nested } = packetInfo(record)
+      return (
+        (record.from === f.sourceEntry || record.from === f.destinationEntry) &&
+        nested &&
+        (nested.messageId === ID.PEER_OPENED_V2 || nested.messageId === ID.PEER_CREDIT_V2)
+      )
+    }),
+    false,
+    'neither opening author issues dependent controls before its semantic ACK'
+  )
+  f.h.filter = null
+  f.h.queue.push(...held)
+  await f.h.settle()
+  t.is(f.sourceLease.trySendCiphertext(fill(59, 3)), true)
+  t.is(f.destinationLease.trySendCiphertext(fill(59, 4)), true)
+  await f.h.settle()
+  t.alike(f.sourceEvents.data, [fill(59, 4)])
+  t.alike(f.destinationEvents.data, [fill(59, 3)])
+  t.alike(f.sourceEvents.resets, [])
+  t.alike(f.destinationEvents.resets, [])
+})
+
 test('private source receipt and cumulative credit are separate opening barriers', async (t) => {
   const held = []
   const f = await privateFixture(t, {
@@ -563,7 +673,69 @@ test('private source receipt and cumulative credit are separate opening barriers
   t.is(f.destinationLease.diagnostics().ready, true)
 })
 
-test('legacy credit pauses at one slot, drains preserved bytes, and FIN waits for consumption', async (t) => {
+test('issued credit admits DATA and FIN while the local credit ACK is delayed', async (t) => {
+  const held = []
+  const f = await privateFixture(t, { filter: holdSourceCreditAck(held) })
+  t.is(f.sourceLease.diagnostics().ready, false)
+  t.is(f.destinationLease.trySendCiphertext(fill(59, 7)), true)
+  f.destinationLease.finish()
+  await f.h.settle()
+  t.alike(f.sourceEvents.resets, [])
+  t.is(f.sourceLease.diagnostics().pendingCiphertextBytes, 59)
+  t.alike(f.sourceEvents.data, [], 'admission does not expose ciphertext before local readiness')
+  t.is(f.sourceEvents.fins, 0)
+  t.is(f.sourceLease.trySendCiphertext(fill(59, 8)), false, 'outbound readiness is unchanged')
+  f.h.filter = null
+  f.h.queue.push(...held)
+  await f.h.settle()
+  t.alike(f.sourceEvents.data, [fill(59, 7)])
+  t.is(f.sourceEvents.fins, 1)
+  t.is(f.sourceLease.diagnostics().pendingCiphertextBytes, 0)
+  t.alike(f.sourceEvents.resets, [])
+})
+
+test('an empty inbound FIN waits for local readiness without resetting the stream', async (t) => {
+  const held = []
+  const f = await privateFixture(t, { filter: holdSourceCreditAck(held) })
+  f.destinationLease.finish()
+  await f.h.settle()
+  t.alike(f.sourceEvents.resets, [])
+  t.is(f.sourceEvents.fins, 0, 'empty FIN cannot bypass the application readiness barrier')
+  t.is(f.sourceLease.diagnostics().closed, false)
+  f.h.filter = null
+  f.h.queue.push(...held)
+  await f.h.settle()
+  t.is(f.sourceEvents.fins, 1)
+  t.alike(f.sourceEvents.resets, [])
+})
+
+test('an unsent credit refill cannot authorize another ciphertext frame', async (t) => {
+  const f = await legacyFixture(t)
+  const trySend = f.terminal.lanes.trySend.bind(f.terminal.lanes)
+  f.terminal.lanes.trySend = (wire) =>
+    decodePeerTransport(wire).messageId === ID.PEER_CREDIT_V2 ? null : trySend(wire)
+  t.is(f.lease.trySendCiphertext(fill(59, 9)), true)
+  await f.h.settle()
+  t.alike(f.native.data, [fill(59, 9)])
+  t.is(f.lease.trySendCiphertext(fill(59, 10)), false)
+  const first = f.h.sent.find((record) => {
+    const { nested } = packetInfo(record)
+    return record.from === f.source && nested && nested.messageId === ID.PEER_DATA_V2
+  })
+  const forged = encodePeerTransport(ID.PEER_DATA_V2, {
+    common: { ...packetInfo(first).nested.fields.common, position: 59n },
+    dataBytes: 59,
+    dataFlags: 0,
+    bytes: fill(59, 10)
+  })
+  t.ok(f.source.lanes.trySend(forged), 'peer bypasses its own sender credit check')
+  await f.h.settle()
+  t.alike(f.native.data, [fill(59, 9)], 'only the actually granted frame reaches native I/O')
+  t.is(f.events.resets.length, 1)
+  t.is(f.lease.diagnostics().closed, true)
+})
+
+test('legacy credit pauses at one slot, drains preserved bytes, and teardown waits for consumption', async (t) => {
   const f = await legacyFixture(t)
   const first = fill(977, 11)
   f.native.pause = true
@@ -572,7 +744,8 @@ test('legacy credit pauses at one slot, drains preserved bytes, and FIN waits fo
   t.is(f.lease.trySendCiphertext(fill(10, 12)), false)
   await f.h.settle()
   t.alike(f.native.data, [])
-  const finished = f.lease.finish()
+  const finished = f.lease.finished()
+  f.lease.finish()
   let ended = false
   finished.then(() => {
     ended = true
@@ -607,16 +780,45 @@ test('private bridges carry ciphertext both ways, renew credit, and finish both 
   await f.h.settle()
   t.alike(f.destinationEvents.data, [fill(977, 21), fill(23, 22)])
   t.alike(f.sourceEvents.data, [fill(59, 23)])
+  const held = []
+  f.h.filter = (record) => {
+    if (
+      record.from !== f.sourceEntry ||
+      packetInfo(record).outer.messageId !== ID.PEER_RELIABLE_ACK_V2
+    )
+      return true
+    held.push(record)
+    return false
+  }
+  let sentFin = false
+  let joined = false
+  const sourceJoined = f.sourceLease.finished().then(() => {
+    joined = true
+  })
   const sourceFin = f.sourceLease.finish()
+  sourceFin.then(() => {
+    sentFin = true
+  })
   await f.h.settle()
   t.is(f.destinationEvents.fins, 1)
   t.is(f.sourceLease.diagnostics().closed, false)
+  t.is(sentFin, false, 'finish waits for its own FIN acknowledgment')
+  t.is(joined, false)
+  f.h.filter = null
+  f.h.queue.push(...held)
+  await f.h.settle()
+  t.is(sentFin, true, 'finish resolves without a reciprocal FIN')
+  t.is(joined, false, 'finished remains the bidirectional teardown join')
+  t.is(f.destinationLease.trySendCiphertext(fill(59, 24)), true)
+  await f.h.settle()
+  t.alike(f.sourceEvents.data, [fill(59, 23), fill(59, 24)], 'reverse traffic survives local FIN')
   const destinationFin = f.destinationLease.finish()
   await f.h.settle()
   t.is(f.sourceEvents.fins, 1)
   t.is(f.sourceLease.diagnostics().closed, true)
   t.is(f.destinationLease.diagnostics().closed, true)
-  await Promise.all([sourceFin, destinationFin])
+  await Promise.all([sourceFin, destinationFin, sourceJoined, f.destinationLease.finished()])
+  t.is(joined, true)
   for (const side of f.h.sides) t.is(side.service.diagnostics().receiveSlots, 0)
 })
 
