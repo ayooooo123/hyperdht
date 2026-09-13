@@ -31,8 +31,10 @@ exists. Accepted limitations are tracked under [Known issues](#known-issues).
 ### Current implementation
 
 The current alpha peer checkpoint is
-[`0c8af51`](https://github.com/ayooooo123/hyperdht/commit/0c8af51),
-published from `implement-private-peer-v2` on 2026-09-12. Its scope is:
+[`234ef75`](https://github.com/ayooooo123/hyperdht/commit/234ef75),
+published from `implement-private-peer-v2` on 2026-09-12. It supersedes the
+initial `0c8af51` cutover with registration-ownership, resolver-admission, and
+logical-stream-retirement corrections. Its scope is:
 
 - ordinary HyperDHT peer APIs stay direct; private peer behavior is selected
   through the frozen `dht.privateRouting` facade;
@@ -40,10 +42,17 @@ published from `implement-private-peer-v2` on 2026-09-12. Its scope is:
 - destination guard, entry, and source guard roles are distinct;
 - signed descriptors use opaque route capabilities and period-blinded storage
   targets rather than destination attachment keys;
+- resolver role admission completes before the source discloses its destination
+  application key and is mutually reserved against destination guard and entry
+  roles;
+- guard-to-entry registration is authenticated with the descriptor's advertised
+  destination-guard relay identity before the entry may replace a live circuit;
 - relays authenticate, open, and reseal fixed STREAM cells with fresh adjacent
-  route contexts instead of transparently joining streams; and
+  route contexts instead of transparently joining streams;
 - one destination circuit multiplexes independent end-to-end
-  Noise/SecretStream sessions.
+  Noise/SecretStream sessions; and
+- logical FIN/RESET retirement is idempotent and stream-scoped, preserving
+  sibling sessions on the shared circuit.
 
 The earlier routed-DHT implementation checkpoint is
 [`cae9721`](https://github.com/ayooooo123/hyperdht/commit/cae9721f946b4d3b2b8adcb61b3230332371e830),
