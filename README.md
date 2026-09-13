@@ -13,7 +13,7 @@ Built on top of [dht-rpc](https://github.com/mafintosh/dht-rpc).
 The Hyperswarm DHT uses a series of holepunching techniques to make sure connectivity works on most networks,
 and is mainly used to facilitate finding and connecting to peers using end to end encrypted Noise streams.
 
-> **ALPHA fork API:** Explicitly acknowledged `privateRouting` now enables fail-closed, routed immutable/mutable DHT get and put. Direct mode is unchanged when that option is absent. This remains **alpha/beta, not production anonymity**, until **both Linux privacy evidence and external human cryptographic review** are complete. The peer semantic/controller modules, blinded presence, and experimental SURB replies remain internal; there is no proven public peer route-owner integration or private Hyperswarm support. See the [public alpha contract and deferred surfaces](docs/private-routing-v1.md#public-api).
+> **ALPHA fork API:** Explicitly acknowledged `privateRouting` changes public peer `connect()` and `createServer()` only: peer lookup and payload transit use fail-closed relay routes with end-to-end Noise. Bootstrap, lookup/announce, immutable and mutable records, plugins, queries, pings, and routing-table maintenance keep their normal direct-overlay behavior and are **not anonymized**. Omit the option for normal direct peer connections. This remains **alpha, not production anonymity**, until Linux privacy evidence and external human cryptographic review are complete; private Hyperswarm integration is not provided. See [ALPHA private peer routing](#alpha-private-peer-routing).
 
 ## Usage
 
