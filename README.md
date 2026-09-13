@@ -60,76 +60,72 @@ socket.on('open', function () {
 process.stdin.pipe(socket).pipe(process.stdout)
 ```
 
-### ALPHA private DHT records
+### ALPHA private peer routing
 
-Use explicitly configured private-relay bootstrap endpoints, not the ordinary
-public DHT bootstrap servers. The relays must already run the compatible private
-protocol and provide enough valid, diverse routes; construction alone does not
-establish readiness.
+Private routing is opt-in. A private node remains an ordinary HyperDHT
+participant: normal `bootstrap` and routing-table discovery supply eligible
+route hops. No private bootstrap endpoint list, bind address, or advertised
+address is accepted.
 
 ```js
 const dht = new DHT({
   privateRouting: {
     release: 'alpha',
     acknowledgeAlpha: true,
-    mode: 'required',
-    bootstrapEndpoints: [{ host: '127.0.0.1', port: 49001 }],
-    host: '127.0.0.1',
-    port: 49002
-    // Optional NAT mapping: advertisedHost and advertisedPort, supplied together.
+    mode: 'required'
   }
 })
 
-try {
-  await dht.ready() // Rejects unless the private guard and both routes are ready.
-  const { hash } = await dht.immutablePut(Buffer.from('experimental record'))
-  const record = await dht.immutableGet(hash)
-  console.log(record.value)
-} finally {
-  await dht.destroy()
-}
+await dht.ready()
+
+const server = dht.createServer(function (socket) {
+  socket.pipe(socket)
+})
+
+await server.listen(keyPair)
+
+const socket = dht.connect(keyPair.publicKey)
+socket.write('private peer payload')
 ```
 
-The loopback example requires a compatible private relay at `127.0.0.1:49001`;
-it does not start one. Every configuration field must be an own data property
-on an ordinary object. The exact fields above are required; only the advertised
-pair is optional. Supply one to three distinct numeric-IP bootstrap endpoints
-with `{ host, port }`, numeric bind/advertised hosts, and ports 1–65535. Hostnames,
-accessors, inherited fields, unknown fields, `mode: 'off'`, and legacy-egress
-toggles are rejected. Omit `privateRouting` entirely for direct mode.
+Every `privateRouting` field must be an own data property on an ordinary
+object. The three fields above are exact and required; accessors, inherited
+fields, unknown fields, `bootstrapEndpoints`, and endpoint host/port fields are
+rejected. Omit `privateRouting` entirely for direct peer connections.
 
-In required mode, ordinary DHT network options (including `bootstrap`, `nodes`,
-`udx`, and `requestTransport`) are not read or forwarded. There is no direct
-bootstrap, query, connection, or failure fallback. An optional top-level
-`keyPair` (or `seed`) supplies local identity; authority consumption copies its
-secret rather than erasing the caller's buffer.
+`createServer()` selects an entry relay from normal HyperDHT discovery and
+publishes a signed, expiring private-route descriptor through a separately
+selected safety relay. `connect()` selects its own safety relay, resolves that
+descriptor from an ordinary overlay participant, and composes the source-owned
+safety route with the destination-owned private route. Relays forward fixed
+1200-byte route cells. The peer Noise/SecretStream session remains end-to-end
+between the client and server application keys.
+
+Route-only peer information is not added to the caller's routing table and is
+not used for a direct destination ping or dial. Missing, invalid, or expired
+route descriptors fail closed; there is no direct peer fallback.
+
+Private mode changes peer `connect()` and `createServer()` only. Ordinary
+HyperDHT operations—including bootstrap, lookup/announce, immutable and mutable
+records, plugins, queries, pings, and routing-table maintenance—retain their
+normal direct-overlay behavior and are **not** anonymized by this option.
 
 `dht.privateRouting` is read-only and frozen:
 
 - `release === 'alpha'`, `mode === 'required'`.
-- `ready()` waits for private readiness, like `dht.ready()` and
-  `dht.fullyBootstrapped()`. Readiness cannot be reused after loss or suspension.
-- `status()` returns the controller state (`OFF`, `BOOTSTRAPPING`,
-  `GUARD_PINNED`, `BUILDING`, `READY`, `ROTATING`, `SUSPENDED`, `UNAVAILABLE`,
-  or `DESTROYED`).
-- `exposureReport()` returns frozen, bounded bootstrap-contact entries with
-  categories, counts, bigint millisecond timestamps, outcomes, and salted,
-  redacted endpoint hashes. No keys, raw addresses, or complete paths.
+- `ready()` waits for normal HyperDHT bootstrap and local relay participation,
+  like `dht.ready()` and `dht.fullyBootstrapped()`.
+- `status()` returns `BOOTSTRAPPING`, `READY`, `SUSPENDED`, or `DESTROYED`.
+- `exposureReport()` reports the routing model and the direct-destination-send
+  trap without exposing keys, addresses, or complete paths.
 
-`immutableGet`, `immutablePut`, `mutableGet`, and `mutablePut` use the private
-controller. Immutable values are limited to 1023 bytes; mutable values to
-895 bytes. Results carry opaque routed destinations, not direct dial addresses.
-Call `ready()` before records. Suspension stops record work; resume must rebuild
-private routes. Local network-interface changes revoke route ownership and
-leave the instance unavailable; create a new instance after that failure.
-`destroy()` cancels pending readiness/work and joins private teardown.
+Suspension stops relay advertisement; resume republishes listening-server route
+descriptors. `destroy()` closes private servers, relay advertisement, and
+pending route work with the DHT lifecycle.
 
-`lookup`, `announce`, `unannounce`, `lookupAndUnannounce`, `findPeer`, `connect`,
-`createServer`, `pool`, raw streams, raw `query`/`request`, `findNode`, `ping`,
-`delayedPing`, local-address validation, and plugins reject with
-`ERR_PRIVATE_COMMAND_UNSUPPORTED`. No public peer streams, server listening,
-Hyperswarm private discovery, or legacy-egress switch are offered. The peer
-examples elsewhere in this README describe **direct mode only**.
+This remains an experimental alpha, not a production anonymity claim. Local
+Node/Bare behavior tests do not replace Linux packet-capture evidence or
+external cryptographic review.
 
 ## API
 
