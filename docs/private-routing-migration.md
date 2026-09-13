@@ -31,10 +31,11 @@ exists. Accepted limitations are tracked under [Known issues](#known-issues).
 ### Current implementation
 
 The current alpha peer checkpoint is
-[`234ef75`](https://github.com/ayooooo123/hyperdht/commit/234ef75),
-published from `implement-private-peer-v2` on 2026-09-12. It supersedes the
-initial `0c8af51` cutover with registration-ownership, resolver-admission, and
-logical-stream-retirement corrections. Its scope is:
+[`5018ef7`](https://github.com/ayooooo123/hyperdht/commit/5018ef7),
+published from `implement-private-peer-v2` on 2026-09-12. It supersedes
+`234ef75` by retaining retired logical stream IDs and discarding their
+late in-flight frames; it also includes the initial `0c8af51` cutover's
+registration-ownership and resolver-admission corrections. Its scope is:
 
 - ordinary HyperDHT peer APIs stay direct; private peer behavior is selected
   through the frozen `dht.privateRouting` facade;
@@ -51,8 +52,9 @@ logical-stream-retirement corrections. Its scope is:
   route contexts instead of transparently joining streams;
 - one destination circuit multiplexes independent end-to-end
   Noise/SecretStream sessions; and
-- logical FIN/RESET retirement is idempotent and stream-scoped, preserving
-  sibling sessions on the shared circuit.
+- logical FIN/RESET retirement is idempotent and stream-scoped; retired IDs
+  remain tombstoned until circuit teardown so late DATA cannot destroy sibling
+  sessions on the shared circuit.
 
 The earlier routed-DHT implementation checkpoint is
 [`cae9721`](https://github.com/ayooooo123/hyperdht/commit/cae9721f946b4d3b2b8adcb61b3230332371e830),
