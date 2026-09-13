@@ -93,13 +93,15 @@ object. The three fields above are exact and required; accessors, inherited
 fields, unknown fields, `bootstrapEndpoints`, and endpoint host/port fields are
 rejected. Omit `privateRouting` entirely for direct peer connections.
 
-`createServer()` selects an entry relay from normal HyperDHT discovery and
-publishes a signed, expiring private-route descriptor through a separately
-selected safety relay. `connect()` selects its own safety relay, resolves that
-descriptor from an ordinary overlay participant, and composes the source-owned
-safety route with the destination-owned private route. Relays forward fixed
-1200-byte route cells. The peer Noise/SecretStream session remains end-to-end
-between the client and server application keys.
+`createServer()` opens a destination-owned outbound attachment to an entry
+relay, then publishes a signed, expiring private-route descriptor through a
+separately selected safety relay. The descriptor contains an opaque, single-use
+route entry—not a destination transport key or dial address. `connect()` selects
+its own safety relay, resolves that descriptor from an ordinary overlay
+participant, and composes the source-owned safety route with the
+destination-owned attachment. Relays forward fixed 1200-byte route cells. The
+peer Noise/SecretStream session remains end-to-end between the client and server
+application keys.
 
 Route-only peer information is not added to the caller's routing table and is
 not used for a direct destination ping or dial. Missing, invalid, or expired

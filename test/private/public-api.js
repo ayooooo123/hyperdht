@@ -4,6 +4,8 @@ const test = require('brittle')
 const b4a = require('b4a')
 
 const HyperDHT = require('../..')
+const directConnect = require('../../lib/connect')
+const { decodeDescriptor } = require('../../lib/private/overlay-descriptor-service')
 
 let nextPort = 49300
 
@@ -134,6 +136,36 @@ test('private connect compiles safety and destination routes around fixed cells'
   })
   t.teardown(() => server.close())
   await server.listen(serverKeyPair)
+
+  let destinationDiscovered = false
+  for await (const result of source.findPeer(server.publicKey)) {
+    destinationDiscovered = true
+    t.absent(result, 'destination application key has no public peer record')
+  }
+  t.is(destinationDiscovered, false, 'destination endpoint is not publicly discoverable')
+  const directDestination = directConnect(source, server.publicKey, {
+    keyPair: HyperDHT.keyPair()
+  })
+  directDestination.on('error', () => {})
+  t.is(
+    await directDestination.opened,
+    false,
+    'destination application key cannot be dialed directly'
+  )
+
+  const descriptor = decodeDescriptor(server._descriptor)
+  let routeEntryDiscovered = false
+  for await (const result of source.findPeer(descriptor.routeEntry)) {
+    routeEntryDiscovered = true
+    t.absent(result, 'opaque route entry has no public peer record')
+  }
+  t.is(routeEntryDiscovered, false, 'descriptor route entry is not publicly discoverable')
+  const direct = directConnect(source, descriptor.routeEntry, {
+    keyPair: HyperDHT.keyPair()
+  })
+  direct.on('error', () => {})
+  t.is(await direct.opened, false, 'descriptor holder cannot dial the destination attachment')
+  t.is(accepted, null, 'direct route-entry dial never reaches the destination server')
 
   const socket = source.connect(server.publicKey)
   socket.on('error', () => {})
