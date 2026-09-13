@@ -5678,6 +5678,13 @@ firewall, so it conflated route availability with policy behavior. The isolated
 regression waits for the authenticated firewall callback and verifies exactly
 one call plus zero emitted connections.
 
+Build Status run `34777014693` exposed a second test-harness race: the invalid
+ciphertext regression waited for an application error without putting the
+application stream into flowing mode, so Linux could deadlock before consuming
+the record. The regression now calls `resume()` before injection. It passes
+18/18 tests and 103/103 assertions on Node and Bare, plus 25/25 independent
+process runs in a fresh Linux arm64 Node 24 container.
+
 The dormant native peer-tail activation now snapshots all twelve handoff
 properties and revalidates their exact data-property identities, authoritative
 clock/deadline/owner facts, and final-exit generation at both prepare and
