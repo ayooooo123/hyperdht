@@ -121,6 +121,10 @@ destination application key. A forced destination-role candidate rejects
 before that key is sent. The destination guard authenticates its registration
 to the entry with its advertised relay Noise identity; the entry verifies that
 identity against the signed descriptor before replacing any live circuit.
+Before initial publication, restart, or refresh, the endpoint asks its selected
+destination guard to recover the signed previous descriptor on the same
+authenticated control connection. The guard performs descriptor GET and PUT
+operations; the destination endpoint emits no descriptor-target storage traffic.
 
 The entry multiplexes independent logical streams over the destination circuit.
 Every physical relay hop authenticates and opens each 1200-byte route cell,
@@ -128,10 +132,10 @@ then reseals the payload with a fresh adjacent circuit key, nonce, circuit ID,
 and counter. A relay therefore transforms on-wire bytes rather than forwarding
 an unchanged transparent stream. The application Noise/SecretStream handshake
 remains end-to-end between the client and server application keys.
-Logical reset and close are stream-scoped and idempotent. The entry retains
-retired stream IDs for the circuit lifetime and discards their late in-flight
-DATA, so closing one multiplexed stream cannot reset its siblings or the
-destination circuit.
+Logical reset and close are stream-scoped and idempotent. Both the entry and
+destination endpoint retain retired stream IDs for the circuit lifetime and
+discard their late in-flight DATA, so closing either side of one multiplexed
+stream cannot reset its siblings or the destination circuit.
 
 Route-only peer information is not added to the caller's routing table and is
 not used for a direct destination ping or dial. Missing, invalid, expired, or
