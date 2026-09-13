@@ -93,7 +93,7 @@ object. The three fields above are exact and required; accessors, inherited
 fields, unknown fields, `bootstrapEndpoints`, and endpoint host/port fields are
 rejected. Omit `privateRouting` entirely for direct peer connections.
 
-`createServer()` opens a destination-owned outbound attachment to an entry
+`createServer()` opens an outbound attachment authenticated by its application key to an entry
 relay, then publishes a signed, expiring private-route descriptor through a
 separately selected safety relay. The descriptor contains an opaque, single-use
 route entry—not a destination transport key or dial address. `connect()` selects
