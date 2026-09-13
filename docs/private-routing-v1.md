@@ -1,38 +1,41 @@
-# Native Private Routing v1
+# Native Private Routing v1 (superseded design record)
 
-**Status:** public DHT-record ALPHA API; peer/Hyperswarm integration remains internal/deferred
+**Status:** superseded DHT-record design; current alpha uses overlay-native
+private peer routes
 **Date:** 2026-07-16  
 **Canonical repository:** `ayooooo123/hyperdht`  
 **Related forks:** `ayooooo123/dht-rpc`, `ayooooo123/hyperswarm`,
 `ayooooo123/hyperswarm-testnet`
 
-**Implementation status (2026-09-12):** the public HyperDHT constructor now
-activates immutable/mutable get and put through the existing private bootstrap
-authority and routing controller, with explicit alpha acknowledgement and
-fail-closed `required` mode. Direct mode remains unchanged when the option is
-absent. Experimental required SURB replies and blinded presence remain internal.
-The new peer semantic services and endpoint/controller modules are internal:
-there is **no proven public peer route-owner integration**, private peer-stream
-API, legacy-peer egress API, or Hyperswarm private API.
+**Superseded on 2026-09-12:** this document preserves the earlier routed-DHT
+design and its security analysis. It is not the current public API contract.
+The active alpha instead keeps HyperDHT as the ordinary overlay and changes
+peer `connect()`/`createServer()`:
 
-This release must remain **alpha/beta, not production anonymity**, until **both**
-deferred gates are complete: **Linux privacy evidence** and **external human
-cryptographic review**. Local Node/Bare tests do not satisfy either gate. The
-remaining July peer/egress design targets do not enable those surfaces. Later
-decisions D10–D12 select blinded presence over mutable records and reject routed
-public `lookup`, `findPeer`, `announce`, `unannounce`, and raw `query`. See the
-[migration record](private-routing-migration.md#current-implementation) for the
-historical internal implementation and open gates; the public alpha contract
-below supersedes its earlier public-activation status.
+- normal HyperDHT bootstrap and routing discovery supply route hops;
+- the source owns a Safety Route;
+- the destination owns and publishes a signed, expiring Private Route
+  descriptor through a separately selected safety relay;
+- descriptor lookup terminates at an ordinary overlay participant;
+- the two route halves carry a Noise/SecretStream session through fixed
+  1200-byte route cells; and
+- ordinary DHT record and routing operations retain direct-overlay behavior.
 
-## Summary
+There is no `privateRouting.bootstrapEndpoints`, raw DHT egress proxy, arbitrary
+UDP destination path, or direct fallback to a route-only peer. See the README's
+“ALPHA private peer routing” section for the current configuration and public
+contract.
 
-This design targets opt-in, fail-closed routing in the Holepunch stack. DHT
-operations use short, independently selected relay branches rather than a
-direct endpoint-to-DHT path. The proposed peer-stream layer would preserve
-Hyperswarm Noise/SecretStream encryption end to end; relays would forward
-fixed-size authenticated cells without terminating the peer's Noise session.
-The public DHT-record alpha path is implemented; public peer-stream integration is not.
+The current release must remain **alpha/beta, not production anonymity**, until
+**both** deferred gates are complete: **Linux privacy evidence** and **external
+human cryptographic review**. Local Node/Bare tests do not satisfy either gate.
+
+## Historical summary
+
+The design below targeted opt-in, fail-closed DHT-record routing through short,
+independently selected relay branches. It remains useful as an implementation
+and threat-model record, but its public activation and peer-integration claims
+are superseded by the overlay-native peer routing described above.
 
 The feature is developed in drop-in-compatible forks before any PearTube
 integration. Existing constructors, exports, package names, and direct-mode

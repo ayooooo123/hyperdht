@@ -28,49 +28,12 @@ const DEFAULTS = {
 class HyperDHT extends DHT {
   constructor(opts = {}) {
     const privateOptions = privateRoutingOptions(opts)
-    const routing = privateOptions ? createPrivateRouting(privateOptions, opts) : null
-
-    try {
-      if (routing) {
-        super({ outboundPolicy: 'transport-only', requestTransport: routing.transport })
-      } else {
-        const port = opts.port || 49737
-        const bootstrap = opts.bootstrap || BOOTSTRAP_NODES
-        const nodes = opts.nodes || []
-        super({ ...opts, port, bootstrap, nodes, filterNode })
-      }
-    } catch (err) {
-      if (routing) void routing.controller.destroy().catch(safetyCatch)
-      throw err
-    }
-
-    if (routing) {
-      PRIVATE_ROUTING.set(this, routing)
-      this.defaultKeyPair = routing.keyPair
-      Object.defineProperty(this, 'privateRouting', {
-        enumerable: true,
-        value: Object.freeze({
-          release: 'alpha',
-          mode: 'required',
-          ready: () => routing.controller.ready(),
-          status: () => routing.controller.snapshot().state,
-          exposureReport: () => routing.controller.exposureReport()
-        })
-      })
-      // Monitor local interface changes, but never create a direct DHT socket.
-      try {
-        const UDX = require('udx-native')
-        routing.interfaces = new UDX().watchNetworkInterfaces()
-        routing.interfaces.on('change', (interfaces) => this._onnetworkchange(interfaces))
-        this.on('network-change', () => {
-          void routing.controller.networkChanged().catch(safetyCatch)
-        })
-      } catch (err) {
-        void this.destroy().catch(safetyCatch)
-        throw err
-      }
-      return
-    }
+    const directOptions = { ...opts }
+    delete directOptions.privateRouting
+    const port = directOptions.port || 49737
+    const bootstrap = directOptions.bootstrap || BOOTSTRAP_NODES
+    const nodes = directOptions.nodes || []
+    super({ ...directOptions, port, bootstrap, nodes, filterNode })
 
     const { router, relayAddresses, persistent } = defaultCacheOpts(opts)
 
@@ -116,8 +79,21 @@ class HyperDHT extends DHT {
       if (!this.online) return
       for (const server of this.listening) server.notifyOnline()
     })
+    if (privateOptions) {
+      const routing = createPrivateRouting(privateOptions, this)
+      PRIVATE_ROUTING.set(this, routing)
+      Object.defineProperty(this, 'privateRouting', {
+        enumerable: true,
+        value: Object.freeze({
+          release: 'alpha',
+          mode: 'required',
+          ready: () => routing.controller.ready(),
+          status: () => routing.controller.snapshot().state,
+          exposureReport: () => routing.controller.exposureReport()
+        })
+      })
+    }
   }
-
   static DEFAULTS = DEFAULTS
 
   static bootstrapper(port, host, opts) {
@@ -126,18 +102,7 @@ class HyperDHT extends DHT {
   }
 
   _bootstrap() {
-    if (this.outboundPolicy !== 'transport-only') return super._bootstrap()
-    // The base constructor calls this before instance ownership is installed.
-    return Promise.resolve().then(async () => {
-      const routing = PRIVATE_ROUTING.get(this)
-      await routing.controller.ready()
-      if (this.destroyed) return
-      if (routing.controller.snapshot().state !== 'READY') {
-        throw require('./lib/private/errors').PrivateRouteError.ERR_PRIVACY_UNAVAILABLE()
-      }
-      this.bootstrapped = true
-      this.emit('ready')
-    })
+    return super._bootstrap()
   }
 
   ready() {
@@ -151,76 +116,61 @@ class HyperDHT extends DHT {
   }
 
   query(message, opts) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     return super.query(message, opts)
   }
 
   request(message, to, opts) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     return super.request(message, to, opts)
   }
 
   findNode(target, opts) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     return super.findNode(target, opts)
   }
 
   ping(to, opts) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     return super.ping(to, opts)
   }
 
   delayedPing(to, delayMs, opts) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     return super.delayedPing(to, delayMs, opts)
   }
 
   connect(remotePublicKey, opts) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
-    return connect(this, remotePublicKey, opts)
+    const routing = PRIVATE_ROUTING.get(this)
+    return routing
+      ? routing.controller.connect(remotePublicKey, opts)
+      : connect(this, remotePublicKey, opts)
   }
 
   createServer(opts, onconnection) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     if (typeof opts === 'function') return this.createServer({}, opts)
     if (opts && opts.onconnection) onconnection = opts.onconnection
+    const routing = PRIVATE_ROUTING.get(this)
+    if (routing) return routing.controller.createServer(opts, onconnection)
     const s = new Server(this, opts)
     if (onconnection) s.on('connection', onconnection)
     return s
   }
 
   pool() {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     return new ConnectionPool(this)
   }
 
   async resume({ log = noop } = {}) {
-    const routing = PRIVATE_ROUTING.get(this)
-    if (routing) {
-      await routing.controller.resume()
-      this.suspended = false
-      this.emit('resume')
-      return
-    }
     if (this._deferRandomPunch) this._lastRandomPunch = Date.now()
     await super.resume({ log })
     const resuming = []
     for (const server of this.listening) resuming.push(server.resume())
     log('Resuming hyperdht servers')
     await Promise.allSettled(resuming)
+    const routing = PRIVATE_ROUTING.get(this)
+    if (routing) await routing.controller.resume()
     log('Done, hyperdht fully resumed')
   }
 
   async suspend({ log = noop } = {}) {
     const routing = PRIVATE_ROUTING.get(this)
-    if (routing) {
-      await routing.controller.suspend()
-      if (!this.suspended) {
-        this.suspended = true
-        this.emit('suspend')
-      }
-      return
-    }
+    if (routing) await routing.controller.suspend()
     this._connectable = false // just so nothing gets connected during suspension
     const suspending = []
     for (const server of this.listening) suspending.push(server.suspend())
@@ -238,29 +188,7 @@ class HyperDHT extends DHT {
 
   async destroy({ force = false } = {}) {
     const routing = PRIVATE_ROUTING.get(this)
-    if (routing) {
-      if (routing.destroyPromise !== null) return routing.destroyPromise
-      let resolveDestroy
-      routing.destroyPromise = new Promise((resolve) => {
-        resolveDestroy = resolve
-      })
-      // Publish the join before revoking bootstrap or invoking close callbacks.
-      resolveDestroy(
-        (async () => {
-          try {
-            // Revoke synchronously, before the constructor's queued bootstrap.
-            await routing.controller.destroy()
-          } finally {
-            try {
-              await closePrivateInterfaces(routing)
-            } finally {
-              await super.destroy()
-            }
-          }
-        })()
-      )
-      return routing.destroyPromise
-    }
+    if (routing) await routing.controller.destroy()
     if (!force) {
       const closing = []
       for (const server of this.listening) closing.push(server.close())
@@ -275,7 +203,6 @@ class HyperDHT extends DHT {
   }
 
   async validateLocalAddresses(addresses) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     const list = []
     const socks = []
     const waiting = []
@@ -327,20 +254,17 @@ class HyperDHT extends DHT {
   }
 
   findPeer(publicKey, opts = {}) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     const target = opts.hash === false ? publicKey : hash(publicKey)
     opts = { ...opts, map: mapFindPeer }
     return this.query({ target, command: COMMANDS.FIND_PEER, value: null }, opts)
   }
 
   lookup(target, opts = {}) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     opts = { ...opts, map: mapLookup }
     return this.query({ target, command: COMMANDS.LOOKUP, value: null }, opts)
   }
 
   lookupAndUnannounce(target, keyPair, opts = {}) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     const unannounces = []
     const dht = this
     const userCommit = opts.commit || noop
@@ -384,12 +308,10 @@ class HyperDHT extends DHT {
   }
 
   unannounce(target, keyPair, opts = {}) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     return this.lookupAndUnannounce(target, keyPair, opts).finished()
   }
 
   announce(target, keyPair, relayAddresses, opts = {}) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     const signAnnounce = opts.signAnnounce || Persistent.signAnnounce
     const bump = opts.bump || 0
 
@@ -412,8 +334,6 @@ class HyperDHT extends DHT {
   }
 
   async immutableGet(target, opts = {}) {
-    const routing = PRIVATE_ROUTING.get(this)
-    if (routing) return routing.controller.immutableGet(target, opts)
     opts = { ...opts, map: mapImmutable }
 
     const query = this.query({ target, command: COMMANDS.IMMUTABLE_GET, value: null }, opts)
@@ -429,8 +349,6 @@ class HyperDHT extends DHT {
   }
 
   async immutablePut(value, opts = {}) {
-    const routing = PRIVATE_ROUTING.get(this)
-    if (routing) return routing.controller.immutablePut(value, opts)
     const target = b4a.allocUnsafe(32)
     sodium.crypto_generichash(target, value)
 
@@ -452,8 +370,6 @@ class HyperDHT extends DHT {
   }
 
   async mutableGet(publicKey, opts = {}) {
-    const routing = PRIVATE_ROUTING.get(this)
-    if (routing) return routing.controller.mutableGet(publicKey, opts)
     let refresh = opts.refresh || null
     let signed = null
     let result = null
@@ -507,8 +423,6 @@ class HyperDHT extends DHT {
   }
 
   async mutablePut(keyPair, value, opts = {}) {
-    const routing = PRIVATE_ROUTING.get(this)
-    if (routing) return routing.controller.mutablePut(keyPair, value, opts)
     const signMutable = opts.signMutable || Persistent.signMutable
 
     const target = b4a.allocUnsafe(32)
@@ -546,7 +460,6 @@ class HyperDHT extends DHT {
   }
 
   onrequest(req) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     switch (req.command) {
       case COMMANDS.PEER_HANDSHAKE: {
         this._router.onpeerhandshake(req)
@@ -619,7 +532,6 @@ class HyperDHT extends DHT {
   }
 
   createRawStream(opts) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     return this.rawStreams.add(opts)
   }
 
@@ -674,7 +586,6 @@ class HyperDHT extends DHT {
   }
 
   register(name, plugin) {
-    if (PRIVATE_ROUTING.has(this)) rejectPrivateCommand()
     this.plugins.set(name, plugin)
     plugin.onregister(this)
   }
@@ -717,113 +628,27 @@ function privateRoutingOptions(opts) {
   if (opts === null || (typeof opts !== 'object' && typeof opts !== 'function')) return null
   if (!('privateRouting' in opts)) return null
   const value = ownData(opts, 'privateRouting')
-  if (value === null || typeof value !== 'object') invalidPrivateOptions()
-  const advertised =
-    Object.hasOwn(value, 'advertisedHost') || Object.hasOwn(value, 'advertisedPort')
-  const fields = ['release', 'acknowledgeAlpha', 'mode', 'bootstrapEndpoints', 'host', 'port']
-  if (advertised) fields.push('advertisedHost', 'advertisedPort')
-  const options = exactPrivateObject(value, fields)
+  const options = exactPrivateObject(value, ['release', 'acknowledgeAlpha', 'mode'])
   if (
     options.release !== 'alpha' ||
     options.acknowledgeAlpha !== true ||
     options.mode !== 'required'
   )
     invalidPrivateOptions()
-  if (
-    advertised &&
-    (options.advertisedHost === undefined || options.advertisedPort === undefined)
-  ) {
-    invalidPrivateOptions()
-  }
-  const endpoints = options.bootstrapEndpoints
-  if (
-    !Array.isArray(endpoints) ||
-    Object.getPrototypeOf(endpoints) !== Array.prototype ||
-    endpoints.length < 1 ||
-    endpoints.length > 3 ||
-    Reflect.ownKeys(endpoints).length !== endpoints.length + 1
-  )
-    invalidPrivateOptions()
-  options.bootstrapEndpoints = []
-  for (let i = 0; i < endpoints.length; i++) {
-    options.bootstrapEndpoints.push(
-      exactPrivateObject(ownData(endpoints, String(i)), ['host', 'port'])
-    )
-  }
   return options
 }
 
-function createPrivateRouting(options, opts) {
-  const { createEndpointBootstrapAuthority } = require('./lib/private/endpoint-bootstrap-authority')
-  const { createPrivateRoutingController } = require('./lib/private/private-routing-controller')
-  const { createCoherentClock } = require('./lib/private/runtime-clock')
-  const process = require('process')
-  const keyPair = Object.hasOwn(opts, 'keyPair')
-    ? ownData(opts, 'keyPair')
-    : createKeyPair(Object.hasOwn(opts, 'seed') ? ownData(opts, 'seed') : undefined)
-  const publicKey = ownData(keyPair, 'publicKey')
-  const secretKey = ownData(keyPair, 'secretKey')
-  if (
-    !b4a.isBuffer(publicKey) ||
-    publicKey.byteLength !== 32 ||
-    !b4a.isBuffer(secretKey) ||
-    secretKey.byteLength !== 64
-  )
-    invalidPrivateOptions()
-  const clock = createCoherentClock(() => process.hrtime.bigint(), Date.now)
-  const endpointBootstrapAuthority = createEndpointBootstrapAuthority({
-    bootstrapEndpoints: options.bootstrapEndpoints,
-    localIdentity: b4a.from(publicKey),
-    // The authority erases its input. Never hand it the application's key buffer.
-    localSecretKey: b4a.from(secretKey),
-    host: options.host,
-    port: options.port,
-    ...(Object.hasOwn(options, 'advertisedHost')
-      ? { advertisedHost: options.advertisedHost, advertisedPort: options.advertisedPort }
-      : {}),
-    wallNow: clock.wallNow,
-    monotonicNow: clock.monotonicNow,
-    schedule: setTimeout,
-    cancelScheduled: clearTimeout,
-    randomBytes(size) {
-      const bytes = b4a.allocUnsafe(size)
-      sodium.randombytes_buf(bytes)
-      return bytes
-    }
+function createPrivateRouting(options, dht) {
+  if (!options || !dht) invalidPrivateOptions()
+  const { createPrivatePeerController } = require('./lib/private/private-peer-controller')
+  const controller = createPrivatePeerController({
+    dht,
+    keyPair: dht.defaultKeyPair,
+    baseReady: () => DHT.prototype.fullyBootstrapped.call(dht),
+    createDirectServer: (serverOptions) => new Server(dht, serverOptions),
+    connectDirect: (publicKey, connectOptions) => connect(dht, publicKey, connectOptions)
   })
-  const controller = createPrivateRoutingController({ endpointBootstrapAuthority })
-  // This parent transport has lifecycle only. Typed records use the controller's
-  // own generation-bound transport, never this raw-query boundary.
-  const transport = Object.freeze({
-    ready: () => controller.ready(),
-    suspend: () => controller.suspend(),
-    resume: () => controller.resume(),
-    destroy: () => controller.destroy(),
-    bootstrap: rejectPrivateCommand,
-    closest: rejectPrivateCommand,
-    key: rejectPrivateCommand,
-    id: rejectPrivateCommand,
-    request: rejectPrivateCommand
-  })
-  return { controller, transport, keyPair, interfaces: null, destroyPromise: null }
-}
-
-async function closePrivateInterfaces(routing) {
-  const interfaces = routing.interfaces
-  if (interfaces === null) return
-  let onclose
-  const closed = new Promise((resolve) => {
-    onclose = resolve
-    interfaces.once('close', onclose)
-  })
-  try {
-    // A synchronous destroy return can still precede the native close event.
-    await interfaces.destroy()
-    await closed
-    routing.interfaces = null
-  } finally {
-    interfaces.removeListener('close', onclose)
-  }
+  return { controller }
 }
 
 function mapLookup(node) {
