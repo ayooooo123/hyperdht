@@ -163,8 +163,9 @@ wire claims.
 - Private server firewall public-API regression: Node, Bare, and a fresh Linux
   Node 24 arm64 container each pass 8/8 tests, 93/93 assertions.
 - Endpoint invalid-ciphertext/application-error regression: Node and Bare pass
-  18/18 tests, 103/103 assertions; fresh Linux arm64 Node 24 passes 25/25
-  independent process runs after the regression explicitly enters flowing mode.
+  18/18 tests, 104/104 assertions; fresh Linux arm64 Node 24 passes 25/25
+  independent process runs and the full 1,393-test suite after the regression
+  installs a pending readable consumer before injection.
 - Final-exit mutation regression: Node and Bare 20/20 tests, 156/156 assertions.
 - Activation probe: unchanged commit accepted; `localDeadline`, `tailControl`,
   and `clockIdentity` substitutions rejected with `INVALID_ROUTE`.
