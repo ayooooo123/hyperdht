@@ -31,8 +31,9 @@ file and the exact revisions below:
 - Native `sodium-native` scalar implementation:
   `562d642e1a78a8e124cf97bfbda77f01c02d1a7f`.
 - Hyperswarm private-context integration:
-  `ec46240e07c8f220bba11e6f4ae6eb6acf89eade`.
-- PearTube desktop/mobile opt-in integration: `baf3d5f53`.
+  `4bae99e4067f77fa3b378914883b357f87292de4`.
+- PearTube desktop/mobile opt-in integration:
+  `53896a3be13f1a35b26a00acf58c3aa139c1fc99`.
 
 Review `code/lib/private/**`, its actual public composition in
 `code/lib/dht.js`, the native scalar dependency revision, and the protocol and
@@ -173,6 +174,11 @@ wire claims.
 - Distributed run 34770010983 did not reach LINK_OFFER: only 48/140 directed UDP
   pairs were reachable and role 1 never attached. Treat this as an open evidence
   gate, not negative protocol evidence.
+- HyperDHT run 34773603689 passes Linux live plus deterministic macOS/Linux.
+- PearTube exact-revision Fast CI, relay build/test, Android debug/release, and
+  iOS build pass. Hyperswarm exact-revision lint and git-disabled installs pass;
+  its Windows job fails inside upstream `bare-base@v1` because socket-firewall
+  cannot locate `npm`, then fail-fast cancels the longer Linux/macOS jobs.
 
 ## Release boundary
 

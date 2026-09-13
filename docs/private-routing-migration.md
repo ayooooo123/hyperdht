@@ -5664,8 +5664,8 @@ cryptographic review, and public activation remain blocked.
 
 ## 2026-09-13 peer alpha evidence and downstream cutover
 
-The peer alpha correctness boundary is now source revision
-`3c99fa273ac2faf7004b9ba6f5e9b4aa7cb27ce5`. `writeAll()` retains a cell until
+The peer alpha code correctness boundary is source revision
+`28f7e51b40cf2000d6a43beec62bfc785cfb3cca`. `writeAll()` retains a cell until
 Streamx reports the transport drained, so a caller cannot erase a queued cell
 before the transport owns it. Entry registration reserves the role before its
 commit wait and excludes resolver admission during that interval. The private
@@ -5719,17 +5719,20 @@ rendezvous and application-data path without putting all overlay maintenance on
 four-hop routes.
 
 Hyperswarm fork revision
-`ec46240e07c8f220bba11e6f4ae6eb6acf89eade` selects
+`4bae99e4067f77fa3b378914883b357f87292de4` selects
 `dht.privateRouting` for every peer server and dial while retaining the root DHT
 for discovery and lifecycle. Its real six-node integration passes on Node and
 Bare, 1/1 test and 3/3 assertions, and proves the selected peer stream has zero
-direct destination sends. PearTube revision
-`baf3d5f53` pins that fork for the backend and mobile bundle.
-`network.privateRouting: true` expands to the exact acknowledged endpoint
-profile on desktop or mobile; it remains opt-in because a deployment needs four
-reachable relay nodes and the external review gate. The backend regression
-passes 29/29, the changed-code policy lint passes, and the Bare mobile backend
-bundle completes with require coverage.
+direct destination sends. Its HyperDHT, DHT RPC, and sodium-native forks are
+exact-commit codeload archives, so a fresh install succeeds with no `git`
+executable on `PATH` and the repository's socket-firewall `--allow-git=none`
+policy remains intact. PearTube revision
+`53896a3be13f1a35b26a00acf58c3aa139c1fc99` pins that fork for the backend and
+mobile bundle. `network.privateRouting: true` expands to the exact acknowledged
+endpoint profile on desktop or mobile; it remains opt-in because a deployment
+needs four reachable relay nodes and the external review gate. The backend
+regression passes 29/29, the changed-code policy lint passes, and the Bare mobile
+backend bundle completes with require coverage.
 
 Draft integration reviews are
 [Hyperswarm PR 2](https://github.com/ayooooo123/hyperswarm/pull/2) and
@@ -5738,6 +5741,19 @@ Hyperswarm focused private path is green; its full upstream suite is not a
 release signal on this host because `test/chaos.js` fails convergence and leaves
 the following test active. An isolated unmodified parent worktree using registry
 HyperDHT 6.33.0 reproduces the same `test/swarm.js:62` assertion-after-end.
+
+HyperDHT Actions run
+[34773603689](https://github.com/ayooooo123/hyperdht/actions/runs/34773603689)
+passes the Linux live gate plus deterministic macOS and Linux jobs at the code
+revision above. PearTube's exact downstream revision passes Fast CI, relay
+tests/container build, Android debug/release, and iOS build. Hyperswarm run
+[34774056889](https://github.com/ayooooo123/hyperswarm/actions/runs/34774056889)
+passes lint and git-disabled dependency installation on Linux and macOS; its
+Windows job fails in the upstream `bare-base@v1` setup because socket-firewall
+cannot locate `npm` on `PATH`, then fail-fast cancels Linux/macOS during the
+pre-existing 60-second chaos test. This is a CI runner/action defect, not a
+private-path pass claim; the focused Node and Bare private integrations above
+are the behavioral evidence.
 
 The complete dormant peer-tail/UDX stack is still not a production runtime.
 Its test fixture supplies fake clocks, fake topology, test-only authorities and
