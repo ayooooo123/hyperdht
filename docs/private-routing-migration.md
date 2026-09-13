@@ -5670,8 +5670,13 @@ Streamx reports the transport drained, so a caller cannot erase a queued cell
 before the transport owns it. Entry registration reserves the role before its
 commit wait and excludes resolver admission during that interval. The private
 server firewall now evaluates the authenticated end-to-end Noise identity and
-never emits a refused connection to the application. The focused Node and Bare
-public-API regressions pass 7/7 tests and 94/94 assertions.
+never emits a refused connection to the application. The focused Node, Bare,
+and Linux Node 24 public-API regressions pass 8/8 tests and 93/93 assertions.
+Revision `78f32beec8dec2ec52fbefc7ef06f52e3cc32d60` isolates the firewall contract
+on a fresh route. The earlier combined scenario could fail before reaching the
+firewall, so it conflated route availability with policy behavior. The isolated
+regression waits for the authenticated firewall callback and verifies exactly
+one call plus zero emitted connections.
 
 The dormant native peer-tail activation now snapshots all twelve handoff
 properties and revalidates their exact data-property identities, authoritative
@@ -5681,9 +5686,9 @@ commit. The prior fault-injection probe accepted substitutions of
 unchanged control and rejects all three substitutions with `INVALID_ROUTE`.
 The permanent Node and Bare regression passes 20/20 tests and 156/156
 assertions.
-The final Node private aggregate passes 1,301/1,301 tests and
-23,206/23,206 assertions. The final Bare private aggregate passes
-1,256/1,256 tests and 23,071/23,071 assertions. At capture revision
+The final Node private aggregate passes 1,302/1,302 tests and
+23,205/23,205 assertions. The final Bare private aggregate passes
+1,257/1,257 tests and 23,070/23,070 assertions. At capture revision
 `32dded3498bec19ed03ac74287b03923f388b576`, fresh privileged Linux containers
 on both the laptop (arm64, Colima) and Unraid (x86_64, Docker) pass the peer
 packet-capture gate, each with 1/1 test and 23/23 assertions. Their live UDP
