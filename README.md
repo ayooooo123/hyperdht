@@ -121,10 +121,15 @@ destination application key. A forced destination-role candidate rejects
 before that key is sent. The destination guard authenticates its registration
 to the entry with its advertised relay Noise identity; the entry verifies that
 identity against the signed descriptor before replacing any live circuit.
-Before initial publication, restart, or refresh, the endpoint asks its selected
-destination guard to recover the signed previous descriptor on the same
-authenticated control connection. The guard performs descriptor GET and PUT
-operations; the destination endpoint emits no descriptor-target storage traffic.
+Destination admission is also two-phase. The endpoint first authenticates with
+a fresh ephemeral Noise key and sends only the build opcode. A relay with an
+active resolver rejects at that point, before seeing the application key or
+key bytes. After reserving the destination role, the guard issues a random
+challenge; the endpoint signs a domain-separated binding of that challenge,
+the authenticated ephemeral peer, the guard identity, and its application key.
+Only then does the guard recover the signed previous descriptor and later
+perform descriptor GET and PUT operations. Initial publication, restart, and
+refresh therefore emit no descriptor-target storage traffic from the endpoint.
 
 The entry multiplexes independent logical streams over the destination circuit.
 Every physical relay hop authenticates and opens each 1200-byte route cell,

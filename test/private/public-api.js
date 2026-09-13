@@ -15,6 +15,7 @@ const { TEST_ONLY_PRIVATE_PEER_OBSERVER } = peerController
 
 const OP_RESOLVE = 2
 const OP_ENTRY_REGISTER = 4
+const STATUS_OK = 0
 const STATUS_UNAVAILABLE = 1
 const ROUTE_CONTEXT_BYTES = 120
 const LOGICAL_DATA = 0
@@ -63,13 +64,18 @@ function trapDescriptorTraffic(t, node) {
   const traffic = { get: 0, put: 0 }
   const plugin = node.plugins.get(DESCRIPTOR_PLUGIN_NAME)
   const query = plugin.query
-  plugin.query = function (request, ...args) {
-    if (request.command === DESCRIPTOR_COMMAND_GET) traffic.get++
-    if (request.command === DESCRIPTOR_COMMAND_PUT) traffic.put++
-    return query.call(this, request, ...args)
+  const request = plugin.request
+  plugin.query = function (message, ...args) {
+    if (message.command === DESCRIPTOR_COMMAND_GET) traffic.get++
+    return query.call(this, message, ...args)
+  }
+  plugin.request = function (message, ...args) {
+    if (message.command === DESCRIPTOR_COMMAND_PUT) traffic.put++
+    return request.call(this, message, ...args)
   }
   t.teardown(() => {
     plugin.query = query
+    plugin.request = request
   })
   return traffic
 }
@@ -176,6 +182,11 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   let holdLateFrame = false
   let clientLogicalFrame = null
   let holdClientFrame = false
+  let forcedDestinationGuard = null
+  let rejectedAdmissionRemoteKey = null
+  let rejectedIdentitySends = 0
+  let rejectedIdentityReceives = 0
+  let resolveHeldResolverReleased
   let resolveDestinationReset
   let resolveLateFrameHeld
   let resolveLateFrameReceived
@@ -204,7 +215,34 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   const clientFrameGate = new Promise((resolve) => {
     releaseClientFrame = resolve
   })
+  const heldResolverReleased = new Promise((resolve) => {
+    resolveHeldResolverReleased = resolve
+  })
   const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
+    if (event.type === 'destination-relay-candidates' && forcedDestinationGuard !== null) {
+      return forcedDestinationGuard
+    }
+    if (
+      forcedDestinationGuard !== null &&
+      event.guardPublicKey &&
+      b4a.equals(event.guardPublicKey, forcedDestinationGuard)
+    ) {
+      if (event.type === 'destination-admission-attempt') {
+        rejectedAdmissionRemoteKey = b4a.from(event.remotePublicKey)
+      } else if (event.type === 'destination-identity-sent') {
+        rejectedIdentitySends++
+      } else if (event.type === 'destination-identity-received') {
+        rejectedIdentityReceives++
+      }
+    }
+    if (
+      event.type === 'resolver-released' &&
+      forcedDestinationGuard !== null &&
+      b4a.equals(event.guardPublicKey, forcedDestinationGuard)
+    ) {
+      resolveHeldResolverReleased()
+      return
+    }
     if (
       holdLateFrame &&
       event.type === 'route-transform' &&
@@ -336,6 +374,40 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   currentTarget.fill(0)
   nextTarget.fill(0)
   stableTarget.fill(0)
+  const relayKeys = await server.controller.descriptors.discoverRelays()
+  const reverseOverlapRelay = relayKeys.find(
+    (relay) =>
+      !b4a.equals(relay, descriptor.destinationGuardPublicKey) &&
+      !b4a.equals(relay, descriptor.entryRelayPublicKey)
+  )
+  if (!reverseOverlapRelay) throw new Error('Missing reverse-overlap relay')
+  const heldResolver = source.connect(reverseOverlapRelay, {
+    keyPair: HyperDHT.keyPair()
+  })
+  heldResolver.on('error', () => {})
+  t.is(await heldResolver.opened, true)
+  const heldResolverStatus = readBytes(heldResolver, 1)
+  heldResolver.write(b4a.from([OP_RESOLVE]))
+  t.is((await heldResolverStatus)[0], STATUS_OK, 'resolver admission remains held before lookup')
+
+  forcedDestinationGuard = reverseOverlapRelay
+  t.is(
+    await code(() => server.controller._publish(server)),
+    'ERR_PRIVACY_UNAVAILABLE',
+    'admitted resolver rejects destination admission'
+  )
+  t.ok(rejectedAdmissionRemoteKey)
+  t.is(
+    b4a.equals(rejectedAdmissionRemoteKey, server.publicKey),
+    false,
+    'rejected destination admission authenticates only an ephemeral Noise identity'
+  )
+  t.is(rejectedIdentitySends, 0, 'rejection sends no destination identity bytes')
+  t.is(rejectedIdentityReceives, 0, 'resolver receives no destination identity bytes')
+  const heldResolverClosed = new Promise((resolve) => heldResolver.once('close', resolve))
+  heldResolver.destroy()
+  await Promise.all([heldResolverClosed, heldResolverReleased])
+  forcedDestinationGuard = null
   const overlappingResolver = source.connect(descriptor.destinationGuardPublicKey, {
     keyPair: HyperDHT.keyPair()
   })
@@ -457,6 +529,27 @@ test('same-key private server restart advances the blinded descriptor sequence',
   const source = nodes[0]
   const destination = nodes[1]
   const serverKeyPair = HyperDHT.keyPair()
+  const positivePlugin = {
+    query() {
+      return 'query-forwarded'
+    },
+    request() {
+      return 'request-forwarded'
+    }
+  }
+  const positiveNode = {
+    plugins: new Map([[DESCRIPTOR_PLUGIN_NAME, positivePlugin]])
+  }
+  const positiveTraffic = trapDescriptorTraffic(t, positiveNode)
+  t.alike(
+    [
+      positivePlugin.query({ command: DESCRIPTOR_COMMAND_GET }),
+      positivePlugin.request({ command: DESCRIPTOR_COMMAND_PUT }),
+      positiveTraffic
+    ],
+    ['query-forwarded', 'request-forwarded', { get: 1, put: 1 }],
+    'descriptor traffic trap observes GET query and PUT request paths'
+  )
   const initialTraffic = trapDescriptorTraffic(t, destination)
   const first = destination.privateRouting.createServer()
   await first.listen(serverKeyPair)
