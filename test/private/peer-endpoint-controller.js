@@ -506,6 +506,7 @@ test('endpoint authenticates ciphertext and revokes before application error cal
     t.is(pair.b.revoked, true)
     failure.resolve(error)
   })
+  right.resume()
   const raw = b4a.alloc(20)
   raw[0] = 17
   pair.b.receive(raw)
