@@ -7,8 +7,10 @@ const HyperDHT = require('../..')
 const { hash } = require('../../lib/crypto')
 const { periodOf } = require('../../lib/private/blinded-presence')
 const {
+  OverlayDescriptorService,
   decodeDescriptor,
-  descriptorTarget
+  descriptorTarget,
+  encodeDescriptor
 } = require('../../lib/private/overlay-descriptor-service')
 const peerController = require('../../lib/private/private-peer-controller')
 const { TEST_ONLY_PRIVATE_PEER_OBSERVER } = peerController
@@ -28,10 +30,16 @@ const DESCRIPTOR_PLUGIN_NAME = 'private-route'
 let nextPort = 49300
 
 function privateRouting(relay = false) {
-  return { release: 'alpha', acknowledgeAlpha: true, mode: 'optional', relay }
+  return {
+    release: 'alpha',
+    acknowledgeAlpha: true,
+    mode: 'optional',
+    profile: 'standard',
+    relay
+  }
 }
 
-async function network(t, roles = [false, false, true, true, true]) {
+async function network(t, roles = [false, false, true, true, true, true]) {
   const boot = new HyperDHT({
     bootstrap: [],
     host: '127.0.0.1',
@@ -124,6 +132,105 @@ function code(operation) {
     return Promise.resolve(error.code)
   }
 }
+function containsSequence(haystack, needle) {
+  outer: for (let offset = 0; offset <= haystack.byteLength - needle.byteLength; offset++) {
+    for (let index = 0; index < needle.byteLength; index++) {
+      if (haystack[offset + index] !== needle[index]) continue outer
+    }
+    return true
+  }
+  return false
+}
+function asyncReplies(values) {
+  return {
+    destroy() {},
+    async *[Symbol.asyncIterator]() {
+      for (const value of values) yield value
+    }
+  }
+}
+
+test('blinded descriptors require quorum storage and exact readback', async (t) => {
+  const now = 3 * 86_400_000 + 2 * 60 * 60 * 1000
+  const period = periodOf(now)
+  const destinationKeyPair = HyperDHT.keyPair()
+  const wire = encodeDescriptor({
+    destinationKeyPair,
+    entryRelayPublicKey: HyperDHT.keyPair().publicKey,
+    destinationGuardPublicKey: HyperDHT.keyPair().publicKey,
+    routeToken: b4a.alloc(32, 0x69),
+    seq: 3n,
+    expiresAt: BigInt(now + 60_000),
+    period
+  })
+  t.is(containsSequence(wire, destinationKeyPair.publicKey), false)
+  t.is(
+    decodeDescriptor(wire, {
+      expectedDestinationPublicKey: destinationKeyPair.publicKey,
+      expectedPeriod: period,
+      now
+    }).seq,
+    3n
+  )
+  t.exception(() =>
+    decodeDescriptor(wire, {
+      expectedDestinationPublicKey: HyperDHT.keyPair().publicKey,
+      expectedPeriod: period,
+      now
+    })
+  )
+
+  const dht = {
+    register(name, plugin) {
+      plugin.onregister(this)
+    }
+  }
+  const descriptors = new OverlayDescriptorService(dht, null, () => now)
+  t.teardown(() => descriptors.plugin.destroy())
+
+  descriptors.plugin.query = () => asyncReplies([{ value: wire }])
+  t.is(
+    await code(() => descriptors.get(destinationKeyPair.publicKey)),
+    'ERR_PRIVACY_UNAVAILABLE',
+    'one storage reply cannot select route state'
+  )
+  descriptors.plugin.query = () => asyncReplies([{ value: wire }, { value: wire }])
+  t.is((await descriptors.get(destinationKeyPair.publicKey)).seq, 3n)
+
+  const storageCandidates = [1, 2, 3].map((port) => ({
+    from: { host: '127.0.0.1', port },
+    token: b4a.alloc(32, port)
+  }))
+  descriptors.plugin.query = () => asyncReplies(storageCandidates.slice(0, 2))
+  t.is(
+    await code(() => descriptors.put(wire)),
+    'ERR_PRIVACY_UNAVAILABLE',
+    'fewer than three storage candidates cannot publish route state'
+  )
+
+  let requests = 0
+  descriptors.plugin.query = () => asyncReplies(storageCandidates)
+  descriptors.plugin.request = async () => {
+    requests++
+    if (requests === 3) throw new Error('withheld replica')
+  }
+  t.is(
+    await code(() => descriptors.put(wire)),
+    'ERR_PRIVACY_UNAVAILABLE',
+    'fewer than three stored replicas cannot publish route state'
+  )
+
+  let queries = 0
+  descriptors.plugin.query = () => {
+    queries++
+    return queries === 1
+      ? asyncReplies(storageCandidates)
+      : asyncReplies([{ value: wire }, { value: wire }])
+  }
+  descriptors.plugin.request = async () => {}
+  t.is(await descriptors.put(wire), 3)
+  wire.fill(0)
+})
 
 test('private routing is an optional context on an ordinary HyperDHT node', async (t) => {
   const valid = privateRouting()
@@ -135,6 +242,7 @@ test('private routing is an optional context on an ordinary HyperDHT node', asyn
     { ...valid, release: 'beta' },
     { ...valid, acknowledgeAlpha: false },
     { ...valid, mode: 'required' },
+    { ...valid, profile: 'high' },
     { ...valid, relay: 'yes' },
     { ...valid, bootstrapEndpoints: [{ host: '127.0.0.1', port: 49737 }] }
   ]
@@ -147,6 +255,7 @@ test('private routing is an optional context on an ordinary HyperDHT node', asyn
   t.ok(source.udx, 'ordinary UDX and routing-table discovery remain active')
   t.is(source.privateRouting.release, 'alpha')
   t.is(source.privateRouting.mode, 'optional')
+  t.is(source.privateRouting.profile, 'standard')
   t.is(source.privateRouting.relay, false)
   t.is(relay.privateRouting.relay, true)
   t.is(await code(() => relay.privateRouting.createServer()), 'ERR_PRIVACY_UNAVAILABLE')
@@ -177,6 +286,7 @@ test('private routing is an optional context on an ordinary HyperDHT node', asyn
 test('private context multiplexes end-to-end Noise streams over transformed route cells', async (t) => {
   let lastSourceOpened = null
   const transformProof = { inbound: null, outbound: null, plaintext: null }
+  let selectedSourceRoute = null
   let latePayload = null
   let lateLogicalFrame = null
   let holdLateFrame = false
@@ -219,6 +329,10 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     resolveHeldResolverReleased = resolve
   })
   const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
+    if (event.type === 'source-route-selected') {
+      selectedSourceRoute = event
+      return
+    }
     if (event.type === 'destination-relay-candidates' && forcedDestinationGuard !== null) {
       return forcedDestinationGuard
     }
@@ -296,15 +410,15 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
       resolveDestinationReset()
       return
     }
-    if (event.type === 'route-cell-opened' && event.label === 'guard-source') {
+    if (event.type === 'route-cell-opened' && event.label === 'source-safety-1-in') {
       lastSourceOpened = event
       return
     }
     if (
       transformProof.inbound === null &&
       event.type === 'route-transform' &&
-      event.from === 'guard-source' &&
-      event.to === 'guard-entry-source' &&
+      event.from === 'source-safety-1-in' &&
+      event.to === 'source-safety-1-out' &&
       lastSourceOpened !== null &&
       b4a.equals(lastSourceOpened.plaintext, event.plaintext)
     ) {
@@ -316,7 +430,7 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
       transformProof.inbound !== null &&
       transformProof.outbound === null &&
       event.type === 'route-cell-sealed' &&
-      event.label === 'guard-entry-source' &&
+      event.label === 'source-safety-1-out' &&
       b4a.equals(transformProof.plaintext, event.plaintext)
     ) {
       transformProof.outbound = b4a.from(event.cell)
@@ -356,6 +470,16 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     b4a.equals(descriptor.entryRelayPublicKey, descriptor.destinationGuardPublicKey),
     false,
     'destination guard and entry roles are distinct'
+  )
+  t.is(
+    containsSequence(descriptor.wire, server.publicKey),
+    false,
+    'stored descriptor bytes do not disclose the stable destination identity'
+  )
+  t.is(
+    b4a.equals(descriptor.blindedPublicKey, server.publicKey),
+    false,
+    'descriptor signature key rotates independently from the stable destination identity'
   )
   const period = periodOf(Date.now())
   const currentTarget = descriptorTarget(server.publicKey, period)
@@ -450,6 +574,18 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     [true, true],
     'both logical sessions complete end-to-end Noise authentication'
   )
+  t.ok(selectedSourceRoute, 'source route selection is observable to the test oracle')
+  const compiledRelays = [
+    selectedSourceRoute.firstSafetyRelayPublicKey,
+    selectedSourceRoute.secondSafetyRelayPublicKey,
+    selectedSourceRoute.entryRelayPublicKey,
+    selectedSourceRoute.destinationGuardPublicKey
+  ]
+  t.is(
+    new Set(compiledRelays.map((publicKey) => b4a.toString(publicKey, 'hex'))).size,
+    4,
+    'standard profile compiles two source-selected and two destination-selected relays'
+  )
   for (const socket of sockets) t.alike(socket.remotePublicKey, serverKeyPair.publicKey)
 
   const echoes = sockets.map((socket, index) => readBytes(socket, payloads[index].byteLength))
@@ -515,9 +651,14 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     overlayParticipation: 'direct-compatible',
     relayService: 'disabled',
     relayDiscovery: 'hyperdht-routing-table',
+    privacyProfile: 'standard',
+    safetyRelays: 2,
+    privateRelays: 2,
     descriptorAddressing: 'period-blinded',
+    descriptorIdentity: 'rotating-blinded-key',
+    descriptorState: 'destination-signed-quorum-readback',
     descriptorOperations: 'source-safety-routed',
-    peerPayload: 'm3-hop-transformed-noise-secretstream',
+    peerPayload: 'bounded-m3-hop-transformed-noise-secretstream',
     directDestinationSends: 0
   })
 

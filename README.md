@@ -72,6 +72,7 @@ const dht = new DHT({
     release: 'alpha',
     acknowledgeAlpha: true,
     mode: 'optional',
+    profile: 'standard',
     relay: false
   }
 })
@@ -90,7 +91,7 @@ socket.write('private peer payload')
 ```
 
 Relay service is explicit. A node that contributes relay capacity uses the same
-four fields with `relay: true`. Relay nodes advertise a separate relay key and
+five fields with `relay: true`. Relay nodes advertise a separate relay key and
 cannot create or connect private application endpoints:
 
 ```js
@@ -99,37 +100,45 @@ const relay = new DHT({
     release: 'alpha',
     acknowledgeAlpha: true,
     mode: 'optional',
+    profile: 'standard',
     relay: true
   }
 })
 ```
 
 Every `privateRouting` field must be an own data property on an ordinary object.
-The four fields above are exact and required; accessors, inherited fields,
-unknown fields, `bootstrapEndpoints`, and endpoint host/port fields are
-rejected.
+The five fields above are exact and required; `profile` currently accepts only
+`'standard'`. Accessors, inherited fields, unknown fields, `bootstrapEndpoints`,
+and endpoint host/port fields are rejected.
 
 A private server selects distinct destination-guard and entry relays, builds a
 fixed-cell circuit to the entry, and publishes a signed, expiring descriptor
-from its guard. The descriptor is stored under a period-blinded DHT target and
-contains relay identities plus an opaque route capability, not a destination
-transport key or dial address. A client resolves the descriptor through a
-separately selected source guard that cannot reuse either destination role.
-Resolution is two-phase: a relay first proves it is not serving as a destination
-guard or entry, reserves the resolver role, and only then accepts the
-destination application key. A forced destination-role candidate rejects
-before that key is sent. The destination guard authenticates its registration
-to the entry with its advertised relay Noise identity; the entry verifies that
-identity against the signed descriptor before replacing any live circuit.
+from its guard. The descriptor is replicated to at least three DHT storage
+nodes and accepted only after an exact two-reply readback quorum. Its wire
+contains a period-blinded signing key, relay identities, and an opaque route
+capability—not the stable destination identity, a destination transport key,
+or a dial address.
+
+A client resolves the descriptor through a first source safety relay that
+cannot reuse either destination role, then selects a distinct second source
+safety relay. The `standard` profile therefore compiles four distinct relay
+identities: two source-selected safety relays followed by the
+destination-selected entry and guard. Resolution is two-phase: the first
+safety relay proves it is not serving as a destination guard or entry, reserves
+the resolver role, and only then accepts the destination application key. A
+forced destination-role candidate rejects before that key is sent.
+
 Destination admission is also two-phase. The endpoint first authenticates with
 a fresh ephemeral Noise key and sends only the build opcode. A relay with an
-active resolver rejects at that point, before seeing the application key or
-key bytes. After reserving the destination role, the guard issues a random
-challenge; the endpoint signs a domain-separated binding of that challenge,
-the authenticated ephemeral peer, the guard identity, and its application key.
-Only then does the guard recover the signed previous descriptor and later
-perform descriptor GET and PUT operations. Initial publication, restart, and
-refresh therefore emit no descriptor-target storage traffic from the endpoint.
+active resolver rejects at that point, before seeing application-key bytes.
+After reserving the destination role, the guard issues a random challenge; the
+endpoint signs a domain-separated binding of that challenge, the authenticated
+ephemeral peer, the guard identity, and its application key. Only then does the
+guard recover the signed previous descriptor and later perform descriptor GET
+and PUT operations. Initial publication, restart, and refresh therefore emit no
+descriptor-target storage traffic from the endpoint. The entry stages guard-
+authenticated registration but does not install it until the guard completes
+descriptor quorum publication and sends the commit marker.
 
 The entry multiplexes independent logical streams over the destination circuit.
 Every physical relay hop authenticates and opens each 1200-byte route cell,
@@ -137,10 +146,13 @@ then reseals the payload with a fresh adjacent circuit key, nonce, circuit ID,
 and counter. A relay therefore transforms on-wire bytes rather than forwarding
 an unchanged transparent stream. The application Noise/SecretStream handshake
 remains end-to-end between the client and server application keys.
-Logical reset and close are stream-scoped and idempotent. Both the entry and
-destination endpoint retain retired stream IDs for the circuit lifetime and
-discard their late in-flight DATA, so closing either side of one multiplexed
-stream cannot reset its siblings or the destination circuit.
+
+Cell sends, receive buffers, deferred transformations, stream counts, frame
+counts, and byte totals are bounded. Every link charges independent peer-ledger
+budgets. Logical reset and close are stream-scoped and idempotent. Both the
+entry and destination endpoint retain retired stream IDs for the circuit
+lifetime and discard late in-flight DATA, so closing either side of one
+multiplexed stream cannot reset its siblings or the destination circuit.
 
 Route-only peer information is not added to the caller's routing table and is
 not used for a direct destination ping or dial. Missing, invalid, expired, or
@@ -154,8 +166,8 @@ are **not** anonymized by this option.
 
 `dht.privateRouting` is read-only and frozen:
 
-- `release === 'alpha'`, `mode === 'optional'`, and `relay` reports the selected
-  role.
+- `release === 'alpha'`, `mode === 'optional'`, `profile === 'standard'`, and
+  `relay` report the selected role.
 - `ready()` waits for private subsystem readiness; `dht.ready()` and
   `dht.fullyBootstrapped()` retain normal HyperDHT semantics.
 - `connect()` and `createServer()` select private peer routing explicitly.
