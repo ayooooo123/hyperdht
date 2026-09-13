@@ -86,10 +86,22 @@ class HyperDHT extends DHT {
         enumerable: true,
         value: Object.freeze({
           release: 'alpha',
-          mode: 'required',
+          mode: 'optional',
+          relay: routing.controller.snapshot().relay,
           ready: () => routing.controller.ready(),
           status: () => routing.controller.snapshot().state,
-          exposureReport: () => routing.controller.exposureReport()
+          exposureReport: () => routing.controller.exposureReport(),
+          connect: (remotePublicKey, connectOptions) =>
+            routing.controller.connect(remotePublicKey, connectOptions),
+          createServer: (serverOptions, onconnection) => {
+            if (typeof serverOptions === 'function') {
+              return routing.controller.createServer({}, serverOptions)
+            }
+            if (serverOptions && serverOptions.onconnection) {
+              onconnection = serverOptions.onconnection
+            }
+            return routing.controller.createServer(serverOptions, onconnection)
+          }
         })
       })
     }
@@ -106,13 +118,11 @@ class HyperDHT extends DHT {
   }
 
   ready() {
-    const routing = PRIVATE_ROUTING.get(this)
-    return routing ? routing.controller.ready() : super.ready()
+    return super.ready()
   }
 
   fullyBootstrapped() {
-    const routing = PRIVATE_ROUTING.get(this)
-    return routing ? routing.controller.ready() : super.fullyBootstrapped()
+    return super.fullyBootstrapped()
   }
 
   query(message, opts) {
@@ -136,17 +146,12 @@ class HyperDHT extends DHT {
   }
 
   connect(remotePublicKey, opts) {
-    const routing = PRIVATE_ROUTING.get(this)
-    return routing
-      ? routing.controller.connect(remotePublicKey, opts)
-      : connect(this, remotePublicKey, opts)
+    return connect(this, remotePublicKey, opts)
   }
 
   createServer(opts, onconnection) {
     if (typeof opts === 'function') return this.createServer({}, opts)
     if (opts && opts.onconnection) onconnection = opts.onconnection
-    const routing = PRIVATE_ROUTING.get(this)
-    if (routing) return routing.controller.createServer(opts, onconnection)
     const s = new Server(this, opts)
     if (onconnection) s.on('connection', onconnection)
     return s
@@ -628,11 +633,12 @@ function privateRoutingOptions(opts) {
   if (opts === null || (typeof opts !== 'object' && typeof opts !== 'function')) return null
   if (!('privateRouting' in opts)) return null
   const value = ownData(opts, 'privateRouting')
-  const options = exactPrivateObject(value, ['release', 'acknowledgeAlpha', 'mode'])
+  const options = exactPrivateObject(value, ['release', 'acknowledgeAlpha', 'mode', 'relay'])
   if (
     options.release !== 'alpha' ||
     options.acknowledgeAlpha !== true ||
-    options.mode !== 'required'
+    options.mode !== 'optional' ||
+    typeof options.relay !== 'boolean'
   )
     invalidPrivateOptions()
   return options
@@ -644,6 +650,7 @@ function createPrivateRouting(options, dht) {
   const controller = createPrivatePeerController({
     dht,
     keyPair: dht.defaultKeyPair,
+    relay: options.relay,
     baseReady: () => DHT.prototype.fullyBootstrapped.call(dht),
     createDirectServer: (serverOptions) => new Server(dht, serverOptions),
     connectDirect: (publicKey, connectOptions) => connect(dht, publicKey, connectOptions)

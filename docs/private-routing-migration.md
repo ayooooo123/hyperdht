@@ -2,30 +2,53 @@
 
 ## Status and scope
 
-This record covers the experimental Gate 3A substrate, the owner-approved Gate 3B1 live routing implementation through Task 17, and subsequent routed-DHT, SURB, and blinded-presence work. It is not a public API or a production anonymity surface. Gate 3A established deterministic primitives and a fake topology; Gate 3B1 and the later slices use production-code native routing owners behind package-private capabilities.
+This record covers the experimental Gate 3A substrate, the owner-approved Gate
+3B1 live routing implementation through Task 17, subsequent routed-DHT, SURB,
+and blinded-presence work, and the later alpha peer-stream cutover. It is not a
+production anonymity claim. The reviewed native route stack remains
+package-private; the peer alpha is a separate, narrower HyperDHT-native circuit
+runtime described below and in the README.
 
-Direct mode remains the only public behavior. The internal controller supports authenticated live routes, immutable/mutable get and put, experimental required SURB replies, blinded presence publication/resolution/revocation, rotation, suspension, and teardown. Eleven separate Node or Bare role processes exercise these paths over native UDX; privileged Linux namespaces add the scoped [packet-capture evidence](#gate-3b1-task-17-wire-level-privacy-evidence). The root package exposes no private-routing constructor or user-selectable required mode. Peer streams are not implemented. A global passive observer and timing correlation by colluding guards and exits remain outside v1's guarantees; no cover traffic exists, and these tests do not establish suitability for protecting users.
+Direct behavior remains the default. Supplying the exact acknowledged
+`privateRouting` option adds a separate `dht.privateRouting` context while
+ordinary `dht.connect()`, `dht.createServer()`, DHT records, queries, and
+routing-table behavior remain direct. Relay participation is an explicit,
+mutually exclusive role. The peer alpha uses period-blinded signed
+descriptors, independent source and destination circuits, authenticated
+1200-byte hop transformation, entry multiplexing, and end-to-end Noise. It
+does not instantiate or claim completion of the full reviewed peer-tail/UDX
+adjacency, shared quota, ARQ, or legacy-egress design.
 
-The canonical design remains [Private Routing Protocol v1](private-routing-v1.md).
-Accepted limitations that are not scheduled for repair are tracked under
-[Known issues](#known-issues); the load-bearing one is
-[KI-1: routes are correlatable by timing and volume](#ki-1-routes-are-correlatable-by-timing-and-volume).
-
-The owner-approved Gate 3B1 Task 5 authenticated-M3 transport, Task 6
-tail-control lifetime/ownership amendment, and Tasks 7–17 live-route lifecycle
-are incorporated into the canonical design documents and implemented
-internally in this fork. This remains a package-private compatibility slice: it
-adds no root public constructor, export, user-selectable required mode, or
-anonymity claim, although its internal path uses the production UDX, relay,
-final-exit, and DHT-exit owners rather than a structural or fake transport.
+The historical canonical design is [Private Routing Protocol v1](private-routing-v1.md).
+The current peer API contract is the README's
+[ALPHA private peer routing](../README.md#alpha-private-peer-routing) section.
+The eleven-role Node/Bare and privileged Linux evidence below applies to the
+package-private routed-DHT stack at the cited revisions, not automatically to
+the later peer alpha. A global passive observer and timing correlation by
+colluding guards and exits remain outside the guarantees; no cover traffic
+exists. Accepted limitations are tracked under [Known issues](#known-issues).
 
 ### Current implementation
 
-The implementation checkpoint is
+The current alpha peer checkpoint is the 2026-09-12 optional-context cutover on
+`implement-private-peer-v2` (publication evidence is recorded only after a
+verified commit is pushed). Its scope is:
+
+- ordinary HyperDHT peer APIs stay direct; private peer behavior is selected
+  through the frozen `dht.privateRouting` facade;
+- only nodes configured with `relay: true` announce and accept relay work;
+- destination guard, entry, and source guard roles are distinct;
+- signed descriptors use opaque route capabilities and period-blinded storage
+  targets rather than destination attachment keys;
+- relays authenticate, open, and reseal fixed STREAM cells with fresh adjacent
+  route contexts instead of transparently joining streams; and
+- one destination circuit multiplexes independent end-to-end
+  Noise/SecretStream sessions.
+
+The earlier routed-DHT implementation checkpoint is
 [`cae9721`](https://github.com/ayooooo123/hyperdht/commit/cae9721f946b4d3b2b8adcb61b3230332371e830),
-published to `private-routing-v1` on 2026-09-09, followed on the same branch
-by the KI-4 offer-admission repair (the "KI-4 cross-host time contract for
-offer admission" checkpoint below):
+published to `private-routing-v1` on 2026-09-09, followed on the same branch by
+the KI-4 offer-admission repair described below:
 
 - **Routed DHT and Gate C:** immutable/mutable get and put support explicit
   `replyMode: 'SURB_REQUIRED'` behind `experimentalSurbReplies: true`.
@@ -48,16 +71,17 @@ offer admission" checkpoint below):
   matrix. See the [measurements](#gate-3b1-task-17-live-eleven-process-scenario-status)
   and [publication evidence](#continuation-checkpoint--2026-09-09-required-mode-puts-and-v2-allocation).
 
-**Open gates:** KI-4's responder-side offer admission is repaired under the
-reviewed cross-host time contract. Four later real-link dispatches stopped
-before LINK_OFFER, including the two attempts under JD's instruction to finish
-the remaining work. None confirms the repair on real links. Further useful
-evidence needs a reachable multi-host placement, not a relaxed protocol check.
-Peer streams need a separate reviewed wire design; external cryptographic
-review and the aggregate public-controller gate remain open.
-Hyperswarm, mobile, and PearTube integration follow those gates. KI-1
-timing/volume correlation and KI-5 operator diversity remain explicit limits;
-mixing/cover traffic is deferred and anonymous-admission Gate A is dropped.
+**Open gates:** the alpha peer runtime still needs Linux packet-capture
+acceptance and external human cryptographic review before any production
+anonymity claim. The full reviewed peer-tail/UDX adjacency runtime, shared
+quota ledger, ARQ/retransmission, legacy egress, Hyperswarm, mobile, and
+PearTube integration remain unimplemented. KI-4's routed-DHT responder-side
+offer admission is repaired under the reviewed cross-host time contract, but
+four later real-link dispatches stopped before LINK_OFFER; none confirms that
+repair on real links. Further useful evidence needs a reachable multi-host
+placement, not a relaxed protocol check. KI-1 timing/volume correlation and
+KI-5 operator diversity remain explicit limits; mixing/cover traffic is
+deferred and anonymous-admission Gate A is dropped.
 
 **External review acceptance:** an internal model report is not the required
 external human cryptographic review. The review must identify its author,
