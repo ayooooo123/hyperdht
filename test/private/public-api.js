@@ -722,28 +722,6 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     'late client data for a server-retired stream cannot retire its sibling'
   )
 
-  let firewallCalls = 0
-  let rejectedConnections = 0
-  const rejectedServer = destination.privateRouting.createServer(
-    {
-      firewall(remotePublicKey) {
-        firewallCalls++
-        t.alike(remotePublicKey, source.defaultKeyPair.publicKey)
-        return true
-      }
-    },
-    () => rejectedConnections++
-  )
-  t.teardown(() => rejectedServer.close())
-  await rejectedServer.listen(HyperDHT.keyPair())
-  const rejected = source.privateRouting.connect(rejectedServer.publicKey)
-  rejected.on('error', () => {})
-  const rejectedClosed = new Promise((resolve) => rejected.once('close', resolve))
-  t.is(await rejected.opened, true, 'server policy runs against an authenticated private peer')
-  await rejectedClosed
-  t.is(firewallCalls, 1, 'private server firewall runs once after Noise authentication')
-  t.is(rejectedConnections, 0, 'firewalled peers are never emitted to the server')
-
   t.ok(transformProof.inbound, 'source guard opens a fixed authenticated route cell')
   t.ok(transformProof.outbound, 'source guard reseals the payload for the next hop')
   t.is(transformProof.inbound.byteLength, 1200)
@@ -769,6 +747,44 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   })
 
   for (const socket of sockets) if (!socket.destroyed) socket.end()
+})
+
+test('private server firewall sees authenticated peer and suppresses connection', async (t) => {
+  const nodes = await network(t)
+  const source = nodes[0]
+  const destination = nodes[1]
+  let firewallCalls = 0
+  let rejectedConnections = 0
+  let resolveFirewall
+  const firewallSeen = new Promise((resolve) => {
+    resolveFirewall = resolve
+  })
+  const server = destination.privateRouting.createServer(
+    {
+      firewall(remotePublicKey) {
+        firewallCalls++
+        resolveFirewall(b4a.from(remotePublicKey))
+        return true
+      }
+    },
+    () => rejectedConnections++
+  )
+  t.teardown(() => server.close())
+  await server.listen(HyperDHT.keyPair())
+
+  const socket = source.privateRouting.connect(server.publicKey)
+  socket.on('error', () => {})
+  const closed = new Promise((resolve) => socket.once('close', resolve))
+  const opened = socket.opened
+  t.alike(
+    await firewallSeen,
+    source.defaultKeyPair.publicKey,
+    'server policy receives the authenticated end-to-end Noise identity'
+  )
+  await closed
+  await opened
+  t.is(firewallCalls, 1, 'private server firewall runs exactly once')
+  t.is(rejectedConnections, 0, 'firewalled peers are never emitted to the server')
 })
 
 test('same-key private server restart advances the blinded descriptor sequence', async (t) => {
