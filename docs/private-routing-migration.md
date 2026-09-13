@@ -30,9 +30,9 @@ exists. Accepted limitations are tracked under [Known issues](#known-issues).
 
 ### Current implementation
 
-The current alpha peer checkpoint is the 2026-09-12 optional-context cutover on
-`implement-private-peer-v2` (publication evidence is recorded only after a
-verified commit is pushed). Its scope is:
+The current alpha peer checkpoint is
+[`0c8af51`](https://github.com/ayooooo123/hyperdht/commit/0c8af51),
+published from `implement-private-peer-v2` on 2026-09-12. Its scope is:
 
 - ordinary HyperDHT peer APIs stay direct; private peer behavior is selected
   through the frozen `dht.privateRouting` facade;
