@@ -31,12 +31,13 @@ exists. Accepted limitations are tracked under [Known issues](#known-issues).
 ### Current implementation
 
 The current alpha peer checkpoint is
-[`4e9064c`](https://github.com/ayooooo123/hyperdht/commit/4e9064c),
+[`0b2df5a`](https://github.com/ayooooo123/hyperdht/commit/0b2df5a),
 published from `implement-private-peer-v2` on 2026-09-12. It supersedes
-`5018ef7` by moving descriptor sequence recovery behind the selected
-destination guard and adding destination-endpoint stream tombstones. It also
-includes the initial `0c8af51` cutover's registration-ownership,
-resolver-admission, and entry-retirement corrections. Its scope is:
+`4e9064c` by making destination admission ephemeral until resolver exclusion
+and destination-role reservation complete. It includes the earlier guarded
+descriptor recovery, two-sided retired-stream isolation,
+registration-ownership, and source-resolver admission corrections. Its scope
+is:
 
 - ordinary HyperDHT peer APIs stay direct; private peer behavior is selected
   through the frozen `dht.privateRouting` facade;
@@ -44,9 +45,13 @@ resolver-admission, and entry-retirement corrections. Its scope is:
 - destination guard, entry, and source guard roles are distinct;
 - signed descriptors use opaque route capabilities and period-blinded storage
   targets rather than destination attachment keys;
-- initial publication, restart, and refresh recover the signed previous
-  descriptor over the authenticated destination-guard build connection; only
-  the guard emits descriptor-target GET and PUT traffic;
+- destination admission uses a fresh ephemeral outer Noise identity and sends
+  only its opcode before resolver exclusion; after role reservation, a random
+  challenge and domain-separated signature bind the authenticated ephemeral
+  peer, selected guard, and destination application key;
+- initial publication, restart, and refresh then recover the signed previous
+  descriptor through that admitted guard; only the guard emits
+  descriptor-target GET and PUT traffic;
 - resolver role admission completes before the source discloses its destination
   application key and is mutually reserved against destination guard and entry
   roles;
