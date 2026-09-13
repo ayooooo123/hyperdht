@@ -5661,3 +5661,89 @@ tests and 22,800/22,800 assertions. Bare passes 1,207/1,207 tests and
 Semantic services, endpoint/controller ownership, Native
 cancellation/completion bounds, Linux privacy evidence, external human
 cryptographic review, and public activation remain blocked.
+
+## 2026-09-13 peer alpha evidence and downstream cutover
+
+The peer alpha correctness boundary is now source revision
+`3c99fa273ac2faf7004b9ba6f5e9b4aa7cb27ce5`. `writeAll()` retains a cell until
+Streamx reports the transport drained, so a caller cannot erase a queued cell
+before the transport owns it. Entry registration reserves the role before its
+commit wait and excludes resolver admission during that interval. The private
+server firewall now evaluates the authenticated end-to-end Noise identity and
+never emits a refused connection to the application. The focused Node and Bare
+public-API regressions pass 7/7 tests and 94/94 assertions.
+
+The dormant native peer-tail activation now snapshots all twelve handoff
+properties and revalidates their exact data-property identities, authoritative
+clock/deadline/owner facts, and final-exit generation at both prepare and
+commit. The prior fault-injection probe accepted substitutions of
+`localDeadline`, `tailControl`, and `clockIdentity`; it now accepts the
+unchanged control and rejects all three substitutions with `INVALID_ROUTE`.
+The permanent Node and Bare regression passes 20/20 tests and 156/156
+assertions.
+The final Node private aggregate passes 1,301/1,301 tests and
+23,206/23,206 assertions. The final Bare private aggregate passes
+1,256/1,256 tests and 23,071/23,071 assertions. At capture revision
+`32dded3498bec19ed03ac74287b03923f388b576`, fresh privileged Linux containers
+on both the laptop (arm64, Colima) and Unraid (x86_64, Docker) pass the peer
+packet-capture gate, each with 1/1 test and 23/23 assertions. Their live UDP
+captures contain neither the application sentinel nor the stable destination
+public key, `directDestinationSends` remains zero, and every observed relay
+opens and reseals a different 1,200-byte cell.
+
+Real-link run
+[34770010983](https://github.com/ayooooo123/hyperdht/actions/runs/34770010983)
+did not reach LINK_OFFER. The eleven remote hosts exposed only 48/140 directed
+UDP pairs; role 1 never attached and the coordinator stopped after 609 seconds.
+This is infrastructure evidence, not confirmation or refutation of the
+responder-side offer fix.
+
+The decentralized route-selection decision follows Veilid's published model:
+the source selects its safety half, the destination selects its private half,
+and neither selects the whole route. Selection uses signed node identities,
+cryptographic random sampling, distinct identities and address-prefix
+diversity; route failure demotes candidates. No central operator registry or
+self-declared “operator” field is added. This is honestly named topology
+diversity, not proof that two keys have different human operators.
+
+The performance/privacy default also follows the low-latency Veilid tradeoff.
+Private peer traffic keeps per-hop authenticated transformation, fixed
+1,200-byte cells, separate source/destination route halves and bounded route
+lifetimes. It does not add constant-rate cover or delay mixing, so it makes no
+global-passive-observer timing-anonymity claim. Ordinary routing-table
+maintenance and topic discovery stay direct; privacy-sensitive peer streams use
+the private context. Generic routed `lookup`, `findPeer`, `announce`,
+`unannounce`, and raw `query` remain outside the reviewed DHT wire. Blinded
+immutable/mutable get/put plus private peer streams cover the approved
+rendezvous and application-data path without putting all overlay maintenance on
+four-hop routes.
+
+Hyperswarm fork revision
+`ec46240e07c8f220bba11e6f4ae6eb6acf89eade` selects
+`dht.privateRouting` for every peer server and dial while retaining the root DHT
+for discovery and lifecycle. Its real six-node integration passes on Node and
+Bare, 1/1 test and 3/3 assertions, and proves the selected peer stream has zero
+direct destination sends. PearTube revision
+`baf3d5f53` pins that fork for the backend and mobile bundle.
+`network.privateRouting: true` expands to the exact acknowledged endpoint
+profile on desktop or mobile; it remains opt-in because a deployment needs four
+reachable relay nodes and the external review gate. The backend regression
+passes 29/29, the changed-code policy lint passes, and the Bare mobile backend
+bundle completes with require coverage.
+
+Draft integration reviews are
+[Hyperswarm PR 2](https://github.com/ayooooo123/hyperswarm/pull/2) and
+[PearTube PR 548](https://github.com/ayooooo123/peartube/pull/548). The
+Hyperswarm focused private path is green; its full upstream suite is not a
+release signal on this host because `test/chaos.js` fails convergence and leaves
+the following test active. An isolated unmodified parent worktree using registry
+HyperDHT 6.33.0 reproduces the same `test/swarm.js:62` assertion-after-end.
+
+The complete dormant peer-tail/UDX stack is still not a production runtime.
+Its test fixture supplies fake clocks, fake topology, test-only authorities and
+synthetic neighbor provisioning that the public controller cannot obtain.
+Promoting that fixture would fabricate discovery and admission rather than
+integrate them. Public activation therefore remains on the narrower peer alpha
+until a real decentralized bootstrap/neighbor service replaces those fixture
+inputs and the exact resulting wire receives named external human
+cryptographic review.

@@ -174,6 +174,10 @@ are **not** anonymized by this option.
 - `status()` returns `BOOTSTRAPPING`, `READY`, `SUSPENDED`, or `DESTROYED`.
 - `exposureReport()` reports the routing model and direct-destination-send trap
   without exposing keys, addresses, or complete paths.
+- `createServer({ firewall })` evaluates the authenticated end-to-end Noise
+  public key. A refused peer is closed and is never emitted as a server
+  connection. Because the policy runs after Noise authentication, the initiator
+  can observe handshake completion before the refusal closes its stream.
 
 Suspension stops relay advertisement and closes live circuits; resume restarts
 advertisement and republishes listening-server route descriptors. `destroy()`
