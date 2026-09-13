@@ -31,11 +31,12 @@ exists. Accepted limitations are tracked under [Known issues](#known-issues).
 ### Current implementation
 
 The current alpha peer checkpoint is
-[`5018ef7`](https://github.com/ayooooo123/hyperdht/commit/5018ef7),
+[`4e9064c`](https://github.com/ayooooo123/hyperdht/commit/4e9064c),
 published from `implement-private-peer-v2` on 2026-09-12. It supersedes
-`234ef75` by retaining retired logical stream IDs and discarding their
-late in-flight frames; it also includes the initial `0c8af51` cutover's
-registration-ownership and resolver-admission corrections. Its scope is:
+`5018ef7` by moving descriptor sequence recovery behind the selected
+destination guard and adding destination-endpoint stream tombstones. It also
+includes the initial `0c8af51` cutover's registration-ownership,
+resolver-admission, and entry-retirement corrections. Its scope is:
 
 - ordinary HyperDHT peer APIs stay direct; private peer behavior is selected
   through the frozen `dht.privateRouting` facade;
@@ -43,6 +44,9 @@ registration-ownership and resolver-admission corrections. Its scope is:
 - destination guard, entry, and source guard roles are distinct;
 - signed descriptors use opaque route capabilities and period-blinded storage
   targets rather than destination attachment keys;
+- initial publication, restart, and refresh recover the signed previous
+  descriptor over the authenticated destination-guard build connection; only
+  the guard emits descriptor-target GET and PUT traffic;
 - resolver role admission completes before the source discloses its destination
   application key and is mutually reserved against destination guard and entry
   roles;
@@ -52,9 +56,9 @@ registration-ownership and resolver-admission corrections. Its scope is:
   route contexts instead of transparently joining streams;
 - one destination circuit multiplexes independent end-to-end
   Noise/SecretStream sessions; and
-- logical FIN/RESET retirement is idempotent and stream-scoped; retired IDs
-  remain tombstoned until circuit teardown so late DATA cannot destroy sibling
-  sessions on the shared circuit.
+- logical FIN/RESET retirement is idempotent and stream-scoped; the entry and
+  destination endpoint retain retired IDs until circuit teardown so late DATA
+  in either direction cannot destroy sibling sessions on the shared circuit.
 
 The earlier routed-DHT implementation checkpoint is
 [`cae9721`](https://github.com/ayooooo123/hyperdht/commit/cae9721f946b4d3b2b8adcb61b3230332371e830),
