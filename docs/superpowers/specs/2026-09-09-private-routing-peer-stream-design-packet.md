@@ -30,6 +30,15 @@ circuit. The entry assigns even logical stream IDs and multiplexes independent
 end-to-end Noise/SecretStream sessions over the destination circuit. Endpoint
 and relay roles are mutually exclusive in the alpha API.
 
+Resolver admission is two-phase. A relay with an active destination-guard or
+entry role rejects before the source transmits the destination application key;
+an admitted resolver is reserved against acquiring either role until lookup
+finishes. Guard-to-entry registration authenticates with the destination
+guard's advertised relay Noise identity, and the entry verifies that identity
+against the signed descriptor before mutating the live circuit map. Logical
+FIN/RESET retirement is idempotent and stream-scoped, so a duplicate reset or
+one closed stream cannot tear down the shared destination circuit.
+
 This cutover does not instantiate the dormant topology-grant,
 `UdxCellEndpoint`, peer-tail control, semantic service, purpose-owner, or quota
 ledger stack. Those components remain the path to the full ratified runtime;

@@ -13,6 +13,11 @@ const {
 const peerController = require('../../lib/private/private-peer-controller')
 const { TEST_ONLY_PRIVATE_PEER_OBSERVER } = peerController
 
+const OP_RESOLVE = 2
+const OP_ENTRY_REGISTER = 4
+const STATUS_UNAVAILABLE = 1
+const ROUTE_CONTEXT_BYTES = 120
+
 let nextPort = 49300
 
 function privateRouting(relay = false) {
@@ -146,7 +151,20 @@ test('private routing is an optional context on an ordinary HyperDHT node', asyn
 test('private context multiplexes end-to-end Noise streams over transformed route cells', async (t) => {
   let lastSourceOpened = null
   const transformProof = { inbound: null, outbound: null, plaintext: null }
+  let resolveDestinationReset
+  const destinationResetSeen = new Promise((resolve) => {
+    resolveDestinationReset = resolve
+  })
   const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
+    if (
+      event.type === 'route-cell-opened' &&
+      event.label === 'destination-endpoint' &&
+      event.plaintext.byteLength === 5 &&
+      event.plaintext[4] === 3
+    ) {
+      resolveDestinationReset()
+      return
+    }
     if (event.type === 'route-cell-opened' && event.label === 'guard-source') {
       lastSourceOpened = event
       return
@@ -223,6 +241,39 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   currentTarget.fill(0)
   nextTarget.fill(0)
   stableTarget.fill(0)
+  const overlappingResolver = source.connect(descriptor.destinationGuardPublicKey, {
+    keyPair: HyperDHT.keyPair()
+  })
+  overlappingResolver.on('error', () => {})
+  t.is(await overlappingResolver.opened, true)
+  const resolverStatus = readBytes(overlappingResolver, 1)
+  overlappingResolver.write(b4a.from([OP_RESOLVE]))
+  t.is(
+    (await resolverStatus)[0],
+    STATUS_UNAVAILABLE,
+    'destination guard rejects resolver role before the destination key is sent'
+  )
+  overlappingResolver.destroy()
+
+  const forgedRegistration = source.connect(descriptor.entryRelayPublicKey, {
+    keyPair: HyperDHT.keyPair()
+  })
+  forgedRegistration.on('error', () => {})
+  t.is(await forgedRegistration.opened, true)
+  const registrationStatus = readBytes(forgedRegistration, 1)
+  forgedRegistration.write(
+    b4a.concat([
+      b4a.from([OP_ENTRY_REGISTER]),
+      descriptor.wire,
+      b4a.alloc(ROUTE_CONTEXT_BYTES, 0x7b)
+    ])
+  )
+  t.is(
+    (await registrationStatus)[0],
+    STATUS_UNAVAILABLE,
+    'entry rejects registration outside the authenticated destination-guard identity'
+  )
+  forgedRegistration.destroy()
 
   const payloads = [b4a.alloc(64 * 1024, 0x5a), b4a.alloc(48 * 1024, 0xa5)]
   const sockets = payloads.map(() => source.privateRouting.connect(server.publicKey))
@@ -242,6 +293,17 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   })
   t.is(accepted.length, 2, 'one destination circuit accepts two independent logical streams')
   for (const socket of accepted) t.alike(socket.remotePublicKey, source.defaultKeyPair.publicKey)
+  const firstClosed = new Promise((resolve) => sockets[0].once('close', resolve))
+  sockets[0].destroy()
+  await Promise.all([firstClosed, destinationResetSeen])
+  const survivorPayload = b4a.from('sibling stream survives peer reset')
+  const survivorEcho = readBytes(sockets[1], survivorPayload.byteLength)
+  sockets[1].write(survivorPayload)
+  t.alike(
+    (await survivorEcho).subarray(0, survivorPayload.byteLength),
+    survivorPayload,
+    'reset retires only its logical stream'
+  )
 
   t.ok(transformProof.inbound, 'source guard opens a fixed authenticated route cell')
   t.ok(transformProof.outbound, 'source guard reseals the payload for the next hop')
@@ -262,7 +324,7 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     directDestinationSends: 0
   })
 
-  for (const socket of sockets) socket.end()
+  for (const socket of sockets) if (!socket.destroyed) socket.end()
 })
 
 test('same-key private server restart advances the blinded descriptor sequence', async (t) => {
