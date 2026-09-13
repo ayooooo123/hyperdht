@@ -86,14 +86,16 @@ jobs:
           sudo -n apt-get install -y -q tcpdump
           npm run test:private:namespace:live
       - name: Peer v3 fixed-cell and leak capture (privileged)
+        env:
+          PR_RETAIN_CAPTURE: '1'
         run: |
           sudo -n true
           npm run test:private:peer:capture
-      - name: Retain synthetic namespace capture evidence
+      - name: Retain private-routing capture evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: namespace-captures
+          name: private-routing-captures
           path: |
             /tmp/pr-capture-*/*.pcap
             /tmp/pr-capture-*/*.close.json
@@ -101,5 +103,6 @@ jobs:
             /tmp/pr-capture-*/*.tcpdump.log
             /tmp/pr-capture-*/*.tcpdump.exit
             /tmp/pr-capture-*/*.shutdown.json
+            /tmp/hyperdht-peer-v3-*/*.pcap
           if-no-files-found: ignore
           retention-days: 7

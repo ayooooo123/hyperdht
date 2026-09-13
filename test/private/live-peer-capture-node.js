@@ -110,6 +110,7 @@ if (process.platform !== 'linux') {
   test('peer v3 Linux packet capture', { timeout: 120000 }, async (t) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hyperdht-peer-v3-'))
     const captureFile = path.join(directory, 'peer-v3.pcap')
+    const retainCapture = process.env.PR_RETAIN_CAPTURE === '1'
     const nodes = []
     let capture = null
     const openedByLabel = new Map()
@@ -296,7 +297,8 @@ if (process.platform !== 'linux') {
       }
       restoreObserver()
       await Promise.allSettled(nodes.reverse().map((node) => node.destroy({ force: true })))
-      fs.rmSync(directory, { recursive: true, force: true })
+      if (retainCapture) t.comment(`peer capture retained at ${captureFile}`)
+      else fs.rmSync(directory, { recursive: true, force: true })
     }
   })
 }
