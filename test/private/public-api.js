@@ -17,6 +17,9 @@ const OP_RESOLVE = 2
 const OP_ENTRY_REGISTER = 4
 const STATUS_UNAVAILABLE = 1
 const ROUTE_CONTEXT_BYTES = 120
+const LOGICAL_DATA = 0
+const LOGICAL_RESET = 3
+const LOGICAL_HEADER_BYTES = 5
 
 let nextPort = 49300
 
@@ -151,16 +154,53 @@ test('private routing is an optional context on an ordinary HyperDHT node', asyn
 test('private context multiplexes end-to-end Noise streams over transformed route cells', async (t) => {
   let lastSourceOpened = null
   const transformProof = { inbound: null, outbound: null, plaintext: null }
+  let latePayload = null
+  let lateLogicalFrame = null
+  let holdLateFrame = false
   let resolveDestinationReset
+  let resolveLateFrameHeld
+  let resolveLateFrameReceived
+  let releaseLateFrame
   const destinationResetSeen = new Promise((resolve) => {
     resolveDestinationReset = resolve
   })
+  const lateFrameHeld = new Promise((resolve) => {
+    resolveLateFrameHeld = resolve
+  })
+  const lateFrameReceived = new Promise((resolve) => {
+    resolveLateFrameReceived = resolve
+  })
+  const lateFrameGate = new Promise((resolve) => {
+    releaseLateFrame = resolve
+  })
   const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
+    if (
+      holdLateFrame &&
+      event.type === 'route-transform' &&
+      event.from === 'guard-destination' &&
+      event.to === 'guard-entry' &&
+      event.plaintext.byteLength > LOGICAL_HEADER_BYTES &&
+      event.plaintext[4] === LOGICAL_DATA
+    ) {
+      holdLateFrame = false
+      lateLogicalFrame = b4a.from(event.plaintext)
+      resolveLateFrameHeld()
+      return lateFrameGate
+    }
+    if (
+      event.type === 'route-cell-opened' &&
+      event.label === 'entry-destination' &&
+      lateLogicalFrame !== null &&
+      b4a.equals(event.plaintext, lateLogicalFrame)
+    ) {
+      resolveLateFrameReceived()
+      return
+    }
     if (
       event.type === 'route-cell-opened' &&
       event.label === 'destination-endpoint' &&
       event.plaintext.byteLength === 5 &&
-      event.plaintext[4] === 3
+      event.plaintext[4] === LOGICAL_RESET
     ) {
       resolveDestinationReset()
       return
@@ -192,6 +232,7 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     }
   })
   t.teardown(restoreObserver)
+  t.teardown(() => releaseLateFrame())
 
   const nodes = await network(t)
   const source = nodes[0]
@@ -293,16 +334,23 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   })
   t.is(accepted.length, 2, 'one destination circuit accepts two independent logical streams')
   for (const socket of accepted) t.alike(socket.remotePublicKey, source.defaultKeyPair.publicKey)
+  latePayload = b4a.from('late response crosses reset')
+  holdLateFrame = true
+  sockets[0].write(latePayload)
+  await lateFrameHeld
   const firstClosed = new Promise((resolve) => sockets[0].once('close', resolve))
   sockets[0].destroy()
   await Promise.all([firstClosed, destinationResetSeen])
-  const survivorPayload = b4a.from('sibling stream survives peer reset')
+  releaseLateFrame()
+  await lateFrameReceived
+
+  const survivorPayload = b4a.from('sibling stream survives late peer data')
   const survivorEcho = readBytes(sockets[1], survivorPayload.byteLength)
   sockets[1].write(survivorPayload)
   t.alike(
     (await survivorEcho).subarray(0, survivorPayload.byteLength),
     survivorPayload,
-    'reset retires only its logical stream'
+    'late data for a reset stream cannot retire its sibling'
   )
 
   t.ok(transformProof.inbound, 'source guard opens a fixed authenticated route cell')

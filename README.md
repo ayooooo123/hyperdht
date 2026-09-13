@@ -128,8 +128,10 @@ then reseals the payload with a fresh adjacent circuit key, nonce, circuit ID,
 and counter. A relay therefore transforms on-wire bytes rather than forwarding
 an unchanged transparent stream. The application Noise/SecretStream handshake
 remains end-to-end between the client and server application keys.
-Logical reset and close are stream-scoped and idempotent. Retiring one
-multiplexed stream does not reset its siblings or the destination circuit.
+Logical reset and close are stream-scoped and idempotent. The entry retains
+retired stream IDs for the circuit lifetime and discards their late in-flight
+DATA, so closing one multiplexed stream cannot reset its siblings or the
+destination circuit.
 
 Route-only peer information is not added to the caller's routing table and is
 not used for a direct destination ping or dial. Missing, invalid, expired, or
