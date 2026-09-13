@@ -20,6 +20,9 @@ const ROUTE_CONTEXT_BYTES = 120
 const LOGICAL_DATA = 0
 const LOGICAL_RESET = 3
 const LOGICAL_HEADER_BYTES = 5
+const DESCRIPTOR_COMMAND_GET = 0
+const DESCRIPTOR_COMMAND_PUT = 1
+const DESCRIPTOR_PLUGIN_NAME = 'private-route'
 
 let nextPort = 49300
 
@@ -55,6 +58,20 @@ async function network(t, roles = [false, false, true, true, true]) {
   await Promise.all(nodes.map((node) => node.ready()))
   await Promise.all(nodes.map((node) => node.privateRouting.ready()))
   return nodes
+}
+function trapDescriptorTraffic(t, node) {
+  const traffic = { get: 0, put: 0 }
+  const plugin = node.plugins.get(DESCRIPTOR_PLUGIN_NAME)
+  const query = plugin.query
+  plugin.query = function (request, ...args) {
+    if (request.command === DESCRIPTOR_COMMAND_GET) traffic.get++
+    if (request.command === DESCRIPTOR_COMMAND_PUT) traffic.put++
+    return query.call(this, request, ...args)
+  }
+  t.teardown(() => {
+    plugin.query = query
+  })
+  return traffic
 }
 
 function readBytes(stream, expected) {
@@ -157,10 +174,15 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   let latePayload = null
   let lateLogicalFrame = null
   let holdLateFrame = false
+  let clientLogicalFrame = null
+  let holdClientFrame = false
   let resolveDestinationReset
   let resolveLateFrameHeld
   let resolveLateFrameReceived
+  let resolveClientFrameHeld
+  let resolveClientFrameReceived
   let releaseLateFrame
+  let releaseClientFrame
   const destinationResetSeen = new Promise((resolve) => {
     resolveDestinationReset = resolve
   })
@@ -172,6 +194,15 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   })
   const lateFrameGate = new Promise((resolve) => {
     releaseLateFrame = resolve
+  })
+  const clientFrameHeld = new Promise((resolve) => {
+    resolveClientFrameHeld = resolve
+  })
+  const clientFrameReceived = new Promise((resolve) => {
+    resolveClientFrameReceived = resolve
+  })
+  const clientFrameGate = new Promise((resolve) => {
+    releaseClientFrame = resolve
   })
   const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
     if (
@@ -194,6 +225,28 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
       b4a.equals(event.plaintext, lateLogicalFrame)
     ) {
       resolveLateFrameReceived()
+      return
+    }
+    if (
+      holdClientFrame &&
+      event.type === 'route-transform' &&
+      event.from === 'guard-entry' &&
+      event.to === 'guard-destination' &&
+      event.plaintext.byteLength > LOGICAL_HEADER_BYTES &&
+      event.plaintext[4] === LOGICAL_DATA
+    ) {
+      holdClientFrame = false
+      clientLogicalFrame = b4a.from(event.plaintext)
+      resolveClientFrameHeld()
+      return clientFrameGate
+    }
+    if (
+      event.type === 'route-cell-opened' &&
+      event.label === 'destination-endpoint' &&
+      clientLogicalFrame !== null &&
+      b4a.equals(event.plaintext, clientLogicalFrame)
+    ) {
+      resolveClientFrameReceived()
       return
     }
     if (
@@ -233,6 +286,7 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   })
   t.teardown(restoreObserver)
   t.teardown(() => releaseLateFrame())
+  t.teardown(() => releaseClientFrame())
 
   const nodes = await network(t)
   const source = nodes[0]
@@ -352,6 +406,29 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     survivorPayload,
     'late data for a reset stream cannot retire its sibling'
   )
+  const third = source.privateRouting.connect(server.publicKey)
+  third.on('error', () => {})
+  sockets.push(third)
+  t.is(await third.opened, true, 'replacement logical stream opens on the surviving circuit')
+  t.is(accepted.length, 3)
+  const clientLatePayload = b4a.from('late client data crosses server reset')
+  holdClientFrame = true
+  third.write(clientLatePayload)
+  await clientFrameHeld
+  const thirdClosed = new Promise((resolve) => third.once('close', resolve))
+  accepted[2].destroy()
+  await thirdClosed
+  releaseClientFrame()
+  await clientFrameReceived
+
+  const reverseSurvivorPayload = b4a.from('sibling survives late client data')
+  const reverseSurvivorEcho = readBytes(sockets[1], reverseSurvivorPayload.byteLength)
+  sockets[1].write(reverseSurvivorPayload)
+  t.alike(
+    (await reverseSurvivorEcho).subarray(0, reverseSurvivorPayload.byteLength),
+    reverseSurvivorPayload,
+    'late client data for a server-retired stream cannot retire its sibling'
+  )
 
   t.ok(transformProof.inbound, 'source guard opens a fixed authenticated route cell')
   t.ok(transformProof.outbound, 'source guard reseals the payload for the next hop')
@@ -380,13 +457,31 @@ test('same-key private server restart advances the blinded descriptor sequence',
   const source = nodes[0]
   const destination = nodes[1]
   const serverKeyPair = HyperDHT.keyPair()
+  const initialTraffic = trapDescriptorTraffic(t, destination)
   const first = destination.privateRouting.createServer()
   await first.listen(serverKeyPair)
   const firstDescriptor = decodeDescriptor(first._descriptor)
+  t.alike(
+    initialTraffic,
+    { get: 0, put: 0 },
+    'initial listen sends no descriptor storage traffic from the destination'
+  )
   await first.close()
 
+  const replacement = new HyperDHT({
+    bootstrap: [{ host: '127.0.0.1', port: nodes[2].address().port }],
+    host: '127.0.0.1',
+    port: nextPort++,
+    ephemeral: false,
+    firewalled: false,
+    privateRouting: privateRouting(false)
+  })
+  t.teardown(() => replacement.destroy({ force: true }))
+  await replacement.ready()
+  await replacement.privateRouting.ready()
+  const replacementTraffic = trapDescriptorTraffic(t, replacement)
   let accepted = false
-  const second = destination.privateRouting.createServer((socket) => {
+  const second = replacement.privateRouting.createServer((socket) => {
     socket.on('error', () => {})
     accepted = true
     socket.end()
@@ -394,7 +489,15 @@ test('same-key private server restart advances the blinded descriptor sequence',
   t.teardown(() => second.close())
   await second.listen(serverKeyPair)
   const secondDescriptor = decodeDescriptor(second._descriptor)
-  t.ok(secondDescriptor.seq > firstDescriptor.seq, 'replacement descriptor wins sequence ordering')
+  t.ok(
+    secondDescriptor.seq > firstDescriptor.seq,
+    'replacement controller recovers and advances the signed descriptor sequence'
+  )
+  t.alike(
+    replacementTraffic,
+    { get: 0, put: 0 },
+    'restart sends no descriptor GET or PUT from the destination'
+  )
 
   const socket = source.privateRouting.connect(serverKeyPair.publicKey)
   socket.on('error', () => {})
