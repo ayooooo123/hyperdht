@@ -6,18 +6,19 @@ This record covers the experimental Gate 3A substrate, the owner-approved Gate
 3B1 live routing implementation through Task 17, subsequent routed-DHT, SURB,
 and blinded-presence work, and the later alpha peer-stream cutover. It is not a
 production anonymity claim. The reviewed native route stack remains
-package-private; the peer alpha is a separate, narrower HyperDHT-native circuit
+package-private; the peer alpha is a separate HyperDHT-native fixed-cell circuit
 runtime described below and in the README.
 
 Direct behavior remains the default. Supplying the exact acknowledged
 `privateRouting` option adds a separate `dht.privateRouting` context while
 ordinary `dht.connect()`, `dht.createServer()`, DHT records, queries, and
 routing-table behavior remain direct. Relay participation is an explicit,
-mutually exclusive role. The peer alpha uses period-blinded signed
-descriptors, independent source and destination circuits, authenticated
-1200-byte hop transformation, entry multiplexing, and end-to-end Noise. It
-does not instantiate or claim completion of the full reviewed peer-tail/UDX
-adjacency, shared quota, ARQ, or legacy-egress design.
+mutually exclusive role. The peer alpha `standard` profile uses a four-relay
+compiled path, period-blinded destination-signed descriptors, quorum storage
+and readback, authenticated 1200-byte hop transformation, entry multiplexing,
+bounded per-link accounting, and end-to-end Noise. It does not instantiate or
+claim completion of the full reviewed peer-tail/UDX adjacency, shared global
+quota, ARQ, or legacy-egress design.
 
 The historical canonical design is [Private Routing Protocol v1](private-routing-v1.md).
 The current peer API contract is the README's
@@ -30,40 +31,53 @@ exists. Accepted limitations are tracked under [Known issues](#known-issues).
 
 ### Current implementation
 
-The current alpha peer checkpoint is
-[`0b2df5a`](https://github.com/ayooooo123/hyperdht/commit/0b2df5a),
-published from `implement-private-peer-v2` on 2026-09-12. It supersedes
-`4e9064c` by making destination admission ephemeral until resolver exclusion
-and destination-role reservation complete. It includes the earlier guarded
-descriptor recovery, two-sided retired-stream isolation,
-registration-ownership, and source-resolver admission corrections. Its scope
-is:
+The current alpha peer implementation on `implement-private-peer-v2`
+supersedes the published
+[`0b2df5a`](https://github.com/ayooooo123/hyperdht/commit/0b2df5a)
+checkpoint. The earlier checkpoint made destination admission ephemeral until
+resolver exclusion and destination-role reservation completed. The current v3
+wire and `standard` profile additionally:
 
-- ordinary HyperDHT peer APIs stay direct; private peer behavior is selected
-  through the frozen `dht.privateRouting` facade;
-- only nodes configured with `relay: true` announce and accept relay work;
-- destination guard, entry, and source guard roles are distinct;
-- signed descriptors use opaque route capabilities and period-blinded storage
-  targets rather than destination attachment keys;
-- destination admission uses a fresh ephemeral outer Noise identity and sends
-  only its opcode before resolver exclusion; after role reservation, a random
-  challenge and domain-separated signature bind the authenticated ephemeral
-  peer, selected guard, and destination application key;
-- initial publication, restart, and refresh then recover the signed previous
-  descriptor through that admitted guard; only the guard emits
-  descriptor-target GET and PUT traffic;
-- resolver role admission completes before the source discloses its destination
-  application key and is mutually reserved against destination guard and entry
-  roles;
-- guard-to-entry registration is authenticated with the descriptor's advertised
-  destination-guard relay identity before the entry may replace a live circuit;
-- relays authenticate, open, and reseal fixed STREAM cells with fresh adjacent
-  route contexts instead of transparently joining streams;
-- one destination circuit multiplexes independent end-to-end
-  Noise/SecretStream sessions; and
-- logical FIN/RESET retirement is idempotent and stream-scoped; the entry and
-  destination endpoint retain retired IDs until circuit teardown so late DATA
-  in either direction cannot destroy sibling sessions on the shared circuit.
+- keep ordinary HyperDHT peer APIs direct; private peer behavior remains an
+  explicit selection through the frozen `dht.privateRouting` facade;
+- require the exact `profile: 'standard'` option and compile two
+  source-selected safety relays plus a destination-selected entry and guard,
+  with all four advertised relay identities distinct;
+- sign each descriptor with the period-blinded destination key and omit the
+  stable destination application key from descriptor bytes;
+- require at least three successful descriptor replicas and an exact
+  two-reply signed readback quorum before publication commits;
+- stage guard-authenticated entry registration and install it only after the
+  descriptor publication quorum succeeds and the guard sends `ENTRY_COMMIT`;
+- retain ephemeral destination admission, resolver-before-key disclosure, and
+  mutual reservation between resolver, destination-guard, and entry roles;
+- recover signed previous-generation state through the admitted destination
+  guard, so initial publication, restart, and refresh send descriptor GET and
+  PUT traffic only from that guard;
+- authenticate, open, account, and reseal every fixed STREAM cell at every
+  relay hop, using fresh adjacent route contexts rather than transparent stream
+  joins;
+- bound pending cell sends, receive buffering, asynchronous transform backlog,
+  lifetime stream IDs, per-stream frames, and per-stream bytes, with separate
+  send and receive peer-ledger charges on every link;
+- multiplex independent end-to-end Noise/SecretStream sessions over one
+  destination circuit; and
+- keep logical FIN/RESET retirement idempotent and stream-scoped, retaining
+  retired IDs until circuit teardown so late DATA in either direction cannot
+  destroy sibling sessions.
+
+Current local verification on 2026-09-13:
+
+- focused peer protocol behavior passes Node and Bare with 5/5 tests and 78/78
+  assertions per runtime;
+- the complete private aggregate passes Node 1,299/1,299 with 23,190/23,190
+  assertions and Bare 1,254/1,254 with 23,055/23,055 assertions;
+- changed-file Prettier and `git diff --check` pass;
+- the portable eleven-process routed-DHT scenario does not start: both attempts
+  fail at `lookup-exit-b/CONTROL` with `PROCESS_BIND_UNAVAILABLE`. No stale
+  `runtime-node.js` process or owner of `127.64.5.1:42005` was present after the
+  failure. This is not recorded as peer-v3 behavior evidence and does not
+  replace Linux packet capture.
 
 The earlier routed-DHT implementation checkpoint is
 [`cae9721`](https://github.com/ayooooo123/hyperdht/commit/cae9721f946b4d3b2b8adcb61b3230332371e830),
@@ -94,7 +108,7 @@ the KI-4 offer-admission repair described below:
 **Open gates:** the alpha peer runtime still needs Linux packet-capture
 acceptance and external human cryptographic review before any production
 anonymity claim. The full reviewed peer-tail/UDX adjacency runtime, shared
-quota ledger, ARQ/retransmission, legacy egress, Hyperswarm, mobile, and
+global quota ledger, ARQ/retransmission, legacy egress, Hyperswarm, mobile, and
 PearTube integration remain unimplemented. KI-4's routed-DHT responder-side
 offer admission is repaired under the reviewed cross-host time contract, but
 four later real-link dispatches stopped before LINK_OFFER; none confirms that

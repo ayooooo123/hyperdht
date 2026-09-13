@@ -87,6 +87,7 @@ class HyperDHT extends DHT {
         value: Object.freeze({
           release: 'alpha',
           mode: 'optional',
+          profile: routing.controller.snapshot().profile,
           relay: routing.controller.snapshot().relay,
           ready: () => routing.controller.ready(),
           status: () => routing.controller.snapshot().state,
@@ -633,11 +634,18 @@ function privateRoutingOptions(opts) {
   if (opts === null || (typeof opts !== 'object' && typeof opts !== 'function')) return null
   if (!('privateRouting' in opts)) return null
   const value = ownData(opts, 'privateRouting')
-  const options = exactPrivateObject(value, ['release', 'acknowledgeAlpha', 'mode', 'relay'])
+  const options = exactPrivateObject(value, [
+    'release',
+    'acknowledgeAlpha',
+    'mode',
+    'profile',
+    'relay'
+  ])
   if (
     options.release !== 'alpha' ||
     options.acknowledgeAlpha !== true ||
     options.mode !== 'optional' ||
+    options.profile !== 'standard' ||
     typeof options.relay !== 'boolean'
   )
     invalidPrivateOptions()
@@ -651,6 +659,7 @@ function createPrivateRouting(options, dht) {
     dht,
     keyPair: dht.defaultKeyPair,
     relay: options.relay,
+    profile: options.profile,
     baseReady: () => DHT.prototype.fullyBootstrapped.call(dht),
     createDirectServer: (serverOptions) => new Server(dht, serverOptions),
     connectDirect: (publicKey, connectOptions) => connect(dht, publicKey, connectOptions)
