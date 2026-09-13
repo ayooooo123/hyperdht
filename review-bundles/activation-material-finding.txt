@@ -1,72 +1,47 @@
-SUPPLEMENTAL REVIEW FINDING — frozen ZIP unchanged
+SECURITY REVIEW FINDING DISPOSITION — RESOLVED IN PACKET SOURCE
 
-Applies to hyperdht-private-peer-v2-security-review.zip
-ZIP SHA256: efd01631e600f78db1269317a38f39fceb5637a283e6c726ed4e16ee30896ab3
-Frozen peer-tail-control.js SHA256:
-37de0d46df3ecf352575b1ca09aef4ace8e175098026917ae30b655eb8757fec
+Finding
+-------
+A review-only hook between genuine peer final-exit activation prepare and
+commit changed localDeadline, tailControl, or clockIdentity. The old commit
+accepted each changed material object. This proved missing commit-time metadata
+validation at an internal synchronous boundary; it did not prove a remotely
+reachable exploit.
 
-Observed invariant gap
-----------------------
-A review-only hook between genuine activation prepare and commit changes one
-material property. The peer commit accepts changes to localDeadline,
-tailControl, and clockIdentity. The unchanged control also commits.
-The material object is not frozen.
+Correction
+----------
+peer-tail-control now snapshots all twelve exact handoff data-property values
+when it creates the handoff. Prepare and commit require the same property set
+and object/scalar values, require the owner, clock, initiator and deadline facts
+to match authoritative session state, and require the final-exit generation to
+match the prepared transfer. A changed object fails closed before the activation
+reservation is consumed.
 
-Reproduction
-------------
-Run from the extracted code directory, with the supplemental probe path:
-  node /path/to/activation-material-probe.cjs .
-
-Observed with Node v24.18.0 on Darwin arm64, real udx-native sockets, and the
-existing fixture fake clock. The command exited1 in0.48seconds because the
-assertion requiring rejection failed. No source file was modified by the probe.
-
-Recorded result (transcribed from the observed command output):
-  unchanged:     accepted=true, materialFrozen=false, fieldChanged=false
-  localDeadline: accepted=true, materialFrozen=false, fieldChanged=true
-  tailControl:   accepted=true, materialFrozen=false, fieldChanged=true
-  clockIdentity: accepted=true, materialFrozen=false, fieldChanged=true
-
-Failed assertion:
-  commit must reject material whose parent deadline, owner or clock identity
-  changed after prepare
-  false !== true
-
-Scope and limitation
+Permanent regression
 --------------------
-This is an internal fault-injection proof of absent commit-time metadata
-validation, NOT a demonstrated remote exploit or proof that an ordinary caller
-can interpose in the synchronous claim path. The probe instruments only the
-shared claim orchestration to insert the mutation. It does not fabricate
-handoffs, reservations, activation owners, peer runtimes, or network authority.
-It restores metadata after observing the result for normal owner cleanup.
+test/private/peer-tail-control.js patches only the module's public prepare hook,
+then independently changes localDeadline, tailControl, and clockIdentity between
+genuine prepare and commit. Node and Bare both pass 20/20 tests and 156/156
+assertions; each substitution is rejected.
 
-Reference points in the frozen code
-----------------------------------
-- docs/superpowers/specs/2026-09-09-private-routing-peer-stream-design-packet.md:
-  section4.2, especially lines521–524, requires the one-shot ownership chain
-  and compare-and-swap parity.
-- lib/private/final-exit-activation.js:171–173 synchronously prepares, stores
-  prepared.material, then commits. The ordinary caller receives the owner only
-  afterward. This constrains the threat model for the injected mutation.
-- lib/private/peer-tail-control.js:3240–3329 holds the peer prepare/commit path.
-  Commit checks consumed object identity but does not compare the changed
-  metadata against authoritative tail state.
-- lib/private/tail-control.js:1967–2057 checks
-  finalExitMaterialDeadlineMatches at both prepare and commit.
-- lib/private/final-exit-handoff.js:108–113 retains the material reference;
-  only the opaque handoff object is frozen.
+Independent reproduction
+------------------------
+From the extracted packet code directory:
 
-Requested external-agent disposition
-------------------------------------
-Assess reachability separately from invariant parity. Compare exact owner,
-parent clocks/deadlines and material bindings to immutable authoritative facts
-at prepare and commit, including post-callback rechecks. Determine whether the
-stored generation is a necessary CAS token and enforce its semantics if so;
-its exploitability was not tested here. Check failure cleanup and one-shot
-reservation consumption. Keep a mutation-boundary regression only if it guards
-the intended contract; do not claim ordinary-caller or network exploitability
-from this instrumentation alone.
+  node review-bundles/activation-material-probe.cjs .
 
-No production fix, final security verdict, or release approval is included.
-This finding and its probe were created after the ZIP and are not inside it.
+Expected result:
+
+  unchanged:     accepted=true
+  localDeadline: accepted=false, error=INVALID_ROUTE
+  tailControl:   accepted=false, error=INVALID_ROUTE
+  clockIdentity: accepted=false, error=INVALID_ROUTE
+
+The probe exits zero only when the unchanged control commits and every changed
+case is rejected. It uses real udx-native sockets and fixture clocks; it does
+not fabricate handoffs, reservations, activation owners, peer runtimes, or
+network authority.
+
+This disposition is implementation evidence, not an external security verdict
+or release approval. The packet manifest identifies the exact reviewed source
+revision.

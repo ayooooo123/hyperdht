@@ -200,6 +200,48 @@ test('pure carrier authorization CAS and atomic route carrier transfer contract'
   destroyPeerM3Runtime(initiatorRuntime)
 })
 
+test('peer final-exit commit rejects material changed after prepare', async (t) => {
+  const peerTailControlModule = require('../../lib/private/peer-tail-control')
+  const scenarios = [
+    ['localDeadline', (material) => (material.localDeadline += 1n)],
+    ['tailControl', (material) => (material.tailControl = Object.freeze({}))],
+    ['clockIdentity', (material) => (material.clockIdentity = Object.freeze({}))]
+  ]
+
+  for (let index = 0; index < scenarios.length; index++) {
+    const [field, mutate] = scenarios[index]
+    const fixture = await authenticatedPeer(t, 49620 + index * 4, 2, true)
+    const session = createPeerTailControl(fixture.peerRuntime, {
+      relayOwner: fixture.f.peerRelayOwner,
+      neighborPool: fixture.f.peerPool,
+      runtimeAuthority: fixture.peerAuthority,
+      memoryPool: createPeerMemoryPool(4096)
+    })
+    const handoff = createPeerFinalExitHandoff(session)
+    const originalPrepare = peerTailControlModule.prepareTailControlFinalExitActivation
+    let material = null
+    let original = null
+
+    peerTailControlModule.prepareTailControlFinalExitActivation = (...args) => {
+      const prepared = originalPrepare(...args)
+      material = prepared.material
+      original = { ...material }
+      mutate(material)
+      return prepared
+    }
+    try {
+      t.exception(
+        () => claimFinalExitActivation(handoff, createFinalExitActivationClaim(handoff)),
+        `${field} substitution cannot cross the prepare/commit boundary`
+      )
+    } finally {
+      peerTailControlModule.prepareTailControlFinalExitActivation = originalPrepare
+      if (material && original) Object.assign(material, original)
+      destroyPeerTailControl(session)
+    }
+  }
+})
+
 test('two-extension v2 tail control and one-shot final handoff complete flow over genuine Native carriage', async (t) => {
   let terminalSession = null
   let holdNextTerminalPacket = false

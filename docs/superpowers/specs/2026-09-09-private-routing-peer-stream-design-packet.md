@@ -55,6 +55,34 @@ This cutover does not instantiate the dormant topology-grant,
 ledger stack. Those components remain the path to the full ratified runtime;
 the alpha must not be described as completing their remaining gates.
 
+### Decentralized selection and traffic policy
+
+The release does not add a central operator PKI. It follows Veilid's published
+[private/safety route split](https://veilid.com/how-it-works/private-routing/):
+the destination chooses the private half, the source independently chooses the
+safety half, and neither party chooses the complete route. Signed relay
+identities prevent substitution; cryptographic random sampling, distinct
+identities, IPv4 `/24` separation, candidate demotion and route rotation reduce
+topology concentration. They cannot prove that two pseudonymous relays have
+different human operators, so the property is named topology diversity rather
+than operator diversity.
+
+Veilid describes private routing as a performance/security balance, defaults to
+one source-selected and one destination-selected hop, and lists stronger
+per-hop payload keying and higher hop counts as future or higher-safety work.
+The current HyperDHT standard peer profile is more conservative on path length:
+two source-selected and two destination-selected relays, with authenticated
+per-hop transformation into fixed 1,200-byte cells. It remains a low-latency
+onion route, not a mixnet. No mandatory fixed-rate dummy traffic or artificial
+delay is added; global timing and volume correlation remain outside the claim.
+
+For the same performance boundary, ordinary DHT maintenance and Hyperswarm
+topic discovery remain direct. Blinded immutable/mutable get/put perform
+private rendezvous, and peer application streams use the private context.
+Generic routed lookup, findPeer, announce, unannounce and raw query remain
+outside the reviewed wire rather than moving all overlay control traffic onto
+the private path.
+
 ## Design direction
 
 | Concern              | Decision                                                                                                                                                                                                                                                       |
