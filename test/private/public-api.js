@@ -722,6 +722,28 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     'late client data for a server-retired stream cannot retire its sibling'
   )
 
+  let firewallCalls = 0
+  let rejectedConnections = 0
+  const rejectedServer = destination.privateRouting.createServer(
+    {
+      firewall(remotePublicKey) {
+        firewallCalls++
+        t.alike(remotePublicKey, source.defaultKeyPair.publicKey)
+        return true
+      }
+    },
+    () => rejectedConnections++
+  )
+  t.teardown(() => rejectedServer.close())
+  await rejectedServer.listen(HyperDHT.keyPair())
+  const rejected = source.privateRouting.connect(rejectedServer.publicKey)
+  rejected.on('error', () => {})
+  const rejectedClosed = new Promise((resolve) => rejected.once('close', resolve))
+  t.is(await rejected.opened, true, 'server policy runs against an authenticated private peer')
+  await rejectedClosed
+  t.is(firewallCalls, 1, 'private server firewall runs once after Noise authentication')
+  t.is(rejectedConnections, 0, 'firewalled peers are never emitted to the server')
+
   t.ok(transformProof.inbound, 'source guard opens a fixed authenticated route cell')
   t.ok(transformProof.outbound, 'source guard reseals the payload for the next hop')
   t.is(transformProof.inbound.byteLength, 1200)
