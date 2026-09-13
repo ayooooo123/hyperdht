@@ -35,11 +35,16 @@ entry role rejects before the source transmits the destination application key;
 an admitted resolver is reserved against acquiring either role until lookup
 finishes. Guard-to-entry registration authenticates with the destination
 guard's advertised relay Noise identity, and the entry verifies that identity
-against the signed descriptor before mutating the live circuit map. Before
-initial publication, restart, or refresh, the endpoint recovers the signed
-previous descriptor through its selected destination guard on the authenticated
-build connection. Only that guard performs descriptor-target GET and PUT
-traffic. Logical FIN/RESET retirement is idempotent and stream-scoped. Both the
+against the signed descriptor before mutating the live circuit map. Destination
+admission authenticates the outer Noise connection with a fresh ephemeral key
+and sends only the build opcode before the guard checks existing resolver
+ownership. Once the guard atomically reserves the destination role, its random
+challenge is signed under a domain-separated transcript binding the
+authenticated ephemeral peer, guard identity, and destination application key.
+Initial publication, restart, and refresh then recover the signed previous
+descriptor through that admitted guard; only the guard performs
+descriptor-target GET and PUT traffic. Logical FIN/RESET retirement is
+idempotent and stream-scoped. Both the
 entry and destination endpoint retain retired stream IDs until circuit teardown
 and discard their late in-flight frames, while never-opened DATA remains
 circuit-fatal. A delayed frame crossing either endpoint's reset therefore
