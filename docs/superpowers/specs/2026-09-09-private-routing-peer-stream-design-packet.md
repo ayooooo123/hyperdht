@@ -1,9 +1,9 @@
-# Private Routing: Peer Streams — Implementation Prerequisite
+# Private Routing: Peer Streams — Prerequisite and Alpha Cutover
 
 **Date:** 2026-09-09
 **Runtime baseline:** `02bce1422de05c271260b1f37344d69dbe9afe23`
 **Original review baseline:** `06dc259c10d6270977d88e1bc12834d9051e1a77`
-**Status:** internal implementation prerequisite ratified, including the reviewed delayed OFFER-replay clarification in transport §5.1/§9. No v2 runtime or public API is enabled; implementation, native privacy acceptance, and external human cryptographic/public-release gates remain separate.
+**Status:** the reviewed prerequisite remains authoritative for the full native peer-tail design. The current branch now enables a narrower alpha peer runtime: an optional HyperDHT context with explicit relay roles, period-blinded signed route descriptors, independent source/destination circuits, authenticated fixed-cell hop transformation, entry multiplexing, and end-to-end Noise. It does not claim the full peer-tail/UDX adjacency runtime, legacy egress, shared quota ledger, ARQ, Linux privacy acceptance, or external human cryptographic/public-release gates specified below.
 
 The [ratification record](#prerequisite-ratification), [transport specification](#transport-specification), and [semantic specification](#semantic-specification) below form the current integrated specifications, subject to the status above. The intervening review record preserves rejected drafts and earlier proof boundaries as history.
 
@@ -13,6 +13,27 @@ waive the existing reviewed-wire or external human cryptographic-review gates.
 The earlier packet's claim that legacy egress was ready after a few choices
 was wrong. This revision records the source constraints and the rejected parts
 of that packet before any implementation relies on them.
+
+## 2026-09-12 alpha cutover boundary
+
+The enabled alpha is deliberately smaller than the complete ratified runtime in
+this packet. It reuses the reviewed 1200-byte `CellCodec`, STREAM class,
+directional keys/nonces, circuit IDs, ordered counters, and replay/authentication
+checks on authenticated HyperDHT Noise links. Every relay opens and reseals each
+cell with fresh adjacent context; no transparent `pipe()`/`joinStreams()` bridge
+or destination attachment key remains.
+
+The destination compiles a destination-to-guard-to-entry circuit and publishes
+a signed descriptor under a period-blinded DHT target. The source resolves that
+descriptor through a third relay and compiles a source-to-guard-to-entry
+circuit. The entry assigns even logical stream IDs and multiplexes independent
+end-to-end Noise/SecretStream sessions over the destination circuit. Endpoint
+and relay roles are mutually exclusive in the alpha API.
+
+This cutover does not instantiate the dormant topology-grant,
+`UdxCellEndpoint`, peer-tail control, semantic service, purpose-owner, or quota
+ledger stack. Those components remain the path to the full ratified runtime;
+the alpha must not be described as completing their remaining gates.
 
 ## Design direction
 
