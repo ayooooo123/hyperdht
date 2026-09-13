@@ -36,8 +36,11 @@ an admitted resolver is reserved against acquiring either role until lookup
 finishes. Guard-to-entry registration authenticates with the destination
 guard's advertised relay Noise identity, and the entry verifies that identity
 against the signed descriptor before mutating the live circuit map. Logical
-FIN/RESET retirement is idempotent and stream-scoped, so a duplicate reset or
-one closed stream cannot tear down the shared destination circuit.
+FIN/RESET retirement is idempotent and stream-scoped. The entry retains retired
+stream IDs until circuit teardown and discards their late in-flight frames,
+while never-opened DATA remains circuit-fatal. A delayed response crossing a
+source reset therefore cannot tear down sibling streams or the shared
+destination circuit.
 
 This cutover does not instantiate the dormant topology-grant,
 `UdxCellEndpoint`, peer-tail control, semantic service, purpose-owner, or quota
