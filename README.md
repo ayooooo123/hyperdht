@@ -115,6 +115,12 @@ from its guard. The descriptor is stored under a period-blinded DHT target and
 contains relay identities plus an opaque route capability, not a destination
 transport key or dial address. A client resolves the descriptor through a
 separately selected source guard that cannot reuse either destination role.
+Resolution is two-phase: a relay first proves it is not serving as a destination
+guard or entry, reserves the resolver role, and only then accepts the
+destination application key. A forced destination-role candidate rejects
+before that key is sent. The destination guard authenticates its registration
+to the entry with its advertised relay Noise identity; the entry verifies that
+identity against the signed descriptor before replacing any live circuit.
 
 The entry multiplexes independent logical streams over the destination circuit.
 Every physical relay hop authenticates and opens each 1200-byte route cell,
@@ -122,6 +128,8 @@ then reseals the payload with a fresh adjacent circuit key, nonce, circuit ID,
 and counter. A relay therefore transforms on-wire bytes rather than forwarding
 an unchanged transparent stream. The application Noise/SecretStream handshake
 remains end-to-end between the client and server application keys.
+Logical reset and close are stream-scoped and idempotent. Retiring one
+multiplexed stream does not reset its siblings or the destination circuit.
 
 Route-only peer information is not added to the caller's routing table and is
 not used for a direct destination ping or dial. Missing, invalid, expired, or
