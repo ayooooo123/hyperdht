@@ -16,6 +16,9 @@ const RawStreamSet = require('./lib/raw-stream-set')
 const ConnectionPool = require('./lib/connection-pool')
 const { STREAM_NOT_CONNECTED } = require('./lib/errors')
 
+// Kept outside the instance: neither the controller nor its authorities are public.
+const PRIVATE_ROUTING = new WeakMap()
+
 const DEFAULTS = {
   ...DHT.DEFAULTS,
   connectionKeepAlive: 5000,
@@ -24,11 +27,13 @@ const DEFAULTS = {
 
 class HyperDHT extends DHT {
   constructor(opts = {}) {
-    const port = opts.port || 49737
-    const bootstrap = opts.bootstrap || BOOTSTRAP_NODES
-    const nodes = opts.nodes || []
-
-    super({ ...opts, port, bootstrap, nodes, filterNode })
+    const privateOptions = privateRoutingOptions(opts)
+    const directOptions = { ...opts }
+    delete directOptions.privateRouting
+    const port = directOptions.port || 49737
+    const bootstrap = directOptions.bootstrap || BOOTSTRAP_NODES
+    const nodes = directOptions.nodes || []
+    super({ ...directOptions, port, bootstrap, nodes, filterNode })
 
     const { router, relayAddresses, persistent } = defaultCacheOpts(opts)
 
@@ -74,9 +79,72 @@ class HyperDHT extends DHT {
       if (!this.online) return
       for (const server of this.listening) server.notifyOnline()
     })
+    if (privateOptions) {
+      const routing = createPrivateRouting(privateOptions, this)
+      PRIVATE_ROUTING.set(this, routing)
+      Object.defineProperty(this, 'privateRouting', {
+        enumerable: true,
+        value: Object.freeze({
+          release: 'alpha',
+          mode: 'optional',
+          profile: routing.controller.snapshot().profile,
+          relay: routing.controller.snapshot().relay,
+          ready: () => routing.controller.ready(),
+          status: () => routing.controller.snapshot().state,
+          exposureReport: () => routing.controller.exposureReport(),
+          connect: (remotePublicKey, connectOptions) =>
+            routing.controller.connect(remotePublicKey, connectOptions),
+          createServer: (serverOptions, onconnection) => {
+            if (typeof serverOptions === 'function') {
+              return routing.controller.createServer({}, serverOptions)
+            }
+            if (serverOptions && serverOptions.onconnection) {
+              onconnection = serverOptions.onconnection
+            }
+            return routing.controller.createServer(serverOptions, onconnection)
+          }
+        })
+      })
+    }
+  }
+  static DEFAULTS = DEFAULTS
+
+  static bootstrapper(port, host, opts) {
+    if (opts && privateRoutingOptions(opts)) rejectPrivateCommand()
+    return super.bootstrapper(port, host, opts)
   }
 
-  static DEFAULTS = DEFAULTS
+  _bootstrap() {
+    return super._bootstrap()
+  }
+
+  ready() {
+    return super.ready()
+  }
+
+  fullyBootstrapped() {
+    return super.fullyBootstrapped()
+  }
+
+  query(message, opts) {
+    return super.query(message, opts)
+  }
+
+  request(message, to, opts) {
+    return super.request(message, to, opts)
+  }
+
+  findNode(target, opts) {
+    return super.findNode(target, opts)
+  }
+
+  ping(to, opts) {
+    return super.ping(to, opts)
+  }
+
+  delayedPing(to, delayMs, opts) {
+    return super.delayedPing(to, delayMs, opts)
+  }
 
   connect(remotePublicKey, opts) {
     return connect(this, remotePublicKey, opts)
@@ -101,10 +169,14 @@ class HyperDHT extends DHT {
     for (const server of this.listening) resuming.push(server.resume())
     log('Resuming hyperdht servers')
     await Promise.allSettled(resuming)
+    const routing = PRIVATE_ROUTING.get(this)
+    if (routing) await routing.controller.resume()
     log('Done, hyperdht fully resumed')
   }
 
   async suspend({ log = noop } = {}) {
+    const routing = PRIVATE_ROUTING.get(this)
+    if (routing) await routing.controller.suspend()
     this._connectable = false // just so nothing gets connected during suspension
     const suspending = []
     for (const server of this.listening) suspending.push(server.suspend())
@@ -121,6 +193,8 @@ class HyperDHT extends DHT {
   }
 
   async destroy({ force = false } = {}) {
+    const routing = PRIVATE_ROUTING.get(this)
+    if (routing) await routing.controller.destroy()
     if (!force) {
       const closing = []
       for (const server of this.listening) closing.push(server.close())
@@ -527,6 +601,71 @@ HyperDHT.BOOTSTRAP = BOOTSTRAP_NODES
 HyperDHT.FIREWALL = FIREWALL
 
 module.exports = HyperDHT
+
+function rejectPrivateCommand() {
+  throw require('./lib/private/dht-command-policy').unsupportedCommand()
+}
+
+function invalidPrivateOptions() {
+  throw require('./lib/private/errors').PrivateRouteError.INVALID_ROUTE()
+}
+
+function ownData(object, name) {
+  if (object === null || typeof object !== 'object') invalidPrivateOptions()
+  const descriptor = Object.getOwnPropertyDescriptor(object, name)
+  if (!descriptor || !Object.hasOwn(descriptor, 'value')) invalidPrivateOptions()
+  return descriptor.value
+}
+
+function exactPrivateObject(object, fields) {
+  if (
+    object === null ||
+    typeof object !== 'object' ||
+    Object.getPrototypeOf(object) !== Object.prototype ||
+    Reflect.ownKeys(object).length !== fields.length
+  )
+    invalidPrivateOptions()
+  const copy = {}
+  for (const field of fields) copy[field] = ownData(object, field)
+  return copy
+}
+
+function privateRoutingOptions(opts) {
+  if (opts === null || (typeof opts !== 'object' && typeof opts !== 'function')) return null
+  if (!('privateRouting' in opts)) return null
+  const value = ownData(opts, 'privateRouting')
+  const options = exactPrivateObject(value, [
+    'release',
+    'acknowledgeAlpha',
+    'mode',
+    'profile',
+    'relay'
+  ])
+  if (
+    options.release !== 'alpha' ||
+    options.acknowledgeAlpha !== true ||
+    options.mode !== 'optional' ||
+    options.profile !== 'standard' ||
+    typeof options.relay !== 'boolean'
+  )
+    invalidPrivateOptions()
+  return options
+}
+
+function createPrivateRouting(options, dht) {
+  if (!options || !dht) invalidPrivateOptions()
+  const { createPrivatePeerController } = require('./lib/private/private-peer-controller')
+  const controller = createPrivatePeerController({
+    dht,
+    keyPair: dht.defaultKeyPair,
+    relay: options.relay,
+    profile: options.profile,
+    baseReady: () => DHT.prototype.fullyBootstrapped.call(dht),
+    createDirectServer: (serverOptions) => new Server(dht, serverOptions),
+    connectDirect: (publicKey, connectOptions) => connect(dht, publicKey, connectOptions)
+  })
+  return { controller }
+}
 
 function mapLookup(node) {
   if (!node.value) return null

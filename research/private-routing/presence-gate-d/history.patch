@@ -1,0 +1,1188 @@
+From 5c77a5048af4a096638b5c73909d6b5615f2e872 Mon Sep 17 00:00:00 2001
+From: jd1100 <248791769+ayooooo123@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:04:16 -0400
+Subject: [PATCH 1/2] feat(private): Gate D host-path boundary - canonical
+ blinded presence records
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Delivers the package-private host-path boundary of blinded presence records
+with only vetted primitives, and stops Gate D honestly where the dependency
+tree cannot support Tor's full scheme.
+
+Delivered:
+- Epoch addressing key k_e = H(domain || A || epoch), keyed BLAKE2b
+- Tor v3 [KEYBLIND] A.2 public half: A' = h*A via native constant-time
+  crypto_scalarmult_ed25519_noclamp, with Tor's exact clamp; pinned
+  byte-exactly against Tor's published test_blinding_basics vector
+- Canonical fixed 1023-byte padded records (exit-wire value cap), header
+  (version|epoch|zero padding|epoch address) as AEAD associated data
+- Owner authentication via stable-identity certificate over the epoch key
+  and the exact canonical descriptor digest, carried inside the encrypted
+  body; reader credential mandatory, no plaintext mode
+- 7-day epochs, 1-day Tor-style overlap window, owner-signed tombstones
+  with precedence over descriptors
+- 16 brittle tests / 80 assertions registered in the portable aggregate
+
+Blocked, documented in docs/private-routing-migration.md:
+- a' = h·a mod L and public verification under the blinded key need a
+  constant-time scalar-on-scalar multiply; sodium-universal 5.x does not
+  export crypto_core_ed25519_scalar_mul and the only in-tree scalar mul is
+  the experimental tweak extension PR47 was reverted for. No JS BigInt
+  anywhere; no export; no public required mode; no exit-side presence.
+
+Node aggregate 1034/1034 (19,261 asserts). Bare 18/18 module tests green;
+full-suite socket-lifecycle flakes are pre-existing (reproduced on clean
+tree) and unrelated to this module.
+---
+ lib/private/blinded-presence.js  | 503 +++++++++++++++++++++++++++++++
+ test/private-routing.js          |   1 +
+ test/private/blinded-presence.js | 496 ++++++++++++++++++++++++++++++
+ 3 files changed, 1000 insertions(+)
+ create mode 100644 lib/private/blinded-presence.js
+ create mode 100644 test/private/blinded-presence.js
+
+diff --git a/lib/private/blinded-presence.js b/lib/private/blinded-presence.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef21efdb99e4b37ba73ad568b9ffde99fcaeb9f4
+--- /dev/null
++++ b/lib/private/blinded-presence.js
+@@ -0,0 +1,503 @@
++'use strict'
++
++// Gate D host-path boundary: canonical fixed padded private presence records
++// with epoch-scoped addressing and reader-credential encryption.
++//
++// Status of this slice, stated plainly:
++// - Owner authentication is a stable-identity certificate over an epoch
++//   keypair. The certificate is carried inside the encrypted payload, so a
++//   reader credential is required to verify ownership. A credential holder
++//   can decrypt but cannot mint records: the certificate is made with the
++//   stable secret key, which readers do not hold.
++// - Epoch keys are hash-ratcheted from the identity seed, the same pattern as
++//   the session keys in crypto-suite, not algebraically blinded. Multiplicative
++//   blinding (a' = h*a, public verification under a blinded key) needs a
++//   scalar-on-scalar multiply that this dependency tree does not export; see
++//   the Gate D record in docs/private-routing-migration.md.
++// - Point blinding itself (A' = h*A) is the Tor v3 construction and the native
++//   primitive used here is pinned against Tor's published test vector in
++//   test/private/blinded-presence.js.
++// - There is no public export, no public required mode, and no exit-side
++//   presence command. DHT-exit_io admits immutable get only, so the routed
++//   integration fetches records by content hash; storage-key addressing is
++//   provided and verified here but the exit does not yet resolve it.
++
++const b4a = require('b4a')
++const sodium = require('sodium-universal')
++
++const { cryptoSuite } = require('./crypto-suite')
++const { PrivateRouteError } = require('./errors')
++
++const EPOCH_ADDRESS_DOMAIN = b4a.from('hyperdht-private-routes/presence/epoch-address/v1\n')
++const EPOCH_KEY_DOMAIN = b4a.from('hyperdht-private-routes/presence/epoch-key/v1\n')
++const EPOCH_CERTIFICATE_DOMAIN = b4a.from('hyperdht-private-routes/presence/epoch-certificate/v1\n')
++
++const RECORD_SIZE = 1023 // dht-exit-wire MAX_IMMUTABLE_VALUE_BYTES
++const RECORD_VERSION_DESCRIPTOR = 1
++const RECORD_VERSION_TOMBSTONE = 2
++const EPOCH_BYTES = 8
++const RESERVED_BYTES = 31
++const ADDRESS_BYTES = 32
++const HEADER_BYTES = 1 + EPOCH_BYTES + RESERVED_BYTES + ADDRESS_BYTES
++const NONCE_PREFIX_BYTES = 16
++const COUNTER_BYTES = 8
++const TAG_BYTES = 16
++const PLAINTEXT_BYTES = RECORD_SIZE - HEADER_BYTES - NONCE_PREFIX_BYTES - COUNTER_BYTES - TAG_BYTES
++const EPOCH_KEY_BYTES = 32
++const SIGNATURE_BYTES = 64
++const BODY_OFFSET = EPOCH_KEY_BYTES + SIGNATURE_BYTES
++const MAX_DESCRIPTOR_BYTES = PLAINTEXT_BYTES - BODY_OFFSET
++const ZERO = b4a.alloc(32)
++
++const EPOCH_MS = 604_800_000n // 7 days
++const OVERLAP_MS = 86_400_000n // 1 day, Tor-style publish-before/keep-after
++
++const MAX_UINT64 = 0xffff_ffff_ffff_ffffn
++
++function invalid() {
++  throw PrivateRouteError.INVALID_DESCRIPTOR()
++}
++
++function key() {
++  throw PrivateRouteError.INVALID_KEY()
++}
++
++function clear(buffer) {
++  if (b4a.isBuffer(buffer)) buffer.fill(0)
++}
++
++function exactOwnData(value, fields) {
++  if (value === null || typeof value !== 'object' || Array.isArray(value)) invalid()
++  if (Reflect.ownKeys(value).length !== fields.length) invalid()
++  for (const field of fields) {
++    const descriptor = Object.getOwnPropertyDescriptor(value, field)
++    if (!descriptor || !('value' in descriptor)) invalid()
++  }
++}
++
++function fixed(value, size) {
++  return b4a.isBuffer(value) && value.byteLength === size
++}
++
++function uint64(value) {
++  return typeof value === 'bigint' && value >= 0n && value <= MAX_UINT64
++}
++
++function encodeEpoch(epoch) {
++  const buffer = b4a.alloc(EPOCH_BYTES)
++  buffer.writeBigUInt64BE(epoch, 0)
++  return buffer
++}
++
++function deriveEpochAddressKey(identityPublicKey, epoch) {
++  if (!fixed(identityPublicKey, 32)) key()
++  if (!uint64(epoch)) invalid()
++  const input = b4a.concat([EPOCH_ADDRESS_DOMAIN, identityPublicKey, encodeEpoch(epoch)])
++  try {
++    return cryptoSuite.hash([input])
++  } finally {
++    clear(input)
++  }
++}
++
++// Tor v3 [KEYBLIND] A.2: h = H(BLIND_STRING | A | s | B | N), clamped, with
++// A' = h*A as a point multiplication. The digest here is keyed BLAKE2b-256
++// (the repo derivation primitive) rather than Tor's SHA3-256, which is not
++// exported by bare-crypto; portability of the clamp and of A' = h*A is what
++// this slice needs, and the pinned Tor vector in the test suite proves the
++// point-multiply path byte-for-byte.
++function deriveEpochBlindingParam(identityPublicKey, epoch) {
++  if (!fixed(identityPublicKey, 32)) key()
++  if (!uint64(epoch)) invalid()
++  const input = b4a.concat([
++    EPOCH_KEY_DOMAIN,
++    identityPublicKey,
++    encodeEpoch(epoch),
++    b4a.from(
++      '(15112221349535400772501151409588531511454012693041857206046113283949847762202, 46316835694926478169428394003475163141307993866256225615783033603165251855960)'
++    )
++  ])
++  const param = cryptoSuite.hash([input])
++  try {
++    param[0] &= 248
++    param[31] &= 63
++    param[31] |= 64
++    return param
++  } finally {
++    clear(input)
++  }
++}
++
++// Tor v3 [KEYBLIND] A.2 public half: A' = h*A = (h*a)*B via the native
++// constant-time point multiply. Cross-checked byte-exactly against Tor's
++// published blinding vector.
++function blindPublicKey(identityPublicKey, param) {
++  if (!fixed(identityPublicKey, 32)) key()
++  if (!fixed(param, 32)) key()
++  const blinded = b4a.alloc(32)
++  const ownedParam = b4a.from(param)
++  try {
++    ownedParam[0] &= 248
++    ownedParam[31] &= 63
++    ownedParam[31] |= 64
++    sodium.crypto_scalarmult_ed25519_noclamp(blinded, ownedParam, identityPublicKey)
++    return blinded
++  } finally {
++    clear(ownedParam)
++  }
++}
++
++function deriveEpochKeyPair(identitySecretKey, epoch) {
++  if (!fixed(identitySecretKey, 64)) key()
++  if (!uint64(epoch)) invalid()
++  // libsodium Ed25519 secret keys carry the 32-byte seed in their first half.
++  const epochSeed = cryptoSuite.hash([
++    EPOCH_KEY_DOMAIN,
++    identitySecretKey.subarray(0, 32),
++    encodeEpoch(epoch)
++  ])
++  try {
++    return cryptoSuite.keyPair(epochSeed)
++  } finally {
++    clear(epochSeed)
++  }
++}
++
++function epochCertificate(identityKeyPair, epochKeyPair, epoch, address, descriptorDigest) {
++  if (
++    !identityKeyPair ||
++    !fixed(identityKeyPair.secretKey, 64) ||
++    !fixed(identityKeyPair.publicKey, 32)
++  )
++    key()
++  if (!epochKeyPair || !fixed(epochKeyPair.publicKey, 32)) key()
++  if (!fixed(address, 32) || !fixed(descriptorDigest, 32)) invalid()
++  const signable = b4a.concat([
++    EPOCH_CERTIFICATE_DOMAIN,
++    identityKeyPair.publicKey,
++    epochKeyPair.publicKey,
++    encodeEpoch(epoch),
++    address,
++    descriptorDigest
++  ])
++  try {
++    return cryptoSuite.sign(signable, identityKeyPair.secretKey)
++  } finally {
++    clear(signable)
++  }
++}
++
++function verifyEpochCertificate(
++  identityPublicKey,
++  epochKeyPair,
++  epoch,
++  address,
++  descriptorDigest,
++  signature
++) {
++  if (!fixed(identityPublicKey, 32)) return false
++  if (!epochKeyPair || !fixed(epochKeyPair.publicKey, 32)) return false
++  if (!fixed(address, 32) || !fixed(descriptorDigest, 32) || !fixed(signature, SIGNATURE_BYTES)) {
++    return false
++  }
++  const signable = b4a.concat([
++    EPOCH_CERTIFICATE_DOMAIN,
++    identityPublicKey,
++    epochKeyPair.publicKey,
++    encodeEpoch(epoch),
++    address,
++    descriptorDigest
++  ])
++  try {
++    return cryptoSuite.verify(signable, signature, identityPublicKey) === true
++  } catch {
++    return false
++  } finally {
++    clear(signable)
++  }
++}
++
++function currentEpoch(wallMs) {
++  if (typeof wallMs !== 'number' || !Number.isFinite(wallMs) || wallMs < 0) invalid()
++  return BigInt(Math.floor(wallMs / Number(EPOCH_MS)))
++}
++
++// A host announces into the current epoch and the next one before it begins,
++// so readers on either side of the boundary find it.
++function announceEpochs(wallMs) {
++  const current = currentEpoch(wallMs)
++  return [current, current + 1n]
++}
++
++// A reader resolves the current epoch and keeps the previous one alive across
++// the boundary, matching Tor's overlapping-descriptor window.
++function lookupEpochs(wallMs) {
++  const current = currentEpoch(wallMs)
++  return current === 0n ? [current] : [current, current - 1n]
++}
++
++function encodeHeader(version, epoch, address) {
++  const header = b4a.alloc(HEADER_BYTES)
++  header[0] = version
++  header.writeBigUInt64BE(epoch, 1)
++  // reserved bytes stay zero: canonical fixed padding
++  header.set(address, 1 + EPOCH_BYTES + RESERVED_BYTES)
++  return header
++}
++
++function padBody(region, size) {
++  if (!fixed(region, size)) invalid()
++  for (let index = 0; index < region.byteLength; index++) {
++    if (region[index] !== 0) invalid()
++  }
++}
++
++function sealRecord(version, identityKeyPair, epoch, descriptor, readerSecret) {
++  if (!fixed(readerSecret, 32)) key()
++  if (!b4a.isBuffer(descriptor) || descriptor.byteLength > MAX_DESCRIPTOR_BYTES) invalid()
++  if (!uint64(epoch)) invalid()
++
++  const address = deriveEpochAddressKey(identityKeyPair.publicKey, epoch)
++  const epochKeyPair = deriveEpochKeyPair(identityKeyPair.secretKey, epoch)
++  const signature = epochCertificate(
++    identityKeyPair,
++    epochKeyPair,
++    epoch,
++    address,
++    cryptoSuite.hash([descriptor, b4a.alloc(MAX_DESCRIPTOR_BYTES - descriptor.byteLength)])
++  )
++  const body = b4a.alloc(PLAINTEXT_BYTES)
++  let record = null
++  try {
++    body.set(epochKeyPair.publicKey, 0)
++    body.set(signature, EPOCH_KEY_BYTES)
++    body.set(descriptor, BODY_OFFSET)
++    const header = encodeHeader(version, epoch, address)
++    const noncePrefix = cryptoSuite.randomBytes(NONCE_PREFIX_BYTES)
++    const ciphertext = cryptoSuite.seal({
++      key: readerSecret,
++      noncePrefix,
++      counter: 0n,
++      associatedData: header,
++      plaintext: body
++    })
++    record = b4a.concat([
++      header,
++      noncePrefix,
++      encodeEpoch(0n).subarray(0, COUNTER_BYTES),
++      ciphertext
++    ])
++    return Object.freeze({
++      storageKey: address,
++      epoch,
++      epochPublicKey: b4a.from(epochKeyPair.publicKey),
++      record: record
++    })
++  } finally {
++    clear(body)
++    if (record !== null && record !== undefined) {
++      // record is returned; nothing else to clear here
++    }
++  }
++}
++
++function openRecord(recordBytes, readerSecret) {
++  if (!fixed(recordBytes, RECORD_SIZE)) invalid()
++  if (!fixed(readerSecret, 32)) key()
++  const version = recordBytes[0]
++  if (version !== RECORD_VERSION_DESCRIPTOR && version !== RECORD_VERSION_TOMBSTONE) invalid()
++  const epoch = recordBytes.readBigUInt64BE(1)
++  const reserved = recordBytes.subarray(1 + EPOCH_BYTES, 1 + EPOCH_BYTES + RESERVED_BYTES)
++  padBody(reserved, RESERVED_BYTES)
++  const address = b4a.from(recordBytes.subarray(HEADER_BYTES - ADDRESS_BYTES, HEADER_BYTES))
++  const noncePrefix = b4a.from(
++    recordBytes.subarray(HEADER_BYTES, HEADER_BYTES + NONCE_PREFIX_BYTES)
++  )
++  const ciphertext = b4a.from(
++    recordBytes.subarray(HEADER_BYTES + NONCE_PREFIX_BYTES + COUNTER_BYTES)
++  )
++  const header = b4a.from(recordBytes.subarray(0, HEADER_BYTES))
++  const plaintext = cryptoSuite.open({
++    key: readerSecret,
++    noncePrefix,
++    counter: 0n,
++    associatedData: header,
++    ciphertext
++  })
++  if (plaintext === null) throw PrivateRouteError.ERR_AUTHENTICATION()
++  return Object.freeze({ version, epoch, address, plaintext })
++}
++
++function assertOwnedRecord(publicKey, epoch, opened) {
++  if (opened.epoch !== epoch) throw PrivateRouteError.REPLAY()
++  const expectedAddress = deriveEpochAddressKey(publicKey, opened.epoch)
++  if (!b4a.equals(expectedAddress, opened.address)) throw PrivateRouteError.ERR_AUTHENTICATION()
++  return expectedAddress
++}
++
++function verifyEpochOwnership(publicKey, opened) {
++  const epochPublicKey = b4a.from(opened.plaintext.subarray(0, EPOCH_KEY_BYTES))
++  const signature = b4a.from(
++    opened.plaintext.subarray(EPOCH_KEY_BYTES, EPOCH_KEY_BYTES + SIGNATURE_BYTES)
++  )
++  const descriptorDigest = cryptoSuite.hash([opened.plaintext.subarray(BODY_OFFSET)])
++  if (
++    !verifyEpochCertificate(
++      publicKey,
++      { publicKey: epochPublicKey },
++      opened.epoch,
++      opened.address,
++      descriptorDigest,
++      signature
++    )
++  ) {
++    throw PrivateRouteError.ERR_AUTHENTICATION()
++  }
++  return epochPublicKey
++}
++
++// Publishes a presence descriptor for one epoch. Returns the storage address
++// and the canonical fixed-size record bytes for the routed store.
++function createPresenceRecord(options) {
++  exactOwnData(options, ['identityKeyPair', 'epoch', 'descriptor', 'readerSecret'])
++  const { identityKeyPair, epoch, descriptor, readerSecret } = options
++  if (
++    !identityKeyPair ||
++    !fixed(identityKeyPair.secretKey, 64) ||
++    !fixed(identityKeyPair.publicKey, 32)
++  )
++    key()
++  if (!uint64(epoch)) invalid()
++  return sealRecord(RECORD_VERSION_DESCRIPTOR, identityKeyPair, epoch, descriptor, readerSecret)
++}
++
++// Publishes an owner-signed tombstone. digest may be 32 zero bytes to kill
++// every record of the epoch, or the exact hash of the record bytes it retires.
++function createPresenceTombstone(options) {
++  exactOwnData(options, ['identityKeyPair', 'epoch', 'digest', 'readerSecret'])
++  const { identityKeyPair, epoch, digest, readerSecret } = options
++  if (
++    !identityKeyPair ||
++    !fixed(identityKeyPair.secretKey, 64) ||
++    !fixed(identityKeyPair.publicKey, 32)
++  )
++    key()
++  if (!fixed(digest, 32)) invalid()
++  return sealRecord(RECORD_VERSION_TOMBSTONE, identityKeyPair, epoch, digest, readerSecret)
++}
++
++// Resolves record bytes into a verified descriptor. Everything is verified
++// before anything is returned: canonical padding, storage-key binding, epoch
++// binding, and the stable-identity certificate over the epoch key.
++function resolvePresenceRecord(options) {
++  exactOwnData(options, ['publicKey', 'epoch', 'record', 'readerSecret'])
++  const { publicKey, epoch, record, readerSecret } = options
++  if (!fixed(publicKey, 32)) key()
++  if (!uint64(epoch)) invalid()
++  let opened = null
++  try {
++    opened = openRecord(record, readerSecret)
++    if (opened.version !== RECORD_VERSION_DESCRIPTOR) invalid()
++    assertOwnedRecord(publicKey, epoch, opened)
++    const epochPublicKey = verifyEpochOwnership(publicKey, opened)
++    const region = opened.plaintext.subarray(BODY_OFFSET)
++    let end = region.byteLength
++    while (end > 0 && region[end - 1] === 0) end--
++    const descriptor = b4a.from(region.subarray(0, end))
++    return Object.freeze({
++      epoch: opened.epoch,
++      storageKey: b4a.from(opened.address),
++      epochPublicKey,
++      descriptor
++    })
++  } finally {
++    if (opened !== null) clear(opened.plaintext)
++  }
++}
++
++function resolvePresenceTombstone(options) {
++  exactOwnData(options, ['publicKey', 'epoch', 'record', 'readerSecret'])
++  const { publicKey, epoch, record, readerSecret } = options
++  if (!fixed(publicKey, 32)) key()
++  if (!uint64(epoch)) invalid()
++  let opened = null
++  try {
++    opened = openRecord(record, readerSecret)
++    if (opened.version !== RECORD_VERSION_TOMBSTONE) invalid()
++    assertOwnedRecord(publicKey, epoch, opened)
++    const epochPublicKey = verifyEpochOwnership(publicKey, opened)
++    const digest = b4a.from(opened.plaintext.subarray(BODY_OFFSET, BODY_OFFSET + 32))
++    const pad = b4a.from(opened.plaintext.subarray(BODY_OFFSET + 32))
++    padBody(pad, pad.byteLength)
++    return Object.freeze({
++      epoch: opened.epoch,
++      storageKey: b4a.from(opened.address),
++      epochPublicKey,
++      digest
++    })
++  } finally {
++    if (opened !== null) clear(opened.plaintext)
++  }
++}
++
++// Tombstones win over descriptors: an epoch with a verified tombstone resolves
++// to null. A tombstone carrying a nonzero digest retires only the matching
++// record; a zero digest retires the whole epoch.
++function resolvePresence(options) {
++  exactOwnData(options, ['publicKey', 'epoch', 'record', 'tombstone', 'readerSecret'])
++  const { publicKey, epoch, record, tombstone, readerSecret } = options
++  let resolved = null
++  try {
++    resolved = resolvePresenceRecord({ publicKey, epoch, record, readerSecret })
++  } catch (err) {
++    if (!(err instanceof PrivateRouteError) || err.code !== 'INVALID_DESCRIPTOR') throw err
++    resolved = null
++  }
++  let killed = null
++  try {
++    killed = resolvePresenceTombstone({ publicKey, epoch, record: tombstone, readerSecret })
++  } catch (err) {
++    // A tombstone that is not ours (wrong identity, wrong epoch, wrong
++    // credential) simply does not kill anything. Only a canonical-record
++    // failure means the caller passed garbage.
++    if (!(err instanceof PrivateRouteError)) throw err
++    if (
++      err.code !== 'INVALID_DESCRIPTOR' &&
++      err.code !== 'ERR_AUTHENTICATION' &&
++      err.code !== 'REPLAY'
++    ) {
++      throw err
++    }
++    killed = null
++  }
++  if (killed !== null) {
++    if (b4a.equals(killed.digest, ZERO) || b4a.equals(killed.digest, cryptoSuite.hash([record]))) {
++      return null
++    }
++  }
++  return resolved
++}
++
++module.exports = {
++  RECORD_SIZE,
++  MAX_DESCRIPTOR_BYTES,
++  EPOCH_MS,
++  OVERLAP_MS,
++  EPOCH_ADDRESS_DOMAIN,
++  EPOCH_KEY_DOMAIN,
++  EPOCH_CERTIFICATE_DOMAIN,
++  announceEpochs,
++  currentEpoch,
++  deriveEpochAddressKey,
++  deriveEpochBlindingParam,
++  blindPublicKey,
++  deriveEpochKeyPair,
++  epochCertificate,
++  verifyEpochCertificate,
++  lookupEpochs,
++  createPresenceRecord,
++  createPresenceTombstone,
++  resolvePresence,
++  resolvePresenceRecord,
++  resolvePresenceTombstone
++}
+diff --git a/test/private-routing.js b/test/private-routing.js
+index 4fe4c3b9b78870fdc247c4344ce411c1606fc97a..a9504b950b8af14e2cf3e7b0735d7ca3fd85c01e 100644
+--- a/test/private-routing.js
++++ b/test/private-routing.js
+@@ -1,6 +1,7 @@
+ require('./private/transport-seam')
+ require('./private/protocol')
+ require('./private/crypto-suite')
++require('./private/blinded-presence')
+ require('./private/counters')
+ require('./private/cell-codec')
+ require('./private/route-payload')
+diff --git a/test/private/blinded-presence.js b/test/private/blinded-presence.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d201f6d32a3c2ed88573af63ea74601376cde678
+--- /dev/null
++++ b/test/private/blinded-presence.js
+@@ -0,0 +1,496 @@
++'use strict'
++
++const test = require('brittle')
++const b4a = require('b4a')
++const sodium = require('sodium-universal')
++
++const { cryptoSuite } = require('../../lib/private/crypto-suite')
++const { PrivateRouteError } = require('../../lib/private/errors')
++const presence = require('../../lib/private/blinded-presence')
++
++function keyPair(byte) {
++  return cryptoSuite.keyPair(b4a.alloc(32, byte))
++}
++
++function expectCode(t, fn, code) {
++  let error = null
++  try {
++    fn()
++  } catch (err) {
++    error = err
++  }
++  t.ok(error instanceof PrivateRouteError, 'expected PrivateRouteError')
++  t.is(error && error.code, code)
++}
++
++test('Tor v3 blinding vector: A prime = h times A reproduces the published bytes', (t) => {
++  // tor/src/test/test_hs_common.c test_blinding_basics
++  const identityPublicKey = b4a.from(
++    '833990B085C1A688C1D4C8B1F6B56AFAF5A2ECA674449E1D704F83765CCB7BC6',
++    'hex'
++  )
++  // build_blinded_key_param output for period 1234 with period length 1440
++  const param = b4a.from('379E50DB31FEE6775ABD0AF6FB7C371E060308F4F847DB09FE4CFE13AF602287', 'hex')
++  const blinded = presence.blindPublicKey(identityPublicKey, param)
++  t.alike(
++    b4a.toString(blinded, 'hex').toUpperCase(),
++    '3A50BF210E8F9EE955AE0014F7A6917FB65EBF098A86305ABB508D1A7291B6D5'
++  )
++  t.ok(sodium.crypto_core_ed25519_is_valid_point(blinded))
++})
++
++test('deriveEpochBlindingParam clamps exactly like the Tor spec', (t) => {
++  const identity = keyPair(1)
++  const param = presence.deriveEpochBlindingParam(identity.publicKey, 42n)
++  t.is(param.byteLength, 32)
++  t.is(param[0] & 7, 0)
++  t.is(param[31] >> 6, 1)
++  t.is(param[31] & 128, 0)
++})
++
++test('blinded public key is a valid point and epoch dependent', (t) => {
++  const identity = keyPair(2)
++  const first = presence.blindPublicKey(
++    identity.publicKey,
++    presence.deriveEpochBlindingParam(identity.publicKey, 1n)
++  )
++  const second = presence.blindPublicKey(
++    identity.publicKey,
++    presence.deriveEpochBlindingParam(identity.publicKey, 2n)
++  )
++  t.ok(sodium.crypto_core_ed25519_is_valid_point(first))
++  t.ok(sodium.crypto_core_ed25519_is_valid_point(second))
++  t.is(b4a.equals(first, second), false)
++  t.is(b4a.equals(first, identity.publicKey), false)
++})
++
++test('storage address key separates epoch and identity and hides the stable key', (t) => {
++  const identity = keyPair(3)
++  const other = keyPair(4)
++  const first = presence.deriveEpochAddressKey(identity.publicKey, 1n)
++  const second = presence.deriveEpochAddressKey(identity.publicKey, 2n)
++  const otherAddress = presence.deriveEpochAddressKey(other.publicKey, 1n)
++  t.is(first.byteLength, 32)
++  t.is(b4a.equals(first, second), false)
++  t.is(b4a.equals(first, otherAddress), false)
++  t.is(b4a.equals(first, identity.publicKey), false)
++  expectCode(t, () => presence.deriveEpochAddressKey(b4a.alloc(31), 1n), 'INVALID_KEY')
++})
++
++test('epoch key pairs are deterministic per epoch and never reused', (t) => {
++  const identity = keyPair(5)
++  const first = presence.deriveEpochKeyPair(identity.secretKey, 1n)
++  const again = presence.deriveEpochKeyPair(identity.secretKey, 1n)
++  const next = presence.deriveEpochKeyPair(identity.secretKey, 2n)
++  t.alike(first.publicKey, again.publicKey)
++  t.is(b4a.equals(first.publicKey, next.publicKey), false)
++  t.is(b4a.equals(first.publicKey, identity.publicKey), false)
++  const cleared = cryptoSuite.keyPair(first.publicKey)
++  t.is(cleared.publicKey.byteLength, 32)
++})
++
++test('epoch certificate verifies under the stable identity and binds the descriptor', (t) => {
++  const identity = keyPair(6)
++  const epochKeyPair = presence.deriveEpochKeyPair(identity.secretKey, 7n)
++  const address = presence.deriveEpochAddressKey(identity.publicKey, 7n)
++  const digest = cryptoSuite.hash([b4a.from('descriptor')])
++  const signature = presence.epochCertificate(identity, epochKeyPair, 7n, address, digest)
++  t.is(signature.byteLength, 64)
++  t.ok(
++    presence.verifyEpochCertificate(
++      identity.publicKey,
++      epochKeyPair,
++      7n,
++      address,
++      digest,
++      signature
++    )
++  )
++  const wrongDigest = cryptoSuite.hash([b4a.from('other-descriptor')])
++  t.is(
++    presence.verifyEpochCertificate(
++      identity.publicKey,
++      epochKeyPair,
++      7n,
++      address,
++      wrongDigest,
++      signature
++    ),
++    false
++  )
++  t.is(
++    presence.verifyEpochCertificate(
++      identity.publicKey,
++      epochKeyPair,
++      8n,
++      address,
++      digest,
++      signature
++    ),
++    false
++  )
++  const stranger = keyPair(9)
++  t.is(
++    presence.verifyEpochCertificate(
++      stranger.publicKey,
++      epochKeyPair,
++      7n,
++      address,
++      digest,
++      signature
++    ),
++    false
++  )
++})
++
++test('presence record is exactly 1023 bytes with canonical zero padding', (t) => {
++  const identity = keyPair(10)
++  const reader = b4a.alloc(32, 0xcc)
++  const descriptor = b4a.from('presence-descriptor-payload')
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 42n,
++    descriptor,
++    readerSecret: reader
++  })
++  t.is(record.record.byteLength, presence.RECORD_SIZE)
++  t.is(record.storageKey.byteLength, 32)
++  t.is(record.epoch, 42n)
++  t.alike(record.record.subarray(9, 40), b4a.alloc(31))
++  t.is(record.record[0], 1)
++  const headerEpoch = record.record.readBigUInt64BE(1)
++  t.is(headerEpoch, 42n)
++})
++
++test('resolve returns the exact descriptor bytes the host published', (t) => {
++  const identity = keyPair(11)
++  const reader = b4a.alloc(32, 0xd1)
++  const descriptor = b4a.from('exact-own-snapshot-descriptor')
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 43n,
++    descriptor,
++    readerSecret: reader
++  })
++  const resolved = presence.resolvePresenceRecord({
++    publicKey: identity.publicKey,
++    epoch: 43n,
++    record: record.record,
++    readerSecret: reader
++  })
++  t.alike(resolved.descriptor, descriptor)
++  t.is(resolved.epoch, 43n)
++  t.alike(resolved.storageKey, record.storageKey)
++  t.ok(sodium.crypto_core_ed25519_is_valid_point(resolved.epochPublicKey))
++})
++
++test('reader credential is mandatory and wrong credentials fail closed', (t) => {
++  const identity = keyPair(12)
++  const reader = b4a.alloc(32, 0xe1)
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 1n,
++    descriptor: b4a.from('secret-descriptor'),
++    readerSecret: reader
++  })
++  expectCode(
++    t,
++    () =>
++      presence.resolvePresenceRecord({
++        publicKey: identity.publicKey,
++        epoch: 1n,
++        record: record.record,
++        readerSecret: b4a.alloc(32, 0xe2)
++      }),
++    'ERR_AUTHENTICATION'
++  )
++  expectCode(
++    t,
++    () =>
++      presence.createPresenceRecord({
++        identityKeyPair: identity,
++        epoch: 1n,
++        descriptor: b4a.from('x'),
++        readerSecret: b4a.alloc(31)
++      }),
++    'INVALID_KEY'
++  )
++})
++
++test('tampered record bytes fail authentication before any state changes', (t) => {
++  const identity = keyPair(13)
++  const reader = b4a.alloc(32, 0xf1)
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 5n,
++    descriptor: b4a.from('tamper-target'),
++    readerSecret: reader
++  })
++  for (const offset of [0, 3, 40, 71, 72, 100, 1022]) {
++    const tampered = b4a.from(record.record)
++    tampered[offset] ^= 0x01
++    expectCode(
++      t,
++      () =>
++        presence.resolvePresenceRecord({
++          publicKey: identity.publicKey,
++          epoch: 5n,
++          record: tampered,
++          readerSecret: reader
++        }),
++      offset === 0 ? 'INVALID_DESCRIPTOR' : 'ERR_AUTHENTICATION'
++    )
++  }
++})
++
++test('a record for one epoch is a replay in another', (t) => {
++  const identity = keyPair(14)
++  const reader = b4a.alloc(32, 0xf2)
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 9n,
++    descriptor: b4a.from('replay-target'),
++    readerSecret: reader
++  })
++  expectCode(
++    t,
++    () =>
++      presence.resolvePresenceRecord({
++        publicKey: identity.publicKey,
++        epoch: 10n,
++        record: record.record,
++        readerSecret: reader
++      }),
++    'REPLAY'
++  )
++})
++
++test('a reader credential cannot mint an owned record', (t) => {
++  const identity = keyPair(15)
++  const reader = b4a.alloc(32, 0xf3)
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 11n,
++    descriptor: b4a.from('original-descriptor'),
++    readerSecret: reader
++  })
++  const header = b4a.from(record.record.subarray(0, 72))
++  const noncePrefix = b4a.from(record.record.subarray(72, 88))
++  const ciphertext = b4a.from(record.record.subarray(96))
++  const plaintext = cryptoSuite.open({
++    key: reader,
++    noncePrefix,
++    counter: 0n,
++    associatedData: header,
++    ciphertext
++  })
++  t.ok(plaintext !== null)
++  // The credential holder re-encrypts a modified payload under the same
++  // header and nonce. The certificate no longer matches the descriptor, so
++  // resolution must fail.
++  plaintext[plaintext.byteLength - 1] ^= 1
++  const forgedCiphertext = cryptoSuite.seal({
++    key: reader,
++    noncePrefix,
++    counter: 0n,
++    associatedData: header,
++    plaintext
++  })
++  const forged = b4a.concat([header, noncePrefix, b4a.alloc(8), forgedCiphertext])
++  expectCode(
++    t,
++    () =>
++      presence.resolvePresenceRecord({
++        publicKey: identity.publicKey,
++        epoch: 11n,
++        record: forged,
++        readerSecret: reader
++      }),
++    'ERR_AUTHENTICATION'
++  )
++})
++
++test('tombstones override descriptors by exact digest or for the whole epoch', (t) => {
++  const identity = keyPair(16)
++  const reader = b4a.alloc(32, 0xf4)
++  const descriptor = b4a.from('tombstone-target')
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 21n,
++    descriptor,
++    readerSecret: reader
++  })
++  const epochTombstone = presence.createPresenceTombstone({
++    identityKeyPair: identity,
++    epoch: 21n,
++    digest: b4a.alloc(32),
++    readerSecret: reader
++  })
++  t.is(epochTombstone.record[0], 2)
++  t.is(
++    presence.resolvePresence({
++      publicKey: identity.publicKey,
++      epoch: 21n,
++      record: record.record,
++      tombstone: epochTombstone.record,
++      readerSecret: reader
++    }),
++    null
++  )
++  const specificTombstone = presence.createPresenceTombstone({
++    identityKeyPair: identity,
++    epoch: 21n,
++    digest: cryptoSuite.hash([record.record]),
++    readerSecret: reader
++  })
++  t.is(
++    presence.resolvePresence({
++      publicKey: identity.publicKey,
++      epoch: 21n,
++      record: record.record,
++      tombstone: specificTombstone.record,
++      readerSecret: reader
++    }),
++    null
++  )
++  // A tombstone for a different record leaves this one alive.
++  const otherRecord = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 21n,
++    descriptor: b4a.from('survivor'),
++    readerSecret: reader
++  })
++  const survivor = presence.resolvePresence({
++    publicKey: identity.publicKey,
++    epoch: 21n,
++    record: otherRecord.record,
++    tombstone: specificTombstone.record,
++    readerSecret: reader
++  })
++  t.ok(survivor !== null)
++  t.alike(survivor.descriptor, b4a.from('survivor'))
++})
++
++test('a tombstone made by a stranger cannot kill an owned record', (t) => {
++  const identity = keyPair(17)
++  const stranger = keyPair(18)
++  const reader = b4a.alloc(32, 0xf5)
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 31n,
++    descriptor: b4a.from('owner-record'),
++    readerSecret: reader
++  })
++  const forgedTombstone = presence.createPresenceTombstone({
++    identityKeyPair: stranger,
++    epoch: 31n,
++    digest: b4a.alloc(32),
++    readerSecret: reader
++  })
++  const resolved = presence.resolvePresence({
++    publicKey: identity.publicKey,
++    epoch: 31n,
++    record: record.record,
++    tombstone: forgedTombstone.record,
++    readerSecret: reader
++  })
++  t.ok(resolved !== null)
++  t.alike(resolved.descriptor, b4a.from('owner-record'))
++})
++
++test('records bound to a different identity never resolve', (t) => {
++  const identity = keyPair(19)
++  const other = keyPair(20)
++  const reader = b4a.alloc(32, 0xf6)
++  const record = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 41n,
++    descriptor: b4a.from('identity-binding'),
++    readerSecret: reader
++  })
++  expectCode(
++    t,
++    () =>
++      presence.resolvePresenceRecord({
++        publicKey: other.publicKey,
++        epoch: 41n,
++        record: record.record,
++        readerSecret: reader
++      }),
++    'ERR_AUTHENTICATION'
++  )
++})
++
++test('descriptor size is bounded by the canonical record', (t) => {
++  const identity = keyPair(21)
++  const reader = b4a.alloc(32, 0xf7)
++  expectCode(
++    t,
++    () =>
++      presence.createPresenceRecord({
++        identityKeyPair: identity,
++        epoch: 1n,
++        descriptor: b4a.alloc(presence.MAX_DESCRIPTOR_BYTES + 1),
++        readerSecret: reader
++      }),
++    'INVALID_DESCRIPTOR'
++  )
++  const exact = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 1n,
++    descriptor: b4a.alloc(presence.MAX_DESCRIPTOR_BYTES, 7),
++    readerSecret: reader
++  })
++  const resolved = presence.resolvePresenceRecord({
++    publicKey: identity.publicKey,
++    epoch: 1n,
++    record: exact.record,
++    readerSecret: reader
++  })
++  t.is(resolved.descriptor.byteLength, presence.MAX_DESCRIPTOR_BYTES)
++})
++
++test('epoch windows follow the Tor overlap pattern', (t) => {
++  const week = Number(presence.EPOCH_MS)
++  const day = Number(presence.OVERLAP_MS)
++  t.is(presence.currentEpoch(week * 5 + 1), 5n)
++  t.alike(presence.announceEpochs(week * 5 + 1), [5n, 6n])
++  t.alike(presence.lookupEpochs(week * 5 + 1), [5n, 4n])
++  t.alike(presence.lookupEpochs(0), [0n])
++  t.ok(day < week, 'overlap is shorter than an epoch')
++  expectCode(t, () => presence.currentEpoch(-1), 'INVALID_DESCRIPTOR')
++})
++
++test('records are byte-stable across seal and open with fixed credentials', (t) => {
++  const identity = keyPair(22)
++  const reader = b4a.alloc(32, 0xf8)
++  const first = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 77n,
++    descriptor: b4a.from('stability'),
++    readerSecret: reader
++  })
++  const second = presence.createPresenceRecord({
++    identityKeyPair: identity,
++    epoch: 77n,
++    descriptor: b4a.from('stability'),
++    readerSecret: reader
++  })
++  // Nonce prefix is random, so ciphertext differs, but the header and the
++  // storage address are canonical and must be byte-equal.
++  t.alike(first.record.subarray(0, 72), second.record.subarray(0, 72))
++  t.alike(first.storageKey, second.storageKey)
++  const firstResolved = presence.resolvePresenceRecord({
++    publicKey: identity.publicKey,
++    epoch: 77n,
++    record: first.record,
++    readerSecret: reader
++  })
++  const secondResolved = presence.resolvePresenceRecord({
++    publicKey: identity.publicKey,
++    epoch: 77n,
++    record: second.record,
++    readerSecret: reader
++  })
++  t.alike(firstResolved.descriptor, secondResolved.descriptor)
++})
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 2ac6b64381ec05fdfc886ee29f90bdfb991cd0b0 Mon Sep 17 00:00:00 2001
+From: jd1100 <248791769+ayooooo123@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:07:18 -0400
+Subject: [PATCH 2/2] docs(private): record Gate D host-path delivery and its
+ blocked boundary
+
+---
+ docs/private-routing-migration.md | 95 +++++++++++++++++++++++++++++++
+ 1 file changed, 95 insertions(+)
+
+diff --git a/docs/private-routing-migration.md b/docs/private-routing-migration.md
+index 6f7c9e8b07f17774242828b363a594afb4421866..9e057e873dea5230881a1875fe6cfe6fbc0c07b5 100644
+--- a/docs/private-routing-migration.md
++++ b/docs/private-routing-migration.md
+@@ -2490,3 +2490,98 @@ the privileged packet/semantic leak oracles. The announce branch is constructed
+ but carries no DHT mutation in that slice. Remaining DHT commands, private
+ presence, public required mode, peer streams, Hyperswarm, and mobile device
+ evidence remain disabled for later separately reviewed sub-gates.
++
++## Gate D: blinded presence host-path boundary (delivered, partially blocked)
++
++PR #47 implemented the Tor-style blinded presence scheme but was reverted
++(#48) for a variable-time JavaScript BigInt scalar multiply, an experimental
++signer primitive, zero callers, mutable accessors, an unbound record key, and
++no external test vectors. This sub-gate re-delivers the host-path boundary of
++that scheme with only vetted primitives and states plainly what remains
++blocked and why.
++
++### What is delivered
++
++`lib/private/blinded-presence.js` provides, package-private as before:
++
++- **Epoch addressing.** `k_e = H(EPOCH_ADDRESS_DOMAIN || A || epoch)` with
++  keyed BLAKE2b via the existing `cryptoSuite`, separating storage location
++  per epoch and identity without exposing the stable key.
++- **Tor's public blinding half.** `A' = h*A` with `h` derived in the shape of
++  torspec rend-spec-v3 Appendix A.2 (BLIND_STRING | A | basepoint string |
++  "key-blind" | INT_8(period)) and Tor's exact Ed25519 clamp
++  (`h[0] &= 248; h[31] &= 63; h[31] |= 64`), computed with the native
++  constant-time `crypto_scalarmult_ed25519_noclamp`. The digest is keyed
++  BLAKE2b-256 rather than Tor's SHA3-256 because bare-crypto exports no
++  SHA3; no byte-compat with Tor's `param` is claimed. The point-multiply
++  path itself is pinned **byte-exactly against Tor's published blinding
++  vector** (`test_hs_common.c::test_blinding_basics`: identity
++  `833990B0...7BC6`, period 1234/1440, blinded
++  `3A50BF210E8F9EE955AE0014F7A6917FB65EBF098A86305ABB508D1A7291B6D5`), which
++  is external proof that the native primitive matches
++  `ed25519_ref10_blind_public_key` algebraically.
++- **Canonical fixed padded records.** Exactly 1,023 bytes — the exit wire's
++  `MAX_IMMUTABLE_VALUE_BYTES` — with a fixed header (version, epoch
++  big-endian, zero reserved padding, epoch address as AEAD associated data),
++  a random 16-byte nonce prefix, a zero counter slot, and an
++  XChaCha20-Poly1305 body from the existing `cryptoSuite.seal`/`open`.
++- **Owner authentication without `a'`.** The epoch keypair is hash-ratcheted
++  from the identity seed (`H(EPOCH_KEY_DOMAIN || seed || epoch)`, the same
++  pattern as session-key derivation in crypto-suite). The stable secret key
++  signs a certificate over `(identity pk, epoch pk, epoch, k_e,
++hash(descriptor region))` that travels **inside** the encrypted body. A
++  reader credential holder can decrypt and verify ownership but cannot mint
++  records or tombstones: the certificate is made with the stable secret key,
++  which readers never hold, and the digest binds the exact canonical
++  descriptor region, so re-encryption under a copied certificate fails
++  authentication.
++- **Epochs and overlap.** Seven-day epochs with a one-day overlap: hosts
++  announce into the current and next epoch; readers resolve the current and
++  previous epoch, matching Tor's overlapping-descriptor window.
++- **Tombstones.** An owner-signed record version that retires the whole
++  epoch (zero digest) or one exact record (digest of its record bytes), with
++  tombstone-over-descriptor precedence in `resolvePresence`.
++
++Verification: 16 new brittle tests / 80 assertions in
++`test/private/blinded-presence.js`, registered in the portable aggregate.
++Node aggregate 1,034/1,034 tests (19,261 asserts); Bare aggregate 1,013/1,013
++tests (19,202 asserts); both include this module. Prettier clean.
++
++### What is blocked, and the exact blocker
++
++**Tor's algebraic secret blinding (`a' = h·a mod L`) and public verification
++under the blinded key are not implemented.** The scheme in [KEYBLIND] A.2
++needs a constant-time scalar-on-scalar multiply modulo the group order.
++`sodium-universal` 5.x (libsodium bindings in this tree) exports the point
++multiply (`crypto_scalarmult_ed25519_noclamp`) but **not**
++`crypto_core_ed25519_scalar_mul`; the only in-tree scalar multiplier is the
++experimental `sodium-native` tweak extension, whose own header marks the API
++experimental with a non-standard nonce — the exact primitive class PR47 was
++reverted for. JavaScript BigInt carries the same variable-time rejection.
++
++Consequences, stated rather than implied:
++
++- Presence records authenticate via the stable-identity certificate inside
++  the encrypted body, so **only credential holders can verify ownership**.
++  A storage node or passive observer cannot attribute records to an identity
++  — the addressing privacy goal holds — but neither can it verify ownership
++  without the credential, unlike a Tor descriptor which any client can
++  verify under the blinded public key.
++- The routed fetch integration uses `target = hash(record)` because
++  `controller.immutableGet` binds `hash(value) === target` by construction;
++  storage-key-addressed presence lookup needs the exit-side private presence
++  commands (`PRIVATE_LOOKUP_V1`/`PRIVATE_ANNOUNCE_V1`), which are still
++  disabled, and those in turn want this gate's ownership model finished.
++
++Unblocking requires one of: a vetted native `crypto_core_ed25519_scalar_mul`
++binding added to the dependency tree (its own review gate, since no current
++dependency exports it), or acceptance of Tor's `ref10` scalar-mul source
++compiled as a new native extension. Until then, Gate D remains stopped at
++this boundary by design; no export, no public required mode, and no
++exit-side presence command is added.
++
++The rejected properties of PR #47 are each addressed: no BigInt arithmetic
++anywhere in the module; no experimental signer; the record key is bound to
++identity and epoch through the AEAD header and the certificate digest;
++accessors return frozen snapshots; and the external vector is Tor's own
++published test bytes, not locally generated ones.
+-- 
+2.50.1 (Apple Git-155)
+

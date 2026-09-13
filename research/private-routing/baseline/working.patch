@@ -1,0 +1,240 @@
+diff --git a/docs/private-routing-migration.md b/docs/private-routing-migration.md
+index 3749188c2c5112f362ced8b9901f61653472bace..1b694a48b7b5cbc37a21da205a3e3686d7f0b6ba 100644
+--- a/docs/private-routing-migration.md
++++ b/docs/private-routing-migration.md
+@@ -1,5 +1,12 @@
+ # Private Routing Gate 3A / Gate 3B1 Migration Record
+ 
++## Preservation status — 2026-09-05
++
++This is an incomplete historical candidate-demotion comparison based on
++`ab818f9`, with a role-runner diagnostic change. It differs from the
++blackhole-isolation experiment and the accepted implementation. It is
++preserved as research source only, not as a merge-ready or production feature.
++
+ ## Status and scope
+ 
+ This record describes the experimental, internal Gate 3A substrate and the owner-approved Gate 3B1 implementation through Task 17 in this fork. It is not a public API or a production anonymity surface. Gate 3A combines the generic DHT-RPC request-transport seam established in Gate 2 with deterministic protocol primitives, an address-free internal adapter, and an in-process fake topology. Gate 3B1 adds production-code native routing owners behind package-private capabilities.
+diff --git a/lib/private/relay-candidate-directory.js b/lib/private/relay-candidate-directory.js
+index 38939a9bf2b8b9c2150f8f5674be17153e757ff0..5dbb0f8235122cc9dbf59d7de3987f6861b6d5e3 100644
+--- a/lib/private/relay-candidate-directory.js
++++ b/lib/private/relay-candidate-directory.js
+@@ -41,6 +41,7 @@ const SCOPE_FIELDS = Object.freeze([
+ const CLOCK_FIELDS = Object.freeze(['wallNow', 'monotonicNow'])
+ const INITIAL_FIELDS = Object.freeze(['lookupGeneration', 'announceGeneration'])
+ const REPLACEMENT_FIELDS = Object.freeze(['branchClass', 'generation'])
++const FAULT_FIELDS = Object.freeze(['branchClass'])
+ const EVIDENCE_FIELDS = Object.freeze(['transaction', 'branchClass', 'position', 'generation'])
+ 
+ const byteLengthGetter = Object.getOwnPropertyDescriptor(
+@@ -613,6 +614,7 @@ function invalidate(state) {
+   state.pending.clear()
+   state.highestCommitted.clear()
+   state.quarantine.clear()
++  state.faulted.clear()
+   state.wallNow = null
+   state.monotonicNow = null
+   state.lastWall = null
+@@ -666,8 +668,15 @@ function sampleDirectoryHandoff(directory, state, suspended) {
+   return sampleDirectoryWall(directory, state, suspended)
+ }
+ 
++// Fault demotion is a PARTITION, not a position in this list. A caller must
++// exhaust `preferred` before admitting anything from `all`: that ordering
++// between the two tiers, not record order within one, is what stops a
++// just-failed hop being handed to the sibling branch. A future KI-6 fix that
++// randomises selection keeps the property so long as it draws within a tier;
++// one that draws from `all` directly silently discards it. See KI-14.
+ function validCandidates(state, role, mask) {
+-  const candidates = []
++  const preferred = []
++  const all = []
+   for (const record of state.records) {
+     if (record.role !== role || record.capabilityMask !== mask) continue
+     if (
+@@ -676,9 +685,19 @@ function validCandidates(state, role, mask) {
+     ) {
+       continue
+     }
+-    candidates.push(record)
++    all.push(record)
++    if (!state.faulted.has(b4aToString(record.identity, 'hex'))) preferred.push(record)
+   }
+-  return candidates
++  return { preferred, all }
++}
++
++// With nothing demoted the second tier searches the same records as the first,
++// so the fallback is skipped rather than doubling the worst case on the path
++// every healthy selection takes.
++function demotionApplies(middles, exits) {
++  return (
++    middles.preferred.length !== middles.all.length || exits.preferred.length !== exits.all.length
++  )
+ }
+ 
+ function pruneInvalidRecords(state, now) {
+@@ -691,6 +710,11 @@ function pruneInvalidRecords(state, now) {
+   for (const [identity, expiresAt] of state.quarantine) {
+     if (expiresAt <= now) state.quarantine.delete(identity)
+   }
++  // Every caller of `validCandidates` prunes first, which is what lets the
++  // demotion test there be a bare `has` with no clock of its own.
++  for (const [identity, expiresAt] of state.faulted) {
++    if (expiresAt <= now) state.faulted.delete(identity)
++  }
+ }
+ 
+ function requireLiveGuard(state, now) {
+@@ -699,15 +723,7 @@ function requireLiveGuard(state, now) {
+   incompatible()
+ }
+ 
+-function choosePairs(state, now, excluded = []) {
+-  requireLiveGuard(state, now)
+-  pruneInvalidRecords(state, now)
+-  const middles = validCandidates(state, ROLE.SAFETY, RELAY_CAPABILITY.CIRCUIT_RELAY_V1)
+-  const exits = validCandidates(
+-    state,
+-    ROLE.PRIVATE,
+-    RELAY_CAPABILITY.CIRCUIT_RELAY_V1 | RELAY_CAPABILITY.DHT_EXIT_V1
+-  )
++function searchPairs(middles, exits, excluded) {
+   for (const firstMiddle of middles) {
+     for (const firstExit of exits) {
+       for (const secondMiddle of middles) {
+@@ -722,10 +738,10 @@ function choosePairs(state, now, excluded = []) {
+       }
+     }
+   }
+-  incompatible()
++  return null
+ }
+ 
+-function chooseReplacementPair(state, now, excluded) {
++function choosePairs(state, now, excluded = []) {
+   requireLiveGuard(state, now)
+   pruneInvalidRecords(state, now)
+   const middles = validCandidates(state, ROLE.SAFETY, RELAY_CAPABILITY.CIRCUIT_RELAY_V1)
+@@ -734,12 +750,38 @@ function chooseReplacementPair(state, now, excluded) {
+     ROLE.PRIVATE,
+     RELAY_CAPABILITY.CIRCUIT_RELAY_V1 | RELAY_CAPABILITY.DHT_EXIT_V1
+   )
++  let chosen = searchPairs(middles.preferred, exits.preferred, excluded)
++  if (chosen === null && demotionApplies(middles, exits)) {
++    chosen = searchPairs(middles.all, exits.all, excluded)
++  }
++  if (chosen === null) incompatible()
++  return chosen
++}
++
++function searchPair(middles, exits, excluded) {
+   for (const middle of middles) {
+     for (const exit of exits) {
+       if (recordsDiverse([...excluded, middle, exit])) return { middle, exit }
+     }
+   }
+-  incompatible()
++  return null
++}
++
++function chooseReplacementPair(state, now, excluded) {
++  requireLiveGuard(state, now)
++  pruneInvalidRecords(state, now)
++  const middles = validCandidates(state, ROLE.SAFETY, RELAY_CAPABILITY.CIRCUIT_RELAY_V1)
++  const exits = validCandidates(
++    state,
++    ROLE.PRIVATE,
++    RELAY_CAPABILITY.CIRCUIT_RELAY_V1 | RELAY_CAPABILITY.DHT_EXIT_V1
++  )
++  let chosen = searchPair(middles.preferred, exits.preferred, excluded)
++  if (chosen === null && demotionApplies(middles, exits)) {
++    chosen = searchPair(middles.all, exits.all, excluded)
++  }
++  if (chosen === null) incompatible()
++  return chosen
+ }
+ 
+ function revalidateSelection(state, now, selected) {
+@@ -879,6 +921,52 @@ class RelayCandidateDirectory {
+     ])
+   }
+ 
++  // A rotation fires for two unrelated reasons. Material expiry is routine and
++  // says nothing about the hop; a loss says the branch failed while this pair
++  // was carrying it. Only the second reaches here, from
++  // `reportRouteManagerBranchLoss`, which is the manager's sole fault path -
++  // expiry reaches the controller through `armBranchExpiry`'s separate
++  // `BranchExpiry` sink and never calls this.
++  //
++  // Attribution is to the BRANCH, not to a hop: nothing in a physical loss or an
++  // elapsed deadline says whether the middle or the exit failed, so both hops of
++  // the failed branch are demoted. Both were about to be vacated anyway.
++  //
++  // Deliberately NOT `quarantine`, and the two must not be conflated.
++  // Quarantine answers a question about identity: one key advertising two
++  // digests at one epoch is proof of equivocation, so a hard bar there has no
++  // false positives. A fault is a heuristic - a timeout or a physical loss can
++  // be the network, the local host, or an unlucky but honest relay - so it earns
++  // a demotion, not a bar. Barring on suspicion would let a transient failure
++  // inherit a penalty designed for proven dishonesty, and because the exclusion
++  // set already leaves exactly one qualifying pair in the smallest supported
++  // pool, it would also let any relay deny the endpoint a route by failing.
++  //
++  // The bound is the record's own `expiresAt`: the same bound the equivocation
++  // quarantine uses, so it invents no constant, and it cannot outlive the record
++  // it applies to because `pruneInvalidRecords` drops both together.
++  reportBranchFault(options) {
++    const state = ensureDirectory(this)
++    exactObject(options, FAULT_FIELDS)
++    const branchClass = branch(ownData(options, 'branchClass'))
++    const pair = state.committed.get(branchClass)
++    if (!pair) return false
++    const now = sampleDirectoryHandoff(this, state, false)
++    pruneInvalidRecords(state, now)
++    requireDirectoryState(this, state, false)
++    let demoted = false
++    for (const record of [pair.middle, pair.exit]) {
++      if (!state.records.includes(record)) continue
++      const key = b4aToString(record.identity, 'hex')
++      const current = state.faulted.get(key)
++      if (current === undefined || current < record.expiresAt) {
++        state.faulted.set(key, record.expiresAt)
++      }
++      demoted = true
++    }
++    return demoted
++  }
++
+   retainForSuspend() {
+     if (arguments.length !== 0) incompatible()
+     const state = ensureDirectory(this)
+@@ -934,6 +1022,7 @@ class RelayCandidateDirectory {
+         Number(typeof state.monotonicNow === 'function'),
+       generationRecordCount: state.highestCommitted.size,
+       quarantineCount: state.quarantine.size,
++      faultedCount: state.faulted.size,
+       pendingCount: state.pending.size
+     })
+   }
+@@ -1084,6 +1173,7 @@ function consumeSealedRelayCandidateDirectory(token) {
+       sampling: false,
+       records: sealed.records,
+       quarantine: sealed.quarantine,
++      faulted: new Map(),
+       scope: sealed.scope,
+       committed: new Map(),
+       pending: new Map(),
+diff --git a/test/private/process/role-runner.js b/test/private/process/role-runner.js
+index 9857a1626a43679cfb29487a4128eb1a74c07623..1dbf6dd165bda1668ac7737da1ac7e961a2e30d9 100644
+--- a/test/private/process/role-runner.js
++++ b/test/private/process/role-runner.js
+@@ -289,7 +289,7 @@ function actorFailure(err) {
+     scheduleIncomingRearm()
+     return
+   }
+-  void fatal(Object.assign(new Error(), { code }))
++  void fatal(Object.assign(new Error(err && err.stack ? err.stack : String(err)), { code }))
+ }
+ 
+ // A rebuilt branch opens a new adjacent link, so a relay that lost its circuit must
