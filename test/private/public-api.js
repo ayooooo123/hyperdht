@@ -5,7 +5,10 @@ const b4a = require('b4a')
 
 const HyperDHT = require('../..')
 const directConnect = require('../../lib/connect')
-const { decodeDescriptor } = require('../../lib/private/overlay-descriptor-service')
+const {
+  decodeDescriptor,
+  encodeDescriptor
+} = require('../../lib/private/overlay-descriptor-service')
 
 let nextPort = 49300
 
@@ -70,6 +73,29 @@ function readBytes(stream, expected) {
     stream.on('data', ondata)
     stream.once('error', onerror)
     stream.once('end', onend)
+  })
+}
+
+function relayStatus(stream) {
+  return new Promise((resolve) => {
+    let settled = false
+    function finish(status) {
+      if (settled) return
+      settled = true
+      stream.removeListener('data', ondata)
+      stream.removeListener('error', onunavailable)
+      stream.removeListener('close', onunavailable)
+      resolve(status)
+    }
+    function ondata(chunk) {
+      finish(chunk[0])
+    }
+    function onunavailable() {
+      finish(1)
+    }
+    stream.once('data', ondata)
+    stream.once('error', onunavailable)
+    stream.once('close', onunavailable)
   })
 }
 
@@ -154,6 +180,25 @@ test('private connect compiles safety and destination routes around fixed cells'
   )
 
   const descriptor = decodeDescriptor(server._descriptor)
+  const forgedRouteEntry = HyperDHT.keyPair().publicKey
+  const forgedAttachmentDescriptor = encodeDescriptor({
+    destinationKeyPair: serverKeyPair,
+    routeEntry: forgedRouteEntry,
+    entryRelayPublicKey: descriptor.entryRelayPublicKey,
+    seq: descriptor.seq + 1n,
+    expiresAt: descriptor.expiresAt
+  })
+  const wrongAttachment = directConnect(source, descriptor.entryRelayPublicKey, {
+    keyPair: HyperDHT.keyPair()
+  })
+  wrongAttachment.on('error', () => {})
+  t.is(await wrongAttachment.opened, true, 'descriptor holder can reach the entry relay')
+  const attachRequest = b4a.allocUnsafe(1 + forgedAttachmentDescriptor.byteLength)
+  attachRequest[0] = 4
+  forgedAttachmentDescriptor.copy(attachRequest, 1)
+  const attachStatus = relayStatus(wrongAttachment)
+  wrongAttachment.write(attachRequest)
+  t.is(await attachStatus, 1, 'unused route entry is rejected under the wrong outer Noise key')
   let routeEntryDiscovered = false
   for await (const result of source.findPeer(descriptor.routeEntry)) {
     routeEntryDiscovered = true
@@ -187,6 +232,35 @@ test('private connect compiles safety and destination routes around fixed cells'
     peerPayload: 'noise-secretstream-end-to-end',
     directDestinationSends: 0
   })
+  socket.end()
+})
+
+test('same-key private server restart advances the published route immediately', async (t) => {
+  const nodes = await network(t)
+  const source = nodes[0]
+  const destination = nodes[1]
+  const serverKeyPair = HyperDHT.keyPair()
+  const first = destination.createServer()
+  await first.listen(serverKeyPair)
+  const firstDescriptor = decodeDescriptor(first._descriptor)
+  await first.close()
+
+  let accepted = false
+  const second = destination.createServer((socket) => {
+    socket.on('error', () => {})
+    accepted = true
+    socket.end()
+  })
+  t.teardown(() => second.close())
+  await second.listen(serverKeyPair)
+  const secondDescriptor = decodeDescriptor(second._descriptor)
+  t.ok(secondDescriptor.seq > firstDescriptor.seq, 'replacement descriptor wins sequence ordering')
+
+  const socket = source.connect(serverKeyPair.publicKey)
+  socket.on('error', () => {})
+  t.is(await socket.opened, true, 'clients resolve the replacement attachment')
+  t.alike(socket.remotePublicKey, serverKeyPair.publicKey)
+  t.is(accepted, true, 'recreated server accepts the private stream')
   socket.end()
 })
 
