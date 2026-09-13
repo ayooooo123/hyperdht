@@ -506,11 +506,11 @@ test('endpoint authenticates ciphertext and revokes before application error cal
     t.is(pair.b.revoked, true)
     failure.resolve(error)
   })
-  right.resume()
+  const consuming = t.exception(readOne(right))
   const raw = b4a.alloc(20)
   raw[0] = 17
   pair.b.receive(raw)
-  await failure.promise
+  await Promise.all([failure.promise, consuming])
   await pair.b.controller.finished()
   t.is(pair.b.resets.length, 1)
   t.alike(pair.b.events, ['revoke', 'reset'])

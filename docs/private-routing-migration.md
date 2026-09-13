@@ -5678,12 +5678,13 @@ firewall, so it conflated route availability with policy behavior. The isolated
 regression waits for the authenticated firewall callback and verifies exactly
 one call plus zero emitted connections.
 
-Build Status run `34777014693` exposed a second test-harness race: the invalid
-ciphertext regression waited for an application error without putting the
-application stream into flowing mode, so Linux could deadlock before consuming
-the record. The regression now calls `resume()` before injection. It passes
-18/18 tests and 103/103 assertions on Node and Bare, plus 25/25 independent
-process runs in a fresh Linux arm64 Node 24 container.
+Build Status runs `34777014693` and `34777481870` exposed a second test-harness
+race: the invalid-ciphertext regression waited for an application error without
+installing a pending readable consumer, so Linux could deadlock before consuming
+the record. The regression now installs `readOne()` and its matcherless
+`t.exception()` before injection. It passes 18/18 tests and 104/104 assertions
+on Node and Bare, plus 25/25 independent process runs and the complete
+1,393-test suite in a fresh Linux arm64 Node 24 container.
 
 The dormant native peer-tail activation now snapshots all twelve handoff
 properties and revalidates their exact data-property identities, authoritative
@@ -5694,8 +5695,8 @@ unchanged control and rejects all three substitutions with `INVALID_ROUTE`.
 The permanent Node and Bare regression passes 20/20 tests and 156/156
 assertions.
 The final Node private aggregate passes 1,302/1,302 tests and
-23,205/23,205 assertions. The final Bare private aggregate passes
-1,257/1,257 tests and 23,070/23,070 assertions. At capture revision
+23,206/23,206 assertions. The final Bare private aggregate passes
+1,257/1,257 tests and 23,071/23,071 assertions. At capture revision
 `32dded3498bec19ed03ac74287b03923f388b576`, fresh privileged Linux containers
 on both the laptop (arm64, Colima) and Unraid (x86_64, Docker) pass the peer
 packet-capture gate, each with 1/1 test and 23/23 assertions. Their live UDP
