@@ -85,6 +85,10 @@ jobs:
         run: |
           sudo -n apt-get install -y -q tcpdump
           npm run test:private:namespace:live
+      - name: Peer v3 fixed-cell and leak capture (privileged)
+        run: |
+          sudo -n true
+          npm run test:private:peer:capture
       - name: Retain synthetic namespace capture evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
