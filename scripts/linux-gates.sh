@@ -18,6 +18,7 @@
 #   process:bare:punch    eleven-role live scenario with the production endpoint punch, Bare roles
 #   namespace        namespace projection enforcement
 #   namespace:live   namespace live route with capture oracles
+#   peer:capture    peer-v3 fixed-cell and leak capture on distinct loopback hosts
 #   all              every gate above, in that order (default)
 
 set -euo pipefail
@@ -66,9 +67,9 @@ expanded=()
 for gate in "${gates[@]}"; do
   case "$gate" in
     all)
-      expanded+=(aggregate:node aggregate:bare process:node process:bare process:node:reverse process:bare:reverse process:node:punch process:bare:punch namespace namespace:live)
+      expanded+=(aggregate:node aggregate:bare process:node process:bare process:node:reverse process:bare:reverse process:node:punch process:bare:punch namespace namespace:live peer:capture)
       ;;
-    aggregate:node | aggregate:bare | process:node | process:bare | process:node:reverse | process:bare:reverse | process:node:punch | process:bare:punch | namespace | namespace:live)
+    aggregate:node | aggregate:bare | process:node | process:bare | process:node:reverse | process:bare:reverse | process:node:punch | process:bare:punch | namespace | namespace:live | peer:capture)
       expanded+=("$gate")
       ;;
     *)
@@ -90,6 +91,7 @@ command_for() {
     process:bare:punch) echo 'PR_CANDIDATE_ORDER=normal PR_PRODUCTION_ENDPOINT_PUNCH=1 npm run --silent test:private:process:bare' ;;
     namespace) echo 'npm run --silent test:private:namespace' ;;
     namespace:live) echo 'npm run --silent test:private:namespace:live' ;;
+    peer:capture) echo 'npm run --silent test:private:peer:capture' ;;
   esac
 }
 

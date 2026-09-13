@@ -2,6 +2,7 @@
 
 const test = require('brittle')
 const b4a = require('b4a')
+const { Writable } = require('streamx')
 
 const HyperDHT = require('../..')
 const { hash } = require('../../lib/crypto')
@@ -13,7 +14,7 @@ const {
   encodeDescriptor
 } = require('../../lib/private/overlay-descriptor-service')
 const peerController = require('../../lib/private/private-peer-controller')
-const { TEST_ONLY_PRIVATE_PEER_OBSERVER } = peerController
+const { TEST_ONLY_PRIVATE_PEER_OBSERVER, TEST_ONLY_PRIVATE_PEER_WRITE_ALL } = peerController
 
 const OP_RESOLVE = 2
 const OP_ENTRY_REGISTER = 4
@@ -139,8 +140,91 @@ function containsSequence(haystack, needle) {
     }
     return true
   }
+
   return false
 }
+function turn() {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+test('private cell writes retain queued buffers until transport completion', async (t) => {
+  const writes = []
+  const callbacks = []
+  const stream = new Writable({
+    write(data, callback) {
+      writes.push(data)
+      callbacks.push(callback)
+    }
+  })
+  const first = b4a.alloc(1200, 0x11)
+  const second = b4a.alloc(1200, 0x22)
+  const send = peerController[TEST_ONLY_PRIVATE_PEER_WRITE_ALL]
+  const firstSending = send(stream, first).finally(() => first.fill(0))
+  const secondSending = send(stream, second).finally(() => second.fill(0))
+  await turn()
+  t.is(writes.length, 1, 'downstream drain holds the second write in Streamx')
+  t.is(writes[0], first, 'Streamx retains the original first buffer')
+  t.is(first[0], 0x11)
+  t.is(second[0], 0x22, 'queued cell remains intact while the first write is held')
+  callbacks.shift()(null)
+  await firstSending
+  await turn()
+  t.is(first[0], 0)
+  t.is(writes.length, 2)
+  t.is(writes[1], second, 'queued write reaches transport before caller erases it')
+  t.is(second[0], 0x22)
+  callbacks.shift()(null)
+  await secondSending
+  t.is(second[0], 0)
+  stream.destroy()
+})
+
+test('pending entry commit excludes resolver admission', async (t) => {
+  let entryRelayPublicKey = null
+  let releaseCommit
+  let resolveCommitHeld
+  const commitHeld = new Promise((resolve) => {
+    resolveCommitHeld = resolve
+  })
+  const commitGate = new Promise((resolve) => {
+    releaseCommit = resolve
+  })
+  let holdCommit = true
+  const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
+    if (holdCommit && event.type === 'entry-commit-pending') {
+      holdCommit = false
+      entryRelayPublicKey = b4a.from(event.entryRelayPublicKey)
+      resolveCommitHeld()
+      return commitGate
+    }
+  })
+  t.teardown(restoreObserver)
+  t.teardown(() => releaseCommit())
+
+  const nodes = await network(t)
+  const source = nodes[0]
+  const destination = nodes[1]
+  const server = destination.privateRouting.createServer((socket) => socket.destroy())
+  t.teardown(() => server.close())
+  const listening = server.listen(HyperDHT.keyPair())
+  await commitHeld
+
+  const resolver = source.connect(entryRelayPublicKey, { keyPair: HyperDHT.keyPair() })
+  resolver.on('error', () => {})
+  t.is(await resolver.opened, true)
+  const response = readBytes(resolver, 1)
+  resolver.write(b4a.from([OP_RESOLVE]))
+  t.is(
+    (await response)[0],
+    STATUS_UNAVAILABLE,
+    'entry reservation rejects resolver before destination-key input'
+  )
+  resolver.destroy()
+
+  releaseCommit()
+  await listening
+  t.ok(server.listening)
+})
 function asyncReplies(values) {
   return {
     destroy() {},
