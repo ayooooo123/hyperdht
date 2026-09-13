@@ -4,8 +4,8 @@
 
 This packet is for an independent human cryptographic/protocol reviewer. The
 review is not complete until a named reviewer returns a dated disposition tied
-to `MANIFEST.json.sourceRevision` and
-`MANIFEST.json.nativeCryptoRevision`.
+to `MANIFEST.json.revisions.hyperdht` and
+`MANIFEST.json.revisions.sodium-native`.
 
 Return one of:
 
@@ -27,7 +27,7 @@ account.
 `MANIFEST.json` is authoritative. It contains SHA-256 hashes for every packet
 file and the exact revisions below:
 
-- HyperDHT packet source: `MANIFEST.json.sourceRevision`.
+- HyperDHT packet source: `MANIFEST.json.revisions.hyperdht`.
 - Native `sodium-native` scalar implementation:
   `562d642e1a78a8e124cf97bfbda77f01c02d1a7f`.
 - Hyperswarm private-context integration:
@@ -160,6 +160,8 @@ wire claims.
   `evidence/VERIFICATION.json`; zero failures.
 - Bare private aggregate: final count recorded in
   `evidence/VERIFICATION.json`; zero failures.
+- Private server firewall public-API regression: Node, Bare, and a fresh Linux
+  Node 24 arm64 container each pass 8/8 tests, 93/93 assertions.
 - Final-exit mutation regression: Node and Bare 20/20 tests, 156/156 assertions.
 - Activation probe: unchanged commit accepted; `localDeadline`, `tailControl`,
   and `clockIdentity` substitutions rejected with `INVALID_ROUTE`.
