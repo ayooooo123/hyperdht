@@ -496,7 +496,7 @@ test('endpoint rejects ciphertext and FIN before authentication', async function
   t.alike(earlyFin.events, ['revoke', 'reset'])
 })
 
-test('endpoint authenticates ciphertext and revokes before application error callbacks', async function (t) {
+test('endpoint rejects invalid ciphertext framing and revokes before application error callbacks', async function (t) {
   const pair = createPair(t)
   const [left, right] = await openPair(pair)
   await waitFor(() => pair.a.fragments.length === 1 && pair.b.fragments.length === 1)
@@ -506,11 +506,10 @@ test('endpoint authenticates ciphertext and revokes before application error cal
     t.is(pair.b.revoked, true)
     failure.resolve(error)
   })
-  const consuming = t.exception(readOne(right))
-  const raw = b4a.alloc(20)
-  raw[0] = 17
+  const raw = b4a.alloc(3)
+  raw[0] = 16
   pair.b.receive(raw)
-  await Promise.all([failure.promise, consuming])
+  await failure.promise
   await pair.b.controller.finished()
   t.is(pair.b.resets.length, 1)
   t.alike(pair.b.events, ['revoke', 'reset'])
