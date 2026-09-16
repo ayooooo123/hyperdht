@@ -5776,3 +5776,62 @@ integrate them. Public activation therefore remains on the narrower peer alpha
 until a real decentralized bootstrap/neighbor service replaces those fixture
 inputs and the exact resulting wire receives named external human
 cryptographic review.
+
+## 2026-09-16 final cross-platform verification on `implement-private-peer-v2`
+
+**Gate matrix.** One uninterrupted `linux-gates.sh all` run passed all eleven
+gates (runner exit 0):
+
+| Gate                                                    | Result                                      |
+| ------------------------------------------------------- | ------------------------------------------- |
+| Aggregate, Node                                         | 1,302/1,302 tests; 23,205/23,205 assertions |
+| Aggregate, Bare                                         | 1,257/1,257 tests; 23,070/23,070 assertions |
+| Normal/reverse process legs, Node and Bare (four gates) | 175/175 each                                |
+| Production-punch legs, Node and Bare (two gates)        | 180/180 each                                |
+| Namespace projection                                    | 30/30                                       |
+| Namespace live capture                                  | 185/185; kernel raw DROP 0                  |
+| Peer-v3 fixed-cell and leak capture                     | 23/23                                       |
+
+**KI-18 recurred and was handled by the recorded procedure, not by widening a
+bound.** The first matrix attempt on the shared `node24lab` VM failed one
+assertion of `namespace:live` — `namespace audit realtime clock changed (drift
+-124.115 ms over 9870 ms)`. Two reruns failed the same way from the socket close
+observer (`-125.089 ms over 7331 ms` at `guard/CONTROL`; `-100.765 ms over
+8398 ms` at `lookup-middle-a/CONTROL`), including one after forcing
+`systemd-timesyncd` to report `NTPSynchronized=yes`. The varying failing role and
+the ~100–125 ms backward steps identify guest-clock stepping, not a protocol
+fault. A disposable `hyperdht-gates-ki18` Colima profile was created with
+`--activate=false`, its `systemd-timesyncd` stopped, and a 45-second probe showed
+0.231 ms maximum wall/monotonic drift; the eleven-gate run above is from that
+profile via `DOCKER_CONTEXT`. The 2 ms observer bound in
+`test/private/process/socket-close-observer.js` is unchanged. The default and
+`node24lab` VMs and their unrelated containers were not modified beyond the
+`systemd-timesyncd` restart noted above.
+
+**Darwin aggregate remains red for an unrelated upstream reason, now
+attributed.** `node test/all.js` and `bare test/all.js` both stop at
+`test/connections.js` test 6, `createServer + connect - same-LAN explicit keypair
+opens server`, with `client should not error: HOLEPUNCH_ABORTED` followed by the
+30 s brittle timeout, so the ten files after `connections.js` — including
+`private-routing.js` — never execute in that runner. `test/connections.js`,
+`lib/connect.js`, `lib/holepuncher.js` and `lib/socket-pool.js` entered this
+branch as pure additions in upstream merge `0c07fa5`; no private-routing commit
+touches them. The same file passes 28/28 tests and 81/81 assertions inside the
+Linux gate image, test 6 included, so this is host-network behavior on the macOS
+development machine rather than a code defect. It is not evidence for or against
+this branch, and the Linux aggregates exercise `test/private-routing.js` directly.
+
+**Sodium-native status-return hazard investigated and dismissed.** A suspected
+sign-loss hazard in the `static inline uint64_t` wrappers that execute
+`if (status < 0) return status;` (both secretstream `push`/`pull` and the six
+xchacha20/chacha20 AEAD encrypt/decrypt/encrypt_detached wrappers) was tested
+directly against the pinned `private-routing/scalar-mul-prebuilds` addon at
+`562d642`. The raw native return on an authentication failure is `-1`, arriving in
+JavaScript as a negative `number`, so every `res < 0` guard in `index.js` fires:
+a tampered secretstream ciphertext throws `pull failed` and a tampered AEAD
+ciphertext throws `could not verify data`. No binding change was warranted and
+none was made; the exploratory branch was deleted without commits.
+
+**Still open and unclaimed.** Named external human cryptographic review, routed
+DHT offer admission on reachable public-UDP hosts, and the native peer-tail UDX
+runtime integration. No production anonymity claim follows from this matrix.
