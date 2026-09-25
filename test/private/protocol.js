@@ -206,6 +206,7 @@ test('private route protocol domains are exact defensive buffers in a frozen map
     ROLE: 'hyperdht-private-routes/role/v0',
     UDX_BOOTSTRAP: 'hyperdht-private-routes/udx-bootstrap/v0',
     TOPOLOGY_GRANT: 'hyperdht-private-routes/topology-grant/v0',
+    TOPOLOGY_GRANT_V1: 'hyperdht-private-routes/topology-grant/v1',
     RELAY_ADVERTISEMENT: 'hyperdht-private-routes/relay-advertisement/v0',
     DESCRIPTOR_DIRECT: 'hyperdht-private-routes/descriptor/direct/v0',
     DELEGATION: 'hyperdht-private-routes/delegation/v0',
