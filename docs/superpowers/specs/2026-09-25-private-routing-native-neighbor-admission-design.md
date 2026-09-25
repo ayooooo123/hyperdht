@@ -98,10 +98,31 @@ domain label `hyperdht-private-routes/topology-grant/v1`. Endpoint ordering
 keeps the format 0 rule (sorted by identity, `topology-grant.js:278`), so
 signature order is fixed.
 
-`linkStaticKey32` is in the grant so the initiator gets the responder's
-static key (`buildSessionOptions` `responderStaticKey`) under the same local
-authority signature. Otherwise it would come from an advertisement, and rule 2
-forbids an advertisement from supplying dial material.
+Why the grant carries `linkStaticKey32`: link setup requires the initiator to
+hold the responder's 32-byte X25519 static public key before it sends
+`LINK_CREATE`. The initiator seals the setup challenge to that key, and the
+responder proves it owns the key (`lib/private/link-setup.js:742`, `:765`,
+`:859`, `:983`). Nothing in production supplies this key today. The fixture
+hands both sides one shared pair (`peer-native-fixture.js:1217`). The 260-byte
+advertisement carries `routeEncryptionPublicKey32`, but that key already
+serves the §3.2 ACTIVE route-key proof (packet line 541).
+
+§3.4 does not force this choice. It forbids an advertisement from minting
+authorization. It does not forbid an authenticated advertisement from
+supplying a setup key after a locally authorized grant exists. The choices
+are:
+
+- **Key in the grant (this draft's default).** One X25519 key serves one
+  protocol. The key is fixed for the life of the grant, and both authorities
+  sign it. Cost: rotating the key needs a new grant, and new grants are
+  swapped out of band.
+- **Reuse `routeEncryptionPublicKey32`.** No new field, and the key rotates
+  whenever the advertisement is refreshed. Cost: one X25519 key is used in two
+  protocols, so the reviewer must check both uses together. Reconnects after a
+  refresh also need the peer's current advertisement.
+- **New advertisement field.** The key rotates with the advertisement and is
+  used for one purpose only. Cost: it changes the fixed 260-byte advertisement
+  and every check tied to that size.
 
 `LinkDirectory` gains an `authorityPublicKeys` set for format 1. `add()`
 requires `local.authority32 ∈ authorityPublicKeys` and both signatures valid,
@@ -179,6 +200,9 @@ format 1. The public alpha stays on the current four-relay peer stream.
 4. **Format 0 and 1 side by side.** Default: keep both, each used by a
    different stack. The other choice is to move the routed-DHT harness to
    format 1 as well, which touches the reviewed Gate 3B1 path.
+5. **Where the link static key lives.** Default: in the grant (see "Grant
+   format 1"). Pick this before step 1, because it decides whether format 1
+   has the `linkStaticKey32` field.
 
 ## Plan outline
 
