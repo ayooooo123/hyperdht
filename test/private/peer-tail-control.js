@@ -689,6 +689,63 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
   t.is(timerCalls, 1, 'a scheduled callback cannot survive its carrier deadline')
 })
 
+test('admitted relay neighbors carry both tail extensions to a ready terminal', async (t) => {
+  let terminalSession = null
+  // guard↔safety and safety↔terminal come from per-node admission owners and
+  // two-authority grants: no shared topology authority, fixed session keys,
+  // or hand-paired provisioning.
+  const f = await setupFourNodeNativeFixture({
+    t,
+    native: true,
+    basePort: 48760,
+    poolCapacity: 4096,
+    admission: true,
+    onTerminalFinalReady(session) {
+      terminalSession = session
+    }
+  })
+  const { sourceTailSession, limits } = await f.openSourceA0()
+
+  const candidate1 = await discoverPeerTailCandidate(sourceTailSession, {
+    mode: 1,
+    requestedMask: 9,
+    randomTarget32: seed(0x21),
+    expiresAt: 50000n
+  })
+  await extendPeerTail(sourceTailSession, {
+    candidate: candidate1,
+    forwardLimits: limits,
+    reverseLimits: limits,
+    payloadParametersDigest: seed(0x41)
+  })
+  t.alike(
+    readPeerTailControl(sourceTailSession).tailIdentity,
+    f.safety.identity32,
+    'guard directory discovery picks its admitted safety neighbor'
+  )
+  await f.safety.tailStarted
+
+  const candidate2 = await discoverPeerTailCandidate(sourceTailSession, {
+    mode: 2,
+    requestedMask: 11,
+    randomTarget32: seed(0x71),
+    suppliedAdvertisement260: readVerifiedPeerAdvertisement(f.terminal.verifiedAd)
+      .canonicalBytes260,
+    expiresAt: 50000n
+  })
+  await extendPeerTail(sourceTailSession, {
+    candidate: candidate2,
+    forwardLimits: limits,
+    reverseLimits: limits,
+    payloadParametersDigest: seed(0x91)
+  })
+  const final = readPeerTailControl(sourceTailSession)
+  t.is(final.extensionIndex, 2)
+  t.is(final.phase, 'FINAL_EXIT_READY')
+  t.alike(final.tailIdentity, f.terminal.identity32)
+  t.ok(terminalSession, 'terminal published its ready tail session')
+})
+
 test('regression: responder tail rejects a signer unrelated to its authenticated runtime', async (t) => {
   // Safety responder signs with an unrelated relay identity
   const clock = fakeClock(1000n)
