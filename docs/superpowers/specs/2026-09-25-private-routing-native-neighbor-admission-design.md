@@ -229,6 +229,19 @@ format 1. The public alpha stays on the current four-relay peer stream.
    format 1 as well, which touches the reviewed Gate 3B1 path.
 5. **Where the link static key lives.** Settled: the peer's advertised route
    key, following the routed-DHT link owners (see "Grant format 1").
+6. **Service budget versus relay uptime.** An idle neighbor link pings after
+   500 ms (`link-control-session.js:13`), and every ping, pong and ACK spends
+   one service cell. Measured on two loopback relays: about 4 cells per second
+   per side. A 60-cell neighbor reservation ran out in about 15 seconds
+   (`service_exhausted`), and the owner reconnected; a 300-cell node ledger
+   lasts about 75 seconds of one neighbor. §3.4 makes the node ledger finite,
+   so a long-lived relay needs budgets sized to its grants: roughly
+   `4 × grant seconds` cells per neighbor reservation, and the node ledger
+   covering every neighbor plus reconnects. Default: keep §3.4's finite
+   ledger, size budgets from grant lifetime in the relay runtime, and start a
+   fresh admission owner (new ledger) at each renewal cycle. The other choice
+   is a rate-limited, refilling node budget, which changes §3.4's "finite"
+   rule and needs a packet amendment.
 
 ## Plan outline
 

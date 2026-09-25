@@ -111,9 +111,13 @@ cryptographic review before any production anonymity claim. The reviewed
 peer-tail/UDX adjacency stack, including its reliable lanes
 (`peer-reliable-lanes.js`), shared memory-pool ledger (`peer-ledger.js`), and
 legacy-egress semantic services (`peer-semantic-services.js`), is implemented
-and tested package-private but is not wired into the public controller; its
-test fixture still supplies discovery, admission, and neighbor inputs that no
-production service provides. Hyperswarm and PearTube (desktop and mobile)
+and tested package-private but is not wired into the public controller.
+Relay-neighbor admission (A1/A2) now has a production owner,
+`peer-neighbor-admission.js`, with two-authority grants, reconnect, renewal
+and send-boundary service accounting (2026-09-25 entries below). The source
+bootstrap to its guard (A0) still runs on test fixtures, and no relay runtime
+loads grants from configuration yet. JD deferred external cryptographic review
+on 2026-09-25. Hyperswarm and PearTube (desktop and mobile)
 integrations exist as draft PRs against the peer alpha. KI-4's routed-DHT
 responder-side offer admission is repaired under the reviewed cross-host time
 contract, but every later real-link dispatch, most recently run 34770010983,
@@ -4260,6 +4264,19 @@ went `UNAVAILABLE`. That is the rule failing closed, reproduced at the
 directory level with the same placement; it is not a selector defect and
 the selector is unchanged.
 
+### KI-20: an operator-agreed neighbor graph narrows paths
+
+**Status: accepted limit of the native neighbor admission design.**
+
+Relay-to-relay links exist only where both operators signed a grant, and an
+extension never dials a relay that is not already a neighbor (packet §3.4).
+A source's guard, safety and terminal therefore follow existing edges. A
+sparse graph shrinks the set of possible paths, and anyone who knows the
+graph can narrow which paths a circuit could have taken. Directory discovery
+already picks only live neighbors (`peer-native-neighbors.js:1428`–`:1459`).
+Dense peering between operators is the mitigation; there is no protocol fix
+short of automatic neighbor admission, which §3.4 forbids.
+
 ### KI-6: hop selection is first-match, not random — FIXED
 
 **Status: FIXED.** Initial, reconnect, and replacement selection now draw
@@ -5958,3 +5975,22 @@ duplicated signature was refused with exit 1; the existing bootstrap-node CLI
 path still starts. `test/private/grant-tool.js` (2 tests, Node and Bare)
 checks that the assembled grant is admitted by each side's own authority.
 There is no `grant add`: no relay runtime reads grants from config yet.
+
+### 2026-09-25 step 5: neighbor service accounting at the send boundary
+
+A new `peer-neighbor-admission` case wraps every native UDX socket's `send`
+and `trySend` before two relays admit each other. After both neighbors are
+live and have exchanged keepalives, each relay's count of sent datagrams,
+excluding direct discovery replies, equals its node service ledger's
+`cellsSpent` exactly: discovery requests, link setup and every keepalive spend
+one cell each before sending (`udx-cell-endpoint.js:1505`–`:1519`). Discovery
+replies (cookie, CAPS response, ACTIVE response) are sent and excluded, since
+§3.2 charges them to the responder's fixed startup pool. Node 10/10 and Bare
+3/3 repeated runs pass. This is an in-process socket-boundary check; a
+privileged Linux packet capture of native neighbor traffic was not run.
+
+The measurement exposed a sizing issue, recorded as open question 6 in the
+design: with 500 ms link pings an idle neighbor spends about 4 service cells
+per second per side, so a 60-cell neighbor reservation lasted about 15 seconds
+before `service_exhausted` and a reconnect. §3.4's finite ledger bounds relay
+uptime unless budgets are sized to grant lifetime.
