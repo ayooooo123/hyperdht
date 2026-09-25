@@ -105,17 +105,23 @@ the KI-4 offer-admission repair described below:
   matrix. See the [measurements](#gate-3b1-task-17-live-eleven-process-scenario-status)
   and [publication evidence](#continuation-checkpoint--2026-09-09-required-mode-puts-and-v2-allocation).
 
-**Open gates:** the alpha peer runtime still needs Linux packet-capture
-acceptance and external human cryptographic review before any production
-anonymity claim. The full reviewed peer-tail/UDX adjacency runtime, shared
-global quota ledger, ARQ/retransmission, legacy egress, Hyperswarm, mobile, and
-PearTube integration remain unimplemented. KI-4's routed-DHT responder-side
-offer admission is repaired under the reviewed cross-host time contract, but
-four later real-link dispatches stopped before LINK_OFFER; none confirms that
-repair on real links. Further useful evidence needs a reachable multi-host
-placement, not a relaxed protocol check. KI-1 timing/volume correlation and
-KI-5 operator diversity remain explicit limits; mixing/cover traffic is
-deferred and anonymous-admission Gate A is dropped.
+**Open gates:** the alpha peer runtime passes the Linux peer packet-capture
+gate (2026-09-13 and 2026-09-16 entries below) but still needs external human
+cryptographic review before any production anonymity claim. The reviewed
+peer-tail/UDX adjacency stack, including its reliable lanes
+(`peer-reliable-lanes.js`), shared memory-pool ledger (`peer-ledger.js`), and
+legacy-egress semantic services (`peer-semantic-services.js`), is implemented
+and tested package-private but is not wired into the public controller; its
+test fixture still supplies discovery, admission, and neighbor inputs that no
+production service provides. Hyperswarm and PearTube (desktop and mobile)
+integrations exist as draft PRs against the peer alpha. KI-4's routed-DHT
+responder-side offer admission is repaired under the reviewed cross-host time
+contract, but every later real-link dispatch, most recently run 34770010983,
+stopped before LINK_OFFER; none confirms that repair on real links. Further
+useful evidence needs a reachable multi-host placement, not a relaxed protocol
+check. KI-1 timing/volume correlation and KI-5 operator diversity remain
+explicit limits; mixing/cover traffic is deferred and anonymous-admission
+Gate A is dropped.
 
 **External review acceptance:** an internal model report is not the required
 external human cryptographic review. The review must identify its author,
