@@ -519,6 +519,30 @@ test('endpoint rejects invalid ciphertext framing and revokes before application
   t.alike(pair.a.resets, [], 'remote reset is not echoed')
 })
 
+test('endpoint authenticates ciphertext and revokes before application error callbacks', async function (t) {
+  const pair = createPair(t)
+  const [left, right] = await openPair(pair)
+  await waitFor(() => pair.a.fragments.length === 1 && pair.b.fragments.length === 1)
+  await turn()
+  const failure = deferred()
+  right.once('error', (error) => {
+    t.is(pair.b.revoked, true)
+    failure.resolve(error)
+  })
+  const consuming = t.exception(readOne(right))
+  const raw = b4a.alloc(20)
+  raw[0] = 17
+  pair.b.receive(raw)
+  await Promise.all([failure.promise, consuming])
+  await pair.b.controller.finished()
+  t.is(pair.b.resets.length, 1)
+  t.alike(pair.b.events, ['revoke', 'reset'])
+  t.ok(right.destroyed)
+  await pair.a.controller.finished()
+  t.ok(left.destroyed, 'semantic reset reaches the remote plaintext stream')
+  t.alike(pair.a.resets, [], 'remote reset is not echoed')
+})
+
 test('endpoint rejects truncated records at remote FIN', async function (t) {
   const pair = createPair(t)
   await openPair(pair)
