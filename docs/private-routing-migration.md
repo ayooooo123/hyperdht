@@ -5841,3 +5841,32 @@ none was made; the exploratory branch was deleted without commits.
 **Still open and unclaimed.** Named external human cryptographic review, routed
 DHT offer admission on reachable public-UDP hosts, and the native peer-tail UDX
 runtime integration. No production anonymity claim follows from this matrix.
+
+## 2026-09-25 native relay-neighbor admission, step 1: grant format 1
+
+JD chose two-party topology grants for relay↔relay links in the dormant native
+stack. The design draft is
+[`2026-09-25-private-routing-native-neighbor-admission-design.md`](superpowers/specs/2026-09-25-private-routing-native-neighbor-admission-design.md).
+It keeps packet §3.4: only a locally configured authority admits a node's side
+of a link, and no advertisement, ACTIVE proof, source request or supplied
+address can create a grant.
+
+Step 1 adds format 1 to `lib/private/topology-grant.js`. Each endpoint carries
+`authority32` and `linkStaticKey32`. Both endpoint authorities sign one digest
+under the new `hyperdht-private-routes/topology-grant/v1` domain, so both ends
+keep the same grant digest for NAT punch plans. `signTopologyGrantV1` signs one
+side for out-of-band exchange, and `assembleTopologyGrantV1` checks both
+signatures before it joins them. `verifyTopologyGrantV1` admits a grant only
+when the local endpoint's authority is in the configured set (at most eight
+keys, nonzero, no duplicates). `LinkDirectory` takes exactly one of
+`authorityPublicKey` (format 0) or `authorityPublicKeys` (format 1), and each
+kind refuses the other format. Format 0 behavior and bytes are unchanged.
+
+`test/private/topology-grant-v1.js` pins the format 1 bytes and signed digest.
+It covers admission by both ends with one shared digest, rejection when only
+the peer's authority is configured, one-sided or v0-domain signatures, a
+single operator signing both sides, every one-byte mutation, format
+separation, and authority-set bounds. Node private aggregate: 1,312/1,312
+tests, 23,271/23,271 assertions. Bare: 1,267/1,267 tests, 23,136/23,136
+assertions. Nothing uses format 1 at runtime yet; the admission owner is step 2.
+Format 1 is new signed data and must be in the external cryptographic review.
