@@ -30,6 +30,7 @@ const {
 } = require('../../lib/private/udx-cell-endpoint')
 const { selectUdxLoopbackHosts } = require('../../lib/private/udx-adapter')
 const {
+  addPeerNeighborGrant,
   createPeerNeighborAdmission,
   destroyPeerNeighborAdmission,
   readPeerNeighborAdmission,
@@ -248,6 +249,99 @@ test('every grant on an endpoint must carry the node epoch and run ID', async (t
   expectCode(t, () => admit(guard, otherRun), 'UNAUTHORIZED')
   const otherEpoch = twoAuthorityGrant(guard, safety, { epoch: EPOCH + 1n })
   expectCode(t, () => admit(guard, otherEpoch), 'UNAUTHORIZED')
+})
+
+async function waitFor(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  return predicate()
+}
+
+function slotOf(relay) {
+  return readPeerNeighborAdmission(relay.admission).neighbors[0]
+}
+
+test('neighbors reconnect under a replacement grant when the first grant expires', async (t) => {
+  const { guard, safety } = await twoRelays(t)
+  const shortLived = twoAuthorityGrant(guard, safety, { expiresAt: BigInt(Date.now()) + 2500n })
+  admit(guard, shortLived)
+  admit(safety, shortLived)
+  await Promise.all([
+    settlePeerNeighborAdmission(guard.admission),
+    settlePeerNeighborAdmission(safety.admission)
+  ])
+  t.is(slotOf(guard).state, 'live')
+  t.is(slotOf(safety).state, 'live')
+
+  const renewed = twoAuthorityGrant(guard, safety)
+  addPeerNeighborGrant(guard.admission, renewed)
+  addPeerNeighborGrant(safety.admission, renewed)
+  t.is(slotOf(guard).nextGrant, true, 'the live neighbor keeps its grant until it ends')
+
+  t.ok(
+    await waitFor(() => slotOf(guard).state === 'reconnecting', 5000),
+    'grant expiry ends the neighbor'
+  )
+  const reconnected = await waitFor(
+    () => slotOf(guard).state === 'live' && slotOf(safety).state === 'live',
+    15000
+  )
+  t.ok(
+    reconnected,
+    `both sides live again (${slotOf(guard).lastError}/${slotOf(safety).lastError})`
+  )
+  t.is(slotOf(guard).nextGrant, false, 'the replacement grant is now current')
+  t.is(readPeerNeighborAdmission(guard.admission).diagnostics.neighborCount, 1)
+  t.is(readPeerNeighborAdmission(safety.admission).diagnostics.neighborCount, 1)
+})
+
+test('a neighbor whose grant expires with no replacement ends expired', async (t) => {
+  const { guard, safety } = await twoRelays(t)
+  const shortLived = twoAuthorityGrant(guard, safety, { expiresAt: BigInt(Date.now()) + 2000n })
+  admit(guard, shortLived)
+  admit(safety, shortLived)
+  await Promise.all([
+    settlePeerNeighborAdmission(guard.admission),
+    settlePeerNeighborAdmission(safety.admission)
+  ])
+  t.is(slotOf(guard).state, 'live')
+  t.ok(
+    await waitFor(
+      () => slotOf(guard).state === 'expired' && slotOf(safety).state === 'expired',
+      8000
+    ),
+    'both sides stop instead of redialing on an expired grant'
+  )
+  t.is(readPeerNeighborAdmission(guard.admission).diagnostics.neighborCount, 0)
+  t.is(readPeerNeighborAdmission(safety.admission).diagnostics.neighborCount, 0)
+})
+
+test('a dialer reconnects after its neighbor restarts', async (t) => {
+  const { guard, safety } = await twoRelays(t)
+  const grant = twoAuthorityGrant(guard, safety)
+  admit(guard, grant)
+  admit(safety, grant)
+  await Promise.all([
+    settlePeerNeighborAdmission(guard.admission),
+    settlePeerNeighborAdmission(safety.admission)
+  ])
+  t.is(slotOf(guard).state, 'live')
+
+  await destroyPeerNeighborAdmission(safety.admission)
+  safety.admission = null
+  t.ok(
+    await waitFor(() => slotOf(guard).state !== 'live', 10000),
+    `the dialer observes the lost neighbor (${slotOf(guard).lastError})`
+  )
+  admit(safety, grant)
+  const reconnected = await waitFor(
+    () => slotOf(guard).state === 'live' && slotOf(safety).state === 'live',
+    20000
+  )
+  t.ok(reconnected, `both sides live again (${slotOf(guard).state}/${slotOf(safety).state})`)
 })
 
 test('destroy ends an admission whose peer never answers', async (t) => {

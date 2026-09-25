@@ -164,13 +164,21 @@ relay node. It owns:
 - **Neighbor pools:** `createPeerNativeNeighborPool` and
   `provisionPeerNativeNeighbor`, with the pool's `nodeServiceBudget` as the
   §3.4 separate ledger. No other budget funds service traffic.
-- **Upkeep:**
-  - renew a link before its grant expires;
-  - reconnect after native loss, charged to the service ledger;
-  - re-provision when the peer refreshes its advertisement, because neighbor
-    matching compares the exact 260 advertisement bytes
-    (`peer-native-neighbors.js:863`);
-  - revoke a neighbor when its ledger runs out or it expires.
+- **Upkeep:** the pool reports every published neighbor that ends (native
+  loss, link close, or expiry at the earlier of grant and peer advertisement
+  expiry) through `onNeighborClosed`. The owner then releases that attempt's
+  directory and, after one second, provisions again, which refetches the
+  peer's current advertisement. So a peer that refreshes its advertisement is
+  picked up when the old one expires.
+  - **Renewal:** `addPeerNeighborGrant` installs a newer grant for a known
+    peer. The pool holds one neighbor per identity, so the live neighbor keeps
+    its current grant; the newer one takes over at the next provisioning.
+    There is a short gap at the old grant's expiry. A grant for a new peer
+    starts provisioning at once.
+  - **Stop:** a slot whose grant has expired with no replacement ends in
+    `expired` and does not redial. Three failed attempts in a row end in
+    `failed`; a new grant restarts it. Every attempt draws on the finite node
+    service ledger, so exhaustion also stops redialing.
 - **Teardown:** destroys pools, directories and pending setups, and erases key
   material, in the same way as the fixture's `closeFixtureResources`.
 
