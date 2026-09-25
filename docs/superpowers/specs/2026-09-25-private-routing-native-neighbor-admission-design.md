@@ -1,8 +1,9 @@
 # Private Routing: Native Relay-Neighbor Admission (per-node admission owner)
 
-**Status:** DRAFT for owner review. JD chose option A (two-party grants) on
-2026-09-25. This draft fits option A inside the peer-stream design packet §3.4
-contract; see "Trust model" for where the two differ. No code has been written.
+**Status:** APPROVED by JD on 2026-09-25 (option A, two-party grants), fitted
+to the peer-stream design packet §3.4 contract; see "Trust model". Step 1
+(grant format 1) is implemented. JD deferred external cryptographic review
+on 2026-09-25; work proceeds on internal review only.
 **Date:** 2026-09-25
 **Relates to:** [peer-stream design packet §3.4](2026-09-09-private-routing-peer-stream-design-packet.md#34-native-relay-neighbor-prerequisite-and-separate-service-accounting),
 [migration record, open gates](../../private-routing-migration.md#current-implementation).
@@ -86,11 +87,8 @@ Format 0 (`TOPOLOGY_GRANT_FORMAT = 0`, one signature) stays for the routed-DHT
 stack and its process harness, which use a single topology owner. Format 1 is
 used only by the peer native path.
 
-Unsigned body = format 0 body with `format = 1`, plus per endpoint:
-
-- `authority32`: the authority key that signs for this endpoint;
-- `linkStaticKey32`: the X25519 static key this endpoint uses when it
-  responds to a link setup.
+Unsigned body = format 0 body with `format = 1`, plus `authority32` per
+endpoint: the authority key that signs for that endpoint.
 
 Signed encoding = unsigned body `| signatureA64 | signatureB64`. Both
 signatures cover `hash(DOMAIN.TOPOLOGY_GRANT_V1, unsigned)` under a new
@@ -98,31 +96,22 @@ domain label `hyperdht-private-routes/topology-grant/v1`. Endpoint ordering
 keeps the format 0 rule (sorted by identity, `topology-grant.js:278`), so
 signature order is fixed.
 
-Why the grant carries `linkStaticKey32`: link setup requires the initiator to
-hold the responder's 32-byte X25519 static public key before it sends
-`LINK_CREATE`. The initiator seals the setup challenge to that key, and the
-responder proves it owns the key (`lib/private/link-setup.js:742`, `:765`,
-`:859`, `:983`). Nothing in production supplies this key today. The fixture
-hands both sides one shared pair (`peer-native-fixture.js:1217`). The 260-byte
-advertisement carries `routeEncryptionPublicKey32`, but that key already
-serves the §3.2 ACTIVE route-key proof (packet line 541).
-
-§3.4 does not force this choice. It forbids an advertisement from minting
-authorization. It does not forbid an authenticated advertisement from
-supplying a setup key after a locally authorized grant exists. The choices
-are:
-
-- **Key in the grant (this draft's default).** One X25519 key serves one
-  protocol. The key is fixed for the life of the grant, and both authorities
-  sign it. Cost: rotating the key needs a new grant, and new grants are
-  swapped out of band.
-- **Reuse `routeEncryptionPublicKey32`.** No new field, and the key rotates
-  whenever the advertisement is refreshed. Cost: one X25519 key is used in two
-  protocols, so the reviewer must check both uses together. Reconnects after a
-  refresh also need the peer's current advertisement.
-- **New advertisement field.** The key rotates with the advertisement and is
-  used for one purpose only. Cost: it changes the fixed 260-byte advertisement
-  and every check tied to that size.
+**Link setup key.** Link setup requires the initiator to hold the responder's
+32-byte X25519 static public key before it sends `LINK_CREATE`: the initiator
+seals the setup challenge to that key and the responder proves it owns it
+(`lib/private/link-setup.js:742`, `:765`, `:859`, `:983`). §3.4 forbids an
+advertisement from minting authorization, not from supplying a setup key after
+a locally admitted grant exists. The routed-DHT link owners already use the
+responder's advertised route key for this (initiator
+`test/private/process/wire-services.js:813`; dynamic responder `:365`,
+`:1861`). The native neighbor path follows that convention: the responder
+static key is the `routeEncryptionPublicKey32` of the peer advertisement the
+admission owner fetched from the granted identity and address. An earlier
+draft put a separate `linkStaticKey32` in the grant; it was removed before any
+runtime used it, because it duplicated the fetched key and would have tied key
+rotation to out-of-band grant reissue. Cost of reuse: one X25519 key serves
+the §3.2 ACTIVE route-key proof and link setup, each under its own
+domain-separated derivation.
 
 `LinkDirectory` gains an `authorityPublicKeys` set for format 1. `add()`
 requires `local.authority32 ∈ authorityPublicKeys` and both signatures valid,
@@ -136,16 +125,42 @@ relay node. It owns:
 
 - **Config:** trusted authority keys, the node's format 1 grants, the service
   budget, and the relay owner and endpoint. Clocks come from the real clock.
-- **Directories:** one `LinkDirectory` per `(localRole, epoch, runId32)`. A
-  directory binds one local role (`topology-grant.js:785`), and a safety relay
-  is `SAFETY_FINAL` toward its guard but `SAFETY_GUARD` toward its terminal
-  (fixture `:1166`, `:1369`).
-- **Dialing:** the endpoint with `INITIATE` in the grant dials, using fresh
-  random `circuitId` and local IDs and the peer's `linkStaticKey32` from the
-  grant.
-- **Accepting:** the responder uses `createDynamicResponderSetup` with its own
-  static secret and identity secret, and learns IDs from `LINK_CREATE`
-  (`link-bootstrap-session.js:116`–`:140`).
+- **One `(epoch, runId32)` per endpoint.** The NAT traversal authority is one
+  per endpoint (`udx-cell-endpoint.js:6002`) and holds one epoch and run ID.
+  `readAuthorizedLink` rejects any handle with a different pair
+  (`:6285`–`:6287`), and a punch counter-offer requires the offer's grant
+  digest, epoch and run ID to equal its own link's (`:6580`–`:6582`). So every
+  grant used on one endpoint carries the same pair. A grant carries one pair
+  for both ends, so linked relays share it, and so does every relay reachable
+  through links. The pair is therefore one deployment-wide config value. The
+  admission owner takes it once and rejects any grant with a different pair.
+  Changing it is a coordinated restart; rolling rotation would need NAT
+  authority scoping per pair and is out of scope.
+- **Directories:** one `LinkDirectory` per link attempt, holding exactly one
+  grant, with the node's single `(epoch, runId32)`. A link handle is consumed
+  by `openLink` (`udx-cell-endpoint.js:2332`), and a directory returns the
+  same handle for a grant it already holds, so a retry or reconnect needs a
+  fresh directory. The directory lives as long as its neighbor: destroying it
+  closes the handle, and the pool's link-close subscription tears the neighbor
+  down.
+- **Advertisement fetch:** before provisioning, the owner runs the existing
+  CAPS/ACTIVE exchange toward the granted peer through
+  `createPeerGrantDirectTransport`, the grant-pinned (`'guard'`) discovery
+  kind. Identity, address, epoch, grant digest and run ID come from the link
+  handle; the advertisement is learned. The exchange's 24-cell reservation
+  comes from the pool's node service ledger
+  (`reservePeerNativeNeighborService`). Discovery already requires the
+  advertised epoch to equal the grant epoch (`peer-direct-bootstrap.js:1298`),
+  so every relay advertises the deployment epoch.
+- **Dialing:** the side whose grant endpoint may `INITIATE` dials; if both may,
+  the lower identity dials. It uses fresh random `circuitId` and local IDs, the
+  grant expiry as the signed setup expiry, and the fetched advertisement's
+  route key as the responder static key.
+- **Accepting:** the responder uses `createDynamicResponderSetup` with its
+  route secret and identity secret, and learns IDs from `LINK_CREATE`
+  (`link-bootstrap-session.js:116`–`:140`). It waits up to the grant expiry.
+  If a branch responder is configured, it is registered on the accepted link
+  so the node answers LINK_OFFER extensions from its dialer.
 - **Neighbor pools:** `createPeerNativeNeighborPool` and
   `provisionPeerNativeNeighbor`, with the pool's `nodeServiceBudget` as the
   §3.4 separate ledger. No other budget funds service traffic.
@@ -168,8 +183,8 @@ matching neighbor.
 No new network message. An operator tool (subcommand of `bin.js`):
 
 1. `grant draft`: reads local config plus the peer's shared line (identity,
-   role, host, port, operations, authority key, link static key). It writes the
-   unsigned format 1 body.
+   role, host, port, operations, authority key). It writes the unsigned
+   format 1 body.
 2. `grant sign`: signs one side with the local authority key.
 3. The operators swap the half-signed grant; the second side signs.
 4. `grant add`: installs the fully signed grant into the node's config.
@@ -186,23 +201,19 @@ format 1. The public alpha stays on the current four-relay peer stream.
 
 ## Open questions (with the default this draft uses)
 
-1. **Epoch meaning.** The grant epoch must match on both ends (`LINK_CREATE`
-   check, `link-bootstrap-session.js:125`). Default: one deployment-wide
-   constant, configured, like the fixture's `7n`. Rotation is later work.
-2. **D1 DIRECTORY choice.** Mode 1 lets the guard pick a safety by random
-   target. Under rule 3, a pick that is not a live neighbor fails with
-   `ERR_PRIVACY_UNAVAILABLE`. Default: the guard picks only from its live
-   neighbors whose role and mask match. This needs a packet note, because the
-   current text does not say so.
+1. **Epoch and run ID.** Settled: one deployment-wide `(epoch, runId32)`,
+   configured (see "Per-node admission owner"). Rotation is later work.
+2. **D1 DIRECTORY choice.** Settled by existing code: directory discovery
+   selects only live, published neighbors whose mask matches
+   (`peer-native-neighbors.js:1428`–`:1459`).
 3. **Supplied terminals.** A destination's supplied private terminal must be
    a neighbor of the source's safety relay. Default: fail closed and report
    it; do not dial.
 4. **Format 0 and 1 side by side.** Default: keep both, each used by a
    different stack. The other choice is to move the routed-DHT harness to
    format 1 as well, which touches the reviewed Gate 3B1 path.
-5. **Where the link static key lives.** Default: in the grant (see "Grant
-   format 1"). Pick this before step 1, because it decides whether format 1
-   has the `linkStaticKey32` field.
+5. **Where the link static key lives.** Settled: the peer's advertised route
+   key, following the routed-DHT link owners (see "Grant format 1").
 
 ## Plan outline
 

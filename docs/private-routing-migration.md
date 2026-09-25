@@ -5870,3 +5870,37 @@ separation, and authority-set bounds. Node private aggregate: 1,312/1,312
 tests, 23,271/23,271 assertions. Bare: 1,267/1,267 tests, 23,136/23,136
 assertions. Nothing uses format 1 at runtime yet; the admission owner is step 2.
 Format 1 is new signed data and must be in the external cryptographic review.
+
+### 2026-09-25 step 1 correction and step 2: per-node admission owner
+
+The first format 1 draft carried a `linkStaticKey32` per endpoint. The
+routed-DHT link owners already use the responder's advertised route key as the
+link-setup static key (`test/private/process/wire-services.js:813`, `:365`,
+`:1861`), and the admission owner fetches that advertisement anyway, so the
+field was removed before any runtime used it. Format 1 now appends only
+`authority32` to each endpoint; its pinned bytes and digest were regenerated.
+
+`lib/private/peer-neighbor-admission.js` is the per-node admission owner. It
+admits format 1 grants whose local side is signed by a configured authority and
+whose `(epoch, runId32)` equals the node's single pair: the endpoint's NAT
+authority and `readAuthorizedLink` accept one pair per endpoint
+(`udx-cell-endpoint.js:6002`, `:6285`–`:6287`), and a grant carries one pair
+for both ends. For each grant it builds a one-grant `LinkDirectory` per attempt
+(link handles are single-use), fetches the peer's current advertisement through
+the new grant-pinned `createPeerGrantDirectTransport` (CAPS/ACTIVE exchange
+charged to the node service ledger through `reservePeerNativeNeighborService`),
+and provisions the neighbor with fresh random link IDs. The dialer uses the
+fetched route key as the responder static key; the acceptor uses a dynamic
+responder setup and optionally registers the node's branch responder on the
+accepted link. Failed attempts retry up to three times; destroy cancels retry
+timers, in-flight fetches and pending provisioning, then joins the pool.
+
+`test/private/peer-neighbor-admission.js` runs two relays on real UDX loopback
+with a real clock: both publish the neighbor and the node ledger records the
+service spend; a relay whose own authority did not sign its side is refused; a
+grant with another epoch or run ID is refused; destroy ends a pending dial
+promptly. Node 20/20 repeated runs and Bare pass. Upkeep (renewal, reconnect,
+advertisement refresh) and the four-node rebuild are the next steps. The
+standalone peer native suites (`peer-native-neighbors`, `peer-direct-bootstrap`,
+`peer-tail-control`, `peer-guard-link`, `peer-capability`) are not in the
+private aggregate; they pass unchanged when run directly.

@@ -53,8 +53,6 @@ function fixture() {
   const safety = safetyRoleIdentity(60)
   const guardAuthority = cryptoSuite.keyPair(seed(91))
   const safetyAuthority = cryptoSuite.keyPair(seed(92))
-  const guardStatic = cryptoSuite.encryptionKeyPair(seed(93))
-  const safetyStatic = cryptoSuite.encryptionKeyPair(seed(94))
   const grant = {
     version: PROTOCOL_VERSION,
     format: 1,
@@ -65,8 +63,7 @@ function fixture() {
       host: '192.0.2.1',
       port: 41001,
       operations: LINK_OPERATION.INITIATE,
-      authority32: guardAuthority.publicKey,
-      linkStaticKey32: guardStatic.publicKey
+      authority32: guardAuthority.publicKey
     },
     endpointB: {
       identity32: safety.publicKey,
@@ -74,15 +71,14 @@ function fixture() {
       host: '2001:db8::2',
       port: 41002,
       operations: LINK_OPERATION.ACCEPT,
-      authority32: safetyAuthority.publicKey,
-      linkStaticKey32: safetyStatic.publicKey
+      authority32: safetyAuthority.publicKey
     },
     epoch: 7n,
     notBefore: 100n,
     expiresAt: 200n,
     runId32: seed(34)
   }
-  return { guard, safety, guardAuthority, safetyAuthority, guardStatic, safetyStatic, grant }
+  return { guard, safety, guardAuthority, safetyAuthority, grant }
 }
 
 function signBoth(f, unsigned = encodeUnsignedTopologyGrantV1(f.grant)) {
@@ -112,8 +108,8 @@ function directory(localIdentity32, localRole, authorityPublicKeys, f, overrides
 test('format 1 grant has pinned canonical bytes and domain-separated signatures', (t) => {
   const f = fixture()
   const unsigned = encodeUnsignedTopologyGrantV1(f.grant)
-  // v0 layout (IPv4 + IPv6 endpoints = 187 bytes) plus two 64-byte extensions.
-  t.is(unsigned.byteLength, 187 + 128)
+  // v0 layout (IPv4 + IPv6 endpoints = 187 bytes) plus two 32-byte authorities.
+  t.is(unsigned.byteLength, 187 + 64)
   t.is(unsigned[4], 1, 'format byte')
   t.is(b4a.toString(DOMAIN.TOPOLOGY_GRANT_V1), 'hyperdht-private-routes/topology-grant/v1')
 
@@ -125,7 +121,7 @@ test('format 1 grant has pinned canonical bytes and domain-separated signatures'
   t.alike(swapped, unsigned, 'endpoint order is canonical, not caller order')
   t.is(
     b4a.toString(cryptoSuite.hash(unsigned), 'hex'),
-    'd1423e2d8031244678163de2e38a64574a2d6d604fa2b765d123ae0256832958',
+    'eebff337c4267e1e238f0aa76b3a0832860ae59ad2073f2cb9d593854194f47e',
     'known-answer unsigned bytes'
   )
 
@@ -135,7 +131,7 @@ test('format 1 grant has pinned canonical bytes and domain-separated signatures'
   const digest = cryptoSuite.hash([DOMAIN.TOPOLOGY_GRANT_V1, unsigned])
   t.is(
     b4a.toString(digest, 'hex'),
-    'e8f97d66d10029d84e6acd9b04fbf63ea2fcb2711e4c4271999911fb1cc7e3ed',
+    '711ad62b85525d1c5947796517b568c6ebce32a973bafa52f88a3812124ad958',
     'known-answer signed digest'
   )
   t.ok(cryptoSuite.verify(digest, decoded.signatureA, decoded.endpointA.authority32))
@@ -187,7 +183,7 @@ test('both ends admit one identical grant, each under its own configured authori
     })
   )
   t.is(view.format, 1)
-  t.alike(view.peer.linkStaticKey32, f.safetyStatic.publicKey, 'dialer learns the signed key')
+  t.alike(view.peer.authority32, f.safetyAuthority.publicKey)
   t.alike(view.local.authority32, f.guardAuthority.publicKey)
 })
 
@@ -321,7 +317,7 @@ test('format 0 and format 1 directories each refuse the other format', (t) => {
 
   const v0Grant = { ...f.grant, format: 0 }
   for (const side of ['endpointA', 'endpointB']) {
-    const { authority32, linkStaticKey32, ...rest } = v0Grant[side]
+    const { authority32, ...rest } = v0Grant[side]
     v0Grant[side] = rest
   }
   const signedV0 = signTopologyGrant(v0Grant, f.guardAuthority.secretKey)
@@ -349,23 +345,30 @@ test('directory authority configuration is exact, bounded and duplicate-free', (
   expectCode(t, make({ authorityPublicKeys: tooMany }), 'INVALID_ROUTE')
 })
 
-test('format 1 endpoints require nonzero authority and link static keys', (t) => {
+test('format 1 endpoints require an exact nonzero authority key', (t) => {
   const f = fixture()
-  for (const field of ['authority32', 'linkStaticKey32']) {
-    expectCode(
-      t,
-      () =>
-        encodeUnsignedTopologyGrantV1({
-          ...f.grant,
-          endpointA: { ...f.grant.endpointA, [field]: b4a.alloc(32) }
-        }),
-      'INVALID_ROUTE'
-    )
-  }
-  const { linkStaticKey32, ...missing } = f.grant.endpointA
+  expectCode(
+    t,
+    () =>
+      encodeUnsignedTopologyGrantV1({
+        ...f.grant,
+        endpointA: { ...f.grant.endpointA, authority32: b4a.alloc(32) }
+      }),
+    'INVALID_ROUTE'
+  )
+  const { authority32, ...missing } = f.grant.endpointA
   expectCode(
     t,
     () => encodeUnsignedTopologyGrantV1({ ...f.grant, endpointA: missing }),
+    'INVALID_ROUTE'
+  )
+  expectCode(
+    t,
+    () =>
+      encodeUnsignedTopologyGrantV1({
+        ...f.grant,
+        endpointA: { ...f.grant.endpointA, linkStaticKey32: seed(5) }
+      }),
     'INVALID_ROUTE'
   )
 })
