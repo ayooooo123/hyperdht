@@ -174,7 +174,8 @@ relay node. It owns:
     peer. The pool holds one neighbor per identity, so the live neighbor keeps
     its current grant; the newer one takes over at the next provisioning.
     There is a short gap at the old grant's expiry. A grant for a new peer
-    starts provisioning at once.
+    starts provisioning at once. A grant is verified when it is installed,
+    so a renewal must already be valid (`notBefore` not in the future).
   - **Stop:** a slot whose grant has expired with no replacement ends in
     `expired` and does not redial. Three failed attempts in a row end in
     `failed`; a new grant restarts it. Every attempt draws on the finite node
