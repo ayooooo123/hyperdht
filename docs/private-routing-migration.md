@@ -5904,3 +5904,24 @@ advertisement refresh) and the four-node rebuild are the next steps. The
 standalone peer native suites (`peer-native-neighbors`, `peer-direct-bootstrap`,
 `peer-tail-control`, `peer-guard-link`, `peer-capability`) are not in the
 private aggregate; they pass unchanged when run directly.
+
+### 2026-09-25 step 3: neighbor upkeep
+
+`createPeerNativeNeighborPool` takes an optional `onNeighborClosed` observer.
+It is called once, in a later microtask, for each published neighbor that
+ends while the pool is live: native loss, link close, or expiry at the earlier
+of grant and peer-advertisement expiry. The admission owner uses it to release
+the ended attempt's directory and provision again after one second, which also
+refetches the peer's current advertisement. `addPeerNeighborGrant` installs a
+newer grant for a known peer; the live neighbor keeps its grant and the newer
+one takes over at the next provisioning (the pool holds one neighbor per
+identity, so renewal has a short gap at the old expiry). A slot with an expired
+grant and no replacement stops as `expired`; three consecutive failures stop as
+`failed` until a new grant arrives. A neighbor lost between pool publication
+and the owner's `live` mark is retried, not claimed.
+
+Three real-UDX tests cover this: both sides reconnect under a replacement
+grant after a 2.5-second grant expires; both stop as `expired` without a
+replacement; the dialer detects a restarted acceptor (about one second) and
+both sides reconnect. Node 10/10 and Bare 5/5 repeated runs of the file pass;
+`peer-native-neighbors` (31/31) and `peer-tail-control` (20/20) pass unchanged.
