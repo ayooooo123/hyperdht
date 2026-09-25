@@ -5925,3 +5925,23 @@ grant after a 2.5-second grant expires; both stop as `expired` without a
 replacement; the dialer detects a restarted acceptor (about one second) and
 both sides reconnect. Node 10/10 and Bare 5/5 repeated runs of the file pass;
 `peer-native-neighbors` (31/31) and `peer-tail-control` (20/20) pass unchanged.
+
+### 2026-09-25 step 4: four-node tail over admitted neighbors
+
+`setupFourNodeNativeFixture({ admission: true })` provisions guard↔safety and
+safety↔terminal through three per-node admission owners, each trusting only
+its own operator key, with two-authority format 1 grants. It drops the shared
+test topology authority, the fixed link static pair, seeded circuit and local
+IDs, and hand-paired `provisionPeerNativeNeighbor` calls for those links. The
+fixture arms each acceptor before its dialer only because fixture time never
+advances, so link retransmission never fires; with a real clock the owners
+start in any order (see the two-relay tests). The source↔guard A0 link and the
+fake clock are unchanged here: A0 is the source bootstrap path, not relay
+neighbor admission.
+
+The new `peer-tail-control` case runs the source over native UDX through
+directory discovery to the admitted safety neighbor, both EXTEND rounds, and
+supplied-terminal discovery to `FINAL_EXIT_READY`, with the terminal
+publishing its ready session. `peer-tail-control` passes 21/21 tests and
+161/161 assertions on Node (10/10 repeats) and Bare; every other suite that
+uses the fixture passes unchanged.

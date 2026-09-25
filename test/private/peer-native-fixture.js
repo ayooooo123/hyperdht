@@ -25,9 +25,19 @@ const {
 } = require('../../lib/private/udx-cell-endpoint')
 const {
   LinkDirectory,
+  assembleTopologyGrantV1,
+  decodeUnsignedTopologyGrantV1,
+  encodeUnsignedTopologyGrantV1,
   signTopologyGrant,
+  signTopologyGrantV1,
   readLinkHandle
 } = require('../../lib/private/topology-grant')
+const {
+  createPeerNeighborAdmission,
+  destroyPeerNeighborAdmission,
+  readPeerNeighborAdmission,
+  settlePeerNeighborAdmission
+} = require('../../lib/private/peer-neighbor-admission')
 const { createPeerLedger, createPeerMemoryPool } = require('../../lib/private/peer-ledger')
 const {
   createPeerRelayOwner,
@@ -259,6 +269,55 @@ function createBoundEndpoint(network, host, port, onBootstrap = null, native = f
         options,
         issuer.createTestUdxAdapterAuthority(fakeFactory(network))
       )
+}
+
+// Format 1 grant signed by each endpoint's own operator authority.
+function twoAuthorityGrant({ initiator, acceptor, runId32, expiresAt, grantId32 }) {
+  const side = (end, operations) => ({
+    identity32: end.keys.publicKey,
+    role: end.role,
+    host: end.host,
+    port: end.port,
+    operations,
+    authority32: end.authority.publicKey
+  })
+  const unsigned = encodeUnsignedTopologyGrantV1({
+    version: PROTOCOL_VERSION,
+    format: 1,
+    grantId32,
+    endpointA: side(initiator, LINK_OPERATION.INITIATE),
+    endpointB: side(acceptor, LINK_OPERATION.ACCEPT),
+    epoch: 7n,
+    notBefore: 0n,
+    expiresAt,
+    runId32
+  })
+  const decoded = decodeUnsignedTopologyGrantV1(unsigned)
+  const signer = (authority32) =>
+    b4a.equals(authority32, initiator.authority.publicKey)
+      ? initiator.authority
+      : acceptor.authority
+  return assembleTopologyGrantV1(
+    unsigned,
+    signTopologyGrantV1(unsigned, signer(decoded.endpointA.authority32)),
+    signTopologyGrantV1(unsigned, signer(decoded.endpointB.authority32))
+  )
+}
+
+// Resolves once the admission slot for `peerIdentity32` has an armed link
+// session (or is already live).
+async function admissionArmed(owner, peerIdentity32, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const slot = readPeerNeighborAdmission(owner).neighbors.find((entry) =>
+      b4a.equals(entry.peerIdentity32, peerIdentity32)
+    )
+    if (slot && (slot.state === 'provisioning' || slot.state === 'live')) return
+    if (!slot || slot.state === 'failed' || Date.now() >= deadline) {
+      throw new Error(`neighbor admission not armed: ${slot ? slot.lastError : 'no slot'}`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
 }
 
 function buildSignedGrant({
@@ -853,7 +912,10 @@ async function setupFourNodeNativeFixture({
   nodeServiceCells = 300,
   serviceCells = 60,
   suppressSafetyTailReady = false,
-  safetyRelayOwnerOverride = null
+  safetyRelayOwnerOverride = null,
+  // Provision guard↔safety and safety↔terminal through per-node admission
+  // owners and two-authority grants instead of the shared test authority.
+  admission = false
 }) {
   const cleanup = []
   let closing = null
@@ -993,23 +1055,26 @@ async function setupFourNodeNativeFixture({
     })
     cleanup.push(() => destroyPeerRelayOwner(guardRelayOwner))
 
-    const guardPool = createPeerNativeNeighborPool({
-      relayOwner: guardRelayOwner,
-      endpoint: fixture.right,
-      maxNeighbors: 4,
-      nodeServiceBudget: {
-        cells: nodeServiceCells,
-        bytes: 1200n * BigInt(nodeServiceCells),
-        commands: nodeServiceCells
-      },
-      neighborServiceReservation: {
-        cells: serviceCells,
-        bytes: 1200n * BigInt(serviceCells),
-        commands: serviceCells
-      },
-      neighborCloseReservation: { cells: 10, bytes: 12_000n, commands: 10 }
-    })
-    cleanup.push(() => destroyPeerNativeNeighborPool(guardPool))
+    let guardPool = null
+    if (!admission) {
+      guardPool = createPeerNativeNeighborPool({
+        relayOwner: guardRelayOwner,
+        endpoint: fixture.right,
+        maxNeighbors: 4,
+        nodeServiceBudget: {
+          cells: nodeServiceCells,
+          bytes: 1200n * BigInt(nodeServiceCells),
+          commands: nodeServiceCells
+        },
+        neighborServiceReservation: {
+          cells: serviceCells,
+          bytes: 1200n * BigInt(serviceCells),
+          commands: serviceCells
+        },
+        neighborCloseReservation: { cells: 10, bytes: 12_000n, commands: 10 }
+      })
+      cleanup.push(() => destroyPeerNativeNeighborPool(guardPool))
+    }
 
     const bootstrap = createPeerBootstrapResponder(guardRelayOwner)
     cleanup.push(() => destroyPeerBootstrapResponder(bootstrap))
@@ -1096,23 +1161,26 @@ async function setupFourNodeNativeFixture({
     const safetyRegistration = registerPeerDirectResponder(safetyEndpoint, safetyBootstrap)
     cleanup.push(() => destroyPeerDirectResponderRegistration(safetyRegistration))
 
-    const safetyPool = createPeerNativeNeighborPool({
-      relayOwner: safetyRelayOwner,
-      endpoint: safetyEndpoint,
-      maxNeighbors: 4,
-      nodeServiceBudget: {
-        cells: nodeServiceCells,
-        bytes: 1200n * BigInt(nodeServiceCells),
-        commands: nodeServiceCells
-      },
-      neighborServiceReservation: {
-        cells: serviceCells,
-        bytes: 1200n * BigInt(serviceCells),
-        commands: serviceCells
-      },
-      neighborCloseReservation: { cells: 10, bytes: 12_000n, commands: 10 }
-    })
-    cleanup.push(() => destroyPeerNativeNeighborPool(safetyPool))
+    let safetyPool = null
+    if (!admission) {
+      safetyPool = createPeerNativeNeighborPool({
+        relayOwner: safetyRelayOwner,
+        endpoint: safetyEndpoint,
+        maxNeighbors: 4,
+        nodeServiceBudget: {
+          cells: nodeServiceCells,
+          bytes: 1200n * BigInt(nodeServiceCells),
+          commands: nodeServiceCells
+        },
+        neighborServiceReservation: {
+          cells: serviceCells,
+          bytes: 1200n * BigInt(serviceCells),
+          commands: serviceCells
+        },
+        neighborCloseReservation: { cells: 10, bytes: 12_000n, commands: 10 }
+      })
+      cleanup.push(() => destroyPeerNativeNeighborPool(safetyPool))
+    }
 
     let safetyRuntime = null
     let safetyTailSession = null
@@ -1150,120 +1218,124 @@ async function setupFourNodeNativeFixture({
     })
     cleanup.push(() => destroyPeerLinkResponder(safetyResponder))
 
-    const guardSafetyDir = new LinkDirectory({
-      localIdentity32: fixture.links.b.publicKey,
-      localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
-      authorityPublicKey: grantAuthority.publicKey,
-      epoch: 7n,
-      runId32: seed(0x81),
-      now: () => 1n,
-      schedule: setTimeout,
-      cancel: clearTimeout,
-      onClose() {}
-    })
-    cleanup.push(() => guardSafetyDir.destroy())
-
-    const safetyGuardDir = new LinkDirectory({
-      localIdentity32: safetyKeys.publicKey,
-      localRole: TOPOLOGY_ROLE.SAFETY_FINAL,
-      authorityPublicKey: grantAuthority.publicKey,
-      epoch: 7n,
-      runId32: seed(0x81),
-      now: () => 1n,
-      schedule: setTimeout,
-      cancel: clearTimeout,
-      onClose() {}
-    })
-    cleanup.push(() => safetyGuardDir.destroy())
-
-    const grantGuardSafety = buildSignedGrant({
-      authority: grantAuthority,
-      local: fixture.links.b,
-      peer: safetyKeys,
-      localHost: fixture.rightHost,
-      localPort: guardPort,
-      peerHost,
-      peerPort: safetyPort,
-      epoch: 7n,
-      runId32: seed(0x81),
-      grantId32: seed(0x82),
-      localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
-      peerRole: TOPOLOGY_ROLE.SAFETY_FINAL,
-      expiresAt
-    })
-
-    const guardLinkHandle = guardSafetyDir.authorize({
-      digest32: guardSafetyDir.add(grantGuardSafety),
-      operation: LINK_OPERATION.INITIATE,
-      localIdentity32: fixture.links.b.publicKey,
-      localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
-      peerIdentity32: safetyKeys.publicKey,
-      peerRole: TOPOLOGY_ROLE.SAFETY_FINAL,
-      epoch: 7n,
-      runId32: seed(0x81)
-    })
-
-    const safetyLinkHandle = safetyGuardDir.authorize({
-      digest32: safetyGuardDir.add(grantGuardSafety),
-      operation: LINK_OPERATION.ACCEPT,
-      localIdentity32: safetyKeys.publicKey,
-      localRole: TOPOLOGY_ROLE.SAFETY_FINAL,
-      peerIdentity32: fixture.links.b.publicKey,
-      peerRole: TOPOLOGY_ROLE.SAFETY_GUARD,
-      epoch: 7n,
-      runId32: seed(0x81)
-    })
-
-    const staticPair1 = cryptoSuite.encryptionKeyPair(seed(0xd5))
-    const sessionIds1 = {
-      circuitId: seed(0xe1).subarray(0, 16),
-      initiatorLocalId: seed(0xe2).subarray(0, 16),
-      responderLocalId: seed(0xe3).subarray(0, 16)
-    }
-    const guardSessionOptions = buildSessionOptions(
-      guardLinkHandle,
-      'initiate',
-      fixture.links.b,
-      safetyKeys,
-      staticPair1,
-      c,
-      sessionIds1
-    )
-    const safetySessionOptions = buildSessionOptions(
-      safetyLinkHandle,
-      'accept',
-      fixture.links.b,
-      safetyKeys,
-      staticPair1,
-      c,
-      sessionIds1
-    )
-
-    const guardCanonicalWire260 = readPeerRelayOwner(
-      guardRelayOwner,
-      fixture.right
-    ).canonicalAdvertisement260
-    const guardVerifiedAd = verifyPeerAdvertisement(guardCanonicalWire260, {
-      expectedIdentity32: fixture.links.b.publicKey,
-      expectedRole: 0,
-      ...clocks
-    })
-
-    const [guardNeighbor, safetyNeighborFromGuard] = await Promise.all([
-      provisionPeerNativeNeighbor(guardPool, {
-        linkHandle: guardLinkHandle,
-        advertisement: safetyVerifiedAd,
-        mode: 'initiate',
-        sessionOptions: guardSessionOptions
-      }),
-      provisionPeerNativeNeighbor(safetyPool, {
-        linkHandle: safetyLinkHandle,
-        advertisement: guardVerifiedAd,
-        mode: 'accept',
-        sessionOptions: safetySessionOptions
+    let guardNeighbor = null
+    let safetyNeighborFromGuard = null
+    if (!admission) {
+      const guardSafetyDir = new LinkDirectory({
+        localIdentity32: fixture.links.b.publicKey,
+        localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
+        authorityPublicKey: grantAuthority.publicKey,
+        epoch: 7n,
+        runId32: seed(0x81),
+        now: () => 1n,
+        schedule: setTimeout,
+        cancel: clearTimeout,
+        onClose() {}
       })
-    ])
-    registerSharedGuardPeerBranchResponder(safetyNeighborFromGuard.established, safetyResponder)
+      cleanup.push(() => guardSafetyDir.destroy())
+
+      const safetyGuardDir = new LinkDirectory({
+        localIdentity32: safetyKeys.publicKey,
+        localRole: TOPOLOGY_ROLE.SAFETY_FINAL,
+        authorityPublicKey: grantAuthority.publicKey,
+        epoch: 7n,
+        runId32: seed(0x81),
+        now: () => 1n,
+        schedule: setTimeout,
+        cancel: clearTimeout,
+        onClose() {}
+      })
+      cleanup.push(() => safetyGuardDir.destroy())
+
+      const grantGuardSafety = buildSignedGrant({
+        authority: grantAuthority,
+        local: fixture.links.b,
+        peer: safetyKeys,
+        localHost: fixture.rightHost,
+        localPort: guardPort,
+        peerHost,
+        peerPort: safetyPort,
+        epoch: 7n,
+        runId32: seed(0x81),
+        grantId32: seed(0x82),
+        localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
+        peerRole: TOPOLOGY_ROLE.SAFETY_FINAL,
+        expiresAt
+      })
+
+      const guardLinkHandle = guardSafetyDir.authorize({
+        digest32: guardSafetyDir.add(grantGuardSafety),
+        operation: LINK_OPERATION.INITIATE,
+        localIdentity32: fixture.links.b.publicKey,
+        localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
+        peerIdentity32: safetyKeys.publicKey,
+        peerRole: TOPOLOGY_ROLE.SAFETY_FINAL,
+        epoch: 7n,
+        runId32: seed(0x81)
+      })
+
+      const safetyLinkHandle = safetyGuardDir.authorize({
+        digest32: safetyGuardDir.add(grantGuardSafety),
+        operation: LINK_OPERATION.ACCEPT,
+        localIdentity32: safetyKeys.publicKey,
+        localRole: TOPOLOGY_ROLE.SAFETY_FINAL,
+        peerIdentity32: fixture.links.b.publicKey,
+        peerRole: TOPOLOGY_ROLE.SAFETY_GUARD,
+        epoch: 7n,
+        runId32: seed(0x81)
+      })
+
+      const staticPair1 = cryptoSuite.encryptionKeyPair(seed(0xd5))
+      const sessionIds1 = {
+        circuitId: seed(0xe1).subarray(0, 16),
+        initiatorLocalId: seed(0xe2).subarray(0, 16),
+        responderLocalId: seed(0xe3).subarray(0, 16)
+      }
+      const guardSessionOptions = buildSessionOptions(
+        guardLinkHandle,
+        'initiate',
+        fixture.links.b,
+        safetyKeys,
+        staticPair1,
+        c,
+        sessionIds1
+      )
+      const safetySessionOptions = buildSessionOptions(
+        safetyLinkHandle,
+        'accept',
+        fixture.links.b,
+        safetyKeys,
+        staticPair1,
+        c,
+        sessionIds1
+      )
+
+      const guardCanonicalWire260 = readPeerRelayOwner(
+        guardRelayOwner,
+        fixture.right
+      ).canonicalAdvertisement260
+      const guardVerifiedAd = verifyPeerAdvertisement(guardCanonicalWire260, {
+        expectedIdentity32: fixture.links.b.publicKey,
+        expectedRole: 0,
+        ...clocks
+      })
+
+      ;[guardNeighbor, safetyNeighborFromGuard] = await Promise.all([
+        provisionPeerNativeNeighbor(guardPool, {
+          linkHandle: guardLinkHandle,
+          advertisement: safetyVerifiedAd,
+          mode: 'initiate',
+          sessionOptions: guardSessionOptions
+        }),
+        provisionPeerNativeNeighbor(safetyPool, {
+          linkHandle: safetyLinkHandle,
+          advertisement: guardVerifiedAd,
+          mode: 'accept',
+          sessionOptions: safetySessionOptions
+        })
+      ])
+      registerSharedGuardPeerBranchResponder(safetyNeighborFromGuard.established, safetyResponder)
+    }
 
     const terminalEndpoint = createBoundEndpoint(
       fixture.network,
@@ -1318,23 +1390,26 @@ async function setupFourNodeNativeFixture({
     const terminalRegistration = registerPeerDirectResponder(terminalEndpoint, terminalBootstrap)
     cleanup.push(() => destroyPeerDirectResponderRegistration(terminalRegistration))
 
-    const terminalPool = createPeerNativeNeighborPool({
-      relayOwner: terminalRelayOwner,
-      endpoint: terminalEndpoint,
-      maxNeighbors: 4,
-      nodeServiceBudget: {
-        cells: nodeServiceCells,
-        bytes: 1200n * BigInt(nodeServiceCells),
-        commands: nodeServiceCells
-      },
-      neighborServiceReservation: {
-        cells: serviceCells,
-        bytes: 1200n * BigInt(serviceCells),
-        commands: serviceCells
-      },
-      neighborCloseReservation: { cells: 10, bytes: 12_000n, commands: 10 }
-    })
-    cleanup.push(() => destroyPeerNativeNeighborPool(terminalPool))
+    let terminalPool = null
+    if (!admission) {
+      terminalPool = createPeerNativeNeighborPool({
+        relayOwner: terminalRelayOwner,
+        endpoint: terminalEndpoint,
+        maxNeighbors: 4,
+        nodeServiceBudget: {
+          cells: nodeServiceCells,
+          bytes: 1200n * BigInt(nodeServiceCells),
+          commands: nodeServiceCells
+        },
+        neighborServiceReservation: {
+          cells: serviceCells,
+          bytes: 1200n * BigInt(serviceCells),
+          commands: serviceCells
+        },
+        neighborCloseReservation: { cells: 10, bytes: 12_000n, commands: 10 }
+      })
+      cleanup.push(() => destroyPeerNativeNeighborPool(terminalPool))
+    }
 
     let terminalRuntime = null
     let terminalTailSession = null
@@ -1366,113 +1441,234 @@ async function setupFourNodeNativeFixture({
       }
     })
     cleanup.push(() => destroyPeerLinkResponder(terminalResponder))
-    const safetyTerminalDir = new LinkDirectory({
-      localIdentity32: safetyKeys.publicKey,
-      localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
-      authorityPublicKey: grantAuthority.publicKey,
-      epoch: 7n,
-      runId32: seed(0x91),
-      now: () => 1n,
-      schedule: setTimeout,
-      cancel: clearTimeout,
-      onClose() {}
-    })
-    cleanup.push(() => safetyTerminalDir.destroy())
-
-    const terminalSafetyDir = new LinkDirectory({
-      localIdentity32: terminalKeys.publicKey,
-      localRole: TOPOLOGY_ROLE.SAFETY_FINAL,
-      authorityPublicKey: grantAuthority.publicKey,
-      epoch: 7n,
-      runId32: seed(0x91),
-      now: () => 1n,
-      schedule: setTimeout,
-      cancel: clearTimeout,
-      onClose() {}
-    })
-    cleanup.push(() => terminalSafetyDir.destroy())
-
-    const grantSafetyTerminal = buildSignedGrant({
-      authority: grantAuthority,
-      local: safetyKeys,
-      peer: terminalKeys,
-      localHost: peerHost,
-      localPort: safetyPort,
-      peerHost,
-      peerPort: terminalPort,
-      epoch: 7n,
-      runId32: seed(0x91),
-      grantId32: seed(0x92),
-      localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
-      peerRole: TOPOLOGY_ROLE.SAFETY_FINAL,
-      expiresAt
-    })
-
-    const safetyTerminalLinkHandle = safetyTerminalDir.authorize({
-      digest32: safetyTerminalDir.add(grantSafetyTerminal),
-      operation: LINK_OPERATION.INITIATE,
-      localIdentity32: safetyKeys.publicKey,
-      localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
-      peerIdentity32: terminalKeys.publicKey,
-      peerRole: TOPOLOGY_ROLE.SAFETY_FINAL,
-      epoch: 7n,
-      runId32: seed(0x91)
-    })
-
-    const terminalSafetyLinkHandle = terminalSafetyDir.authorize({
-      digest32: terminalSafetyDir.add(grantSafetyTerminal),
-      operation: LINK_OPERATION.ACCEPT,
-      localIdentity32: terminalKeys.publicKey,
-      localRole: TOPOLOGY_ROLE.SAFETY_FINAL,
-      peerIdentity32: safetyKeys.publicKey,
-      peerRole: TOPOLOGY_ROLE.SAFETY_GUARD,
-      epoch: 7n,
-      runId32: seed(0x91)
-    })
-
-    const staticPair2 = cryptoSuite.encryptionKeyPair(seed(0xd6))
-    const sessionIds2 = {
-      circuitId: seed(0xf1).subarray(0, 16),
-      initiatorLocalId: seed(0xf2).subarray(0, 16),
-      responderLocalId: seed(0xf3).subarray(0, 16)
-    }
-    const safetyTerminalSessionOptions = buildSessionOptions(
-      safetyTerminalLinkHandle,
-      'initiate',
-      safetyKeys,
-      terminalKeys,
-      staticPair2,
-      c,
-      sessionIds2
-    )
-    const terminalSafetySessionOptions = buildSessionOptions(
-      terminalSafetyLinkHandle,
-      'accept',
-      safetyKeys,
-      terminalKeys,
-      staticPair2,
-      c,
-      sessionIds2
-    )
-
-    const [safetyToTerminalNeighbor, terminalNeighborFromSafety] = await Promise.all([
-      provisionPeerNativeNeighbor(safetyPool, {
-        linkHandle: safetyTerminalLinkHandle,
-        advertisement: terminalVerifiedAd,
-        mode: 'initiate',
-        sessionOptions: safetyTerminalSessionOptions
-      }),
-      provisionPeerNativeNeighbor(terminalPool, {
-        linkHandle: terminalSafetyLinkHandle,
-        advertisement: safetyVerifiedAd,
-        mode: 'accept',
-        sessionOptions: terminalSafetySessionOptions
+    let safetyToTerminalNeighbor = null
+    let terminalNeighborFromSafety = null
+    if (!admission) {
+      const safetyTerminalDir = new LinkDirectory({
+        localIdentity32: safetyKeys.publicKey,
+        localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
+        authorityPublicKey: grantAuthority.publicKey,
+        epoch: 7n,
+        runId32: seed(0x91),
+        now: () => 1n,
+        schedule: setTimeout,
+        cancel: clearTimeout,
+        onClose() {}
       })
-    ])
-    registerSharedGuardPeerBranchResponder(
-      terminalNeighborFromSafety.established,
-      terminalResponder
-    )
+      cleanup.push(() => safetyTerminalDir.destroy())
+
+      const terminalSafetyDir = new LinkDirectory({
+        localIdentity32: terminalKeys.publicKey,
+        localRole: TOPOLOGY_ROLE.SAFETY_FINAL,
+        authorityPublicKey: grantAuthority.publicKey,
+        epoch: 7n,
+        runId32: seed(0x91),
+        now: () => 1n,
+        schedule: setTimeout,
+        cancel: clearTimeout,
+        onClose() {}
+      })
+      cleanup.push(() => terminalSafetyDir.destroy())
+
+      const grantSafetyTerminal = buildSignedGrant({
+        authority: grantAuthority,
+        local: safetyKeys,
+        peer: terminalKeys,
+        localHost: peerHost,
+        localPort: safetyPort,
+        peerHost,
+        peerPort: terminalPort,
+        epoch: 7n,
+        runId32: seed(0x91),
+        grantId32: seed(0x92),
+        localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
+        peerRole: TOPOLOGY_ROLE.SAFETY_FINAL,
+        expiresAt
+      })
+
+      const safetyTerminalLinkHandle = safetyTerminalDir.authorize({
+        digest32: safetyTerminalDir.add(grantSafetyTerminal),
+        operation: LINK_OPERATION.INITIATE,
+        localIdentity32: safetyKeys.publicKey,
+        localRole: TOPOLOGY_ROLE.SAFETY_GUARD,
+        peerIdentity32: terminalKeys.publicKey,
+        peerRole: TOPOLOGY_ROLE.SAFETY_FINAL,
+        epoch: 7n,
+        runId32: seed(0x91)
+      })
+
+      const terminalSafetyLinkHandle = terminalSafetyDir.authorize({
+        digest32: terminalSafetyDir.add(grantSafetyTerminal),
+        operation: LINK_OPERATION.ACCEPT,
+        localIdentity32: terminalKeys.publicKey,
+        localRole: TOPOLOGY_ROLE.SAFETY_FINAL,
+        peerIdentity32: safetyKeys.publicKey,
+        peerRole: TOPOLOGY_ROLE.SAFETY_GUARD,
+        epoch: 7n,
+        runId32: seed(0x91)
+      })
+
+      const staticPair2 = cryptoSuite.encryptionKeyPair(seed(0xd6))
+      const sessionIds2 = {
+        circuitId: seed(0xf1).subarray(0, 16),
+        initiatorLocalId: seed(0xf2).subarray(0, 16),
+        responderLocalId: seed(0xf3).subarray(0, 16)
+      }
+      const safetyTerminalSessionOptions = buildSessionOptions(
+        safetyTerminalLinkHandle,
+        'initiate',
+        safetyKeys,
+        terminalKeys,
+        staticPair2,
+        c,
+        sessionIds2
+      )
+      const terminalSafetySessionOptions = buildSessionOptions(
+        terminalSafetyLinkHandle,
+        'accept',
+        safetyKeys,
+        terminalKeys,
+        staticPair2,
+        c,
+        sessionIds2
+      )
+
+      ;[safetyToTerminalNeighbor, terminalNeighborFromSafety] = await Promise.all([
+        provisionPeerNativeNeighbor(safetyPool, {
+          linkHandle: safetyTerminalLinkHandle,
+          advertisement: terminalVerifiedAd,
+          mode: 'initiate',
+          sessionOptions: safetyTerminalSessionOptions
+        }),
+        provisionPeerNativeNeighbor(terminalPool, {
+          linkHandle: terminalSafetyLinkHandle,
+          advertisement: safetyVerifiedAd,
+          mode: 'accept',
+          sessionOptions: terminalSafetySessionOptions
+        })
+      ])
+      registerSharedGuardPeerBranchResponder(
+        terminalNeighborFromSafety.established,
+        terminalResponder
+      )
+    }
+
+    if (admission) {
+      const runId32 = seed(0x81)
+      const operators = {
+        guard: cryptoSuite.keyPair(seed(0x61)),
+        safety: cryptoSuite.keyPair(seed(0x62)),
+        terminal: cryptoSuite.keyPair(seed(0x63))
+      }
+      const grantGuardSafety = twoAuthorityGrant({
+        initiator: {
+          keys: fixture.links.b,
+          role: TOPOLOGY_ROLE.SAFETY_GUARD,
+          host: fixture.rightHost,
+          port: guardPort,
+          authority: operators.guard
+        },
+        acceptor: {
+          keys: safetyKeys,
+          role: TOPOLOGY_ROLE.SAFETY_FINAL,
+          host: peerHost,
+          port: safetyPort,
+          authority: operators.safety
+        },
+        runId32,
+        expiresAt,
+        grantId32: seed(0x82)
+      })
+      const grantSafetyTerminal = twoAuthorityGrant({
+        initiator: {
+          keys: safetyKeys,
+          role: TOPOLOGY_ROLE.SAFETY_GUARD,
+          host: peerHost,
+          port: safetyPort,
+          authority: operators.safety
+        },
+        acceptor: {
+          keys: terminalKeys,
+          role: TOPOLOGY_ROLE.SAFETY_FINAL,
+          host: peerHost,
+          port: terminalPort,
+          authority: operators.terminal
+        },
+        runId32,
+        expiresAt,
+        grantId32: seed(0x92)
+      })
+      const admit = (endpoint, relayOwner, keys, route, operator, grants, branchResponder) => {
+        const owner = createPeerNeighborAdmission({
+          relayOwner,
+          endpoint,
+          identityKeyPair: keys,
+          routeKeyPair: route,
+          authorityPublicKeys: [operator.publicKey],
+          epoch: 7n,
+          runId32,
+          grants,
+          maxNeighbors: 4,
+          nodeServiceBudget: {
+            cells: nodeServiceCells,
+            bytes: 1200n * BigInt(nodeServiceCells),
+            commands: nodeServiceCells
+          },
+          neighborServiceReservation: {
+            cells: serviceCells,
+            bytes: 1200n * BigInt(serviceCells),
+            commands: serviceCells
+          },
+          branchResponder
+        })
+        cleanup.push(() => destroyPeerNeighborAdmission(owner))
+        return owner
+      }
+      // Fixture time never advances, so link retransmission never fires: arm
+      // each acceptor before its dialer starts.
+      const terminalAdmission = admit(
+        terminalEndpoint,
+        terminalRelayOwner,
+        terminalKeys,
+        terminalRoute,
+        operators.terminal,
+        [grantSafetyTerminal],
+        terminalResponder
+      )
+      await admissionArmed(terminalAdmission, safetyKeys.publicKey)
+      const safetyAdmission = admit(
+        safetyEndpoint,
+        safetyRelayOwner,
+        safetyKeys,
+        safetyRoute,
+        operators.safety,
+        [grantGuardSafety, grantSafetyTerminal],
+        safetyResponder
+      )
+      await admissionArmed(safetyAdmission, fixture.links.b.publicKey)
+      const guardAdmission = admit(
+        fixture.right,
+        guardRelayOwner,
+        fixture.links.b,
+        guardRoute,
+        operators.guard,
+        [grantGuardSafety],
+        null
+      )
+      await Promise.all(
+        [terminalAdmission, safetyAdmission, guardAdmission].map(settlePeerNeighborAdmission)
+      )
+      for (const owner of [terminalAdmission, safetyAdmission, guardAdmission]) {
+        for (const slot of readPeerNeighborAdmission(owner).neighbors) {
+          if (slot.state !== 'live') {
+            throw new Error(`neighbor admission ${slot.state}: ${slot.lastError}`)
+          }
+        }
+      }
+      guardPool = readPeerNeighborAdmission(guardAdmission).pool
+      safetyPool = readPeerNeighborAdmission(safetyAdmission).pool
+      terminalPool = readPeerNeighborAdmission(terminalAdmission).pool
+    }
 
     const guardAdvertisement = readPeerRelayOwner(guardRelayOwner).canonicalAdvertisement260
 
