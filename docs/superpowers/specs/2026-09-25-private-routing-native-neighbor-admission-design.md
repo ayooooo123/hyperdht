@@ -188,14 +188,21 @@ matching neighbor.
 
 ## Grant exchange (v1: out of band)
 
-No new network message. An operator tool (subcommand of `bin.js`):
+No new network message. The experimental `hyperdht grant` subcommand
+(`lib/private/grant-tool.js`) covers the exchange:
 
-1. `grant draft`: reads local config plus the peer's shared line (identity,
-   role, host, port, operations, authority key). It writes the unsigned
-   format 1 body.
-2. `grant sign`: signs one side with the local authority key.
-3. The operators swap the half-signed grant; the second side signs.
-4. `grant add`: installs the fully signed grant into the node's config.
+1. `grant draft`: builds the unsigned format 1 body from both endpoints'
+   identity, role, host, port, operations and authority key, plus epoch, run
+   ID and validity window. Prints hex.
+2. `grant sign`: each operator signs the same draft with their own authority
+   key file (64-byte secret key or 32-byte seed). Prints the signature.
+3. `grant assemble`: joins the two signatures in either order, matching each
+   to the endpoint whose authority it verifies under.
+4. `grant inspect`: prints the decoded grant and whether both signatures hold.
+
+The fully signed hex is what `createPeerNeighborAdmission` (`grants`) and
+`addPeerNeighborGrant` take. There is no node config file yet, so there is no
+`grant add`; a relay runtime that loads grants from config is later work.
 
 Signing grants online over the network is not in scope. It would be a new
 wire protocol, and it would need rules proving that no advertisement or remote
