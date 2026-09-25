@@ -5945,3 +5945,16 @@ supplied-terminal discovery to `FINAL_EXIT_READY`, with the terminal
 publishing its ready session. `peer-tail-control` passes 21/21 tests and
 161/161 assertions on Node (10/10 repeats) and Bare; every other suite that
 uses the fixture passes unchanged.
+
+### 2026-09-25 step 6: operator grant tool
+
+`hyperdht grant draft|sign|assemble|inspect` (`lib/private/grant-tool.js`,
+wired in `bin.js`) builds, signs, joins and inspects two-authority grants
+offline. `assemble` accepts the two signatures in either order and refuses a
+pair that does not cover both endpoint authorities. A CLI smoke drafted a
+guard/safety grant, signed it with two separate key files, assembled it with
+the signatures reversed and inspected it as signed with valid signatures; a
+duplicated signature was refused with exit 1; the existing bootstrap-node CLI
+path still starts. `test/private/grant-tool.js` (2 tests, Node and Bare)
+checks that the assembled grant is admitted by each side's own authority.
+There is no `grant add`: no relay runtime reads grants from config yet.
