@@ -37,6 +37,51 @@ const {
   settlePeerNeighborAdmission
 } = require('../../lib/private/peer-neighbor-admission')
 const { createCoherentTestClock } = require('./coherent-clock')
+const NativeUDX = require('udx-native')
+const { unwrapDirectRpcPacket } = require('../../lib/private/peer-direct-bootstrap')
+const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
+
+// Direct discovery replies are charged to the responder's fixed startup pool
+// (packet §3.2), not to its node service ledger.
+const RESPONDER_REPLIES = new Set([
+  PEER_MESSAGE_ID.PEER_CAPS_COOKIE_CHALLENGE_V2,
+  PEER_MESSAGE_ID.PEER_CAPS_RESPONSE_V2,
+  PEER_MESSAGE_ID.PEER_ACTIVE_CHALLENGE_RESPONSE_V2
+])
+
+function isResponderReply(packet) {
+  try {
+    return RESPONDER_REPLIES.has(unwrapDirectRpcPacket(b4a.from(packet)).messageId)
+  } catch {
+    return false
+  }
+}
+
+// Counts every datagram each native socket hands to UDX, by local port.
+async function countNativeSends(t, setup) {
+  const counts = new Map()
+  const createSocket = NativeUDX.prototype.createSocket
+  NativeUDX.prototype.createSocket = function (options) {
+    const socket = createSocket.call(this, options)
+    for (const name of ['send', 'trySend']) {
+      const original = socket[name]
+      socket[name] = function (packet, ...rest) {
+        const port = socket.address().port
+        const entry = counts.get(port) || { service: 0, responder: 0 }
+        if (isResponderReply(packet)) entry.responder++
+        else entry.service++
+        counts.set(port, entry)
+        return original.call(this, packet, ...rest)
+      }
+    }
+    return socket
+  }
+  try {
+    return { counts, value: await setup() }
+  } finally {
+    NativeUDX.prototype.createSocket = createSocket
+  }
+}
 
 const EPOCH = 7n
 const RUN_ID = b4a.alloc(32, 0x5a)
@@ -229,6 +274,30 @@ test('two relays admit one two-authority grant and publish the native neighbor',
     guardView.diagnostics.nodeServiceLedger.cellsSpent > 0,
     'advertisement fetch and link setup are charged to the node service ledger'
   )
+})
+
+test('every neighbor service send is charged to the node service ledger first', async (t) => {
+  const { counts, value } = await countNativeSends(t, () => twoRelays(t))
+  const { guard, safety } = value
+  const grant = twoAuthorityGrant(guard, safety)
+  admit(guard, grant)
+  admit(safety, grant)
+  await Promise.all([
+    settlePeerNeighborAdmission(guard.admission),
+    settlePeerNeighborAdmission(safety.admission)
+  ])
+  // Let link keepalives run so steady-state service traffic is included.
+  await new Promise((resolve) => setTimeout(resolve, 1200))
+  for (const relay of [guard, safety]) {
+    const ledger = readPeerNeighborAdmission(relay.admission).diagnostics.nodeServiceLedger
+    const sent = counts.get(relay.port)
+    t.is(
+      sent.service,
+      ledger.cellsSpent,
+      `port ${relay.port}: discovery requests, link setup and keepalives each spent one cell`
+    )
+    t.ok(sent.responder > 0, 'discovery replies were sent from the separate responder pool')
+  }
 })
 
 test('a relay cannot be provisioned by a grant its own authority did not sign', async (t) => {
