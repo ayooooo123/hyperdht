@@ -300,6 +300,28 @@ test('every neighbor service send is charged to the node service ledger first', 
   }
 })
 
+test('an omitted node budget is derived from a supplied neighbor reservation', async (t) => {
+  const { guard, safety } = await twoRelays(t)
+  // A 20 s grant alone would size about 132 cells per neighbor; the caller
+  // asks for 1,000, so the node ledger must be derived from 1,000.
+  const grant = twoAuthorityGrant(guard, safety, { expiresAt: BigInt(Date.now()) + 20_000n })
+  const mixed = {
+    nodeServiceBudget: undefined,
+    neighborServiceReservation: { cells: 1000, bytes: 1_200_000n, commands: 1000 }
+  }
+  admit(guard, grant, mixed)
+  admit(safety, grant, mixed)
+  await Promise.all([
+    settlePeerNeighborAdmission(guard.admission),
+    settlePeerNeighborAdmission(safety.admission)
+  ])
+  for (const relay of [guard, safety]) {
+    const view = readPeerNeighborAdmission(relay.admission)
+    t.is(view.neighbors[0].state, 'live', `live (${view.neighbors[0].lastError})`)
+    t.ok(view.diagnostics.nodeServiceLedger.cellsReserved >= 1000, 'the full reservation was taken')
+  }
+})
+
 test('a relay cannot be provisioned by a grant its own authority did not sign', async (t) => {
   const { guard, safety } = await twoRelays(t)
   const grant = twoAuthorityGrant(guard, safety)
