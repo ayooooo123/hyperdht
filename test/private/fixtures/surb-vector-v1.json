@@ -1,0 +1,66 @@
+{
+  "note": "Deterministic SURB conformance vector (Gate C amendment). Feed the inputs; every listed output must match byte-for-byte. The reply payload is intentionally excluded: inner seal uses a fresh ephemeral and is not reproducible. MAX_HOPS=4, HOP=81, RHO=324. Per-hop processing uses a fixed 48-byte dummy payload. HopContext is never on the wire.",
+  "inputs": {
+    "terminalHandle": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    "replyBinding": "737572622d666978747572652d62696e64696e672d7631",
+    "now": "1700000000000",
+    "ephemeralSeeds": [
+      "5fc1695f965e3d2f7e9227627d4e7458cdd1d3f533b62480212f314a81393c8c",
+      "db0a91d2338d5843310635e86e71e156adfa5d24e23ac00fe4b39044e5f89c6c",
+      "59a0d72534aff731c578872271f7bccf8044343772544cbd421a5a34c5e84942"
+    ],
+    "replySeed": "61565d514774a08501eed9785ee5feb979188990ce4b2bbd562007c763095c73",
+    "hops": [
+      {
+        "id": "c09880659290aba961eab6936a725b008e83bb93ef3edc0deff82386363cad42",
+        "routeKey": "2f750f4950267322b878835f35d7c4d4ae4decb057ca2e96a910ef233c70796a",
+        "routeSecretKey": "9ab594e0c9939fe792ab8c7a043fea9e6f417bc6047b381187ab5d54e4235664",
+        "capabilityEpoch": "7",
+        "issuedAtMs": "1699999999000",
+        "expiresAtMs": "1700003600000"
+      },
+      {
+        "id": "9fe58b359ef40ec58ca8d5f5ae01609d669fe797d3910d7681e5346522969140",
+        "routeKey": "67fc362be3d8ebe6d8e1f5f1b44746e05429d7af7e4ac1b2b1c30442e45e4329",
+        "routeSecretKey": "753f45ec9f6017fab6bd07ad146061ccaec5f03807748c49f4764854468f9a7e",
+        "capabilityEpoch": "7",
+        "issuedAtMs": "1699999999000",
+        "expiresAtMs": "1700003600000"
+      },
+      {
+        "id": "c6ae491a326e3686804fda9abedd12757df50c111009f51764734b3d740b1f87",
+        "routeKey": "58652b802c3362311599e0c84744226a5737f384e0cb047d7a8b0d8cdf6d2d63",
+        "routeSecretKey": "0a65debc9496108e7aa5f17c8cf047257983697d0ab4ea8a631624296106de58",
+        "capabilityEpoch": "7",
+        "issuedAtMs": "1699999999000",
+        "expiresAtMs": "1700003600000"
+      }
+    ]
+  },
+  "outputs": {
+    "ephem": "343c7e54305856aac5a04127020514ab6cb3f2ee3d5766ac6d50b0ff2442bd28",
+    "header": "b47ea572cfe6e972c16819e64cbee6d01ef506da8446678860f8a02658d956efdeeb069a90795f5b57fc44df98d5808d3775e090a1caef0860171d382074b7f18df05ba71dee8d45c04f6d81eae6e06fc8b97abf07786638ca2641fc797a8066339f79704c715a948624db268bf9e3b5ce1612df95e820c5821840b41a68ddaf90e69655075232acc942503ce5154c6a02e8e1523490e758c5a198faf747367d15c2999eb668f1bc987528b30e64630878d9c05ad9ba9375775ec97273f869cd5fc1e9d46cd86acddee774225e3a4a229db885ee8e34380608c5eeb647ce131cc620626de3f23539c65272216880fbcdc0bca31efcc835ad0dc50c030b7a115b92ecfd5d550c9f1cdc80292e549cac50efd97cfa805b73dadda955d983566417e2dc3b6a9207e0f87cad031f5236b77c9c88ec3813e97311fe7a019d0093596d69a0c5e1",
+    "mac": "06cbaa1db031496b59ded46f65430704",
+    "replyPub": "bdf2c752a1e43147fdafe6b4d921883ba085d2dff3d68070ad57741394f94715",
+    "hops": [
+      {
+        "nextHop": "9fe58b359ef40ec58ca8d5f5ae01609d669fe797d3910d7681e5346522969140",
+        "terminal": false,
+        "nextEphem": "dd3af5907a4a5cadb68f9eb074a5e56763439e5cc6af88f911ae8dc4a7490459",
+        "nextMac": "77537cd85089e0788c1032ebf0ab9fd2",
+        "nextHeader": "7b09879bf09ed01adfb42181aa40b164c47aab51c35ed1d5b410154d85d01e096e56881839b72f18e2ede0ced6d642aa4ff45e17e5884e41c6865fcfc4aec0c58946da85feb098dca9783f92f593e03a8cac572eb445b75a6d424b8da1a3d6b4b7bcf5a8f6c22431b336e5d58d24f259bc9c66aa5cfed05ff1ea10d7578349a35d73ae5d6af188df2a41bffe051a56ad304c994a99e34bf9acb3c4f8079458e050e22b1cfa99289752c5bd4b1d85b8ee1d0159d613e42d12e83721d00b4fdd4607f18af3a961c4f8d8c7c7af47479050c75d124933939c3e36e851a16810e7eaeec07ca5e0b19af394e3fa565aa4a90eb4df4e03691fb7346966a3058171ef4afd4d0cdd8d4a2bf744eb5742b68170a9963950c54c6ebd8869ae394f349be64735b75aad8d7dfbec67ed9a130c3ee700553d763a3455d122b7d2c5b27680c83e35a93bbb"
+      },
+      {
+        "nextHop": "c6ae491a326e3686804fda9abedd12757df50c111009f51764734b3d740b1f87",
+        "terminal": false,
+        "nextEphem": "effd93113ac1606fc724ef81220d4fa6082925e9dd9437048b8f4ecfe16f0025",
+        "nextMac": "061ad600edfa6d3bb379085c9a42e810",
+        "nextHeader": "01787705e2ce00a8b26103c20fe06a5c8f6b7f7917d55bb870bbb47c3eaccf1ac29e9b5ea8d0d117ff842acbc4734735942a2d44c2c4e7f0392ccac946cda5ab0cb9d55a4f0be2ab3c1494c7a8b740c3eea3b8348024708196a957fad89a5e6acf0a6a7d6ecff8f28a63d475575e66effab4d0bd3f54713efcdb7b4e85a0da449b5811f61e3b90be18b2fc09dd9dfbf0be4b991ace90f16aa7a241a9b8837c257ec486dbe0be3be53840318653d61645df47b845f67c3aa42a917a29a1c5f2408db60e014609005e42afd62eb0cfad2c885f359e6cb453af5b1a375b2ff7039b1d100d9e49ef7c419a9e150f7635e25a3cb964734b35f3b0b7bee6edc191217b4ece1930f565ee482541c7c417f472145e1e05daa6afae680f5c22173fac424d898829b9cac30480e86bdeeb35f6a71c9437ec5f641bf69c98435b15066b5b1e2c7810e6"
+      },
+      {
+        "nextHop": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "terminal": true
+      }
+    ]
+  }
+}

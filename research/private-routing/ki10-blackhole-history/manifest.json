@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "id": "ki10-blackhole-history",
+  "source_worktree": "hyperdht-private-routing",
+  "base_commit": "6c307fa8edbd380be4ff9a6a1bce0c1fd926e903",
+  "source_head": "7aeee57b59d5db63cda23f32bd29146d0f330fa9",
+  "source_branch": "ki10-blackhole-chain",
+  "status": "already-integrated",
+  "notes": [
+    "Original history preserved; source tip tree equals accepted 6468028. Do not re-apply to current runtime."
+  ],
+  "history_patch": "history.patch",
+  "working_patch": null,
+  "files": [
+    {
+      "path": ".github/workflows/test-private-routing.yml",
+      "sha256": "9b40e787c71e31995027d707db73898dd94b6f4f48f2e2f159b5b69f34744367"
+    },
+    {
+      "path": "test/private/live-process-suite.js",
+      "sha256": "6305fb3380e47685fc3d9b524ed4d2d501266404c04f570a3bb1dda46c6bd837"
+    },
+    {
+      "path": "test/private/process-codec.js",
+      "sha256": "744a7a0922465a643bd3d52ee3bfbe147503cf3a6550a8eb8a8f1a14bedee1e6"
+    },
+    {
+      "path": "test/private/process/control-channel.js",
+      "sha256": "86784b929155c5472a4cb45095b9f25b935e314dae5b2e8d468f7750b1f43ccc"
+    },
+    {
+      "path": "test/private/process/role-runner.js",
+      "sha256": "fe19357e9c7299aeb3db2b1af60632ed79c108865f7cb8b03f7932df1fa6aba2"
+    }
+  ]
+}

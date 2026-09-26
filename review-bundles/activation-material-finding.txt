@@ -1,0 +1,47 @@
+SECURITY REVIEW FINDING DISPOSITION — RESOLVED IN PACKET SOURCE
+
+Finding
+-------
+A review-only hook between genuine peer final-exit activation prepare and
+commit changed localDeadline, tailControl, or clockIdentity. The old commit
+accepted each changed material object. This proved missing commit-time metadata
+validation at an internal synchronous boundary; it did not prove a remotely
+reachable exploit.
+
+Correction
+----------
+peer-tail-control now snapshots all twelve exact handoff data-property values
+when it creates the handoff. Prepare and commit require the same property set
+and object/scalar values, require the owner, clock, initiator and deadline facts
+to match authoritative session state, and require the final-exit generation to
+match the prepared transfer. A changed object fails closed before the activation
+reservation is consumed.
+
+Permanent regression
+--------------------
+test/private/peer-tail-control.js patches only the module's public prepare hook,
+then independently changes localDeadline, tailControl, and clockIdentity between
+genuine prepare and commit. Node and Bare both pass 20/20 tests and 156/156
+assertions; each substitution is rejected.
+
+Independent reproduction
+------------------------
+From the extracted packet code directory:
+
+  node review-bundles/activation-material-probe.cjs .
+
+Expected result:
+
+  unchanged:     accepted=true
+  localDeadline: accepted=false, error=INVALID_ROUTE
+  tailControl:   accepted=false, error=INVALID_ROUTE
+  clockIdentity: accepted=false, error=INVALID_ROUTE
+
+The probe exits zero only when the unchanged control commits and every changed
+case is rejected. It uses real udx-native sockets and fixture clocks; it does
+not fabricate handoffs, reservations, activation owners, peer runtimes, or
+network authority.
+
+This disposition is implementation evidence, not an external security verdict
+or release approval. The packet manifest identifies the exact reviewed source
+revision.

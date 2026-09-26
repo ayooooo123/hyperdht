@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "id": "blackhole-isolation",
+  "source_worktree": "hyperdht-blackhole-isolation",
+  "base_commit": "ab818f9e278d5f3452f95e916093f2b1414b7163",
+  "source_head": "ab818f9e278d5f3452f95e916093f2b1414b7163",
+  "source_branch": null,
+  "status": "historical",
+  "notes": [
+    "Historical detached experiment for blackhole route cell isolation.",
+    "Preserved tracked modifications including docs preservation notice and approved untracked tests."
+  ],
+  "history_patch": null,
+  "working_patch": "working.patch",
+  "files": [
+    {
+      "path": "docs/private-routing-migration.md",
+      "sha256": "61b19ba733745cdf8512e3c1267776b966ff83ad840d6d4dbb51f862c8365f81"
+    },
+    {
+      "path": "lib/private/relay-candidate-directory.js",
+      "sha256": "99a629cc028928ca1aeec8a2d1ae52fdbac2be528868d44ce3b2fa8fc92c115d"
+    },
+    {
+      "path": "lib/private/route-manager.js",
+      "sha256": "8be5f52114cf853f1f20a279e428503adcb86e4b780b311b9c306e99faa60527"
+    },
+    {
+      "path": "test/private-routing.js",
+      "sha256": "94be5ebce13b2a52c567fbdba17e1f6aa3abe861e3127bd85b22adf98fc6e426"
+    },
+    {
+      "path": "test/private/process-codec.js",
+      "sha256": "d8f744c49a57d04eaf03c66e0424c8a450c4f73cad535734316c43387d20b76b"
+    },
+    {
+      "path": "test/private/process-route-cell-blackhole.js",
+      "sha256": "3312c05955d99e92b938fc49dad74ff8218890448909aa89e21fc8197ecee843"
+    },
+    {
+      "path": "test/private/process/control-channel.js",
+      "sha256": "c61f96aad740fd4667ccf915436b7b5b87695fbad7ee7ddf482f825175810376"
+    },
+    {
+      "path": "test/private/process/role-runner.js",
+      "sha256": "393880a222b3f1b813afe616c07d1fc1b76e3fc7537fcb4884c966af752b7667"
+    },
+    {
+      "path": "test/private/process/route-cell-blackhole.js",
+      "sha256": "fadc46a42b1ede893087d56c47d95fdbdad9bde70f634b054b301ed5d99436c4"
+    },
+    {
+      "path": "test/private/process/wire-services.js",
+      "sha256": "7f343e57b1244be0e7af8e85f102dd8ebe4e47011bde0a74b23fa698ce005073"
+    }
+  ]
+}

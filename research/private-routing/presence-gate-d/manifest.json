@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "presence-gate-d",
+  "source_worktree": "private-presence-gate-d",
+  "base_commit": "6c307fa8edbd380be4ff9a6a1bce0c1fd926e903",
+  "source_head": "2ac6b64381ec05fdfc886ee29f90bdfb991cd0b0",
+  "source_branch": "private-presence-gate-d",
+  "status": "rejected",
+  "notes": [
+    "Presence Gate D rejected for type authentication, zero trimming, overlap, no production callers."
+  ],
+  "history_patch": "history.patch",
+  "working_patch": "working.patch",
+  "files": [
+    {
+      "path": "docs/private-routing-migration.md",
+      "sha256": "e08a4a67bb9ddb64c317f6b1e7a7669f887dba663f41764e854b7e5760146c2e"
+    },
+    {
+      "path": "lib/private/blinded-presence.js",
+      "sha256": "02f1e40e37c50bd0f7c6f3a7a2758050e3cffb17a49372ab997ea80ac20bef44"
+    },
+    {
+      "path": "test/private-routing.js",
+      "sha256": "cb4e36ffa1c3a73bba0bf13947326fc3d810f721d4d42b837ee09f06f7da673e"
+    },
+    {
+      "path": "test/private/blinded-presence.js",
+      "sha256": "e578caf0811c32282be4906100c16decec05d4a17d892e5e97da57af963d63d3"
+    }
+  ]
+}

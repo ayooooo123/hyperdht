@@ -1,0 +1,299 @@
+From 5a538510687b2dca9e612a4421d063f68fd5b374 Mon Sep 17 00:00:00 2001
+From: jd1100 <248791769+ayooooo123@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:19:14 -0400
+Subject: [PATCH 1/2] test(private): prove native blackhole loss propagation
+
+---
+ .github/workflows/test-private-routing.yml | 10 +++++++
+ test/private/live-process-suite.js         | 25 +++++++++++++---
+ test/private/process-codec.js              |  7 ++++-
+ test/private/process/control-channel.js    |  8 +++---
+ test/private/process/role-runner.js        | 33 ++++++----------------
+ 5 files changed, 50 insertions(+), 33 deletions(-)
+
+diff --git a/.github/workflows/test-private-routing.yml b/.github/workflows/test-private-routing.yml
+index 60e912e3f113f315646989eab9d8d15ced8afa93..29832c8c8744622252dc33cd08e65c4e8b9086c0 100644
+--- a/.github/workflows/test-private-routing.yml
++++ b/.github/workflows/test-private-routing.yml
+@@ -52,6 +52,16 @@ jobs:
+         env:
+           PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
+         run: npm run test:private:process:bare
++      - name: Eleven-process live scenario, reverse candidates (Node roles)
++        env:
++          PR_CANDIDATE_ORDER: reverse
++          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
++        run: npm run test:private:process:node
++      - name: Eleven-process live scenario, reverse candidates (Bare roles)
++        env:
++          PR_CANDIDATE_ORDER: reverse
++          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
++        run: npm run test:private:process:bare
+       - name: Role failure stacks
+         if: failure()
+         run: cat "${{ runner.temp }}/role-fatal.log" || echo "no role stacks recorded"
+diff --git a/test/private/live-process-suite.js b/test/private/live-process-suite.js
+index 864463fbf5a701b8ca097232428cbf4bb2a0b685..6fab7f79ef8aaa4ae695f60ae40ffc7371d4666f 100644
+--- a/test/private/live-process-suite.js
++++ b/test/private/live-process-suite.js
+@@ -9,6 +9,7 @@ const { createCoherentTestClock } = require('./coherent-clock')
+ const { createProcessConfigAuditor } = require('./process/config-auditor')
+ const { CODEC_VECTOR_DIGEST_HEX } = require('./process/codec-vectors')
+ const { createProcessControl, spawnRoleProcesses } = require('./process/coordinator')
++const { LINK_UNRESPONSIVE_AFTER } = require('../../lib/private/link-control-session')
+ const {
+   PROCESS_PLANS,
+   ROLES,
+@@ -16,6 +17,9 @@ const {
+   createLiveProcessTopology
+ } = require('./process/topology-fixture')
+ 
++const HEALTHY_SILENCE_MS = LINK_UNRESPONSIVE_AFTER + 500
++const BLACKHOLE_ROTATION_BOUND_MS = LINK_UNRESPONSIVE_AFTER + 3_500
++
+ function capabilities(seed) {
+   return {
+     clocks: TEST_ONLY_PROCESS_TOPOLOGY_ISSUER.clocks(createCoherentTestClock()),
+@@ -453,23 +457,36 @@ function registerLiveProcessSuite(launch) {
+       )
+       t.is((await cancelled).operationSequence, 2n, 'delayed lookup cancels without retry')
+ 
++      const healthyGeneration = readyEndpointSnapshot.lookupGeneration
++      await new Promise((resolve) => setTimeout(resolve, HEALTHY_SILENCE_MS))
++      const healthySnapshot = await sendAndWait('endpoint', 'snapshot', 'snapshot')
++      t.is(
++        healthySnapshot.lookupGeneration,
++        healthyGeneration,
++        'healthy silent lookup branch survives the native detector window'
++      )
++
+       const rotatePhase = nextPhase('endpoint')
+       phases.set('endpoint', rotatePhase)
+       generations.set('endpoint', 2n)
+       const rotationEvent = control.expectEvent('endpoint', 'rotated', 2n, rotatePhase)
++      const blackholeStartedAt = Date.now()
+       const faultAcknowledged = await sendAndWait(
+         initialRouting.lookupPair.middleRole,
+-        'rotate',
+-        'ready',
+-        { nextGeneration: generations.get(initialRouting.lookupPair.middleRole) + 1n }
++        'blackhole',
++        'ready'
+       )
+       t.is(
+         faultAcknowledged.state,
+         'READY',
+-        `${initialRouting.lookupPair.middleRole} physical lookup link fault is acknowledged`
++        `${initialRouting.lookupPair.middleRole} silently drops route cells`
+       )
+       const rotated = await rotationEvent
+       t.is(rotated.previousGeneration, endpointGeneration)
++      t.ok(
++        Date.now() - blackholeStartedAt <= BLACKHOLE_ROTATION_BOUND_MS,
++        'native detector rotates the blackholed branch within the process deadline'
++      )
+       const secondValueWaiting = control.expect('endpoint', 'value', 2n)
+       await control.send(
+         'endpoint',
+diff --git a/test/private/process-codec.js b/test/private/process-codec.js
+index b3fdb1ebe575637d710c120b81ac4fc7724a6723..8dd122a44fc49f8ac959a3e7c37554eee0ea0bdc 100644
+--- a/test/private/process-codec.js
++++ b/test/private/process-codec.js
+@@ -562,7 +562,12 @@ test('physical lifecycle commands are bound only to their failing link owners',
+     validateControlMessage(middleBlackhole, messageContext('command', middleBlackhole)),
+     middleBlackhole
+   )
+-  const wrongBlackhole = base('blackhole', 'lookup-middle-b', 5)
++  const middleBlackholeB = base('blackhole', 'lookup-middle-b', 5)
++  t.alike(
++    validateControlMessage(middleBlackholeB, messageContext('command', middleBlackholeB)),
++    middleBlackholeB
++  )
++  const wrongBlackhole = base('blackhole', 'announce-middle', 7)
+   throwsCode(t, () =>
+     validateControlMessage(wrongBlackhole, messageContext('command', wrongBlackhole))
+   )
+diff --git a/test/private/process/control-channel.js b/test/private/process/control-channel.js
+index 09cbf1662c4ce2696f53e2c907ba7a8aeaf43890..d099a0987f4668aee02a69ecd85d087780693971 100644
+--- a/test/private/process/control-channel.js
++++ b/test/private/process/control-channel.js
+@@ -90,6 +90,7 @@ const UNAVAILABLE_REASONS = new Set(['NETWORK_CHANGE', 'GUARD_LOSS', 'CANCELLED'
+ const RUNTIMES = new Set(['node', 'bare'])
+ const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
+ const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
++const LOOKUP_MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b'])
+ const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
+ const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
+ 
+@@ -1025,11 +1026,10 @@ function validateCommand(message, context) {
+       )
+         invalid()
+       break
+-    // Same role restriction as `rotate`, and for the same reason: the fault verbs exist to
+-    // fault one named hop of the lookup branch. `blackhole` carries no generation, because
+-    // unlike `rotate` it produces no notification for anything to rotate on.
++    // A blackhole silently faults the selected lookup middle. It carries no generation
++    // because the native detector, not the command, starts route rotation.
+     case 'blackhole':
+-      if (common.role !== 'lookup-middle-a') invalid()
++      if (!LOOKUP_MIDDLE_ROLES.has(common.role)) invalid()
+       break
+     case 'guard-loss':
+       if (common.role !== 'guard') invalid()
+diff --git a/test/private/process/role-runner.js b/test/private/process/role-runner.js
+index d05c5c0e2464c288a85bb6d8148e03098f63948e..6504cd3a590582c2146d04f1249ab6bc525e9751 100644
+--- a/test/private/process/role-runner.js
++++ b/test/private/process/role-runner.js
+@@ -47,13 +47,7 @@ const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
+ const RELAY_ROLES = new Set(['guard', 'lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
+ const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
+ const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
+-// The one role the `blackhole` verb may be sent to. `control-channel.js` rejects the
+-// message for any other role before it is dispatched, so this is not a second policy: it is
+-// the same single fact, named once, read by the only two sites that need it - the endpoint
+-// constructor below and the verb's dispatch. Every other role therefore keeps the
+-// production `UdxCellEndpoint` and an unwrapped udx socket, which is what the eleven-role
+-// gate exists to exercise.
+-const BLACKHOLE_ROLE = 'lookup-middle-a'
++const BLACKHOLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b'])
+ 
+ let projection = null
+ let generation = 0n
+@@ -511,14 +505,11 @@ async function createCellOwner() {
+     onLinkFailure: receiveRoleLinkFailure,
+     port: projection.bind.port
+   }
+-  // Only the role that can receive `blackhole` pays for the adapter seam. The projection is
+-  // a JavaScript socket facade that classifies every datagram, so installing it everywhere
+-  // would mean no role in this gate ever constructs the production endpoint or sends over an
+-  // unwrapped udx socket - the exact paths the gate is the highest-fidelity check of.
+-  cellEndpoint =
+-    projection.role === BLACKHOLE_ROLE
+-      ? createProjectedCellEndpoint(endpointOptions)
+-      : new UdxCellEndpoint(endpointOptions)
++  // Only lookup middles pay for the datagram-dropping test adapter. Every other role
++  // constructs the production endpoint with an unwrapped UDX socket.
++  cellEndpoint = BLACKHOLE_ROLES.has(projection.role)
++    ? createProjectedCellEndpoint(endpointOptions)
++    : new UdxCellEndpoint(endpointOptions)
+   try {
+     await cellEndpoint.bind()
+   } catch {
+@@ -1119,16 +1110,10 @@ async function handle(message) {
+       }
+       await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+       return
+-    // Silent death, and the only fault verb that destroys nothing. The route cells this
+-    // role would relay are dropped in both directions at its UDX adapter, every local
+-    // object stays alive and the socket stays bound, so no party anywhere forms the intent
+-    // to notify - which is the one condition the two link-fault verbs cannot produce,
+-    // because both make this relay emit BRANCH_DESTROY.
+-    // Two independent reasons this throws for any other role, so a misdirected verb can
+-    // never be a silent no-op: the role is not `BLACKHOLE_ROLE`, and - because only that
+-    // role installs the adapter - `blackholeRouteCells` counted zero sockets and refuses.
++    // Silent death: drop both directions while every local object and socket stays live.
++    // The native link detector must discover the loss and drive route rotation.
+     case 'blackhole':
+-      if (projection.role !== BLACKHOLE_ROLE || !blackholeRouteCells()) {
++      if (!BLACKHOLE_ROLES.has(projection.role) || !blackholeRouteCells()) {
+         throw Object.assign(new Error(), { code: 'PROCESS_BLACKHOLE_UNAVAILABLE' })
+       }
+       await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 7aeee57b59d5db63cda23f32bd29146d0f330fa9 Mon Sep 17 00:00:00 2001
+From: jd1100 <248791769+ayooooo123@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 22:21:50 -0400
+Subject: [PATCH 2/2] test(private): blackhole every selectable middle
+
+---
+ test/private/process-codec.js           | 10 +++++++++-
+ test/private/process/control-channel.js |  5 ++---
+ test/private/process/role-runner.js     |  9 ++++-----
+ 3 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/test/private/process-codec.js b/test/private/process-codec.js
+index 8dd122a44fc49f8ac959a3e7c37554eee0ea0bdc..1b7330ce00dcbf29545569651280e11b916f3717 100644
+--- a/test/private/process-codec.js
++++ b/test/private/process-codec.js
+@@ -567,7 +567,15 @@ test('physical lifecycle commands are bound only to their failing link owners',
+     validateControlMessage(middleBlackholeB, messageContext('command', middleBlackholeB)),
+     middleBlackholeB
+   )
+-  const wrongBlackhole = base('blackhole', 'announce-middle', 7)
++  const announceMiddleBlackhole = base('blackhole', 'announce-middle', 7)
++  t.alike(
++    validateControlMessage(
++      announceMiddleBlackhole,
++      messageContext('command', announceMiddleBlackhole)
++    ),
++    announceMiddleBlackhole
++  )
++  const wrongBlackhole = base('blackhole', 'lookup-exit-a', 4)
+   throwsCode(t, () =>
+     validateControlMessage(wrongBlackhole, messageContext('command', wrongBlackhole))
+   )
+diff --git a/test/private/process/control-channel.js b/test/private/process/control-channel.js
+index d099a0987f4668aee02a69ecd85d087780693971..024f4832d5b32ddfdd822c4247fecd56340034cb 100644
+--- a/test/private/process/control-channel.js
++++ b/test/private/process/control-channel.js
+@@ -90,7 +90,6 @@ const UNAVAILABLE_REASONS = new Set(['NETWORK_CHANGE', 'GUARD_LOSS', 'CANCELLED'
+ const RUNTIMES = new Set(['node', 'bare'])
+ const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
+ const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
+-const LOOKUP_MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b'])
+ const AUDIT_ROLES = new Set([...EXIT_ROLES, 'dht-referral'])
+ const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
+ 
+@@ -1026,10 +1025,10 @@ function validateCommand(message, context) {
+       )
+         invalid()
+       break
+-    // A blackhole silently faults the selected lookup middle. It carries no generation
++    // A blackhole silently faults the selected middle. It carries no generation
+     // because the native detector, not the command, starts route rotation.
+     case 'blackhole':
+-      if (!LOOKUP_MIDDLE_ROLES.has(common.role)) invalid()
++      if (!MIDDLE_ROLES.has(common.role)) invalid()
+       break
+     case 'guard-loss':
+       if (common.role !== 'guard') invalid()
+diff --git a/test/private/process/role-runner.js b/test/private/process/role-runner.js
+index 6504cd3a590582c2146d04f1249ab6bc525e9751..9b419bc42fa834f5ac47a64658d6a023bbcf3318 100644
+--- a/test/private/process/role-runner.js
++++ b/test/private/process/role-runner.js
+@@ -47,7 +47,6 @@ const DHT_ROLES = new Set(['dht-seed', 'dht-referral', 'dht-value'])
+ const RELAY_ROLES = new Set(['guard', 'lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
+ const MIDDLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b', 'announce-middle'])
+ const EXIT_ROLES = new Set(['lookup-exit-a', 'lookup-exit-b', 'announce-exit'])
+-const BLACKHOLE_ROLES = new Set(['lookup-middle-a', 'lookup-middle-b'])
+ 
+ let projection = null
+ let generation = 0n
+@@ -505,9 +504,9 @@ async function createCellOwner() {
+     onLinkFailure: receiveRoleLinkFailure,
+     port: projection.bind.port
+   }
+-  // Only lookup middles pay for the datagram-dropping test adapter. Every other role
+-  // constructs the production endpoint with an unwrapped UDX socket.
+-  cellEndpoint = BLACKHOLE_ROLES.has(projection.role)
++  // Every selectable middle pays for the datagram-dropping test adapter. Every other
++  // role constructs the production endpoint with an unwrapped UDX socket.
++  cellEndpoint = MIDDLE_ROLES.has(projection.role)
+     ? createProjectedCellEndpoint(endpointOptions)
+     : new UdxCellEndpoint(endpointOptions)
+   try {
+@@ -1113,7 +1112,7 @@ async function handle(message) {
+     // Silent death: drop both directions while every local object and socket stays live.
+     // The native link detector must discover the loss and drive route rotation.
+     case 'blackhole':
+-      if (!BLACKHOLE_ROLES.has(projection.role) || !blackholeRouteCells()) {
++      if (!MIDDLE_ROLES.has(projection.role) || !blackholeRouteCells()) {
+         throw Object.assign(new Error(), { code: 'PROCESS_BLACKHOLE_UNAVAILABLE' })
+       }
+       await emit('ready', { answeredRequestCount: answeredRequestCount(), state })
+-- 
+2.50.1 (Apple Git-155)
+
