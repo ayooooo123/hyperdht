@@ -238,11 +238,14 @@ format 1. The public alpha stays on the current four-relay peer stream.
    lasts about 75 seconds of one neighbor. §3.4 makes the node ledger finite,
    so a long-lived relay needs budgets sized to its grants: roughly
    `4 × grant seconds` cells per neighbor reservation, and the node ledger
-   covering every neighbor plus reconnects. Default: keep §3.4's finite
-   ledger, size budgets from grant lifetime in the relay runtime, and start a
-   fresh admission owner (new ledger) at each renewal cycle. The other choice
-   is a rate-limited, refilling node budget, which changes §3.4's "finite"
-   rule and needs a packet amendment.
+   covering every neighbor plus reconnects. Settled (JD, 2026-09-25): keep
+   §3.4's finite ledger. When budgets are not given, the admission owner sizes
+   them from the longest admitted grant: 5 cells per grant second plus 32 per
+   neighbor reservation, and per neighbor twice that plus discovery for every
+   attempt and 8 reconnects in the node ledger. A relay starts a fresh owner,
+   and so a fresh ledger, at each renewal cycle; grants added later with
+   `addPeerNeighborGrant` draw on the same ledger. A refilling budget would
+   change §3.4 and is not used.
 
 ## Plan outline
 

@@ -5994,3 +5994,14 @@ design: with 500 ms link pings an idle neighbor spends about 4 service cells
 per second per side, so a 60-cell neighbor reservation lasted about 15 seconds
 before `service_exhausted` and a reconnect. §3.4's finite ledger bounds relay
 uptime unless budgets are sized to grant lifetime.
+
+### 2026-09-25 grant-sized service budgets
+
+JD kept §3.4's finite service ledger. When a caller does not pass budgets, the
+admission owner now sizes them from the longest admitted grant: a neighbor
+reservation of 5 cells per grant second plus 32, and a node ledger of twice
+that plus discovery for every attempt and eight reconnects, per neighbor. A
+throwaway two-relay smoke on a 20-second grant stayed live the whole time
+(132-cell reservation, 528-cell node ledger, 77 cells spent), where the old
+60-cell reservation ran out after about 15 seconds. A relay that renews grants
+starts a fresh owner per renewal cycle.
