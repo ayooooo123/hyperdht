@@ -1,0 +1,603 @@
+diff --git a/docs/historical/HANDOFF-NATIVE-PRIVATE-ROUTING.md b/docs/historical/HANDOFF-NATIVE-PRIVATE-ROUTING.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8844f7f9b904d120adc3e1643e5fb1b53f8e5b66
+--- /dev/null
++++ b/docs/historical/HANDOFF-NATIVE-PRIVATE-ROUTING.md
+@@ -0,0 +1,477 @@
++# Handoff Prompt: Continue Native Private Routing for the Holepunch Stack
++
++Copy this entire document into a new agent task. The workspace and local
++worktrees named below are on the same machine.
++
++## Role and objective
++
++You are continuing an experimental, security-sensitive private-routing project
++for the Holepunch stack under the `ayooooo123` GitHub account.
++
++The long-term goal is a drop-in-compatible family of low-level forks—starting
++with `dht-rpc` and `hyperdht`, then Hyperswarm and its testnet—in which a client
++can enable required private routing and avoid revealing its IP address to
++ordinary DHT nodes, swarm peers, or the destination peer. Traffic should travel
++through authenticated, rotated, always-relayed routes resembling an
++I2P/Veilid-style native overlay. Application and peer-stream traffic must be
++end-to-end encrypted between endpoint and destination; intermediate relays
++must not receive application plaintext.
++
++The endpoint's pinned guard necessarily sees the endpoint IP. Relays also see
++their adjacent peers, timing, direction, and fixed-cell volume. Lookup and
++announce keys may remain visible where the protocol requires them. This
++milestone does not claim protection against a global observer, complete Sybil
++resistance, or production anonymity.
++
++Do not integrate this into PearTube yet. Prove the construction in low-level
++libraries and controlled testnets first. Mobile lifecycle and BareKit support
++remain important later, but are outside the current milestone.
++
++## Strategic decision: native routing, not Tor
++
++The project originally extracted three Tor-related packages:
++
++- <https://github.com/ayooooo123/bare-arti>
++- <https://github.com/ayooooo123/dht-relay-tor>
++- <https://github.com/ayooooo123/dht-transport-policy>
++
++Those repositories exist and their latest main-branch GitHub Actions runs were
++green as of 2026-07-29. None is published to npm, and no GitHub Releases exist.
++`bare-arti` currently has `"private": true`, intentionally preventing npm
++publication. `dht-transport-policy` still uses
++`"dht-relay-tor": "github:ayooooo123/dht-relay-tor"` as a dev dependency;
++`dht-relay-tor` has unpublished `bare-arti ^0.0.1` as an optional dependency.
++
++The owner subsequently deprioritized Arti/Tor and approved refocusing on a
++native private overlay in the lower-level Holepunch libraries. Do not publish,
++delete, or resume the Tor packages unless the owner explicitly redirects the
++work.
++
++## Required working method
++
++Before acting, inspect and follow all applicable skills and repository
++instructions. In particular, use:
++
++- `using-superpowers`;
++- `holepunch-p2p-architect`, including its dynamic repository-context loader;
++- `writing-plans` after the document-approval gate below;
++- `test-driven-development` for every new behavior or correction;
++- `subagent-driven-development` when subagents are available;
++- `systematic-debugging` for unexpected failures; and
++- `verification-before-completion` before any passing/completion claim.
++
++The established task workflow is:
++
++1. one implementer owns a bounded task;
++2. a separate reviewer checks exact spec compliance;
++3. a separate reviewer checks security and code quality;
++4. the same implementer fixes findings;
++5. reviewers re-check until approved; and
++6. focused Node and Bare tests, aggregate tests, formatting, generated runner,
++   diff checks, and CI are verified before handoff.
++
++Skills, repository instructions, canonical documents, Git state, and the dirty
++files may be inspected read-only before the owner approves the written
++amendment. Do not edit implementation or test files before that approval.
++If separate reviewers or subagents are unavailable, stop at the review gate
++and ask the owner to arrange a fresh review; do not self-certify the work as an
++independent review.
++
++Use Holepunch style: CommonJS in these forks, no semicolons, single quotes,
++`b4a` rather than `Buffer` in library code, strict owned inputs, bounded
++allocation, explicit one-shot capabilities, and deep cleanup/zeroization.
++
++Never invent security-sensitive wire bytes or crypto APIs when the reviewed
++prototype or approved design is ambiguous. Stop at a design/spec gate instead.
++
++## Repository and workspace map
++
++Workspace root:
++
++```text
++/Users/jd/Documents/Codex/2026-07-10/task-extract-three-packages-into-standalone
++```
++
++### Active DHT-RPC fork
++
++```text
++local:  /Users/jd/Documents/Codex/2026-07-10/task-extract-three-packages-into-standalone/dht-rpc-private-routing
++remote: https://github.com/ayooooo123/dht-rpc
++branch: private-routing-v1
++HEAD:   fe04496196ea2ce42d1de27b0f770b02d2a87cd5
++PR:     https://github.com/ayooooo123/dht-rpc/pull/1
++```
++
++The local worktree is clean and matches the remote branch. PR 1 is open and
++mergeable. Its latest branch and pull-request `Integrate` runs were green.
++This fork owns the fail-closed generic request-transport seam. HyperDHT pins it
++by exact commit:
++
++```json
++"dht-rpc": "github:ayooooo123/dht-rpc#fe04496196ea2ce42d1de27b0f770b02d2a87cd5"
++```
++
++Do not alter that seam unless the current HyperDHT task exposes a genuine,
++reviewed deficiency.
++
++### Active HyperDHT fork
++
++```text
++local:  /Users/jd/Documents/Codex/2026-07-10/task-extract-three-packages-into-standalone/hyperdht-private-routing
++remote: https://github.com/ayooooo123/hyperdht
++branch: private-routing-v1
++HEAD:   ca961adc1ea4fc686986b7bc3b8db03579ab0834
++PR:     https://github.com/ayooooo123/hyperdht/pull/1
++```
++
++Critical remote-state warning:
++
++- remote `private-routing-v1` is still at
++  `50560ebaf3d018edd71d2748b5ba356b2ab52d44`;
++- local HEAD is 52 commits ahead of that remote;
++- the existing PR and its green CI therefore cover the older Gate 3A remote
++  state, not the current local Gate 3B1 work; and
++- the local worktree also contains preserved, uncommitted Task 6 work.
++
++Do not push the dirty Task 6 implementation. After its plan gate,
++implementation, independent reviews, and full verification are complete, push
++only the reviewed committed state to the existing branch/PR. If the new task
++does not clearly authorize that push, confirm with the owner first.
++
++### Read-only sources
++
++The original HyperDHT fork/branch used to seed the Tor packages is read-only:
++
++```text
++/Users/jd/Documents/Codex/2026-07-10/task-extract-three-packages-into-standalone/source-hyperdht
++branch: claude/hyperdht-hyperswarm-transports-71d7fn
++HEAD:   b329b8b417183ac2e9438cfb2a3da1be561f40db
++push remote: file:///dev/null
++```
++
++The native private-routes prototype is also read-only evidence:
++
++```text
++repo:   /Users/jd/.config/superpowers/worktrees/peartube/private-routing
++commit: 0305df915b6a767093f9e75e6c06bc0a35da6169
++root:   packages/private-routes
++```
++
++Use exact `git show` reads from that commit. Never modify the prototype
++worktree or silently substitute bytes from another revision.
++
++The Bare Rust addon reference is read-only:
++
++```text
++/Users/jd/Documents/Codex/2026-07-10/task-extract-three-packages-into-standalone/reference-bare-addon-rust
++HEAD: 24cfbff99fa875ab1bbdea7b7f185d31e313bd06
++push remote: file:///dev/null
++```
++
++## Canonical documents
++
++Read these completely before continuing:
++
++```text
++hyperdht-private-routing/docs/private-routing-v1.md
++hyperdht-private-routing/docs/private-routing-migration.md
++hyperdht-private-routing/docs/superpowers/specs/2026-07-18-private-routing-gate-3b1-live-immutable-get-design.md
++hyperdht-private-routing/docs/superpowers/plans/2026-07-18-private-routing-gate-3b1.md
++hyperdht-private-routing/docs/superpowers/specs/2026-07-19-private-routing-task6-private-responder-authority-design.md
++```
++
++The last file is the reviewed Task 6 design amendment. Its status is
++`Approved after independent review`, committed at local HEAD `ca961ad`.
++
++## Completed milestones
++
++- DHT-RPC's request-transport seam is complete, pushed, and green at
++  `fe044961`.
++- HyperDHT Gates 1 and 2 and deterministic Gate 3A are complete at the older
++  remote branch state.
++- Gate 3B1 Tasks 1–4 are implemented and independently hardened locally:
++  routed replies, signed relay capabilities, bounded candidate evidence, and
++  bounded authenticated guard bootstrap.
++- Gate 3B1 Task 5 is implemented and independently approved through
++  `644f92abdfb27e38c16b8284e782fb2e3380111b`. It owns exact M3 contexts,
++  LINK CREATE/CREATED sessions, live UDX cell endpoints, authenticated adjacent
++  links, exact-tuple reconnect, teardown ordering, and direct-authority
++  revocation.
++- Inherited Task 5 evidence at `644f92a`:
++  - full private Node: 512/512 tests, 13,698 assertions;
++  - full private Bare: 512/512 tests, 13,698 assertions;
++  - native UDX Node: 1/1 test, 6 assertions; and
++  - native UDX Bare: 1/1 test, 6 assertions.
++- Commits `5146f11` through `ca961ad` contain only the Task 6 responder design
++  amendment and its review corrections.
++
++Direct mode remains the only public behavior. There is no public
++`privateRouting` or `privacy` constructor option yet.
++
++## Current milestone and mandatory gate
++
++Current plan:
++
++```text
++Gate 3B1, Task 6: Migrate authenticated in-route extension without discovery
++```
++
++The owner approved the recommended responder-authority concept. The full
++written amendment was then drafted, iterated through independent review, and
++marked approved in the repository. However, the prior task ended by explicitly
++asking the owner to review and approve the written file, and the owner did not
++answer that gate before requesting this handoff.
++
++Therefore, your first workflow action must be:
++
++1. present the owner with
++   `docs/superpowers/specs/2026-07-19-private-routing-task6-private-responder-authority-design.md`;
++2. ask whether they approve that written amendment; and
++3. do not resume implementation until they explicitly approve it.
++
++After approval, read and invoke the `writing-plans` skill. Amend Task 6 of
++`docs/superpowers/plans/2026-07-18-private-routing-gate-3b1.md` to encode the
++reviewed design exactly, independently review the updated plan, and commit only
++the plan document before resuming code.
++
++Approval of the written amendment authorizes this local planning and
++implementation sequence. It does not authorize pushing the branch; pushing
++remains a separate owner-authorization gate unless the new task explicitly
++grants it.
++
++## Task 6 design in brief
++
++The byte-level protocol remains the exact reviewed prototype sequence:
++
++```text
++EXTEND_REQUEST_V1 -> LINK_OFFER/LINK_ACCEPT -> EXTENDED_V1 -> TAIL_READY_V1
++```
++
++The ownership seam changes:
++
++- no post-pin relay discovery;
++- no random discovery target or candidate enumeration;
++- no dependency on future Task 9 `BranchPathAuthority`;
++- the endpoint consumes already-selected Task 3 advertisement evidence;
++- the complete signed advertisement travels inside authenticated
++  `EXTEND_REQUEST_V1`;
++- only the current relay tail has an opaque, token-gated responder authority;
++- only a relay-owned dial capability may decode and contact the tuple in that
++  verified advertisement;
++- the endpoint gets no tuple, socket, DNS, bind, `trySend`, connect, or
++  arbitrary-dial authority;
++- current-tail and successor replay caches remain on their respective
++  machines;
++- local monotonic deadlines and signed wire wall-clock expiries are separate;
++- M3 adoption projects a wire expiry into the local monotonic clock exactly
++  once, then moves `{ wireExpiresAt, localDeadline, clockIdentity }` through
++  opaque capabilities without reset;
++- relay contexts may be staged before TAIL_READY only to carry authenticated
++  control traffic;
++- no endpoint next-tail/application-send authority, final-exit activation, or
++  directory commit is published before valid TAIL_READY;
++- endpoint-local cleanup is immediate;
++- already-installed remote state is destroyed on observed context/link close
++  or proactively by its local projected expiry—there is no impossible claim of
++  synchronous cross-machine cleanup without an ACK; and
++- after extension index 2, an opaque dual-clock final-exit handoff transfers
++  into Task 7 in the same runtime.
++
++Read the amendment for the exact internal capability and transfer APIs. Do not
++replace it with this summary.
++
++## Preserved dirty Task 6 work
++
++The HyperDHT worktree is intentionally dirty. These paths belong to the
++unfinished Task 6 implementer:
++
++```text
++ M lib/private/guard-link.js
++ M test/private/guard-link.js
++?? lib/private/extension-link-completion.js
++?? lib/private/extension-setup-channel.js
++?? lib/private/final-exit-handoff.js
++?? lib/private/m3-adjacency-adopter.js
++?? lib/private/m3-adjacency-runtime.js
++?? lib/private/redacted-responder-proof.js
++?? lib/private/route-extension.js
++?? lib/private/tail-control.js
++?? lib/private/tail-extension-committer.js
++?? test/private/extension-link-completion.js
++?? test/private/extension-setup-channel.js
++?? test/private/final-exit-handoff.js
++?? test/private/redacted-responder-proof.js
++?? test/private/route-extension-session.js
++?? test/private/tail-control.js
++?? test/private/tail-extension-committer.js
++```
++
++Do not reset, clean, checkout, overwrite, or stash these files. Inspect and
++continue them carefully. Preserve unrelated user changes. Use `apply_patch`
++for edits.
++
++The partial work contains exact CommonJS ports of low-level prototype pieces
++and provisional selected-evidence route extension. It deliberately stopped
++before inventing the missing responder ownership contract. It is not a
++complete or committable Task 6 implementation.
++
++The partial slices currently include:
++
++- exact redacted responder proof;
++- extension setup channel;
++- extension link completion;
++- M3 responder adopter and adjacency runtime;
++- exact EXTEND/EXTENDED codecs with discovery references removed;
++- tail extension committer;
++- final-exit handoff;
++- authenticated extension blocks in `guard-link.js`; and
++- a provisional selected-evidence `RouteExtensionSession`.
++
++The reviewed amendment requires substantial refactoring beyond the current
++partial APIs, including separate wall/monotonic clocks, proactive runtime
++expiry, a paired responder token, relay identity signer capabilities,
++request-bound adjacent dialing, accepted-adjacency and forwarding transfers,
++and actor-correct replay ownership.
++
++## Fresh partial-work evidence
++
++On 2026-07-29, the following focused Node command was run from
++`hyperdht-private-routing`:
++
++```bash
++/Users/jd/.nvm/versions/node/v22.19.0/bin/node \
++  node_modules/brittle/bin/node.js \
++  test/private/redacted-responder-proof.js \
++  test/private/extension-setup-channel.js \
++  test/private/extension-link-completion.js \
++  test/private/tail-extension-committer.js \
++  test/private/final-exit-handoff.js \
++  test/private/tail-control.js \
++  test/private/route-extension-session.js \
++  test/private/guard-link.js
++```
++
++Result:
++
++```text
++40/40 tests passed
++841/841 assertions passed
++git diff --check passed
++```
++
++This is preservation evidence, not Task 6 acceptance. It does not cover the
++reviewed responder amendment, aggregate runner registration, full direct-mode
++compatibility, or Bare.
++
++There is currently no `bare` executable in this shell's `PATH`.
++`node_modules/.bin/brittle-bare` consequently fails with
++`bare: command not found`. Inspect the repository's package scripts and GitHub
++Actions definitions for the fork-native Bare command and version, then restore
++that runtime locally or verify on the existing GitHub-native Bare job at the
++exact pushed SHA. Do not guess an unpinned runtime, and do not mark Task 6
++complete until its focused and aggregate Bare suites are genuinely green. Do
++not regress the inherited Task 5 Bare evidence.
++
++The shell may emit:
++
++```text
++pyenv: cannot rehash: /Users/jd/.pyenv/shims isn't writable
++```
++
++That warning is unrelated to the repository. An explicit working Node binary
++is:
++
++```text
++/Users/jd/.nvm/versions/node/v22.19.0/bin/node
++```
++
++## Exact next execution sequence
++
++After the owner approves the written design:
++
++1. Invoke `writing-plans`.
++2. Amend Task 6's plan and file map with every exact API and TDD slice from the
++   reviewed amendment.
++3. Independently spec-review the plan; fix and re-review until approved.
++4. Commit only the reviewed plan update. Leave partial source files dirty.
++5. Reconcile the partial code against the reviewed plan without discarding
++   exact prototype ports.
++6. For every newly required behavior, add one bounded failing test and observe
++   the intended failure before implementing it.
++7. Implement in dependency order:
++   - dual-clock M3 runtime projection and proactive timer ownership;
++   - paired `TailResponderToken`;
++   - relay identity owner and domain-limited signers;
++   - request-bound adjacent dial/factory capability;
++   - accepted successor adjacency/replay transfer;
++   - narrowed initiator `TailControlSession`;
++   - co-located token-gated responder transitions;
++   - failure-atomic forwarding transfer;
++   - selected-evidence `RouteExtensionSession`;
++   - TAIL_READY publication and dual-clock final-exit handoff; and
++   - guard -> middle -> DHT-exit in-memory integration and cleanup.
++8. Preserve exact prototype wire vectors and provenance comments.
++9. Register every new focused test in `test/private-routing.js`.
++10. Run `npm run test:generate` and inspect generated `test/all.js`; focused
++    success is insufficient if the aggregate runner omits the tests.
++11. Run focused Node and Bare suites, full private Node and Bare suites, native
++    UDX tests, full direct-mode tests, formatting, and diff checks.
++12. Obtain separate spec-compliance and security/code-quality approval. The
++    same implementer fixes all findings.
++13. Commit the complete Task 6 implementation only after those reviews and
++    tests pass. Do not commit a half-built route extension.
++14. Push the reviewed branch to the existing PR only within owner-authorized
++    scope, then wait for every new GitHub-native job at the exact pushed SHA.
++
++## Non-negotiable guardrails
++
++- Treat `source-hyperdht`, the prototype worktree, and the Bare addon reference
++  as read-only.
++- Never use destructive Git commands on the dirty HyperDHT worktree.
++- Do not commit `node_modules`, build products, captures, secrets, debug
++  binaries, or unrelated changes.
++- Do not add a public private-routing constructor or package export in Gate
++  3B1.
++- Do not enable Hyperswarm, peer streams, mutable operations, announce
++  application traffic, PearTube, or mobile behavior in this milestone.
++- No DNS, direct DHT fallback, direct races, hole punching, guard replacement,
++  post-pin discovery, relay registry, or diversity relaxation.
++- The endpoint may contact only its pinned guard after pinning.
++- The final DHT exit owns the only ordinary DHT socket and destination table.
++- Relays receive opaque adjacent capabilities, never a full route.
++- Every capability and pending transfer is bounded, role-scoped, one-shot where
++  specified, replay-safe, and deeply cleared.
++- Every retry preserves semantic bytes and may only shorten deadlines.
++- Direct HyperDHT behavior and wire vectors must remain unchanged.
++- Do not claim Tor-equivalent anonymity or production readiness from Gate 3B1.
++
++## What to report at the next milestone
++
++Report:
++
++- exact local and pushed SHAs;
++- commits created;
++- dirty/clean worktree state;
++- focused and aggregate Node/Bare results with test/assertion counts;
++- direct-mode and native UDX compatibility results;
++- spec and quality review verdicts and fixes;
++- CI job names, run URLs, and exact-head status;
++- any TODO, especially unavailable Bare/runtime or namespace coverage;
++- any dependency still pinned to Git instead of npm; and
++- the next gated task.
++
++Do not report the overall native private overlay, Hyperswarm privacy, mobile
++privacy, or PearTube's switch as complete. Gate 3B1 is only a live immutable-get
++vertical slice.
++
++## Suggested first response to the owner
++
++Lead with:
++
++> I have the handoff and verified the continuation point. Before touching the
++> preserved Task 6 worktree, I need your explicit approval of the independently
++> reviewed written responder-authority amendment:
++> `docs/superpowers/specs/2026-07-19-private-routing-task6-private-responder-authority-design.md`.
++> Once approved, I will update and independently review the Task 6
++> implementation plan, then resume strict TDD without discarding the partial
++> ports.
+diff --git a/docs/historical/private-routing-task6.prose b/docs/historical/private-routing-task6.prose
+new file mode 100644
+index 0000000000000000000000000000000000000000..121b835d07f6036797029b7b3507784e411a44a4
+--- /dev/null
++++ b/docs/historical/private-routing-task6.prose
+@@ -0,0 +1,68 @@
++# Gate 3B1 Task 6 manager workflow
++
++agent implementer:
++  model: opus
++  prompt: "Own one bounded Task 6 slice. Fetch exact repository, spec, prototype, and skill context yourself. Preserve dirty work. Use strict red-green TDD. Never push."
++
++agent specReviewer:
++  model: opus
++  prompt: "Independently review exact compliance with the approved Task 6 responder-authority amendment. Read source documents and code directly. Do not edit."
++
++agent securityReviewer:
++  model: opus
++  prompt: "Independently review security, capability ownership, replay, deadlines, cleanup, and code quality. Read source documents and code directly. Do not edit."
++
++let plan = session: implementer
++  prompt: "Amend only Task 6 and its file map in the existing Gate 3B1 implementation plan, exactly encoding the approved responder-authority amendment. Do not touch source or tests and do not commit."
++
++let planSpecReview = session: specReviewer
++  prompt: "Review the amended Task 6 plan against the approved responder-authority amendment and canonical Gate 3B1 documents."
++  context: plan
++
++loop until **the amended plan has independent approval with no open findings** (max: 5):
++  plan = session: implementer
++    prompt: "Fix every substantiated plan-review finding, changing only the Gate 3B1 plan document."
++    context: planSpecReview
++  planSpecReview = session: specReviewer
++    prompt: "Re-review the amended Task 6 plan after fixes."
++    context: plan
++
++session: implementer
++  prompt: "Commit only the independently approved Gate 3B1 plan document. Preserve all dirty source and test files."
++
++for slice in ["dual-clock M3 runtime", "TailResponderToken and relay identity signers", "request-bound adjacent dialing", "accepted successor adjacency and replay", "initiator tail control", "co-located responder transitions", "failure-atomic forwarding", "selected-evidence route extension", "TAIL_READY and final-exit handoff", "guard-middle-exit integration"]:
++  let implementation = session: implementer
++    prompt: "Implement the bounded Task 6 slice using strict failing-test-first TDD, focused verification, and no commit or push."
++    context: slice
++  let specReview = session: specReviewer
++    prompt: "Review this slice for exact approved-spec compliance."
++    context: { slice, implementation }
++  loop until **spec review is approved with no open findings** (max: 5):
++    implementation = session: implementer
++      prompt: "Fix all substantiated spec-review findings with failing regression tests first."
++      context: { slice, specReview }
++    specReview = session: specReviewer
++      prompt: "Re-review this slice for exact spec compliance."
++      context: { slice, implementation }
++  let securityReview = session: securityReviewer
++    prompt: "Review this approved slice for security and code quality."
++    context: { slice, implementation }
++  loop until **security review is approved with no open findings** (max: 5):
++    implementation = session: implementer
++      prompt: "Fix all substantiated security/code-quality findings with failing regression tests first."
++      context: { slice, securityReview }
++    securityReview = session: securityReviewer
++      prompt: "Re-review the slice after fixes."
++      context: { slice, implementation }
++
++parallel:
++  nodeVerification = session: specReviewer
++    prompt: "Verify focused, aggregate, direct-mode, generated-runner, formatting, and native UDX Node evidence."
++  bareVerification = session: specReviewer
++    prompt: "Determine and execute the repository-pinned Bare verification path without guessing a runtime."
++  finalSecurity = session: securityReviewer
++    prompt: "Perform final whole-Task-6 security and code-quality review."
++
++session: implementer
++  prompt: "Resolve any final substantiated findings, commit the complete reviewed Task 6 implementation, and report evidence. Never push."
++  context: { nodeVerification, bareVerification, finalSecurity }
+diff --git a/docs/historical/private-routing-task6-docs.prose b/docs/historical/private-routing-task6-docs.prose
+new file mode 100644
+index 0000000000000000000000000000000000000000..cdea5fdd922de10d5752ae26af4728f38863c8d2
+--- /dev/null
++++ b/docs/historical/private-routing-task6-docs.prose
+@@ -0,0 +1,40 @@
++# Gate 3B1 Task 6 lifetime/transport written-spec gate
++
++agent writer:
++  model: opus
++  prompt: "Own the bounded canonical-document update. Fetch exact repository, approved temporary addendum, source, and skill context yourself. Preserve dirty implementation work. Edit documentation only. Never commit or push."
++
++agent specReviewer:
++  model: opus
++  prompt: "Independently review exact written-spec compliance with the owner-approved Task 6 tail lifetime and authenticated UDX/M3 transport addendum. Read canonical documents, approved temporary artifact, and source directly. Do not edit."
++
++agent securityReviewer:
++  model: opus
++  prompt: "Independently review the written repository spec for capability security, ownership, replay, clocks, accounting, shared-link isolation, failure atomicity, and cleanup. Read canonical documents, approved temporary artifact, and source directly. Do not edit."
++
++let writtenSpec = session: writer
++  prompt: "Incorporate local://task6-tail-session-lifetime-addendum-v2.md exactly into the relevant canonical repository design and migration documents. Update the Task 5 M3CellLinkTransfer prerequisite, Task 6 responder ownership/lifetime/transport contract, and migration constraints. Do not edit the implementation plan yet: brainstorming requires owner review of the written spec first. Do not touch source/tests or commit. Report exact files and sections."
++
++parallel:
++  specReview = session: specReviewer
++    prompt: "Review the completed canonical documentation diff against every clause in local://task6-tail-session-lifetime-addendum-v2.md and existing approved Task 5/6 designs. Return APPROVED or exact omissions/contradictions."
++    context: writtenSpec
++  securityReview = session: securityReviewer
++    prompt: "Review the completed canonical documentation diff for security correctness and internally implementable ownership/lifetime/transport semantics. Return APPROVED or exact blockers."
++    context: writtenSpec
++
++loop until **both independent reviews are approved with no open findings** (max: 5):
++  writtenSpec = session: writer
++    prompt: "Fix every substantiated written-spec and security-review finding in canonical documentation only. Do not edit the implementation plan, source, or tests."
++    context: { specReview, securityReview }
++  parallel:
++    specReview = session: specReviewer
++      prompt: "Re-review the corrected canonical documentation against the complete approved temporary addendum."
++      context: writtenSpec
++    securityReview = session: securityReviewer
++      prompt: "Re-review the corrected canonical documentation for security and implementability."
++      context: writtenSpec
++
++session: writer
++  prompt: "Report the exact reviewed canonical documents and section-level changes. Do not commit; the owner must review the written repository spec first."
++  context: { writtenSpec, specReview, securityReview }

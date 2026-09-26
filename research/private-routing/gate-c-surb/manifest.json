@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "gate-c-surb",
+  "source_worktree": "gate-c-surb-integration",
+  "base_commit": "6c307fa8edbd380be4ff9a6a1bce0c1fd926e903",
+  "source_head": "6c307fa8edbd380be4ff9a6a1bce0c1fd926e903",
+  "source_branch": "gate-c-surb-integration",
+  "status": "unaccepted",
+  "notes": [
+    "Gate C SURB integration is unaccepted.",
+    "Checker is intentionally incomplete: absent /tmp/surb_vectors.txt and undefined relay sec fields."
+  ],
+  "history_patch": null,
+  "working_patch": "working.patch",
+  "files": [
+    {
+      "path": "check_vectors.js",
+      "sha256": "b0ef0df84abd039c3c6d9e4f38974948595092e43637974c5c0bead10e96d1cd"
+    },
+    {
+      "path": "docs/private-routing-migration.md",
+      "sha256": "025986a75d9b912e0b43ff28ca59008ae070110d5303795388ca9c78838706fc"
+    },
+    {
+      "path": "lib/private/surb.js",
+      "sha256": "10a4f8332ecc3f31200364f977181c31b929df77fcbcbe791bc60a0edd003787"
+    }
+  ]
+}

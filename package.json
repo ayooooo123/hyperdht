@@ -1,6 +1,6 @@
 {
   "name": "hyperdht",
-  "version": "6.32.0",
+  "version": "6.33.0",
   "description": "The DHT powering Hyperswarm",
   "main": "index.js",
   "browser": "browser.js",
@@ -12,12 +12,24 @@
     "browser.js",
     "testnet.js",
     "bin.js",
-    "lib/**.js"
+    "lib/**/*.js"
   ],
   "imports": {
+    "#private-route-process": {
+      "bare": "./test/private/process/runtime-bare.js",
+      "default": "./test/private/process/runtime-node.js"
+    },
     "events": {
       "bare": "bare-events",
       "default": "events"
+    },
+    "process": {
+      "bare": "bare-process",
+      "default": "process"
+    },
+    "fs": {
+      "bare": "bare-fs",
+      "default": "fs"
     },
     "child_process": {
       "bare": "bare-node-child-process",
@@ -25,13 +37,14 @@
     }
   },
   "dependencies": {
-    "@hyperswarm/secret-stream": "^6.6.2",
+    "@hyperswarm/secret-stream": "6.9.1",
     "b4a": "^1.3.1",
     "bare-events": "^2.2.0",
-    "blind-relay": "^1.3.0",
+    "bare-process": "4.5.1",
+    "blind-relay": "1.6.1",
     "bogon": "^1.0.0",
     "compact-encoding": "^3.0.0",
-    "dht-rpc": "^6.15.1",
+    "dht-rpc": "github:ayooooo123/dht-rpc#fe04496196ea2ce42d1de27b0f770b02d2a87cd5",
     "hypercore-crypto": "^3.3.0",
     "hypercore-id-encoding": "^1.2.0",
     "hyperdht-address": "^1.0.1",
@@ -41,12 +54,18 @@
     "safety-catch": "^1.0.1",
     "signal-promise": "^1.0.3",
     "sodium-universal": "^5.0.1",
-    "streamx": "^2.16.1",
+    "streamx": "2.28.1",
     "unslab": "^1.3.0",
+    "udx-native": "1.20.7",
     "xache": "^1.1.0"
   },
+  "overrides": {
+    "sodium-native": "github:ayooooo123/sodium-native#562d642e1a78a8e124cf97bfbda77f01c02d1a7f"
+  },
   "devDependencies": {
+    "bare-fs": "4.7.4",
     "bare-node-child-process": "^1.0.1",
+    "bare-runtime": "1.30.3",
     "brittle": "^3.0.0",
     "graceful-goodbye": "^1.3.0",
     "newline-decoder": "^1.0.2",
@@ -59,6 +78,14 @@
     "test:bare": "bare test/all.js",
     "test:generate": "brittle -r test/all.js test/*.js",
     "integration": "brittle test/integration/*.js",
+    "test:private:process:node": "brittle-node test/private/live-process-node.js",
+    "test:private:process:bare": "brittle-node test/private/live-process-bare.js",
+    "test:private:namespace": "brittle-node test/private/namespace-projection.js",
+    "test:private:namespace:live": "brittle-node test/private/live-namespace-node.js",
+    "test:private:peer:capture": "brittle-node test/private/live-peer-capture-node.js",
+    "test:private:linux-gates": "bash scripts/linux-gates.sh",
+    "test:remote:peer": "bash scripts/remote-peer.sh",
+    "test:remote:peer:local": "bash scripts/remote-peer.sh local",
     "end-to-end": "brittle test/end-to-end/*.js"
   },
   "author": "Mathias Buus (@mafintosh)",

@@ -1,19 +1,37 @@
 #!/usr/bin/env node
 
-const HyperDHT = require('./')
-
-const bootstrap = arg('bootstrap')
-const nodes = arg('node') ? '' : arg('nodes')
-
-const isBootstrap = bootstrap === '' || (bootstrap !== null && bootstrap.startsWith('--'))
-
-if (isBootstrap) {
-  const port = Number(arg('port') || '0') || 49737
-  const host = arg('host')
-  if (!host) throw new Error('You need to specify --host <node ip>')
-  startBootstrapNode(port, host)
+if (process.argv[2] === 'grant') {
+  runGrantTool(process.argv.slice(3))
 } else {
-  startNodes(Number(nodes) || 1, bootstrap ? bootstrap.split(',') : undefined)
+  const HyperDHT = require('./')
+
+  const bootstrap = arg('bootstrap')
+  const nodes = arg('node') ? '' : arg('nodes')
+
+  const isBootstrap = bootstrap === '' || (bootstrap !== null && bootstrap.startsWith('--'))
+
+  if (isBootstrap) {
+    const port = Number(arg('port') || '0') || 49737
+    const host = arg('host')
+    if (!host) throw new Error('You need to specify --host <node ip>')
+    startBootstrapNode(HyperDHT, port, host)
+  } else {
+    startNodes(HyperDHT, Number(nodes) || 1, bootstrap ? bootstrap.split(',') : undefined)
+  }
+}
+
+// Experimental: offline two-authority topology grants for native relay
+// neighbors. See docs/superpowers/specs/2026-09-25-*-neighbor-admission-design.md.
+function runGrantTool(argv) {
+  const fs = require('fs')
+  const { GrantToolError, run } = require('./lib/private/grant-tool')
+  try {
+    console.log(run(argv, { readFile: (path) => fs.readFileSync(path, 'utf8') }))
+  } catch (err) {
+    if (err instanceof GrantToolError) console.error(err.message)
+    else console.error(err && err.code ? err.code : err)
+    process.exitCode = 1
+  }
 }
 
 function arg(name) {
@@ -22,7 +40,7 @@ function arg(name) {
   return i < process.argv.length - 1 ? process.argv[i + 1] : ''
 }
 
-async function startBootstrapNode(port, host) {
+async function startBootstrapNode(HyperDHT, port, host) {
   console.log('Starting DHT bootstrap node...')
 
   const node = HyperDHT.bootstrapper(port, host)
@@ -40,7 +58,7 @@ async function startBootstrapNode(port, host) {
   })
 }
 
-async function startNodes(cnt, bootstrap) {
+async function startNodes(HyperDHT, cnt, bootstrap) {
   console.log('Booting DHT nodes...')
 
   const port = Number(arg('port') || '0') || 0
@@ -52,8 +70,6 @@ async function startNodes(cnt, bootstrap) {
   while (all.length < cnt) {
     const node = new HyperDHT({ host, port, anyPort: !port, bootstrap })
     await node.ready()
-
-    all.push(node)
 
     const id = all.push(node) - 1
     console.log('Node #' + id + ' bound to', node.address())

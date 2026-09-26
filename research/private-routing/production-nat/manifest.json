@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "id": "production-nat",
+  "source_worktree": "production-nat-traversal",
+  "base_commit": "6c307fa8edbd380be4ff9a6a1bce0c1fd926e903",
+  "source_head": "924fd55a53c58eae769e301cb0dd1d07ce2f85b3",
+  "source_branch": "production-nat-traversal",
+  "status": "unaccepted",
+  "notes": ["Prior NAT rework is unaccepted."],
+  "history_patch": "history.patch",
+  "working_patch": "working.patch",
+  "files": [
+    {
+      "path": "docs/private-routing-migration.md",
+      "sha256": "504d775c788ff92241558ad3c30a3c1534c554c3dbdbf4c1a77e55ec4dad6d46"
+    },
+    {
+      "path": "lib/private/dht-exit-wire.js",
+      "sha256": "744c611e54b92ec3427c0778fc306179abdbc44cbbc8a3b735c1a1383b387e72"
+    },
+    {
+      "path": "lib/private/link-bootstrap-session.js",
+      "sha256": "7c3ef9ff3788ad707b0d7d965a69970494d43cd860c6ddf67e9a31879839de38"
+    },
+    {
+      "path": "lib/private/nat-punch.js",
+      "sha256": "b70840772214dcfaae3a8dab75a4ab622031c6b6fdd6d9e111233cae37cfba9e"
+    },
+    {
+      "path": "lib/private/nat-reflect.js",
+      "sha256": "ac7372a78f5593aa05d52e13901e093347bce5ce65a8d44fc554af3ebb49f71e"
+    },
+    {
+      "path": "lib/private/protocol.js",
+      "sha256": "531fa50990484cd86d5890ac38cb1d689f0fabf14170ffd5f7c333c4c4c6fc37"
+    },
+    {
+      "path": "lib/private/topology-grant.js",
+      "sha256": "b79ea1ad2772d65d7ee0249af19ca4bf539c69346e189cda5c689c3fcf2045d3"
+    },
+    {
+      "path": "lib/private/udx-cell-endpoint.js",
+      "sha256": "e3a96578e4d26d8bcaa96c6e13ec48781d5e17f7eed769934b5222d1155ab880"
+    },
+    {
+      "path": "test/private-routing.js",
+      "sha256": "4d044f3c6d14ada448e523d932a12f4cc4b970ad00d90dcabed542d9d66fb1bf"
+    },
+    {
+      "path": "test/private/nat-punch.js",
+      "sha256": "415d69073ff596668f34bb5f56d5091bb3e7c745de2a2ab7019cc390cd521c34"
+    },
+    {
+      "path": "test/private/nat-traversal-live.js",
+      "sha256": "fb563dd6246263ad05e8b692911943f431e0642f86e2757724afcf7b421c2502"
+    },
+    {
+      "path": "test/private/process/wire-services.js",
+      "sha256": "9b5788aca7b7860513aef450e837dd31ed5a78f3239b47399201e4d88dbc616f"
+    },
+    {
+      "path": "test/private/protocol.js",
+      "sha256": "d8fdc0a05e99ba4519203dcd506a9ecb5c69c6557e94011a1eeb987bfbb1fb02"
+    }
+  ]
+}
