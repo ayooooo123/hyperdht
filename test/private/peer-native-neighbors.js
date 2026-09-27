@@ -55,6 +55,11 @@ function expectCode(t, fn, code) {
   }
 }
 
+// The requesting circuit's own send allowance at the discovering relay.
+function circuitAllowance(cells = 200) {
+  return createPeerLedger({ cells, bytes: BigInt(cells) * 1200n, commands: cells })
+}
+
 async function expectCodeAsync(t, promise, code) {
   try {
     await promise
@@ -878,7 +883,8 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery rejects invalid o
         suppliedAdvertisement260: null,
         clockIdentity: clock,
         wireExpiresAt: 2_000_000n,
-        localDeadline: 2_000_000n
+        localDeadline: 2_000_000n,
+        circuitAllowance: circuitAllowance()
       }),
     'UNAUTHORIZED'
   )
@@ -902,7 +908,8 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery validates request
     suppliedAdvertisement260: null,
     clockIdentity: clock,
     wireExpiresAt: 2_000_000n,
-    localDeadline: 2_000_000n
+    localDeadline: 2_000_000n,
+    circuitAllowance: circuitAllowance()
   }
 
   // Non-object request
@@ -981,6 +988,13 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery validates request
     'INVALID_ROUTE'
   )
 
+  // Discovery always names the circuit it is charged to
+  expectCode(
+    t,
+    () => createPeerNativeNeighborDiscovery(f.pool, { ...baseRequest, circuitAllowance: null }),
+    'INVALID_ROUTE'
+  )
+
   // Accessor getter on request rejected
   const accessorReq = { ...baseRequest }
   Object.defineProperty(accessorReq, 'mode', {
@@ -1033,7 +1047,8 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery validates request
     () =>
       createPeerNativeNeighborDiscovery(f.pool, {
         ...baseRequest,
-        localDeadline: coercibleTime
+        localDeadline: coercibleTime,
+        circuitAllowance: circuitAllowance()
       }),
     'INVALID_ROUTE'
   )
@@ -1072,7 +1087,8 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery positive SUPPLIED
     suppliedAdvertisement260,
     clockIdentity: clock,
     wireExpiresAt: 2_000_000n,
-    localDeadline: 2_000_000n
+    localDeadline: 2_000_000n,
+    circuitAllowance: circuitAllowance()
   }
 
   const discovery = createPeerNativeNeighborDiscovery(f.pool, request)
@@ -1104,15 +1120,16 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery SUPPLIED mode rej
     suppliedAdvertisement260: unknownAd260,
     clockIdentity: clock,
     wireExpiresAt: 2_000_000n,
-    localDeadline: 2_000_000n
+    localDeadline: 2_000_000n,
+    circuitAllowance: circuitAllowance()
   }
 
   expectCode(t, () => createPeerNativeNeighborDiscovery(f.pool, request), 'ERR_PRIVACY_UNAVAILABLE')
 })
 
-test('Peer Native Neighbors: createPeerNativeNeighborDiscovery rejects capacity failure when neighbor serviceLedger has insufficient cells', async (t) => {
+test('Peer Native Neighbors: discovery is charged to its circuit allowance and never to the neighbor service', async (t) => {
   const clock = fakeClock(1000n)
-  // default serviceCells is 20, which is < 24 required for discovery
+  // The neighbor's 20-cell service reservation could not fund one 24-cell discovery.
   const f = await setupTwoEndedNativeAdjacency({
     t,
     clock,
@@ -1120,6 +1137,7 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery rejects capacity 
     peerPort: 48824,
     serviceCells: 20
   })
+  const service = readPeerNativeNeighborDiagnostics(f.pool).nodeServiceLedger
 
   const request = {
     mode: 1,
@@ -1128,10 +1146,29 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery rejects capacity 
     suppliedAdvertisement260: null,
     clockIdentity: clock,
     wireExpiresAt: 2_000_000n,
-    localDeadline: 2_000_000n
+    localDeadline: 2_000_000n,
+    circuitAllowance: circuitAllowance(23)
   }
-
   expectCode(t, () => createPeerNativeNeighborDiscovery(f.pool, request), 'CIRCUIT_LIMIT')
+
+  const allowance = circuitAllowance(24)
+  const discovery = createPeerNativeNeighborDiscovery(f.pool, {
+    ...request,
+    circuitAllowance: allowance
+  })
+  t.is(readPeerLedger(allowance).cellsReserved, 24, 'the circuit reserves the discovery profile')
+  t.alike(
+    readPeerNativeNeighborDiagnostics(f.pool).nodeServiceLedger,
+    service,
+    'the neighbor service ledger is untouched'
+  )
+  expectCode(
+    t,
+    () => createPeerNativeNeighborDiscovery(f.pool, { ...request, circuitAllowance: allowance }),
+    'CIRCUIT_LIMIT'
+  )
+  t.is(discovery.close(), true)
+  t.is(readPeerLedger(allowance).cellsReserved, 0, 'closing returns the unspent allowance')
 })
 
 test('Peer Native Neighbors: pool destruction cleanly closes active discoveries', async (t) => {
@@ -1152,7 +1189,8 @@ test('Peer Native Neighbors: pool destruction cleanly closes active discoveries'
     suppliedAdvertisement260: null,
     clockIdentity: clock,
     wireExpiresAt: 2_000_000n,
-    localDeadline: 2_000_000n
+    localDeadline: 2_000_000n,
+    circuitAllowance: circuitAllowance()
   }
 
   const discovery = createPeerNativeNeighborDiscovery(f.pool, request)
@@ -1197,7 +1235,8 @@ test('Peer Native Neighbors: Native discovery cancellation releases the slot wit
     suppliedAdvertisement260: null,
     clockIdentity: clock,
     wireExpiresAt: 3000n,
-    localDeadline: 5000n
+    localDeadline: 5000n,
+    circuitAllowance: circuitAllowance()
   }
   const originalTimerCount = clock.timerCount()
   const abandoned = createPeerNativeNeighborDiscovery(f.pool, request)
@@ -1281,7 +1320,8 @@ test('Peer Native Neighbors: createPeerNativeNeighborDiscovery clamps candidate 
       suppliedAdvertisement260: null,
       clockIdentity: clock,
       wireExpiresAt: 3000n,
-      localDeadline: 3000n
+      localDeadline: 3000n,
+      circuitAllowance: circuitAllowance()
     }
 
     const discovery = createPeerNativeNeighborDiscovery(f.pool, request)
@@ -1324,7 +1364,8 @@ test('Peer Native Neighbors: discovery closes at the original projected wire dea
     suppliedAdvertisement260: null,
     clockIdentity: clock,
     wireExpiresAt: 2500n,
-    localDeadline: 10000n
+    localDeadline: 10000n,
+    circuitAllowance: circuitAllowance()
   }
   const discovery = createPeerNativeNeighborDiscovery(f.pool, request)
   const rejected = expectCodeAsync(
@@ -1353,7 +1394,8 @@ test('Peer Native Neighbors: discovery closes at the original projected wire dea
   const replacement = createPeerNativeNeighborDiscovery(f.pool, {
     ...request,
     wireExpiresAt: clock.wallNow() + 1000n,
-    localDeadline: clock.monotonicNow() + 1000n
+    localDeadline: clock.monotonicNow() + 1000n,
+    circuitAllowance: circuitAllowance()
   })
   replacement.close()
 })
@@ -1388,8 +1430,8 @@ test('Peer Native Neighbors: clock failures and reentrant pool revocation roll b
     peerPort: 48838,
     serviceCells: 40
   })
-  // Provisioning spends this same ledger. Leave room for one 24-cell discovery,
-  // but never two: a leaked first reservation must prevent the replacement.
+  // Leave the circuit room for one 24-cell discovery but never two: a leaked first
+  // reservation must prevent the replacement.
   const request = {
     mode: 1,
     requestedMask: 11,
@@ -1397,7 +1439,8 @@ test('Peer Native Neighbors: clock failures and reentrant pool revocation roll b
     suppliedAdvertisement260: null,
     clockIdentity: clock,
     wireExpiresAt: 3000n,
-    localDeadline: 3000n
+    localDeadline: 3000n,
+    circuitAllowance: circuitAllowance(24)
   }
   wallFault = {
     remaining: 2,
@@ -1428,4 +1471,68 @@ test('Peer Native Neighbors: clock failures and reentrant pool revocation roll b
     'revocation during Native adoption leaves no requester slot and keeps the shared socket usable'
   )
   destroyPeerActiveCandidate(candidate)
+})
+
+// Several circuits discover through one neighbor at once: each completes on its own
+// allowance, the neighbor's direct requester set serves them together, and the
+// neighbor-service ledger never moves.
+test('Peer Native Neighbors: concurrent discoveries through one neighbor each complete on their own circuit', async (t) => {
+  const clock = fakeClock(1000n)
+  const f = await setupTwoEndedNativeAdjacency({
+    t,
+    clock,
+    native: true,
+    localPort: 48871,
+    peerPort: 48872,
+    serviceCells: 50
+  })
+  const responder = createPeerBootstrapResponder(f.peerRelayOwner)
+  const registration = registerPeerDirectResponder(f.peerEndpoint, responder)
+  const service = readPeerNativeNeighborDiagnostics(f.pool).nodeServiceLedger
+  try {
+    const allowances = [circuitAllowance(), circuitAllowance(), circuitAllowance()]
+    const discoveries = allowances.map((allowance, index) =>
+      createPeerNativeNeighborDiscovery(f.pool, {
+        mode: 1,
+        requestedMask: 11,
+        randomTarget32: seed(0x40 + index),
+        suppliedAdvertisement260: null,
+        clockIdentity: clock,
+        wireExpiresAt: 3000n,
+        localDeadline: 3000n,
+        circuitAllowance: allowance
+      })
+    )
+    const candidates = await Promise.all(
+      discoveries.map((discovery, index) =>
+        discoverPeerCandidate(discovery.transport, {
+          ledger: discovery.ledger,
+          requestedMask: 11,
+          randomTarget: seed(0x40 + index),
+          maximumResults: 1
+        })
+      )
+    )
+    for (const [index, candidate] of candidates.entries()) {
+      t.alike(
+        readPeerActiveCandidateFacts(candidate).completeAdvertisement,
+        discoveries[index].advertisement260,
+        `discovery ${index} authenticates the neighbor`
+      )
+      destroyPeerActiveCandidate(candidate)
+    }
+    t.ok(
+      allowances.every((allowance) => readPeerLedger(allowance).cellsSpent > 0),
+      'each circuit spends its own allowance'
+    )
+    t.alike(
+      readPeerNativeNeighborDiagnostics(f.pool).nodeServiceLedger,
+      service,
+      'the neighbor service ledger is untouched'
+    )
+    for (const discovery of discoveries) discovery.close()
+  } finally {
+    destroyPeerDirectResponderRegistration(registration)
+    destroyPeerBootstrapResponder(responder)
+  }
 })

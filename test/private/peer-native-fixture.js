@@ -832,8 +832,8 @@ async function peerGuardFixture(t, leftPort, rightPort, fixtureOptions = {}) {
   const advertisement = readPeerRelayOwner(guardOwner).canonicalAdvertisement260
   const limits = {
     cellSize: 1200,
-    maxCells: 30,
-    maxBytes: 36000,
+    maxCells: 60,
+    maxBytes: 72000,
     maxCommands: 21,
     idleTimeoutMs: 30000,
     expiresAt: 50000n
@@ -1682,8 +1682,8 @@ async function setupFourNodeNativeFixture({
       const tailKeyPair = cryptoSuite.encryptionKeyPair(seed(0xb1))
       const limits = {
         cellSize: 1200,
-        maxCells: 30,
-        maxBytes: 36000,
+        maxCells: 60,
+        maxBytes: 72000,
         maxCommands: 21,
         idleTimeoutMs: 30000,
         expiresAt: 50000n
@@ -2210,8 +2210,10 @@ async function setupTwoEndedNativeAdjacency({
   }
 }
 
+// Parent ledgers for `branches` branches of the fixtures' 60-cell limits, apart from the
+// 10-cell closure partition each branch reserves separately.
 function ledgers(branches = 1) {
-  const budget = { cells: 20 * branches, bytes: 24000n * BigInt(branches), commands: 20 * branches }
+  const budget = { cells: 50 * branches, bytes: 60000n * BigInt(branches), commands: 20 * branches }
   const closure = { cells: 10 * branches, bytes: 12000n * BigInt(branches), commands: branches }
   return {
     sendLedger: createPeerLedger(budget),
@@ -2263,8 +2265,8 @@ async function authenticatedPeer(t, port, extensionIndex = 2, native = false, op
   })
   const limits = {
     cellSize: 1200,
-    maxCells: 30,
-    maxBytes: 36000,
+    maxCells: 60,
+    maxBytes: 72000,
     maxCommands: 21,
     idleTimeoutMs: 30000,
     expiresAt: 50000n
@@ -2497,8 +2499,8 @@ async function setupDistinctNativeNeighbor(
 
   const branchLimits = limits || {
     cellSize: 1200,
-    maxCells: 30,
-    maxBytes: 36000,
+    maxCells: 60,
+    maxBytes: 72000,
     maxCommands: 21,
     idleTimeoutMs: 30000,
     expiresAt: 50000n

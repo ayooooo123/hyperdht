@@ -36,7 +36,7 @@ function uint64(value) {
   return output
 }
 
-function expectInvalid(t, operation) {
+function expectCode(t, operation, code) {
   let error = null
   try {
     operation()
@@ -44,7 +44,17 @@ function expectInvalid(t, operation) {
     error = err
   }
   t.ok(error instanceof PrivateRouteError)
-  t.is(error && error.code, 'INVALID_ROUTE')
+  t.is(error && error.code, code)
+}
+
+function expectInvalid(t, operation) {
+  expectCode(t, operation, 'INVALID_ROUTE')
+}
+
+// Bytes that do not open under the context's key and associated data are noise to the
+// caller, not a contract violation.
+function expectUnauthenticated(t, operation) {
+  expectCode(t, operation, 'ERR_AUTHENTICATION')
 }
 
 const TAIL = Object.freeze({
@@ -289,24 +299,20 @@ test('openPeerContextFrame rejects tampered ciphertext, modified AD bindings, an
 
   const frame = sealPeerContextFrame(opts)
 
-  // Tamper frame byte
+  // Tampered ciphertext does not authenticate
   const tamperedFrame = b4a.from(frame)
   tamperedFrame[100] ^= 0xff
-  expectInvalid(t, () => openPeerContextFrame(opts, tamperedFrame))
+  expectUnauthenticated(t, () => openPeerContextFrame(opts, tamperedFrame))
 
-  // Mismatched direction
-  expectInvalid(t, () => openPeerContextFrame({ ...opts, direction: 1 }, frame))
+  // A different direction, purpose or routeId is different associated data
+  expectUnauthenticated(t, () => openPeerContextFrame({ ...opts, direction: 1 }, frame))
+  expectUnauthenticated(t, () => openPeerContextFrame({ ...opts, purpose: 2 }, frame))
+  expectUnauthenticated(t, () =>
+    openPeerContextFrame({ ...opts, routeId: b4a.alloc(16, 0x99) }, frame)
+  )
 
-  // Mismatched purpose
-  expectInvalid(t, () => openPeerContextFrame({ ...opts, purpose: 2 }, frame))
-
-  // Mismatched routeId
-  expectInvalid(t, () => openPeerContextFrame({ ...opts, routeId: b4a.alloc(16, 0x99) }, frame))
-
-  // Mismatched counter
+  // A counter that disagrees with the wire, or none at all, is a caller error
   expectInvalid(t, () => openPeerContextFrame({ ...opts, counter: 6n }, frame))
-
-  // Missing counter
   expectInvalid(t, () => openPeerContextFrame({ ...opts, counter: undefined }, frame))
 })
 
@@ -374,7 +380,7 @@ test('native false authentication result rejects and erases plaintext before par
     sodium.crypto_aead_xchacha20poly1305_ietf_decrypt = decrypt
   }
   t.is(returned, null, 'unauthenticated plaintext is never returned')
-  t.is(error && error.code, 'INVALID_ROUTE')
+  t.is(error && error.code, 'ERR_AUTHENTICATION')
   t.ok(
     attemptedPlaintext && attemptedPlaintext.every((byte) => byte === 0),
     'failed plaintext is erased'

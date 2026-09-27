@@ -376,7 +376,11 @@ test('closure regression: forwarding downstream release before upstream ACK', as
   const next = adoptPeerEstablishedLink(fixture2.localAuthority, fixture2.handle)
 
   const layer = testLayerStack(0x21)
-  const forwardingOwner = createPeerM3ForwardingOwner(previous, next, { layers: layer.stack })
+  let ends = 0
+  const forwardingOwner = createPeerM3ForwardingOwner(previous, next, {
+    layers: layer.stack,
+    onEnd: () => ends++
+  })
   const envelope = seededEnvelope(0x51)
   const expected = openPeerLayer(layer.forward, b4a.from(envelope))
   const receiving = receivePeerM3Payload(fixture2.peerRuntime)
@@ -418,6 +422,16 @@ test('closure regression: forwarding downstream release before upstream ACK', as
   }
   t.is(await teardown, true)
   t.is(readPeerNativeNeighborDiagnostics(fixture2.f.pool).reservationCount, 0)
+  // The finished downstream leg ends the forwarder without any explicit destroy: its layer
+  // keys are released once and zeroed, and its owner hears of it once.
+  t.is(layer.releases, 1, 'graceful teardown releases the layer keys')
+  t.ok(
+    [...layer.stack.keys[0].forward, ...layer.stack.keys[0].reverse].every((key) =>
+      key.every((byte) => byte === 0)
+    ),
+    'the released layer keys are zeroed'
+  )
+  t.is(ends, 1, 'the forwarder ends once')
   t.is(
     readPeerNativeNeighborDiagnostics(fixture1.f.pool).reservationCount,
     1,
@@ -433,7 +447,37 @@ test('closure regression: forwarding downstream release before upstream ACK', as
   fixture1.clock.advance(1)
   await new Promise((resolve) => setImmediate(resolve))
   t.is(readPeerNativeNeighborDiagnostics(fixture1.f.pool).reservationCount, 0)
-  destroyPeerM3ForwardingOwner(forwardingOwner)
+  t.is(destroyPeerM3ForwardingOwner(forwardingOwner), false, 'an ended forwarder stays ended')
+  t.is(layer.releases, 1, 'repeated cleanup releases nothing again')
+  t.is(ends, 1)
+})
+
+test('closure regression: a downstream-initiated graceful teardown also ends the forwarder', async (t) => {
+  const fixture1 = await authenticatedPeer(t, 48508)
+  const fixture2 = await authenticatedPeer(t, 48512)
+  const previous = adoptPeerEstablishedLink(fixture1.localAuthority, fixture1.handle)
+  const next = adoptPeerEstablishedLink(fixture2.localAuthority, fixture2.handle)
+  const layer = testLayerStack(0x23)
+  let ends = 0
+  const forwardingOwner = createPeerM3ForwardingOwner(previous, next, {
+    layers: layer.stack,
+    onEnd: () => ends++
+  })
+  // The downstream peer tears down; the forwarder drains upstream first, then ACKs.
+  t.is(await beginPeerM3BranchTeardown(fixture2.peerRuntime, b4a.alloc(16, 0x79)), true)
+  for (let turn = 0; turn < 20 && layer.releases === 0; turn++) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  t.is(layer.releases, 1, 'the forwarder releases its layer keys once')
+  t.ok(
+    [...layer.stack.keys[0].forward, ...layer.stack.keys[0].reverse].every((key) =>
+      key.every((byte) => byte === 0)
+    ),
+    'the released layer keys are zeroed'
+  )
+  t.is(ends, 1, 'the forwarder ends once')
+  t.is(destroyPeerM3ForwardingOwner(forwardingOwner), false)
+  t.is(layer.releases, 1)
 })
 
 test('abrupt branch closure stops at eight authenticated attempts without closing its neighbor', async (t) => {
@@ -476,16 +520,17 @@ test('responder branches cannot spend sibling ordinary or physical-closure reser
   const second = adoptPeerEstablishedLink(fixture.localAuthority, sibling.handle)
   const payload = b4a.from('branch-owned allowance')
   let allDelivered = true
-  for (let attempt = 0; attempt < 19; attempt++) {
+  // The fixture partition is 50 cells: the ACCEPT spends one and 49 data sends the rest.
+  for (let attempt = 0; attempt < 49; attempt++) {
     const received = receivePeerM3Payload(first)
     await sendPeerM3Payload(fixture.peerRuntime, payload)
     allDelivered &&= b4a.equals(await received, payload)
   }
-  t.is(allDelivered, true, 'all nineteen admitted data sends arrive')
+  t.is(allDelivered, true, 'all forty-nine admitted data sends arrive')
   t.is(
     await asyncErrorCode(sendPeerM3Payload(fixture.peerRuntime, payload)),
     'ROUTE_UNAVAILABLE',
-    'the first branch cannot borrow a sibling allowance after its ACCEPT and nineteen data sends'
+    'the first branch cannot borrow a sibling allowance after its ACCEPT and forty-nine data sends'
   )
   const siblingReceive = receivePeerM3Payload(second)
   await sendPeerM3Payload(sibling.peerRuntime, payload)
@@ -505,7 +550,7 @@ test('responder branches cannot spend sibling ordinary or physical-closure reser
   }
   t.is(
     readPeerLedger(fixture.peerLedgers.sendLedger).cellsSpent,
-    22,
+    52,
     'spent sends are never refunded'
   )
   t.is(readPeerLedger(fixture.peerLedgers.teardownSendLedger).commandsSpent, 2)
@@ -564,7 +609,7 @@ test('delayed setup replies remain charged after transfer without duplicating al
   t.is(readPeerLedger(fixture.peerLedgers.receiveLedger).commandsSpent, 2)
   const payload = b4a.from('the original reply allowance remains spent')
   let delivered = true
-  for (let attempt = 0; attempt < 16; attempt++) {
+  for (let attempt = 0; attempt < 46; attempt++) {
     const receiving = receivePeerM3Payload(second)
     await sendPeerM3Payload(sibling.peerRuntime, payload)
     delivered &&= b4a.equals(await receiving, payload)

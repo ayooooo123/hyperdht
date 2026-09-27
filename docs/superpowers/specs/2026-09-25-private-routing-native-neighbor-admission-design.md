@@ -1,8 +1,8 @@
 # Private Routing: Native Relay-Neighbor Admission (per-node admission owner)
 
-**Status:** APPROVED by maintainer on 2026-09-25 (option A, two-party grants), fitted
+**Status:** APPROVED by the project owner on 2026-09-25 (option A, two-party grants), fitted
 to the peer-stream design packet §3.4 contract; see "Trust model". Step 1
-(grant format 1) is implemented. maintainer deferred external cryptographic review
+(grant format 1) is implemented. the project owner deferred external cryptographic review
 on 2026-09-25; work proceeds on internal review only.
 **Date:** 2026-09-25
 **Relates to:** [peer-stream design packet §3.4](2026-09-09-private-routing-peer-stream-design-packet.md#34-native-relay-neighbor-prerequisite-and-separate-service-accounting),
@@ -221,7 +221,18 @@ format 1. The public alpha stays on the current four-relay peer stream.
    configured (see "Per-node admission owner"). Rotation is later work.
 2. **D1 DIRECTORY choice.** Settled by existing code: directory discovery
    selects only live, published neighbors whose mask matches
-   (`peer-native-neighbors.js:1428`–`:1459`).
+   (`createPeerNativeNeighborDiscovery` in `peer-native-neighbors.js`).
+   Settled (R17): D1 and D2 are circuit work. Their 24-cell reservation comes
+   from the requesting circuit's own send allowance at the guard or safety
+   (the branch send ledger reserved at admission, reached through
+   `readPeerM3CircuitAllowance`), and their sends report kind
+   `circuit-discovery` in class `circuit`. The neighbor-service and node
+   ledgers fund only provisioning, the grant-pinned discovery that provisioning
+   runs, maintenance and close. A circuit without that allowance is refused,
+   and never borrows from the neighbor ledger, so many sources' discoveries
+   cannot starve a relay's neighbor links. Discoveries from several circuits
+   through one neighbor run at the same time: a remote keeps any number of
+   candidate requesters, each accepting only replies to its own query nonce.
 3. **Supplied terminals.** A destination's supplied private terminal must be
    a neighbor of the source's safety relay. Default: fail closed and report
    it; do not dial.
@@ -238,7 +249,7 @@ format 1. The public alpha stays on the current four-relay peer stream.
    lasts about 75 seconds of one neighbor. §3.4 makes the node ledger finite,
    so a long-lived relay needs budgets sized to its grants: roughly
    `4 × grant seconds` cells per neighbor reservation, and the node ledger
-   covering every neighbor plus reconnects. Settled (maintainer, 2026-09-25): keep
+   covering every neighbor plus reconnects. Settled (the project owner, 2026-09-25): keep
    §3.4's finite ledger. When budgets are not given, the admission owner sizes
    them from the longest admitted grant: 5 cells per grant second plus 32 per
    neighbor reservation, and per neighbor twice that plus discovery for every

@@ -31,6 +31,7 @@ function expectInvalid(t, fn) {
 }
 
 test('computePeerSemanticOwnedBytes exact owner floors and u32 bounds', (t) => {
+  // Legacy egress legs keep the inherited 16,777,218-byte record: 2*16,777,218+3 per stream.
   t.is(computePeerSemanticOwnedBytes({ purpose: 1, isInitiator: true, maxStreams: 1 }), 33572251)
   t.is(computePeerSemanticOwnedBytes({ purpose: 1, isInitiator: true, maxStreams: 2 }), 67144502)
   t.is(
@@ -38,17 +39,31 @@ test('computePeerSemanticOwnedBytes exact owner floors and u32 bounds', (t) => {
     17812 + 16777280
   )
 
-  t.is(computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: true, maxStreams: 1 }), 33557016)
+  // Private-to-private legs cap a record at 65,536 plaintext bytes: 2*65,556+3 per stream.
+  const privateRecord = 2 * 65556 + 3
+  t.is(
+    computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: true, maxStreams: 1 }),
+    2049 + 528 + privateRecord
+  )
   t.is(computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: false, maxStreams: 1 }), 2049)
 
   t.is(computePeerSemanticOwnedBytes({ purpose: 3, isInitiator: true, maxStreams: 1 }), 726)
   t.is(
     computePeerSemanticOwnedBytes({ purpose: 3, isInitiator: true, maxStreams: 2 }),
-    726 + 33556888
+    726 + 1921 + 528 + privateRecord
   )
+  t.is(computePeerSemanticOwnedBytes({ purpose: 3, isInitiator: false, maxStreams: 2 }), 726 + 1921)
 
   expectInvalid(t, () =>
     computePeerSemanticOwnedBytes({ purpose: 1, isInitiator: true, maxStreams: 128 })
+  )
+  // The u32 field bounds a private source endpoint at 32,125 lifetime streams.
+  t.is(
+    computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: true, maxStreams: 32125 }),
+    133692 * 32125
+  )
+  expectInvalid(t, () =>
+    computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: true, maxStreams: 32126 })
   )
 
   const getterObj = {}
@@ -61,6 +76,17 @@ test('computePeerSemanticOwnedBytes exact owner floors and u32 bounds', (t) => {
   getterObj.isInitiator = true
   getterObj.maxStreams = 1
   expectInvalid(t, () => computePeerSemanticOwnedBytes(getterObj))
+
+  // The record limit follows from the purpose; an unknown option never selects a floor.
+  expectInvalid(t, () =>
+    computePeerSemanticOwnedBytes({
+      purpose: 2,
+      isInitiator: true,
+      maxStreams: 1,
+      recordPlaintextMax: 65536
+    })
+  )
+  expectInvalid(t, () => computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: true }))
 })
 
 test('computePeerQueuedBytes calculation and boundary', (t) => {
@@ -130,6 +156,18 @@ test('computePeerRouteBudget baseline totals, directDiscovery shape, and command
   t.is(b4.totalCells, 2164)
   t.is(b4.adjacencies[0].forward.commands, 4)
   t.is(b4.adjacencies[2].reverse.commands, 8)
+
+  // Every option is named: an unknown key on the route or on an application rejects.
+  expectInvalid(t, () =>
+    computePeerRouteBudget({ purpose: 2, maxStreams: 1, applications: [app0], recordCap: 1 })
+  )
+  expectInvalid(t, () =>
+    computePeerRouteBudget({
+      purpose: 2,
+      maxStreams: 1,
+      applications: [{ ...app0, forwardWindows: 1 }]
+    })
+  )
 })
 
 test('computePeerRouteBudget array index getter trap rejection', (t) => {

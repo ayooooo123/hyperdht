@@ -247,8 +247,8 @@ test('A0 reserves exact directional children, rolls back failed admission and pr
   const firstPeer = setup.guardRuntime
   t.is(
     readPeerLedger(parents.sendLedger).cellsReserved,
-    19,
-    'A0 reserves twenty ordinary cells and spends its first OFFER'
+    49,
+    'A0 reserves fifty ordinary cells and spends its first OFFER'
   )
   t.is(
     readPeerLedger(parents.teardownSendLedger).cellsReserved,
@@ -275,7 +275,7 @@ test('A0 reserves exact directional children, rolls back failed admission and pr
   }
   const insufficient = {
     ...peerBranchLedgers(),
-    receiveLedger: createPeerLedger({ cells: 19, bytes: 22800n, commands: 20 })
+    receiveLedger: createPeerLedger({ cells: 49, bytes: 58800n, commands: 20 })
   }
   const rollback = Object.values(insufficient).map(readPeerLedger)
   let error = null
@@ -303,7 +303,7 @@ test('A0 reserves exact directional children, rolls back failed admission and pr
   const secondPeer = setup.guardRuntime
   const payload = b4a.alloc(1100, 0x87)
   let delivered = true
-  for (let attempt = 0; attempt < 19; attempt++) {
+  for (let attempt = 0; attempt < 49; attempt++) {
     const received = receivePeerM3Payload(firstPeer)
     await sendPeerM3Payload(first, payload)
     delivered &&= b4a.equals(await received, payload)

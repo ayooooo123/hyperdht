@@ -82,13 +82,14 @@ const LIMITS = Object.freeze({
   maxQueuedBytes: 524288
 })
 
-function relayConfig(node, mask, grants) {
+// A relay's capability mask follows from its grants: a guard or safety is upstream in some
+// grant (mask 9), a terminal only ever downstream (mask 11).
+function relayConfig(node, grants) {
   return {
     role: 'relay',
     memoryBytes: 1 << 20,
     identity: node.identity,
     relay: {
-      capabilityMask: mask,
       reachable: { host: '127.0.0.1', port: node.dht.port },
       limits: LIMITS,
       lifetimeMs: 600_000,
@@ -131,38 +132,96 @@ async function relayTopology(t) {
   })
   return {
     testnet,
-    guard: { node: guard, config: relayConfig(guard, 9, [guardSafety]) },
-    safety: { node: safety, config: relayConfig(safety, 9, [guardSafety, safetyTerminal]) },
-    terminal: { node: terminal, config: relayConfig(terminal, 11, [safetyTerminal]) }
+    guard: { node: guard, config: relayConfig(guard, [guardSafety]) },
+    safety: { node: safety, config: relayConfig(safety, [guardSafety, safetyTerminal]) },
+    terminal: { node: terminal, config: relayConfig(terminal, [safetyTerminal]) }
   }
 }
 
 test('native config validation rejects incomplete relay configuration before any send', (t) => {
-  const identity = relayIdentity()
+  const end = (role, identity = relayIdentity()) => ({
+    identity,
+    operator: cryptoSuite.keyPair(),
+    role,
+    dht: { port: 4000 }
+  })
+  const local = end(TOPOLOGY_ROLE.SAFETY_GUARD)
+  const grant = (initiator, acceptor) =>
+    twoAuthorityGrant({
+      initiator,
+      acceptor,
+      runId32: b4a.alloc(32, 1),
+      expiresAt: BigInt(Date.now()) + 3_600_000n
+    })
+  const identity = local.identity
   const base = {
     role: 'relay',
     memoryBytes: 4096,
     identity,
     relay: {
-      capabilityMask: 9,
       reachable: { host: '127.0.0.1', port: 4000 },
       limits: LIMITS,
       lifetimeMs: 1000,
       epoch: 1n,
       admission: {
-        authorityPublicKeys: [cryptoSuite.keyPair().publicKey],
+        authorityPublicKeys: [local.operator.publicKey],
         runId32: b4a.alloc(32, 1),
-        grants: [b4a.alloc(8, 1)]
+        grants: [grant(local, end(TOPOLOGY_ROLE.SAFETY_FINAL))]
       }
     }
   }
-  t.ok(readNativeConfig(base), 'a complete relay configuration validates')
+  t.is(readNativeConfig(base).relay.capabilityMask, 9, 'an upstream relay forwards circuits')
+  const downstream = {
+    ...base,
+    relay: {
+      ...base.relay,
+      epoch: 0n,
+      reachable: { host: '::1', port: 4000 },
+      admission: {
+        ...base.relay.admission,
+        grants: [
+          grant(end(TOPOLOGY_ROLE.SAFETY_GUARD), { ...local, role: TOPOLOGY_ROLE.SAFETY_FINAL })
+        ]
+      }
+    }
+  }
+  t.is(
+    readNativeConfig(downstream).relay.capabilityMask,
+    11,
+    'a relay that is only ever downstream is a terminal and hosts no guard'
+  )
   const variants = [
     { ...base, role: 'exit' },
     { ...base, memoryBytes: 0 },
     { ...base, identity: { publicKey: identity.publicKey, secretKey: b4a.alloc(32) } },
     { ...base, identity: otherRoleIdentity() },
-    { ...base, relay: { ...base.relay, capabilityMask: 10 } },
+    // The mask is derived and never configured.
+    { ...base, relay: { ...base.relay, capabilityMask: 9 } },
+    // Grants must decode, name this relay, and pair SAFETY_GUARD with SAFETY_FINAL.
+    {
+      ...base,
+      relay: { ...base.relay, admission: { ...base.relay.admission, grants: [b4a.alloc(8, 1)] } }
+    },
+    {
+      ...base,
+      relay: {
+        ...base.relay,
+        admission: {
+          ...base.relay.admission,
+          grants: [grant(end(TOPOLOGY_ROLE.SAFETY_GUARD), end(TOPOLOGY_ROLE.SAFETY_FINAL))]
+        }
+      }
+    },
+    {
+      ...base,
+      relay: {
+        ...base.relay,
+        admission: {
+          ...base.relay.admission,
+          grants: [grant(end(TOPOLOGY_ROLE.SOURCE, otherRoleIdentity()), local)]
+        }
+      }
+    },
     { ...base, relay: { ...base.relay, epoch: 1 } },
     { ...base, relay: { ...base.relay, limits: { ...LIMITS, maxCells: 10 } } },
     { ...base, relay: { ...base.relay, admission: { ...base.relay.admission, grants: [] } } },
@@ -480,7 +539,7 @@ async function nativeNetwork(t, overrides = {}) {
       terminalView.tailControlTranscriptDigest
     )
   }
-  return { topology, runtimes, source, build }
+  return { topology, runtimes, source, build, arrived }
 }
 
 const allLive = (runtime) => {
@@ -540,4 +599,74 @@ test('a relay follows its DHT through suspend and resume to the next socket', as
   t.ok(await until(() => !source.diagnostics().guardPinned), 'the source drops its lost pin')
   t.ok(await build(), 'a circuit is built through the resumed guard')
   t.ok(source.diagnostics().guardPinned, 'the source holds a live pin again')
+})
+
+// Four circuits build at once from a fresh source through one guard: the source shares
+// the pin still being created, each relay funds both branches of every circuit it
+// forwards, and each relay's D1/D2 queries to one neighbor run side by side. Every relay
+// charges that discovery to the circuit it serves, so its node-service ledger moves only
+// by its own neighbor sends and its neighbor links keep their funding.
+test('a fresh source builds four circuits at once through one guard, each paying its own discovery', async (t) => {
+  const { runtimes, source, arrived } = await nativeNetwork(t)
+  const relays = ['guard', 'safety']
+  const events = { guard: [], safety: [] }
+  const stops = relays.map((name) =>
+    runtimes[name].observeSendAttempts((event) => {
+      if (event.kind === 'attempt') events[name].push(event)
+    })
+  )
+  const before = {}
+  for (const name of relays) before[name] = runtimes[name].diagnostics().neighborService
+
+  const circuits = 4
+  const limits = { maxCells: 60, maxCommands: 30, idleTimeoutMs: 30_000 }
+  const leases = await Promise.all(
+    Array.from({ length: circuits }, () =>
+      source.buildTail({
+        forwardLimits: limits,
+        reverseLimits: limits,
+        payloadParametersDigest: cryptoSuite.randomBytes(32),
+        terminal: null
+      })
+    )
+  )
+  t.is(leases.length, circuits, 'every build completes')
+  t.ok(await until(() => arrived.length >= circuits), 'the terminal receives every circuit')
+  const after = {}
+  for (const name of relays) after[name] = runtimes[name].diagnostics().neighborService
+  for (const stop of stops) stop()
+  const sourceDigests = leases.map((lease) =>
+    b4a.toString(lease.consume().tailControlTranscriptDigest, 'hex')
+  )
+  const terminalDigests = arrived.map((lease) =>
+    b4a.toString(lease.consume().tailControlTranscriptDigest, 'hex')
+  )
+  t.alike(sourceDigests.sort(), terminalDigests.sort(), 'each circuit ends at the terminal')
+
+  for (const name of relays) {
+    const discovery = events[name].filter((event) => event.owner.kind === 'circuit-discovery')
+    const service = events[name].filter((event) => event.owner.class === 'neighbor')
+    const ordinals = new Map()
+    for (const event of discovery) {
+      if (!ordinals.has(event.owner.ledger)) ordinals.set(event.owner.ledger, [])
+      ordinals.get(event.owner.ledger).push(event.owner.ordinal)
+    }
+    t.ok(
+      discovery.every((event) => event.owner.class === 'circuit' && event.owner.charged),
+      `${name}: discovery is charged circuit traffic`
+    )
+    t.ok(ordinals.size >= circuits, `${name}: every circuit discovery names its own ledger`)
+    t.ok(
+      [...ordinals.values()].every((list) => list.every((ordinal, index) => ordinal === index + 1)),
+      `${name}: each discovery ledger counts only its own sends`
+    )
+    t.is(
+      after[name].cellsSpent - before[name].cellsSpent,
+      service.length,
+      `${name}: the neighbor-service ledger moves only by neighbor sends`
+    )
+  }
+  t.ok(allLive(runtimes.guard) && allLive(runtimes.safety), 'neighbor links stay live')
+  for (const lease of leases) lease.revoke()
+  for (const lease of arrived) lease.revoke()
 })

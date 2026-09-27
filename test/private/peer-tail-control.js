@@ -43,7 +43,8 @@ const {
   sendPeerM3Payload,
   receivePeerM3Payload,
   issuePeerM3RouteCarrier,
-  takePeerM3RouteCarrier
+  takePeerM3RouteCarrier,
+  beginPeerM3BranchTeardown
 } = require('../../lib/private/peer-m3-adjacency-runtime')
 const {
   createPeerRelayOwner,
@@ -69,6 +70,12 @@ const {
   seed,
   safetyIdentity
 } = require('./peer-native-fixture')
+
+function transcriptU64(transcript, offset) {
+  let value = 0n
+  for (let i = offset; i < offset + 8; i++) value = (value << 8n) | BigInt(transcript[i])
+  return value
+}
 
 async function interceptNativeMessages(onMessage, setup) {
   const createSocket = NativeUDX.prototype.createSocket
@@ -404,6 +411,8 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
   t.teardown(() => destroyFinalExitActivationOwner(activationOwner))
   const sourceMaterial = consumeFinalExitActivationOwner(activationOwner)
   const circuitId = b4a.from(sourceMaterial.tailControlTranscript.subarray(73, 89))
+  // Finalization frames carry the terminal hop's generation from the same transcript.
+  const finalGeneration = transcriptU64(sourceMaterial.tailControlTranscript, 89)
   t.is(Object.keys(sourceMaterial).length, 12, 'source activation retains exactly 12 material keys')
   t.is(isPeerTailFinalExitHandoff(handoff), true, 'consumed handoff keeps v2 routing provenance')
   t.exception(
@@ -492,28 +501,30 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
   )
   pendingRawPayload.fill(0)
 
+  await sendPeerM3Payload(finalResult.runtime, {
+    class: CELL_CLASS.DATAGRAM,
+    payload: layered(obsoleteTailEnvelope)
+  })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  let forgedError = null
+  try {
+    issuePeerM3RouteCarrier(termResult.runtime, Object.freeze({}))
+  } catch (err) {
+    forgedError = err.code
+  }
+  t.is(forgedError, 'UNAUTHORIZED', 'a forged authorization cannot move the runtime')
+  const retained = await receivePeerM3Payload(termResult.runtime)
+  t.alike(retained, obsoleteTailEnvelope, 'failed transfer neither drains nor erases the queue')
+  retained.fill(0)
+  // Class-6 bytes cannot be authentic before purpose negotiation. Queued before the take,
+  // they no longer block it: the take drops them, and the terminal reader below sees only
+  // the authentic early finalization, in order.
   const prematureRouteEnvelope = b4a.alloc(1101, 0)
   prematureRouteEnvelope[0] = 6
-  for (const [payload, authorization, expectedError] of [
-    [prematureRouteEnvelope, termResult.authorization, 'ERR_BUSY'],
-    [obsoleteTailEnvelope, Object.freeze({}), 'UNAUTHORIZED']
-  ]) {
-    await sendPeerM3Payload(finalResult.runtime, {
-      class: CELL_CLASS.DATAGRAM,
-      payload: layered(payload)
-    })
-    await new Promise((resolve) => setTimeout(resolve, 10))
-    let error = null
-    try {
-      issuePeerM3RouteCarrier(termResult.runtime, authorization)
-    } catch (err) {
-      error = err.code
-    }
-    t.is(error, expectedError, 'premature context or forged authorization cannot move the runtime')
-    const retained = await receivePeerM3Payload(termResult.runtime)
-    t.alike(retained, payload, 'failed transfer neither drains nor erases the queued envelope')
-    retained.fill(0)
-  }
+  await sendPeerM3Payload(finalResult.runtime, {
+    class: CELL_CLASS.DATAGRAM,
+    payload: layered(prematureRouteEnvelope)
+  })
   await sendPeerM3Payload(finalResult.runtime, layered(obsoleteTailEnvelope))
   holdNextTerminalPacket = true
   await sendPeerM3Payload(finalResult.runtime, layered(obsoleteTailEnvelope))
@@ -541,7 +552,7 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
     const earlyFrame = sealPeerContextFrame({
       contextClass: 5,
       circuitId,
-      generation: 1n,
+      generation: finalGeneration,
       direction: 0,
       counter: finalizeCounters[0]++,
       key: sourceMaterial.finalizeForwardKey,
@@ -575,7 +586,7 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
       {
         contextClass: 5,
         circuitId,
-        generation: 1n,
+        generation: finalGeneration,
         direction: 0,
         counter: earlyCounter + BigInt(i),
         key: terminalMaterial.finalizeForwardKey,
@@ -603,7 +614,7 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
     const frame = sealPeerContextFrame({
       contextClass: 5,
       circuitId,
-      generation: 1n,
+      generation: finalGeneration,
       direction,
       counter,
       key: senderMaterial[keyName],
@@ -624,7 +635,7 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
       {
         contextClass: 5,
         circuitId,
-        generation: 1n,
+        generation: finalGeneration,
         direction,
         counter,
         key: receiverMaterial[keyName],
@@ -654,7 +665,7 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
       circuitId,
       routeId: b4a.alloc(16, 0x93),
       purpose: 1,
-      generation: 1n,
+      generation: finalGeneration,
       direction,
       counter: contextClass === 5 ? finalizeCounters[direction]++ : 0n,
       key,
@@ -691,10 +702,28 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
   }
 
   activateM3RouteTransport(routeCarrier)
-  const spentReceive = await exchangeClassifiedFrame(0, 6)
-  await exchangeClassifiedFrame(1, 5) // Receiving class6 did not promote the terminal.
+  // Before its own route readiness the terminal cannot hold route keys, so a class-6 frame
+  // that reaches it then is noise: it is dropped, and the terminal's next reader below
+  // receives the class-5 retry instead.
+  const earlyRouteFrame = sealPeerContextFrame({
+    contextClass: 6,
+    circuitId,
+    routeId: b4a.alloc(16, 0x93),
+    purpose: 1,
+    generation: finalGeneration,
+    direction: 0,
+    counter: 0n,
+    key: seed(0xd8),
+    noncePrefix: b4a.alloc(16, 0xd9),
+    payload: b4a.from('route frame before terminal readiness')
+  })
+  await sendM3RouteFrame(routeCarrier, earlyRouteFrame)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  earlyRouteFrame.fill(0)
+  await exchangeClassifiedFrame(1, 5) // A dropped class6 did not promote the terminal.
   await exchangeClassifiedFrame(0, 5, true) // Explicit class5 retry survives local promotion.
   activateM3RouteTransport(termRouteCarrier)
+  const spentReceive = await exchangeClassifiedFrame(0, 6)
   await exchangeClassifiedFrame(1, 6)
   let replayCode = null
   try {
@@ -993,8 +1022,8 @@ test('expired discovery candidates release same-tail admission without shortenin
   })
   const limits = {
     cellSize: 1200,
-    maxCells: 30,
-    maxBytes: 36000,
+    maxCells: 60,
+    maxBytes: 72000,
     maxCommands: 21,
     idleTimeoutMs: 30000,
     expiresAt: 45000n
@@ -1039,16 +1068,16 @@ test('regression: legal asymmetric forward and reverse expiry bounds succeed in 
   // Legally asymmetric limits: forward 45000n vs reverse 50000n
   const forwardLimits = {
     cellSize: 1200,
-    maxCells: 30,
-    maxBytes: 36000,
+    maxCells: 60,
+    maxBytes: 72000,
     maxCommands: 21,
     idleTimeoutMs: 30000,
     expiresAt: 45000n
   }
   const reverseLimits = {
     cellSize: 1200,
-    maxCells: 30,
-    maxBytes: 36000,
+    maxCells: 60,
+    maxBytes: 72000,
     maxCommands: 21,
     idleTimeoutMs: 30000,
     expiresAt: 50000n
@@ -1538,3 +1567,257 @@ test('runtime clock reentrancy cannot return a retired runtime as usable', async
     'destruction inside the owned clock revokes the current operation'
   )
 })
+
+// Stale control from a forwarding relay carries fewer layers than the source removes, so the
+// source over-peels it into bytes with an arbitrary prefix. Unauthenticated bytes that read as
+// class 5 or 6 must neither block the source's take nor reach its reader, before or after the
+// take, and a real guard control cell held across the take is dropped the same way. Authentic
+// finalization still arrives, and class 6 reaches a reader only after local route readiness.
+test('unauthenticated class-5 or class-6 bytes and a held relay cell never block the source take or reach its reader', async (t) => {
+  const basePort = 48760
+  let holdGuardPacket = false
+  let held = null
+  const f = await interceptNativeMessages(
+    (socket, args, emit) => {
+      if (
+        holdGuardPacket &&
+        socket.address()?.port === basePort &&
+        args[0].byteLength === 1200 &&
+        args[0][1] === CELL_CLASS.DATAGRAM
+      ) {
+        holdGuardPacket = false
+        const packet = b4a.from(args[0])
+        const rest = args.slice(1)
+        held = () => emit.call(socket, 'message', packet, ...rest)
+        return false
+      }
+    },
+    () => setupFourNodeNativeFixture({ t, native: true, basePort, poolCapacity: 8192 })
+  )
+
+  const { sourceTailSession, limits } = await f.openSourceA0()
+  const candidate1 = await discoverPeerTailCandidate(sourceTailSession, {
+    mode: 1,
+    requestedMask: 9,
+    randomTarget32: seed(0x22),
+    expiresAt: 50000n
+  })
+  // Hold the guard's first own reply to EXTEND: a real, authentic guard control cell. The
+  // source's retry then draws the guard's cached reply and the build goes on.
+  holdGuardPacket = true
+  const extending = extendPeerTail(sourceTailSession, {
+    candidate: candidate1,
+    forwardLimits: limits,
+    reverseLimits: limits,
+    payloadParametersDigest: seed(0x42)
+  })
+  let extended = false
+  extending.then(() => {
+    extended = true
+  })
+  for (let turn = 0; turn < 40 && !extended; turn++) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    if (held) f.clock.advance(250)
+  }
+  await extending
+  t.ok(held, 'a real guard control cell is held across the build')
+  await f.safety.tailStarted
+  const terminalAdBytes = readVerifiedPeerAdvertisement(f.terminal.verifiedAd).canonicalBytes260
+  const candidate2 = await discoverPeerTailCandidate(sourceTailSession, {
+    mode: 2,
+    requestedMask: 11,
+    randomTarget32: seed(0x72),
+    suppliedAdvertisement260: terminalAdBytes,
+    expiresAt: 50000n
+  })
+  await extendPeerTail(sourceTailSession, {
+    candidate: candidate2,
+    forwardLimits: limits,
+    reverseLimits: limits,
+    payloadParametersDigest: seed(0x92)
+  })
+  const terminalTailSession = await f.terminal.tailStarted
+
+  const handoff = createPeerFinalExitHandoff(sourceTailSession)
+  const activationOwner = claimFinalExitActivation(handoff, createFinalExitActivationClaim(handoff))
+  t.teardown(() => destroyFinalExitActivationOwner(activationOwner))
+  const sourceMaterial = consumeFinalExitActivationOwner(activationOwner)
+  const circuitId = b4a.from(sourceMaterial.tailControlTranscript.subarray(73, 89))
+  const generation = transcriptU64(sourceMaterial.tailControlTranscript, 89)
+  const finalResult = takePeerTailFinalRuntime(sourceTailSession, activationOwner)
+
+  const termHandoff = createPeerFinalExitHandoff(terminalTailSession)
+  const terminalActivationOwner = claimFinalExitActivation(
+    termHandoff,
+    createFinalExitActivationClaim(termHandoff)
+  )
+  t.teardown(() => destroyFinalExitActivationOwner(terminalActivationOwner))
+  const terminalMaterial = consumeFinalExitActivationOwner(terminalActivationOwner)
+  const termResult = takePeerTailFinalRuntime(terminalTailSession, terminalActivationOwner)
+
+  // Unauthenticated envelope bytes with the wanted prefix. Sent from the terminal they reach
+  // the source exactly as over-peeled relay control does: prefix set, content not authentic.
+  const noise = (prefix) => {
+    const envelope = cryptoSuite.randomBytes(1101)
+    envelope[0] = prefix
+    return envelope
+  }
+
+  // Before the take: bytes reading as class 6 and class 5 are queued at the source.
+  for (const prefix of [6, 5]) {
+    await sendPeerM3Payload(termResult.runtime, {
+      class: CELL_CLASS.DATAGRAM,
+      payload: noise(prefix)
+    })
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const carrier = issuePeerM3RouteCarrier(finalResult.runtime, finalResult.authorization)
+  t.ok(carrier, 'queued class-5 and class-6 bytes do not block the source take')
+  const routeCarrier = takeM3RouteTransport(carrier)
+  t.teardown(() => destroyM3RouteTransport(routeCarrier))
+  const termRouteCarrier = takeM3RouteTransport(
+    issuePeerM3RouteCarrier(termResult.runtime, termResult.authorization)
+  )
+  t.teardown(() => destroyM3RouteTransport(termRouteCarrier))
+
+  // After the take: a waiting source reader sees neither class-5 nor class-6 noise, nor the
+  // real guard cell released now, and stays usable for the next authentic frame.
+  let delivered = null
+  const reading = receiveReservedM3RouteEnvelope(reserveM3RouteFrame(routeCarrier)).then(
+    (envelope) => {
+      delivered = envelope
+      return envelope
+    }
+  )
+  await sendM3RouteFrame(termRouteCarrier, cryptoSuite.randomBytes(1100))
+  activateM3RouteTransport(termRouteCarrier)
+  await sendM3RouteFrame(termRouteCarrier, cryptoSuite.randomBytes(1100))
+  held()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  t.is(delivered, null, 'no noise and no stale relay cell reaches the source reader')
+
+  const finalize = (counter, payload) =>
+    sealPeerContextFrame({
+      contextClass: 5,
+      circuitId,
+      generation,
+      direction: 1,
+      counter,
+      key: terminalMaterial.finalizeReverseKey,
+      noncePrefix: terminalMaterial.finalizeReverseNoncePrefix,
+      payload
+    })
+  const openFinalize = (frame, counter) =>
+    openPeerContextFrame(
+      {
+        contextClass: 5,
+        circuitId,
+        generation,
+        direction: 1,
+        counter,
+        key: sourceMaterial.finalizeReverseKey,
+        noncePrefix: sourceMaterial.finalizeReverseNoncePrefix
+      },
+      frame
+    )
+  const payload = b4a.from('authentic finalization after noise')
+  await sendM3FinalizeFrame(termRouteCarrier, finalize(0n, payload))
+  const first = await reading
+  t.is(first.contextClass, 5)
+  t.alike(openFinalize(first.frame, 0n).payload, payload, 'the pending reader gets the real frame')
+
+  // A byte-identical canonical retry under a fresh finalize counter is authentic and delivered;
+  // replay protection belongs to its owner, which sees the same bytes twice in order.
+  const retry = receiveReservedM3RouteEnvelope(reserveM3RouteFrame(routeCarrier))
+  await sendM3FinalizeFrame(termRouteCarrier, finalize(1n, payload))
+  t.alike(openFinalize((await retry).frame, 1n).payload, payload, 'the retry arrives intact')
+
+  // Class 6 reaches a reader only after local route readiness. A route frame that fails its
+  // AEAD is then reported as ERR_AUTHENTICATION, which an owner drops as noise.
+  activateM3RouteTransport(routeCarrier)
+  const routeRead = receiveReservedM3RouteEnvelope(reserveM3RouteFrame(routeCarrier))
+  await sendM3RouteFrame(termRouteCarrier, cryptoSuite.randomBytes(1100))
+  const routeNoise = await routeRead
+  t.is(routeNoise.contextClass, 6, 'after readiness class 6 reaches the reader')
+  t.exception(
+    () =>
+      openPeerContextFrame(
+        {
+          contextClass: 6,
+          circuitId,
+          routeId: b4a.alloc(16, 0x93),
+          purpose: 2,
+          generation,
+          direction: 1,
+          counter: transcriptU64(routeNoise.frame, 0),
+          key: seed(0xe1),
+          noncePrefix: b4a.alloc(16, 0xe2)
+        },
+        routeNoise.frame
+      ),
+    { code: 'ERR_AUTHENTICATION' },
+    'unauthenticated route bytes fail authentication, never a contract error'
+  )
+})
+
+// A forwarding tail keeps nothing a forwarder does not need: its tail secret, transcript and
+// finalize keys go at publication, and the whole owner retires when forwarding ends. After
+// physical loss, a graceful teardown or expiry, the guard's storage returns to zero and its
+// tail owner is gone, before any explicit destroy or fixture cleanup.
+for (const [end, basePort] of [
+  ['physical loss', 48790],
+  ['graceful teardown', 48794],
+  ['expiry', 48798]
+]) {
+  test(`a forwarding tail retires with its forwarder after ${end}`, async (t) => {
+    const f = await setupFourNodeNativeFixture({ t, native: true, basePort, poolCapacity: 8192 })
+    const { sourceTailSession, limits } = await f.openSourceA0()
+    for (const [mode, requestedMask, supplied, fill] of [
+      [1, 9, null, 0x23],
+      [2, 11, readVerifiedPeerAdvertisement(f.terminal.verifiedAd).canonicalBytes260, 0x73]
+    ]) {
+      const candidate = await discoverPeerTailCandidate(sourceTailSession, {
+        mode,
+        requestedMask,
+        randomTarget32: seed(fill),
+        ...(supplied ? { suppliedAdvertisement260: supplied } : {}),
+        expiresAt: 50000n
+      })
+      await extendPeerTail(sourceTailSession, {
+        candidate,
+        forwardLimits: limits,
+        reverseLimits: limits,
+        payloadParametersDigest: seed(fill + 1)
+      })
+    }
+    const guardSession = await f.guard.tailStarted
+    t.is(readPeerTailControl(guardSession).phase, 'FORWARDING', 'the guard forwards')
+    t.ok(readPeerMemory(f.guard.memoryPool).reservedBytes > 0, 'a live forwarder holds storage')
+
+    if (end === 'physical loss') {
+      await f.guard.endpoint.close()
+    } else if (end === 'graceful teardown') {
+      const handoff = createPeerFinalExitHandoff(sourceTailSession)
+      const activation = claimFinalExitActivation(handoff, createFinalExitActivationClaim(handoff))
+      t.teardown(() => destroyFinalExitActivationOwner(activation))
+      consumeFinalExitActivationOwner(activation)
+      const finalResult = takePeerTailFinalRuntime(sourceTailSession, activation)
+      t.is(
+        await beginPeerM3BranchTeardown(finalResult.runtime, b4a.alloc(16, 0x5a)),
+        true,
+        'the source tears the circuit down gracefully'
+      )
+    } else {
+      for (let step = 0; step < 120; step++) {
+        f.clock.advance(500)
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+    }
+    for (let turn = 0; turn < 100 && readPeerMemory(f.guard.memoryPool).reservedBytes > 0; turn++) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    t.is(readPeerMemory(f.guard.memoryPool).reservedBytes, 0, 'no guard storage survives')
+    t.is(readPeerMemory(f.guard.memoryPool).takenBytes, 0, 'no guard buffer is still taken')
+    t.exception(() => readPeerTailControl(guardSession), 'the guard tail owner is gone')
+  })
+}

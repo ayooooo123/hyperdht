@@ -1325,6 +1325,6 @@ test('purpose owner erases route state on explicit destroy', async (t) => {
   t.is(readPeerMemory(f.sourceMemory).reservedBytes, 0)
   t.is(readPeerMemory(f.sourceMemory).takenBytes, 0)
   t.is(readPeerLedger(f.sourceLedger).cellsReserved, 0)
-  t.is(computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: true, maxStreams: 1 }), 33_557_016)
+  t.is(computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: true, maxStreams: 1 }), 133_692)
   t.is(MAX_U64, 0xffff_ffff_ffff_ffffn)
 })
