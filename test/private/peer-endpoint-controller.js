@@ -6,10 +6,13 @@ const { Writable } = require('streamx')
 const SecretStream = require('@hyperswarm/secret-stream')
 const NoiseWrap = require('../../lib/noise-wrap')
 const { PrivateRouteError } = require('../../lib/private/errors')
-const { createPeerEndpointController } = require('../../lib/private/peer-endpoint-controller')
+const {
+  createPeerEndpointController,
+  createPeerConnectingStream
+} = require('../../lib/private/peer-endpoint-controller')
 
 const PROFILE = { error: 0, firewall: 0, secretStream: { version: 1 } }
-const ACTIVE_OWNER = { diagnostics: () => ({ status: 'ACTIVE' }) }
+const ACTIVE_OWNER = { diagnostics: () => ({ status: 'ACTIVE' }), route: () => ({ purpose: 2 }) }
 const AUTHENTICATION = { code: 'ERR_AUTHENTICATION' }
 const DESTROYED = { code: 'ERR_DESTROYED' }
 
@@ -145,7 +148,11 @@ function createSession(options = {}) {
   }
   state.authenticate = () => {
     if (state.revoked) return
-    state.hooks.onAuthenticatedOpen()
+    const maxFrames = options.maxFrames === undefined ? 1000000 : options.maxFrames
+    state.hooks.onAuthenticatedOpen({
+      maxFrames,
+      maxBytes: options.maxBytes === undefined ? BigInt(maxFrames) * 977n : options.maxBytes
+    })
     authenticated.resolve()
   }
   state.writable = () => {
@@ -232,7 +239,7 @@ function createSession(options = {}) {
   return state
 }
 
-function createPair(t, optionsA, optionsB) {
+function createPair(t, optionsA = {}, optionsB = {}) {
   const a = createSession(optionsA)
   const b = createSession(optionsB)
   a.peer = b
@@ -242,12 +249,12 @@ function createPair(t, optionsA, optionsB) {
   const originalA = { publicKey: b4a.from(keyA.publicKey), secretKey: b4a.from(keyA.secretKey) }
   const originalB = { publicKey: b4a.from(keyB.publicKey), secretKey: b4a.from(keyB.secretKey) }
   b.controller = createPeerEndpointController({
-    owner: ACTIVE_OWNER,
+    owner: { ...ACTIVE_OWNER, route: () => ({ purpose: optionsB.purpose || 3 }) },
     session: b.session,
     keyPair: keyB
   })
   a.controller = createPeerEndpointController({
-    owner: ACTIVE_OWNER,
+    owner: { ...ACTIVE_OWNER, route: () => ({ purpose: optionsA.purpose || 2 }) },
     session: a.session,
     keyPair: keyA,
     remotePublicKey: keyB.publicKey
@@ -424,7 +431,7 @@ test('endpoint rejects inactive owners and accessor-backed identity before attac
   t.exception(
     () =>
       createPeerEndpointController({
-        owner: { diagnostics: () => ({ status: 'CLOSED' }) },
+        owner: { ...ACTIVE_OWNER, diagnostics: () => ({ status: 'CLOSED' }) },
         session: state.session,
         keyPair
       }),
@@ -613,7 +620,7 @@ test('endpoint cancels a blocked plaintext write and ignores late writable notif
   const errors = []
   left.on('error', (error) => errors.push(error.code))
   pair.a.budget = 0
-  left.write(b4a.alloc(2000, 0x61))
+  left.write(b4a.alloc(65536 * 3 + 1, 0x61))
   const writing = Writable.drained(left)
   await turn()
   const before = pair.a.fragments.length
@@ -686,4 +693,326 @@ test('endpoint fails closed when the semantic lease cannot drain after native op
   t.alike(state.events, ['revoke', 'reset'])
   t.alike(state.resets, [failure])
   t.ok(state.controller.stream.destroyed)
+})
+
+test('endpoint validates admitted own-data purpose before identity or session work', function (t) {
+  const state = createSession()
+  let reads = 0
+  const keyPair = {
+    get publicKey() {
+      reads++
+      throw new Error('Identity must not be read')
+    }
+  }
+  const routes = [undefined, null, 0, 4, -1, 2.5, '2', true, NaN].map((purpose) => ({
+    purpose
+  }))
+  routes.push({})
+  routes.push(Object.create({ purpose: 2 }))
+  routes.push({
+    get purpose() {
+      reads++
+      return 2
+    }
+  })
+  for (const route of routes) {
+    t.exception(
+      () =>
+        createPeerEndpointController({
+          owner: { ...ACTIVE_OWNER, route: () => route },
+          session: state.session,
+          keyPair
+        }),
+      { code: 'INVALID_ROUTE' }
+    )
+  }
+  const owners = [
+    { diagnostics: ACTIVE_OWNER.diagnostics },
+    Object.assign(Object.create({ route: ACTIVE_OWNER.route }), {
+      diagnostics: ACTIVE_OWNER.diagnostics
+    }),
+    {
+      diagnostics: ACTIVE_OWNER.diagnostics,
+      get route() {
+        reads++
+        return ACTIVE_OWNER.route
+      }
+    }
+  ]
+  for (const owner of owners) {
+    t.exception(() => createPeerEndpointController({ owner, session: state.session, keyPair }), {
+      code: 'INVALID_ROUTE'
+    })
+  }
+  t.is(reads, 0)
+  t.is(state.attached, false)
+  t.alike(state.handshakes, [])
+  t.alike(state.fragments, [])
+})
+
+test('endpoint fragments large private writes with credit backpressure and half-close continuation', async function (t) {
+  const pair = createPair(t)
+  const [left, right] = await openPair(pair)
+  const payload = b4a.alloc(65536 * 3 + 1)
+  for (let i = 0; i < payload.byteLength; i++) payload[i] = (i + Math.floor(i / 65536)) & 255
+  const firstRecord = readOne(right)
+  const before = pair.a.fragments.length
+  pair.a.budget = 1
+  left.write(payload)
+  let drained = false
+  const writing = Writable.drained(left).then((ok) => {
+    drained = true
+    return ok
+  })
+  await waitFor(() => pair.a.fragments.length === before + 1)
+  await turn()
+  t.is(drained, false)
+  pair.a.budget = Infinity
+  pair.a.writable()
+  const retained = await firstRecord
+  t.alike(retained, payload.subarray(0, 65536))
+  t.is(retained.buffer.byteLength, 65556)
+  t.is(retained.byteOffset, 4)
+  for (let offset = 65536; offset < payload.byteLength; offset += 65536) {
+    const plain = await readOne(right)
+    const end = Math.min(payload.byteLength, offset + 65536)
+    t.alike(plain, payload.subarray(offset, end))
+    t.is(plain.buffer.byteLength, end - offset + 20)
+    t.not(plain.buffer, retained.buffer)
+  }
+  t.is(await writing, true)
+  const ciphertext = b4a.concat(pair.a.fragments.slice(before))
+  const lengths = []
+  let offset = 0
+  while (offset < ciphertext.byteLength) {
+    const body = ciphertext[offset] + ciphertext[offset + 1] * 256 + ciphertext[offset + 2] * 65536
+    lengths.push(body)
+    offset += body + 3
+  }
+  t.alike(lengths, [65553, 65553, 65553, 18])
+  t.is(offset, ciphertext.byteLength)
+  const eof = readOne(right)
+  left.end()
+  t.is(await eof, null)
+  const reply = b4a.alloc(65537, 0x39)
+  const firstReply = readOne(left)
+  right.write(reply)
+  t.alike(await firstReply, reply.subarray(0, 65536))
+  t.alike(await readOne(left), reply.subarray(65536))
+  t.is(await Writable.drained(right), true)
+  const reverseEof = readOne(left)
+  right.end()
+  t.is(await reverseEof, null)
+  await Promise.all([pair.a.controller.finished(), pair.b.controller.finished()])
+  t.alike(pair.a.resets, [])
+  t.alike(pair.b.resets, [])
+  t.alike(retained, payload.subarray(0, 65536), 'public backing survives graceful cleanup')
+  t.ok(left.destroyed && right.destroyed)
+})
+
+test('endpoint rejects above-cap private body prefix without waiting for ciphertext', async function (t) {
+  const pair = createPair(t)
+  const [, right] = await openPair(pair)
+  await waitFor(() => pair.b.controller._adapter._inboundRecordCount === 1)
+  const adapter = pair.b.controller._adapter
+  t.is(pair.b.controller._inboundHeld, false)
+  const failure = deferred()
+  right.once('error', (error) => failure.resolve(error))
+  pair.b.receive(b4a.from([0x12, 0x00, 0x01]))
+  t.is((await failure.promise).code, AUTHENTICATION.code)
+  await pair.b.controller.finished()
+  t.is(adapter._inboundRecordCount, 1, 'oversized body never reaches SecretStream')
+  t.is(adapter._inbound, null)
+  t.alike(pair.b.events, ['revoke', 'reset'])
+  t.ok(right.destroyed)
+})
+
+test('legacy endpoint purpose preserves records larger than 64 KiB', async function (t) {
+  const pair = createPair(t, { purpose: 1 }, { purpose: 1 })
+  const [left, right] = await openPair(pair)
+  const payload = b4a.alloc(65537, 0x53)
+  const reading = readOne(right)
+  left.write(payload)
+  const plain = await reading
+  t.is(await Writable.drained(left), true)
+  t.alike(plain, payload)
+  t.is(plain.buffer.byteLength, 65557, 'legacy plaintext stays in one atomic record')
+  await Promise.all([pair.a.controller.destroy(), pair.b.controller.destroy()])
+  t.alike(plain, payload)
+})
+
+test('endpoint rejects a whole write before exceeding its admitted raw-byte quota', async (t) => {
+  const pair = createPair(t, { maxFrames: 10, maxBytes: 90n })
+  const [left, right] = await openPair(pair)
+  const failed = deferred()
+  const remoteFailed = deferred()
+  left.once('error', failed.resolve)
+  right.once('error', remoteFailed.resolve)
+  const before = pair.a.fragments.length
+  left.write(b4a.alloc(12, 1))
+  t.is((await failed.promise).code, 'ERR_QUOTA_EXCEEDED')
+  t.is((await remoteFailed.promise).code, 'ERR_QUOTA_EXCEEDED')
+  await Promise.all([pair.a.controller.finished(), pair.b.controller.finished()])
+  t.is(pair.a.fragments.length, before, 'no prefix or partial record crosses the byte boundary')
+  t.is(await Writable.drained(left), false)
+})
+
+test('endpoint preflights all fragments of a write rather than truncating its final record', async (t) => {
+  const pair = createPair(t, { maxFrames: 69 })
+  const [left] = await openPair(pair)
+  const failed = deferred()
+  left.once('error', failed.resolve)
+  const before = pair.a.fragments.length
+  left.write(b4a.alloc(65537, 2))
+  t.is((await failed.promise).code, 'ERR_QUOTA_EXCEEDED')
+  await pair.a.controller.finished()
+  t.is(
+    pair.a.fragments.length,
+    before,
+    'a write requiring seventy DATA frames emits neither record'
+  )
+})
+
+test('exact DATA-frame exhaustion still permits FIN and reverse continuation', async (t) => {
+  const pair = createPair(t, { maxFrames: 2 })
+  const [left, right] = await openPair(pair)
+  const reading = readOne(right)
+  left.write(b4a.alloc(957, 3))
+  const received = await reading
+  t.alike(received, b4a.alloc(957, 3))
+  t.is(await Writable.drained(left), true)
+  const eof = readOne(right)
+  left.end()
+  t.is(await eof, null)
+  const reply = readOne(left)
+  right.write(b4a.from('reply after the final DATA frame'))
+  t.alike(await reply, b4a.from('reply after the final DATA frame'))
+  const reverseEof = readOne(left)
+  right.end()
+  t.is(await reverseEof, null)
+  await Promise.all([pair.a.controller.finished(), pair.b.controller.finished()])
+  t.alike(pair.a.resets, [])
+  t.alike(pair.b.resets, [])
+  t.alike(received, b4a.alloc(957, 3))
+})
+
+test('connecting facade retains early writes through real Noise and guarded binding', async (t) => {
+  const a = createSession()
+  const b = createSession()
+  a.peer = b
+  b.peer = a
+  const keyA = SecretStream.keyPair()
+  const keyB = SecretStream.keyPair()
+  const server = createPeerEndpointController({
+    owner: ACTIVE_OWNER,
+    session: b.session,
+    keyPair: keyB
+  })
+  const starting = deferred()
+  let client = null
+  const stream = createPeerConnectingStream(
+    async (connecting) => {
+      await starting.promise
+      client = createPeerEndpointController({
+        owner: ACTIVE_OWNER,
+        session: a.session,
+        keyPair: keyA,
+        remotePublicKey: keyB.publicKey,
+        stream: connecting
+      })
+      await client.whenOpen()
+    },
+    (error) => starting.reject(error || PrivateRouteError.ERR_DESTROYED())
+  )
+  t.teardown(async () => {
+    starting.reject(PrivateRouteError.ERR_DESTROYED())
+    stream.destroy()
+    await Promise.all([server.destroy(), client ? client.destroy() : Promise.resolve()])
+  })
+  const bytes = b4a.alloc(65537, 4)
+  stream.write(bytes)
+  starting.resolve()
+  const incoming = await server.whenOpen()
+  t.is(await stream.opened, true)
+  t.alike(stream.publicKey, keyA.publicKey)
+  t.alike(stream.remotePublicKey, keyB.publicKey)
+  t.alike(incoming.remotePublicKey, keyA.publicKey)
+  t.alike(await readOne(incoming), bytes.subarray(0, 65536))
+  t.alike(await readOne(incoming), bytes.subarray(65536))
+  t.is(await Writable.drained(stream), true)
+  const eof = readOne(incoming)
+  stream.end()
+  t.is(await eof, null)
+  const reverseEof = readOne(stream)
+  incoming.end()
+  t.is(await reverseEof, null)
+  await Promise.all([client.finished(), server.finished()])
+})
+
+test('connecting cancellation joins its pending setup without binding a late endpoint', async (t) => {
+  const starting = deferred()
+  let entered = false
+  let canceled = null
+  const stream = createPeerConnectingStream(
+    async () => {
+      entered = true
+      await starting.promise
+    },
+    (error) => {
+      canceled = error
+      starting.reject(error)
+    }
+  )
+  const closed = new Promise((resolve) => stream.once('close', resolve))
+  stream.write(b4a.alloc(65537, 5))
+  await waitFor(() => entered)
+  stream.destroy()
+  await closed
+  t.is(canceled.code, 'ERR_DESTROYED')
+  t.is(await stream.opened, false)
+  t.is(await Writable.drained(stream), false)
+  t.is(stream.destroyed, true)
+})
+
+test('connecting facade authenticates before any application reads or writes', async (t) => {
+  t.timeout(5000)
+  const a = createSession()
+  const b = createSession()
+  a.peer = b
+  b.peer = a
+  const local = SecretStream.keyPair()
+  const remote = SecretStream.keyPair()
+  const server = createPeerEndpointController({
+    owner: ACTIVE_OWNER,
+    session: b.session,
+    keyPair: remote
+  })
+  let client = null
+  const stream = createPeerConnectingStream(
+    async (connecting) => {
+      client = createPeerEndpointController({
+        owner: ACTIVE_OWNER,
+        session: a.session,
+        keyPair: local,
+        remotePublicKey: remote.publicKey,
+        stream: connecting
+      })
+      await client.whenOpen()
+    },
+    (error) => {
+      if (client) client.destroy(error)
+    }
+  )
+  t.teardown(async () => {
+    stream.destroy()
+    await Promise.all([server.destroy(), client ? client.destroy() : Promise.resolve()])
+  })
+  t.is(await stream.opened, true)
+  const incoming = await server.whenOpen()
+  t.alike(stream.remotePublicKey, remote.publicKey)
+  t.alike(incoming.remotePublicKey, local.publicKey)
+  const reading = readOne(incoming)
+  stream.write(b4a.from('first write after readiness'))
+  t.alike(await reading, b4a.from('first write after readiness'))
+  t.is(await Writable.drained(stream), true)
 })

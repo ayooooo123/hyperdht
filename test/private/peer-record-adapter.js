@@ -11,12 +11,13 @@ const {
   PeerRecordAdapter,
   createPeerPlaintextDuplex
 } = require('../../lib/private/peer-record-adapter')
-const PREFIX_BYTES = 3
+const {
+  PEER_RECORD_LIMITS,
+  PEER_RECORD_PREFIX_BYTES: PREFIX_BYTES
+} = require('../../lib/private/peer-protocol')
 const HEADER_BODY_BYTES = 56
 const SECRETSTREAM_ABYTES = 17
-const MAX_BODY_BYTES = 0xffffff
-const MAX_RAW_RECORD_BYTES = PREFIX_BYTES + MAX_BODY_BYTES
-const MAX_PLAINTEXT_BYTES = MAX_BODY_BYTES - SECRETSTREAM_ABYTES
+const LEGACY_LIMITS = PEER_RECORD_LIMITS[1]
 const MAX_DATA_FRAGMENT_BYTES = 977
 const MAX_SETTLE_TURNS = 144
 
@@ -203,6 +204,7 @@ function createHarness(overrides = {}) {
   }
 
   const adapter = new PeerRecordAdapter({
+    purpose: Object.prototype.hasOwnProperty.call(overrides, 'purpose') ? overrides.purpose : 2,
     onOutboundRecord(record) {
       state.outboundRecords.push(record)
       if (overrides.onOutboundRecord) return overrides.onOutboundRecord(record, state)
@@ -405,12 +407,13 @@ function feedRecord(adapter, record) {
   return offset
 }
 
-test('PeerRecordAdapter requires the exact eight own callback fields', async function (t) {
+test('PeerRecordAdapter requires purpose and exactly eight own callback fields', async function (t) {
   const harness = createHarness()
   teardownAdapter(t, harness)
   t.ok(harness.adapter instanceof PeerRecordAdapter)
 
   const inherited = Object.create({
+    purpose: 2,
     onOutboundRecord: noop,
     onInboundCapacity: noop,
     onFailure: noop,
@@ -427,6 +430,7 @@ test('PeerRecordAdapter requires the exact eight own callback fields', async fun
   }, INVALID_ROUTE)
 
   const exact = {
+    purpose: 2,
     onOutboundRecord: noop,
     onInboundCapacity: noop,
     onFailure: noop,
@@ -553,8 +557,8 @@ test('record-boundary crossing returns a charged remainder until the facade tran
   t.not(firstPlain.buffer, secondPlain.buffer, 'successive records have fresh backing stores')
 })
 
-test('zero, tiny, and maximum inbound records retain per-record weight and exact backing', async function (t) {
-  const bound = createBound({ secret: { outboundHeader: false } })
+test('zero, tiny, and legacy maximum inbound records retain per-record weight and exact backing', async function (t) {
+  const bound = createBound({ adapter: { purpose: 1 }, secret: { outboundHeader: false } })
   teardownBound(t, bound)
   await primeInboundHeader(bound)
 
@@ -590,11 +594,11 @@ test('zero, tiny, and maximum inbound records retain per-record weight and exact
     )
   }, 'tiny-record ownership transfer')
 
-  const maximum = applicationRecordOfSize(MAX_PLAINTEXT_BYTES, 0x6d)
-  t.is(maximum.byteLength, MAX_RAW_RECORD_BYTES)
-  t.is(feedRecord(bound.adapter, maximum), MAX_RAW_RECORD_BYTES)
+  const maximum = applicationRecordOfSize(LEGACY_LIMITS.plaintext, 0x6d)
+  t.is(maximum.byteLength, LEGACY_LIMITS.raw)
+  t.is(feedRecord(bound.adapter, maximum), LEGACY_LIMITS.raw)
   const plain = await maxReading
-  t.is(plain.byteLength, MAX_PLAINTEXT_BYTES)
+  t.is(plain.byteLength, LEGACY_LIMITS.plaintext)
   t.is(plain[0], 0x6d)
   t.is(plain[plain.byteLength - 1], 0x6d)
   t.is(plain.buffer, bound.secret.inboundRecords[3].buffer)
@@ -816,23 +820,23 @@ test('thrown and rejected outbound callbacks release once and fail once', async 
   t.is(rejected.state.failures.length, 1)
 })
 
-test('plaintext writes accept the exact maximum and reject one byte more before encryption', async function (t) {
-  const maximum = createBound()
+test('legacy plaintext writes accept the dependency maximum and reject one byte more before encryption', async function (t) {
+  const maximum = createBound({ adapter: { purpose: 1 } })
   teardownBound(t, maximum)
   t.is(await maximum.adapter.flush(), true, 'outbound header transferred')
 
-  const maxPlaintext = b4a.alloc(MAX_PLAINTEXT_BYTES, 0x4d)
+  const maxPlaintext = b4a.alloc(LEGACY_LIMITS.plaintext, 0x4d)
   t.is(maximum.facade.write(maxPlaintext), false)
   t.is(await Writable.drained(maximum.facade), true)
   t.is(maximum.secret.writeInputs.length, 1)
   t.is(maximum.secret.writeInputs[0], maxPlaintext, 'facade preserves borrowed plaintext identity')
-  t.is(maximum.state.outboundRecords[1].byteLength, MAX_RAW_RECORD_BYTES)
+  t.is(maximum.state.outboundRecords[1].byteLength, LEGACY_LIMITS.raw)
 
-  const oversized = createBound()
+  const oversized = createBound({ adapter: { purpose: 1 } })
   teardownBound(t, oversized)
   t.is(await oversized.adapter.flush(), true, 'second outbound header transferred')
   const error = onceEvent(oversized.facade, 'error')
-  oversized.facade.write(b4a.alloc(MAX_PLAINTEXT_BYTES + 1))
+  oversized.facade.write(b4a.alloc(LEGACY_LIMITS.plaintext + 1))
   const rejected = await error
   t.is(rejected instanceof PrivateRouteError, true)
   t.is(rejected.code, QUOTA_ERROR.code)
@@ -1211,11 +1215,11 @@ test('native SecretStream destroy while holding plaintext preserves caller-retai
   )
 })
 
-test('native empty and maximum records transfer capacity without reusing retained backing', async function (t) {
-  const sizes = [0, MAX_PLAINTEXT_BYTES]
+test('native empty and legacy maximum records transfer capacity without reusing retained backing', async function (t) {
+  const sizes = [0, LEGACY_LIMITS.plaintext]
 
   for (const size of sizes) {
-    const pair = createRealNativePair()
+    const pair = createRealNativePair({ purpose: 1 })
     teardownNativePair(t, pair)
     await openRealNativePair(pair)
 
@@ -1258,5 +1262,203 @@ test('native empty and maximum records transfer capacity without reusing retaine
 
     pair.facade.destroy()
     t.alike(plain1, snapshot1, 'next-record delivery and destroy preserve the retained bytes')
+  }
+})
+
+test('adapter rejects invalid or non-own purpose before allocation or callback work', function (t) {
+  let calls = 0
+  let reads = 0
+  const callback = () => calls++
+  const callbacks = {
+    onOutboundRecord: callback,
+    onInboundCapacity: callback,
+    onFailure: callback,
+    defer: callback,
+    acquireInbound: callback,
+    releaseInbound: callback,
+    acquireOutbound: callback,
+    releaseOutbound: callback
+  }
+  const invalid = [undefined, null, 0, 4, -1, 2.5, '2', true, {}, NaN].map((purpose) => ({
+    ...callbacks,
+    purpose
+  }))
+  invalid.push({ ...callbacks })
+  invalid.push(Object.assign(Object.create({ purpose: 2 }), callbacks))
+  invalid.push(
+    Object.defineProperty({ ...callbacks }, 'purpose', {
+      enumerable: true,
+      get() {
+        reads++
+        return 2
+      }
+    })
+  )
+  invalid.push({ ...callbacks, purpose: 2, plaintext: 1000000 })
+  const NativeArrayBuffer = globalThis.ArrayBuffer
+  let allocations = 0
+  try {
+    globalThis.ArrayBuffer = class extends NativeArrayBuffer {
+      constructor(length) {
+        super(length)
+        allocations++
+      }
+    }
+    for (const options of invalid) {
+      t.exception(() => new PeerRecordAdapter(options), INVALID_ROUTE)
+    }
+  } finally {
+    globalThis.ArrayBuffer = NativeArrayBuffer
+  }
+  t.is(allocations, 0)
+  t.is(calls, 0)
+  t.is(reads, 0, 'purpose accessors are not invoked')
+})
+
+test('private application prefix above the purpose cap rejects before allocation, acquisition or parser entry', async function (t) {
+  for (const purpose of [2, 3]) {
+    const bound = createBound({ adapter: { purpose }, secret: { outboundHeader: false } })
+    teardownBound(t, bound)
+    await primeInboundHeader(bound)
+    const prefix = prefixFor(65554)
+    const acquired = bound.state.inboundAcquires.length
+    const NativeArrayBuffer = globalThis.ArrayBuffer
+    let allocations = 0
+    let failure = null
+    try {
+      globalThis.ArrayBuffer = class extends NativeArrayBuffer {
+        constructor(length) {
+          super(length)
+          allocations++
+        }
+      }
+      bound.adapter.consumeCiphertext(prefix.subarray(0, 1))
+      bound.adapter.consumeCiphertext(prefix.subarray(1, 2))
+      try {
+        bound.adapter.consumeCiphertext(prefix.subarray(2))
+      } catch (error) {
+        failure = error
+      }
+    } finally {
+      globalThis.ArrayBuffer = NativeArrayBuffer
+    }
+    t.is(failure && failure.code, AUTHENTICATION_ERROR.code)
+    t.is(allocations, 0)
+    t.is(bound.state.inboundAcquires.length, acquired)
+    t.is(bound.secret.inboundRecords.length, 1, 'only the unchanged header reached the parser')
+    await onceClose(bound.facade)
+    t.alike(bound.state.inboundReleases, bound.state.inboundAcquires)
+  }
+})
+
+test('outbound private raw records enforce the admitted cap before acquiring a slot', async function (t) {
+  for (const purpose of [2, 3]) {
+    const harness = createHarness({ purpose })
+    teardownAdapter(t, harness)
+    harness.adapter.write(headerRecord())
+    t.is(await harness.adapter.flush(), true)
+    harness.adapter.write(applicationRecordOfSize(65536))
+    t.is(await harness.adapter.flush(), true)
+    t.alike(harness.state.outboundAcquires, [
+      { rawBytes: 59, kind: 'header' },
+      { rawBytes: 65556, kind: 'application' }
+    ])
+    const rejected = onceEvent(harness.adapter, 'error')
+    harness.adapter.write(applicationRecordOfSize(65537))
+    t.is((await rejected).code, RECORDS_UNAVAILABLE.code)
+    t.is(harness.state.outboundAcquires.length, 2)
+    t.alike(harness.state.outboundReleases, harness.state.outboundAcquires)
+  }
+})
+
+test('native private maximum inbound records retain exact backing and header framing', async function (t) {
+  for (const purpose of [2, 3]) {
+    const pair = createRealNativePair({ purpose })
+    teardownNativePair(t, pair)
+    await openRealNativePair(pair)
+    t.is(pair.peerOutbound[0].byteLength, 59)
+    t.alike(pair.peerOutbound[0].subarray(0, 3), prefixFor(56))
+    t.is(pair.state.outboundRecords[0].byteLength, 59)
+    t.alike(pair.state.outboundRecords[0].subarray(0, 3), prefixFor(56))
+    const payload = b4a.alloc(65536, 0x67)
+    const reading = readOne(pair.facade)
+    const record = await sendPeerToFacade(pair, payload)
+    const plain = await reading
+    t.is(record.byteLength, 65556)
+    t.alike(plain, payload)
+    t.is(plain.byteOffset, 4)
+    t.is(plain.buffer.byteLength, 65556)
+    pair.facade.destroy()
+    await onceClose(pair.facade)
+    t.alike(plain, payload, 'teardown does not erase public plaintext')
+    t.alike(pair.state.inboundReleases, pair.state.inboundAcquires)
+  }
+})
+
+test('native private writes fragment at 65536 bytes and await each outbound record', async function (t) {
+  for (const purpose of [2, 3]) {
+    let transfer = null
+    const pair = createRealNativePair({
+      purpose,
+      onOutboundRecord(record, state) {
+        if (state.outboundRecords.length === 1) return
+        return new Promise((resolve) => {
+          transfer = { record, resolve }
+        })
+      }
+    })
+    teardownNativePair(t, pair)
+    await openRealNativePair(pair)
+    for (const size of [65535, 65536, 65537, 1024 * 1024 + 19]) {
+      const payload = b4a.alloc(size)
+      for (let i = 0; i < size; i++) payload[i] = (i * 17 + Math.floor(i / 65536)) & 255
+      const before = pair.state.outboundRecords.length
+      let drained = false
+      t.is(pair.facade.write(payload), false)
+      const writing = Writable.drained(pair.facade).then((ok) => {
+        drained = true
+        return ok
+      })
+      let offset = 0
+      let records = 0
+      while (offset < size) {
+        await waitFor(() => transfer !== null, 'bounded native outbound record')
+        const pending = transfer
+        transfer = null
+        const length = Math.min(65536, size - offset)
+        t.is(pending.record.byteLength, length + 20)
+        t.alike(pending.record.subarray(0, 3), prefixFor(length + 17))
+        await new Promise((resolve) => setImmediate(resolve))
+        t.is(drained, false, 'the application write remains borrowed under backpressure')
+        t.is(transfer, null, 'no next record is encrypted while the current slot is held')
+        t.is(pair.state.outboundRecords.length, before + records + 1)
+        const reading = readOne(pair.peer)
+        pair.rawA.push(pending.record)
+        t.alike(await reading, payload.subarray(offset, offset + length))
+        pending.resolve()
+        offset += length
+        records++
+      }
+      t.is(await writing, true)
+      t.is(records, Math.ceil(size / 65536))
+      t.alike(pair.state.outboundReleases, pair.state.outboundAcquires)
+    }
+    const finished = onceEvent(pair.facade, 'finish')
+    pair.facade.end()
+    await finished
+    const reply = b4a.from('reverse plaintext after fragmented writer ended')
+    const reading = readOne(pair.facade)
+    await sendPeerToFacade(pair, reply)
+    const plain = await reading
+    t.alike(plain, reply)
+    const ended = onceEvent(pair.facade, 'end')
+    const closed = onceClose(pair.facade)
+    pair.facade.resume()
+    pair.peer.end()
+    pair.adapter.endCiphertext()
+    await ended
+    await closed
+    t.alike(pair.state.failures, [])
+    t.alike(plain, reply)
   }
 })
