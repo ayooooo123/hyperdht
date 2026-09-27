@@ -188,6 +188,15 @@ This remains an experimental alpha, not a production anonymity claim. Local
 Node/Bare behavior tests do not replace Linux packet-capture evidence or
 external cryptographic review.
 
+### Local private-routing evidence
+
+Run `npm run test:e2e` and `npm run test:e2e:bare` for the hermetic alpha
+scenarios. The separate `test:e2e:b1` and `test:e2e:b1:bare` commands exercise
+the intended hardening contract and deliberately fail on the pre-B1 baseline.
+`npm run bench:private-routing` prints a direct/alpha performance comparison.
+See [the C1 evidence guide](docs/private-routing-e2e.md) for topology, negative
+controls, benchmark definitions, and the remaining capture/diversity gates.
+
 ## API
 
 #### `const node = new DHT([options])`
