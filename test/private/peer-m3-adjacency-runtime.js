@@ -10,7 +10,13 @@ const {
 } = require('../../lib/private/peer-transport-wire')
 const { CELL_CLASS } = require('../../lib/private/protocol')
 const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
-const { digestPeerLimits } = require('../../lib/private/peer-crypto')
+const {
+  digestPeerLimits,
+  derivePeerLayerKeys,
+  clearPeerLayerKeys,
+  sealPeerLayer,
+  openPeerLayer
+} = require('../../lib/private/peer-crypto')
 const { readPeerNativeNeighborDiagnostics } = require('../../lib/private/peer-native-neighbors')
 const {
   createPeerLinkResponder,
@@ -57,6 +63,31 @@ async function asyncErrorCode(promise) {
   }
 }
 
+// A forwarding owner takes one owned layer stack; this one records its releases.
+function testLayerStack(fill) {
+  const keys = derivePeerLayerKeys(b4a.alloc(32, fill), b4a.alloc(290, fill + 1))
+  const forward = keys.forward.map((key) => b4a.from(key))
+  const reverse = keys.reverse.map((key) => b4a.from(key))
+  const record = { releases: 0, forward, reverse }
+  record.stack = {
+    keys: [keys],
+    release() {
+      record.releases++
+      clearPeerLayerKeys(keys)
+      return true
+    }
+  }
+  return record
+}
+
+function seededEnvelope(fill) {
+  const envelope = b4a.alloc(1101)
+  for (let index = 0; index < envelope.byteLength; index++) {
+    envelope[index] = (fill + index * 31) & 0xff
+  }
+  return envelope
+}
+
 test('peer runtime rejects a caller-created established capability', (t) => {
   const clock = fakeClock()
   const authority = createPeerM3AdjacencyAuthority({
@@ -94,7 +125,7 @@ test('authenticated peer adjacency exchanges payloads and transfers extension pr
     'the current tail cannot take the source-to-successor secret'
   )
   const proof = takePeerM3ExtensionProof(runtime)
-  const decoded = decodePeerTransport(proof.successorProof378)
+  const decoded = decodePeerTransport(proof.successorProof)
   t.is(decoded.fields.extensionIndex, 2)
   const limits = encodePeerLimits(fixture.limits)
   t.alike(decoded.fields.admittedLimitsDigest, digestPeerLimits(limits, limits, seed(0x46)))
@@ -344,10 +375,13 @@ test('closure regression: forwarding downstream release before upstream ACK', as
   const previous = adoptPeerEstablishedLink(fixture1.localAuthority, fixture1.handle)
   const next = adoptPeerEstablishedLink(fixture2.localAuthority, fixture2.handle)
 
-  const forwardingOwner = createPeerM3ForwardingOwner(previous, next)
+  const layer = testLayerStack(0x21)
+  const forwardingOwner = createPeerM3ForwardingOwner(previous, next, { layers: layer.stack })
+  const envelope = seededEnvelope(0x51)
+  const expected = openPeerLayer(layer.forward, b4a.from(envelope))
   const receiving = receivePeerM3Payload(fixture2.peerRuntime)
-  await sendPeerM3Payload(fixture1.peerRuntime, b4a.from('through both adjacency owners'))
-  t.alike(await receiving, b4a.from('through both adjacency owners'))
+  await sendPeerM3Payload(fixture1.peerRuntime, envelope)
+  t.alike(await receiving, expected, 'the forwarder removes exactly its forward layer')
 
   const socket = fixture2.f.localSocket
   const originalSend = socket.send.bind(socket)
@@ -889,7 +923,8 @@ test('Native upstream loss retires the surviving successor without reporting a f
   registerPeerM3PhysicalLossSink(next, () => {
     falseLosses++
   })
-  const forwarding = createPeerM3ForwardingOwner(previous, next)
+  const layer = testLayerStack(0x41)
+  const forwarding = createPeerM3ForwardingOwner(previous, next, { layers: layer.stack })
   t.teardown(() => {
     destroyPeerM3ForwardingOwner(forwarding)
   })
@@ -912,4 +947,76 @@ test('Native upstream loss retires the surviving successor without reporting a f
     1,
     'propagation spends the surviving branch closure partition'
   )
+  t.is(layer.releases, 1, 'upstream loss releases the forwarder layer keys once')
+  destroyPeerM3ForwardingOwner(forwarding)
+  t.is(layer.releases, 1, 'a later destroy does not release them again')
+})
+
+test('forwarding owner removes its forward layer, adds its reverse layer and releases its keys once', async (t) => {
+  const upstream = await authenticatedPeer(t, 48670)
+  const downstream = await authenticatedPeer(t, 48674)
+  const previous = adoptPeerEstablishedLink(upstream.localAuthority, upstream.handle)
+  const next = adoptPeerEstablishedLink(downstream.localAuthority, downstream.handle)
+  const layer = testLayerStack(0x61)
+  const owner = createPeerM3ForwardingOwner(previous, next, { layers: layer.stack })
+
+  const forward = seededEnvelope(0x13)
+  const expectedForward = openPeerLayer(layer.forward, b4a.from(forward))
+  t.unlike(expectedForward, forward, 'the forward layer changes the envelope')
+  const receivingForward = receivePeerM3Payload(downstream.peerRuntime)
+  await sendPeerM3Payload(upstream.peerRuntime, b4a.from(forward))
+  t.alike(await receivingForward, expectedForward, 'downstream sees the envelope without it')
+
+  const reverse = seededEnvelope(0x29)
+  const expectedReverse = sealPeerLayer(layer.reverse, b4a.from(reverse))
+  t.unlike(expectedReverse, reverse, 'the reverse layer changes the envelope')
+  const receivingReverse = receivePeerM3Payload(upstream.peerRuntime)
+  await sendPeerM3Payload(downstream.peerRuntime, b4a.from(reverse))
+  t.alike(await receivingReverse, expectedReverse, 'upstream sees the envelope with it')
+
+  t.is(layer.releases, 0, 'a live forwarder holds its keys')
+  t.is(destroyPeerM3ForwardingOwner(owner), true)
+  t.is(layer.releases, 1, 'destroy releases the keys')
+  t.is(destroyPeerM3ForwardingOwner(owner), false)
+  t.is(layer.releases, 1, 'the keys are released exactly once')
+})
+
+test('forwarding owner closes both legs when a payload is not one context envelope', async (t) => {
+  const upstream = await authenticatedPeer(t, 48680)
+  const downstream = await authenticatedPeer(t, 48684)
+  const previous = adoptPeerEstablishedLink(upstream.localAuthority, upstream.handle)
+  const next = adoptPeerEstablishedLink(downstream.localAuthority, downstream.handle)
+  const layer = testLayerStack(0x71)
+  const owner = createPeerM3ForwardingOwner(previous, next, { layers: layer.stack })
+  t.teardown(() => destroyPeerM3ForwardingOwner(owner))
+
+  const downstreamResult = asyncErrorCode(receivePeerM3Payload(downstream.peerRuntime))
+  await sendPeerM3Payload(upstream.peerRuntime, b4a.from('not a context envelope'))
+  t.is(await downstreamResult, 'ERR_DESTROYED', 'no unlayered payload is forwarded')
+  t.is(layer.releases, 1, 'closing the forwarder releases its keys')
+})
+
+test('forwarding owner requires exactly one owned layer stack', async (t) => {
+  const upstream = await authenticatedPeer(t, 48690)
+  const downstream = await authenticatedPeer(t, 48694)
+  const previous = adoptPeerEstablishedLink(upstream.localAuthority, upstream.handle)
+  const next = adoptPeerEstablishedLink(downstream.localAuthority, downstream.handle)
+  const layer = testLayerStack(0x75)
+  t.is(
+    errorCode(() => createPeerM3ForwardingOwner(previous, next)),
+    'INVALID_ROUTE'
+  )
+  t.is(
+    errorCode(() =>
+      createPeerM3ForwardingOwner(previous, next, {
+        layers: { keys: [layer.stack.keys[0], layer.stack.keys[0]], release() {} }
+      })
+    ),
+    'INVALID_ROUTE'
+  )
+  t.is(layer.releases, 0, 'a rejected owner never takes the stack')
+  const owner = createPeerM3ForwardingOwner(previous, next, { layers: layer.stack })
+  t.ok(owner, 'the same runtimes still accept a valid stack')
+  destroyPeerM3ForwardingOwner(owner)
+  t.is(layer.releases, 1)
 })

@@ -2,7 +2,7 @@ const test = require('brittle')
 const b4a = require('b4a')
 
 const { PrivateRouteError } = require('../../lib/private/errors')
-const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
+const { PEER_MESSAGE_ID, PEER_PROTOCOL_VERSION } = require('../../lib/private/peer-protocol')
 const { decodePeerSemantic, encodePeerSemantic } = require('../../lib/private/peer-semantic-wire')
 
 function expectCode(t, fn, code) {
@@ -53,8 +53,8 @@ function makeAdvertisement() {
       reachableEndpoint: bytes(19, 3),
       routeEncryptionPublicKey: bytes(32, 4),
       capabilityMask: 11,
-      minimumVersion: 2,
-      maximumVersion: 2,
+      minimumVersion: 3,
+      maximumVersion: 3,
       cellSize: 1200,
       maxCellPayload: 1146,
       contextEnvelopeSize: 1101,
@@ -299,12 +299,12 @@ test('semantic v2 fixed objects use exact envelope and body lengths', (t) => {
     const encoded = encodePeerSemantic(messageId, fields)
     t.is(encoded.byteLength, 8 + bodyBytes)
     t.is(encoded[0], 0)
-    t.is(encoded[3], 2)
+    t.is(encoded[3], PEER_PROTOCOL_VERSION)
     t.is(readU16(encoded, 4), messageId)
     t.is(readU16(encoded, 6), bodyBytes)
 
     const decoded = decodePeerSemantic(encoded)
-    t.is(decoded.protocolVersion, 2)
+    t.is(decoded.protocolVersion, PEER_PROTOCOL_VERSION)
     t.is(decoded.messageId, messageId)
     t.is(decoded.body.byteLength, bodyBytes)
     t.is(decoded.authSuffix.byteLength, 0)

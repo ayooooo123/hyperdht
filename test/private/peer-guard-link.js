@@ -35,6 +35,7 @@ const {
   PEER_MESSAGE_ID,
   PEER_BRANCH_CLASS,
   PEER_LINK_ROLE,
+  PEER_PROTOCOL_VERSION,
   encodePeerObject
 } = require('../../lib/private/peer-protocol')
 const { createPeerRelayOwner, readPeerRelayOwner } = require('../../lib/private/peer-capability')
@@ -117,14 +118,14 @@ function buildSignatureInput(messageId, label, body) {
   const input = b4a.allocUnsafe(headerOffset + 8 + bodyLen)
   input.writeUInt16BE(labelLen, 0)
   input.set(label, 2)
-  input.writeUInt32BE(2, headerOffset)
+  input.writeUInt32BE(PEER_PROTOCOL_VERSION, headerOffset)
   input.writeUInt16BE(messageId, headerOffset + 4)
   input.writeUInt16BE(bodyLen, headerOffset + 6)
   input.set(body, headerOffset + 8)
   return input
 }
 
-test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 663-byte packet with R/F/C proof and verified sendLedger', async (t) => {
+test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-byte v3 packet with R/F/C proof and verified sendLedger', async (t) => {
   const { adapterIssuer, fakeFactory } = createFakeNetwork()
 
   let leftSession = null
@@ -303,8 +304,8 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 663-
       reachableEndpoint: { host: '127.0.0.1', port: 48002 },
       routeEncryptionPublicKey32: rightRouteKey.publicKey,
       capabilityMask: 9,
-      minimumVersion: 2,
-      maximumVersion: 2,
+      minimumVersion: 3,
+      maximumVersion: 3,
       datagramReplayWindow: 64,
       maxConcurrentCircuits: 2,
       capacityClass: 1,
@@ -468,16 +469,21 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 663-
 
   const attempt = takePeerLinkReplyAttempt(replyToken, rightEstablished)
   t.ok(attempt, 'reply attempt produced')
-  t.is(attempt.packet.byteLength, 663, 'packet is genuine 663-byte reply cell')
+  t.is(attempt.packet.byteLength, 695, 'packet is genuine 695-byte v3 reply cell')
 
-  const { accept285, proof378 } = decodePeerLinkReply(attempt.packet, 1)
+  const { accept285, proofWire } = decodePeerLinkReply(attempt.packet, 1)
   t.is(accept285.byteLength, 285, 'accept component is 285 bytes')
-  t.is(proof378.byteLength, 378, 'proof component is 378 bytes')
+  t.is(proofWire.byteLength, 410, 'proof component is 410 bytes')
 
-  const decodedProof = decodePeerTransport(proof378)
+  const decodedProof = decodePeerTransport(proofWire)
   t.is(decodedProof.messageId, PEER_MESSAGE_ID.PEER_REDACTED_RESPONDER_PROOF_V2)
   t.is(decodedProof.fields.extensionIndex, 1)
   t.is(decodedProof.fields.expiresAt, reverseLimits.expiresAt)
+  t.alike(
+    decodedProof.fields.responderLinkEphemeralPublicKey,
+    decodePeerTransport(accept285).fields.responderLinkEphemeralPublicKey,
+    'the proof names the link ephemeral the signed ACCEPT carries'
+  )
 
   const expectedLimitsDigest = digestPeerLimits(
     accept285.subarray(155, 181),

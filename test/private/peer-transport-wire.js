@@ -4,7 +4,7 @@ const test = require('brittle')
 const b4a = require('b4a')
 
 const { PrivateRouteError } = require('../../lib/private/errors')
-const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
+const { PEER_MESSAGE_ID, PEER_PROTOCOL_VERSION } = require('../../lib/private/peer-protocol')
 const {
   encodePeerTransport,
   decodePeerTransport,
@@ -56,8 +56,8 @@ function sampleCapability() {
       reachableEndpoint: b4a.alloc(19, 3),
       routeEncryptionPublicKey: b4a.alloc(32, 4),
       capabilityMask: 9,
-      minimumVersion: 2,
-      maximumVersion: 2,
+      minimumVersion: 3,
+      maximumVersion: 3,
       cellSize: 1200,
       maxCellPayload: 1146,
       contextEnvelopeSize: 1101,
@@ -96,7 +96,9 @@ function sampleRedactedProof() {
       advertisedRouteEncryptionPublicKey: b4a.alloc(32, 8),
       admittedLimitsDigest: b4a.alloc(32, 9),
       expiresAt: 1000n,
-      responderProofNonce: b4a.alloc(32, 10)
+      responderProofNonce: b4a.alloc(32, 10),
+      // Equal to the sample ACCEPT's responderLinkEphemeralPublicKey below.
+      responderLinkEphemeralPublicKey: b4a.alloc(32, 14)
     },
     authSuffix: b4a.alloc(64, 11)
   }
@@ -135,7 +137,7 @@ function sampleSemanticFirstHeader(id, bodyBytes) {
   hdr[0] = 0
   hdr[1] = 0
   hdr[2] = 0
-  hdr[3] = 2 // version 2
+  hdr[3] = PEER_PROTOCOL_VERSION
   hdr[4] = id >>> 8
   hdr[5] = id & 0xff
   hdr[6] = bodyBytes >>> 8
@@ -320,7 +322,7 @@ test('roundtrip all 32 transport message types', (t) => {
         generation: 1n,
         extensionIndex: 1,
         responderAdvertisementDigest: b4a.alloc(32, 3),
-        proofLength: 378,
+        proofLength: 410,
         completeProof: proofWire,
         extensionNonce: b4a.alloc(32, 4)
       }
@@ -578,7 +580,7 @@ test('roundtrip all 32 transport message types', (t) => {
     t.ok(b4a.isBuffer(wire), `encoded message 0x${tc.messageId.toString(16)} to buffer`)
 
     const decoded = decodePeerTransport(wire)
-    t.is(decoded.protocolVersion, 2)
+    t.is(decoded.protocolVersion, PEER_PROTOCOL_VERSION)
     t.is(decoded.messageId, tc.messageId)
     t.ok(decoded.fields, `decoded fields for 0x${tc.messageId.toString(16)}`)
   }
@@ -794,7 +796,7 @@ test('link reply expectation fixes member count, order and extension index', (t)
     const reply = encodePeerLinkReply(sample.accept, proof, index)
     const decoded = decodePeerLinkReply(reply, index)
     t.alike(decoded.accept285, sample.accept)
-    t.alike(decoded.proof378, proof)
+    t.alike(decoded.proofWire, proof)
     for (const other of [0, 1, 2].filter((value) => value !== index)) {
       expectInvalid(t, () => decodePeerLinkReply(reply, other))
       expectInvalid(t, () => encodePeerLinkReply(sample.accept, proof, other))
@@ -812,11 +814,12 @@ test('link reply expectation fixes member count, order and extension index', (t)
   }
 })
 
-test('link reply rejects spliced identity, advertisement and expiry before returning members', (t) => {
+test('link reply rejects spliced identity, advertisement, ephemeral and expiry before returning members', (t) => {
   const sample = sampleLinkReply(1)
   for (const replacement of [
     { responderIdentity: b4a.alloc(32, 99) },
     { responderAdvertisementDigest: b4a.alloc(32, 99) },
+    { responderLinkEphemeralPublicKey: b4a.alloc(32, 99) },
     { expiresAt: sample.proof.fields.expiresAt - 1n }
   ]) {
     const proof = encodePeerTransport(
@@ -832,6 +835,25 @@ test('link reply rejects spliced identity, advertisement and expiry before retur
   }
 })
 
+test('v3 redacted proof requires a nonzero responder link ephemeral and exact v3 size', (t) => {
+  const sample = sampleLinkReply(2)
+  expectInvalid(t, () =>
+    encodePeerTransport(
+      PEER_MESSAGE_ID.PEER_REDACTED_RESPONDER_PROOF_V2,
+      { ...sample.proof.fields, responderLinkEphemeralPublicKey: b4a.alloc(32) },
+      sample.proof.authSuffix
+    )
+  )
+  const zeroed = b4a.from(sample.proofWire)
+  zeroed.fill(0, 8 + 306, 8 + 338)
+  expectInvalid(t, () => decodePeerTransport(zeroed))
+  t.is(sample.proofWire.byteLength, 410, 'a v3 proof is 410 bytes on the wire')
+  // A version-2 sized proof (306-byte body) is never read under the v3 schema.
+  const shortBody = b4a.concat([sample.proofWire.subarray(0, 8 + 306), sample.proof.authSuffix])
+  shortBody.writeUInt16BE(306, 6)
+  expectInvalid(t, () => decodePeerTransport(shortBody))
+})
+
 test('link reply member ownership survives caller and encoded packet erasure', (t) => {
   const sample = sampleLinkReply(2)
   const expectedAccept = b4a.from(sample.accept)
@@ -842,5 +864,5 @@ test('link reply member ownership survives caller and encoded packet erasure', (
   const decoded = decodePeerLinkReply(wire, 2)
   wire.fill(0)
   t.alike(decoded.accept285, expectedAccept)
-  t.alike(decoded.proof378, expectedProof)
+  t.alike(decoded.proofWire, expectedProof)
 })

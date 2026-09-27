@@ -1365,19 +1365,28 @@ test('Native: ordinary traffic cannot access teardown ledger, forged closure tok
   })
   await t.exception(transfer.sendClosure(Object.freeze({})), { code: 'UNAUTHORIZED' })
   const codec = new CellCodec({ crypto: cryptoSuite, cellSize: BOOTSTRAP_SIZE })
+  const { SenderCounter } = require('../../lib/private/counters')
+  t.not(taken.linkEpoch, taken.generation, 'the clear header epoch is not the circuit generation')
   for (const cellClass of [CELL_CLASS.DATAGRAM, CELL_CLASS.CONTROL]) {
     const context = taken.contexts[cellClass].tx
     const payload = b4a.from('ordinary authenticated payload')
-    const packet = codec.seal({
-      key: context.key,
-      noncePrefix: context.noncePrefix,
-      senderCounter: context.counter,
-      class: cellClass,
-      direction: DIRECTION.FORWARD,
-      epoch: taken.generation,
-      circuitId: taken.peerLocalId,
-      payload
-    })
+    const sealWithEpoch = (epoch, senderCounter) =>
+      codec.seal({
+        key: context.key,
+        noncePrefix: context.noncePrefix,
+        senderCounter,
+        class: cellClass,
+        direction: DIRECTION.FORWARD,
+        epoch,
+        circuitId: taken.peerLocalId,
+        payload
+      })
+    // The refused probe spends a throwaway counter so the ordered lane keeps no gap.
+    await t.exception(
+      transfer.send(sealWithEpoch(taken.generation, new SenderCounter()), taken.sendLedger),
+      { code: 'UNAUTHORIZED' }
+    )
+    const packet = sealWithEpoch(taken.linkEpoch, context.counter)
     await t.exception(transfer.send(packet, taken.teardownSendLedger), { code: 'UNAUTHORIZED' })
     const receiving = receivePeerM3Payload(p.peerRuntime)
     await transfer.send(packet, taken.sendLedger)
@@ -1419,6 +1428,7 @@ test('authenticated six- and seven-byte closure prefixes fail without ordinary d
     receivePeerM3Payload,
     isPeerM3Runtime
   } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const { PEER_PROTOCOL_VERSION } = require('../../lib/private/peer-protocol')
   let port = 48700
   for (const cellClass of [CELL_CLASS.DATAGRAM, CELL_CLASS.CONTROL]) {
     for (const size of [6, 7]) {
@@ -1432,7 +1442,7 @@ test('authenticated six- and seven-byte closure prefixes fail without ordinary d
         )
         try {
           const payload = b4a.alloc(size)
-          b4a.writeUInt32BE(payload, 2, 0)
+          b4a.writeUInt32BE(payload, PEER_PROTOCOL_VERSION, 0)
           payload[4] = messageId >>> 8
           payload[5] = messageId & 0xff
           const context = taken.contexts[cellClass].tx
@@ -1443,7 +1453,7 @@ test('authenticated six- and seven-byte closure prefixes fail without ordinary d
             senderCounter: context.counter,
             class: cellClass,
             direction: DIRECTION.FORWARD,
-            epoch: taken.generation,
+            epoch: taken.linkEpoch,
             circuitId: taken.peerLocalId,
             payload
           })
@@ -1504,7 +1514,7 @@ test('twelve authenticated teardown requests cannot exceed one branch reserve or
         senderCounter: context.counter,
         class: CELL_CLASS.DATAGRAM,
         direction: DIRECTION.FORWARD,
-        epoch: taken.generation,
+        epoch: taken.linkEpoch,
         circuitId: taken.peerLocalId,
         payload
       })
@@ -1568,7 +1578,7 @@ test('authenticated ordinary CONTROL spends no physical-closure allowance', asyn
         senderCounter: context.counter,
         class: CELL_CLASS.CONTROL,
         direction: DIRECTION.FORWARD,
-        epoch: taken.generation,
+        epoch: taken.linkEpoch,
         circuitId: taken.peerLocalId,
         payload
       }),

@@ -5,6 +5,7 @@ const { PrivateRouteError } = require('../../lib/private/errors')
 const { M3_MESSAGE_ID, decodeM3Object, encodeM3Object } = require('../../lib/private/protocol')
 const {
   PEER_MESSAGE_ID,
+  PEER_PROTOCOL_VERSION,
   decodePeerObject,
   encodePeerObject
 } = require('../../lib/private/peer-protocol')
@@ -56,8 +57,8 @@ const FIXTURES = [
   ['PEER_DISCOVER_RESPONSE_V2', 436, 436, 0],
   ['PEER_LINK_OFFER_V2', 360, 360, 64],
   ['PEER_LINK_ACCEPT_V2', 213, 213, 64],
-  ['PEER_REDACTED_RESPONDER_PROOF_V2', 306, 306, 64],
-  ['PEER_EXTENDED_V2', 486, 486, 0],
+  ['PEER_REDACTED_RESPONDER_PROOF_V2', 338, 338, 64],
+  ['PEER_EXTENDED_V2', 518, 518, 0],
   ['PEER_TAIL_READY_V2', 210, 210, 64],
   ['PEER_EXTEND_REQUEST_V2', 516, 516, 0],
   ['PEER_BRANCH_DESTROY_V2', 42, 42, 0],
@@ -97,7 +98,8 @@ const FIXTURES = [
   ['PRIVATE_OPEN_V2', 216, 216, 0]
 ]
 
-test('peer v2 envelopes emit the fixed registry wire identifiers', (t) => {
+test('peer v3 envelopes emit the fixed registry wire identifiers', (t) => {
+  t.is(PEER_PROTOCOL_VERSION, 3)
   const expectedIds = [
     0x0300, 0x0301, 0x0302, 0x0303, 0x0304, 0x0305, 0x0306, 0x0307, 0x0308, 0x0309, 0x030a, 0x030b,
     0x030c, 0x030d, 0x030e, 0x030f, 0x0310, 0x0311, 0x0312, 0x0313, 0x0314, 0x0315, 0x0316, 0x0317,
@@ -114,12 +116,12 @@ test('peer v2 envelopes emit the fixed registry wire identifiers', (t) => {
     })
     t.alike(
       encoded.subarray(0, 8),
-      wire(2, expectedIds[index], bodyBytes, suffixBytes).subarray(0, 8)
+      wire(PEER_PROTOCOL_VERSION, expectedIds[index], bodyBytes, suffixBytes).subarray(0, 8)
     )
   }
 })
 
-test('peer v2 envelope accepts every declared body and suffix boundary', (t) => {
+test('peer v3 envelope accepts every declared body and suffix boundary', (t) => {
   for (const [name, minimumBodyBytes, maximumBodyBytes, suffixBytes] of FIXTURES) {
     const messageId = PEER_MESSAGE_ID[name]
     const bodyLengths =
@@ -136,7 +138,7 @@ test('peer v2 envelope accepts every declared body and suffix boundary', (t) => 
       const decoded = decodePeerObject(encoded)
 
       t.is(encoded.byteLength, 8 + bodyBytes + suffixBytes)
-      t.is(decoded.protocolVersion, 2)
+      t.is(decoded.protocolVersion, PEER_PROTOCOL_VERSION)
       t.is(decoded.messageId, messageId)
       t.is(decoded.body.byteLength, bodyBytes)
       t.is(decoded.authSuffix.byteLength, suffixBytes)
@@ -146,13 +148,19 @@ test('peer v2 envelope accepts every declared body and suffix boundary', (t) => 
 
     expectInvalid(t, () => encodePeerObject({ messageId, body: b4a.alloc(minimumBodyBytes - 1) }))
     expectInvalid(t, () => encodePeerObject({ messageId, body: b4a.alloc(maximumBodyBytes + 1) }))
-    expectInvalid(t, () => decodePeerObject(wire(2, messageId, minimumBodyBytes - 1, suffixBytes)))
-    expectInvalid(t, () => decodePeerObject(wire(2, messageId, maximumBodyBytes + 1, suffixBytes)))
+    expectInvalid(t, () =>
+      decodePeerObject(wire(PEER_PROTOCOL_VERSION, messageId, minimumBodyBytes - 1, suffixBytes))
+    )
+    expectInvalid(t, () =>
+      decodePeerObject(wire(PEER_PROTOCOL_VERSION, messageId, maximumBodyBytes + 1, suffixBytes))
+    )
 
     if (name === 'PEER_DISCOVER_REQUEST_V2') {
       for (const bodyBytes of [80, 338]) {
         expectInvalid(t, () => encodePeerObject({ messageId, body: b4a.alloc(bodyBytes) }))
-        expectInvalid(t, () => decodePeerObject(wire(2, messageId, bodyBytes, 0)))
+        expectInvalid(t, () =>
+          decodePeerObject(wire(PEER_PROTOCOL_VERSION, messageId, bodyBytes, 0))
+        )
       }
     }
 
@@ -163,17 +171,23 @@ test('peer v2 envelope accepts every declared body and suffix boundary', (t) => 
         authSuffix: b4a.alloc(suffixBytes + 1)
       })
     )
-    expectInvalid(t, () => decodePeerObject(wire(2, messageId, minimumBodyBytes, suffixBytes + 1)))
+    expectInvalid(t, () =>
+      decodePeerObject(wire(PEER_PROTOCOL_VERSION, messageId, minimumBodyBytes, suffixBytes + 1))
+    )
   }
 })
 
-test('peer v2 envelope rejects v1, reserved, unknown, and trailing layouts', (t) => {
+test('peer v3 envelope rejects v1, v2, reserved, unknown, and trailing layouts', (t) => {
   const body = b4a.alloc(88)
   const valid = encodePeerObject({ messageId: PEER_MESSAGE_ID.PEER_OPEN_V2, body })
 
   const wrongVersion = b4a.from(valid)
   wrongVersion[3] = 1
   expectInvalid(t, () => decodePeerObject(wrongVersion))
+  // A version 2 object with an otherwise valid layout is never read under version 3.
+  const previousVersion = b4a.from(valid)
+  previousVersion[3] = 2
+  expectInvalid(t, () => decodePeerObject(previousVersion))
   expectInvalid(t, () => decodeM3Object(valid))
 
   const validV1Wire = encodeM3Object({
@@ -183,11 +197,11 @@ test('peer v2 envelope rejects v1, reserved, unknown, and trailing layouts', (t)
   expectInvalid(t, () => decodePeerObject(validV1Wire))
 
   expectInvalid(t, () => encodePeerObject({ messageId: 0x0008, body: b4a.alloc(48) }))
-  expectInvalid(t, () => decodePeerObject(wire(2, 0x0008, 48, 0)))
+  expectInvalid(t, () => decodePeerObject(wire(PEER_PROTOCOL_VERSION, 0x0008, 48, 0)))
 
   for (const messageId of [0x0320, 0x033f, 0x0348, 0x034c, 0x035f, 0x0366, 0x03bf, 0x03c0]) {
     expectInvalid(t, () => encodePeerObject({ messageId, body: b4a.alloc(0) }))
-    expectInvalid(t, () => decodePeerObject(wire(2, messageId, 0, 0)))
+    expectInvalid(t, () => decodePeerObject(wire(PEER_PROTOCOL_VERSION, messageId, 0, 0)))
   }
 
   const wrongBodyLength = b4a.from(valid)
@@ -204,7 +218,7 @@ test('peer v2 envelope rejects v1, reserved, unknown, and trailing layouts', (t)
   )
 })
 
-test('peer v2 decoder retains owned fields and uses intrinsic buffer operations', (t) => {
+test('peer v3 decoder retains owned fields and uses intrinsic buffer operations', (t) => {
   const body = b4a.alloc(88, 0x61)
   const signature = b4a.alloc(64, 0x62)
   const encoded = encodePeerObject({

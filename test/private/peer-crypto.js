@@ -4,19 +4,31 @@ const test = require('brittle')
 const b4a = require('b4a')
 const sodium = require('sodium-universal')
 const { PrivateRouteError } = require('../../lib/private/errors')
+const { PEER_PROTOCOL_VERSION } = require('../../lib/private/peer-protocol')
 
 const {
+  PEER_LAYER_BLOCK_SIZE,
   hashPeer,
   derivePeerKey,
   digestPeerLimits,
   createPeerTailTranscript,
+  combinePeerTailSecret,
+  agreePeerTailSecret,
   derivePeerTailKeys,
   createPeerAdjacencyTranscript,
   derivePeerAdjacencyKeys,
+  derivePeerAdjacencyHeader,
   clearPeerAdjacencyKeys,
+  derivePeerLayerKeys,
+  clearPeerLayerKeys,
+  sealPeerLayer,
+  openPeerLayer,
+  sealPeerSourceLayers,
+  openPeerSourceLayers,
   createPeerPurposePreTranscript,
   createPeerPurposeTranscript,
   derivePeerPurposeSharedSecret,
+  derivePeerPurposeTerminalKeyPair,
   computePeerPurposeMac,
   verifyPeerPurposeMac,
   derivePeerPurposeKeys,
@@ -72,7 +84,7 @@ function allZero(value) {
 }
 
 const LIMITS_INPUT = b4a.from(
-  '0000000204b0000003e900124f810000001500001388000001d1a94a200104b0000003ea00124f820000001600001388000001d1a94a20020303030303030303030303030303030303030303030303030303030303030303',
+  '0000000304b0000003e900124f810000001500001388000001d1a94a200104b0000003ea00124f820000001600001388000001d1a94a20020303030303030303030303030303030303030303030303030303030303030303',
   'hex'
 )
 const REVERSE_LIMITS = LIMITS_INPUT.subarray(4, 30)
@@ -98,7 +110,7 @@ function expectedTailTranscript(limitsDigest) {
   return b4a.concat([
     uint16(50),
     b4a.from('hyperdht-private-routes/tail-control/transcript/v2'),
-    uint32(2),
+    uint32(PEER_PROTOCOL_VERSION),
     b4a.from([2]),
     TAIL_FIELDS.branchId,
     TAIL_FIELDS.circuitId,
@@ -113,9 +125,10 @@ function expectedTailTranscript(limitsDigest) {
   ])
 }
 
-test('v2 tail transcript, limits digest, and eight KDF labels freeze vectors', (t) => {
+test('v3 tail transcript, limits digest, and eight KDF labels freeze vectors', (t) => {
+  t.is(PEER_PROTOCOL_VERSION, 3)
   const expectedLimitsDigest = b4a.from(
-    'ad0ea505115f3f93c0997d090ab23f43434ef367393d3ae69d877adc7652d5e8',
+    '8edb23aa9f458f8e53d08480f7c529c7db042c12ee66f48f105b2965a69d5e39',
     'hex'
   )
   const limitsDigest = digestPeerLimits(REVERSE_LIMITS, FORWARD_LIMITS, CANDIDATE_COMMITMENT)
@@ -128,19 +141,19 @@ test('v2 tail transcript, limits digest, and eight KDF labels freeze vectors', (
   t.alike(transcript, expectedTranscript)
   t.alike(
     hashPeer('hyperdht-private-routes/m3/tail-control/transcript-digest/v2', [transcript]),
-    b4a.from('f158224e74734e8be5175f6ffe1e180962f40aa7d53174ffe1dc60d4bc1b401d', 'hex')
+    b4a.from('cd57d311b1f4aa7eaeae3a4db0c31f47063082795b401b27687159b21d75d9f0', 'hex')
   )
 
   const keys = derivePeerTailKeys(b4a.alloc(32, 0x0c), transcript)
   const expected = {
-    tailControlForwardKey: 'a61e4ed99877699833f6f0afa35b7a13012a660c6417ee3dff910a1e3c5ce9d9',
-    tailControlReverseKey: '995d929cd27c297e1e4059130aad72e0a8cc76cbce5dba17f6f5b8f76d15790f',
-    tailControlForwardNoncePrefix: '6d4cb3a68abb51204a3d0edb017b7fdd',
-    tailControlReverseNoncePrefix: 'fb29994fd3c5b9d6c70adfd24b64dfae',
-    finalizeForwardKey: '2fa2c353e2e8d9aecd54451a420181f7e7453989c1f2474d5ce3d3e0114b5169',
-    finalizeReverseKey: 'c412cf148ebe85c60cc2eb157ce6cef899199ad97c28dfac0d1f5fbc7ee01c29',
-    finalizeForwardNoncePrefix: '2d6fff80ca66b45febc47bfeb04d80d8',
-    finalizeReverseNoncePrefix: 'ad2b084cbda9203cfb7b801dba5eecb7'
+    tailControlForwardKey: '89ffbeaf368d86eeb613dc6c901b2cf3cb8dbf8c02c8acc6b9ec92d992a93a68',
+    tailControlReverseKey: 'c9be7d7e6099b174fd71c17cc204c9bf9627829a8f9000ac0aab2ffe7885049f',
+    tailControlForwardNoncePrefix: '2b9661de2a758c3fd32d651a2aea5513',
+    tailControlReverseNoncePrefix: '3544cc7165d30efd66d3eadea32f9b15',
+    finalizeForwardKey: 'bca72230ab6a9e8afd3dd571560771d7544e436b0407c37e0edfe00ff99f69de',
+    finalizeReverseKey: 'a27cef3a41cf51a1564f0e38ea1c1a5c9122da164a4bffbfa2bc4b5b33ecf840',
+    finalizeForwardNoncePrefix: '387db24fb5c9c09a4afc2b214c6b86a9',
+    finalizeReverseNoncePrefix: '100c08090e1923c236b1521c56dc3bce'
   }
   for (const [name, hex] of Object.entries(expected)) t.alike(keys[name], b4a.from(hex, 'hex'))
 
@@ -155,14 +168,14 @@ test('v2 tail transcript, limits digest, and eight KDF labels freeze vectors', (
   )
 })
 
-test('derivePeerKey uses the exact v2 framing and independent output32', (t) => {
+test('derivePeerKey uses the exact v3 framing and independent output32', (t) => {
   const sharedSecret = b4a.alloc(32, 0x31)
   const label = 'peer-test-kdf/v2'
   const transcript = b4a.from('exact transcript bytes')
   const expectedInput = b4a.concat([
     uint16(Buffer.byteLength(label)),
     b4a.from(label),
-    uint32(2),
+    uint32(PEER_PROTOCOL_VERSION),
     uint32(transcript.byteLength),
     transcript
   ])
@@ -185,7 +198,7 @@ function referenceConfirmation(options) {
   const kdfInput = b4a.concat([
     uint16(label.byteLength),
     label,
-    uint32(2),
+    uint32(PEER_PROTOCOL_VERSION),
     uint32(context.byteLength),
     context
   ])
@@ -364,7 +377,8 @@ test('peer crypto rejects malformed transcript, limits, and confirmation keys', 
     'INVALID_ROUTE'
   )
   expectCode(t, () => derivePeerTailKeys(b4a.alloc(31), b4a.alloc(290)), 'INVALID_KEY')
-  expectCode(t, () => derivePeerTailKeys(b4a.alloc(32), b4a.alloc(289)), 'INVALID_ROUTE')
+  expectCode(t, () => derivePeerTailKeys(b4a.alloc(32), b4a.alloc(290)), 'INVALID_KEY')
+  expectCode(t, () => derivePeerTailKeys(b4a.alloc(32, 1), b4a.alloc(289)), 'INVALID_ROUTE')
   expectCode(
     t,
     () => derivePeerKey(b4a.alloc(32), 'x'.repeat(0x10000), b4a.alloc(0)),
@@ -425,7 +439,12 @@ function referenceHashPeer(domain, parts) {
   return out
 }
 
-function referenceDerivePeerKey(sharedSecret, label, transcript, protocolVersion = 2) {
+function referenceDerivePeerKey(
+  sharedSecret,
+  label,
+  transcript,
+  protocolVersion = PEER_PROTOCOL_VERSION
+) {
   const labelBytes = b4a.from(label, 'utf8')
   const framing = b4a.alloc(10 + labelBytes.byteLength)
   framing[0] = labelBytes.byteLength >>> 8
@@ -456,7 +475,7 @@ function referenceAdjacencyKeys(
   completeOffer,
   completeAccept,
   cellClass,
-  protocolVersion = 2
+  protocolVersion = PEER_PROTOCOL_VERSION
 ) {
   const prefix = b4a.from('hyperdht-private-routes/link/created/v2', 'utf8')
   const offerDigest = referenceHashPeer('hyperdht-private-routes/m3/link-offer-digest/v2', [
@@ -505,7 +524,7 @@ function referenceAdjacencyKeys(
   }
 }
 
-test('v2 adjacency KDF derives 8 distinct outputs across CONTROL0 and DATAGRAM2 and matches independent reference', (t) => {
+test('v3 adjacency KDF derives 8 distinct outputs across CONTROL0 and DATAGRAM2 and matches independent reference', (t) => {
   const secret = sequence(0x01, 32)
   const offer = sequence(0x10, 432)
   const accept = sequence(0x20, 285)
@@ -545,15 +564,17 @@ test('v2 adjacency KDF derives 8 distinct outputs across CONTROL0 and DATAGRAM2 
   const controlTamperedAccept = derivePeerAdjacencyKeys(secret, offer, acceptTampered, 0)
   t.absent(b4a.equals(controlKeys.forwardKey, controlTamperedAccept.forwardKey))
 
-  // Verify scalar0 / protocol version mismatch
+  // Verify scalar0 and scalar2 (version 2 wire) material never equals version 3 keys
   const scalar0Control = referenceAdjacencyKeys(secret, offer, accept, 0, 0)
   t.absent(b4a.equals(controlKeys.forwardKey, scalar0Control.forwardKey))
+  const scalar2Control = referenceAdjacencyKeys(secret, offer, accept, 0, 2)
+  t.absent(b4a.equals(controlKeys.forwardKey, scalar2Control.forwardKey))
 
   clearPeerAdjacencyKeys(controlKeys)
   clearPeerAdjacencyKeys(datagramKeys)
 })
 
-test('v2 adjacency KDF rejects zero shared secret, wrong widths, non-adjacency classes, and erases partial outputs on late failure', (t) => {
+test('v3 adjacency KDF rejects zero shared secret, wrong widths, non-adjacency classes, and erases partial outputs on late failure', (t) => {
   const secret = sequence(0x01, 32)
   const offer = sequence(0x10, 432)
   const accept = sequence(0x20, 285)
@@ -601,7 +622,7 @@ function purposeFixture() {
   offerHeaderBody[0] = 0
   offerHeaderBody[1] = 0
   offerHeaderBody[2] = 0
-  offerHeaderBody[3] = 2
+  offerHeaderBody[3] = PEER_PROTOCOL_VERSION
   offerHeaderBody[4] = 0x03
   offerHeaderBody[5] = 0x11
   offerHeaderBody[6] = 0
@@ -613,7 +634,7 @@ function purposeFixture() {
   acceptHeaderBody[0] = 0
   acceptHeaderBody[1] = 0
   acceptHeaderBody[2] = 0
-  acceptHeaderBody[3] = 2
+  acceptHeaderBody[3] = PEER_PROTOCOL_VERSION
   acceptHeaderBody[4] = 0x03
   acceptHeaderBody[5] = 0x12
   acceptHeaderBody[6] = 1
@@ -659,12 +680,12 @@ function purposeFixture() {
   }
 }
 
-test('v2 purpose transcript, MACs, agreement, and route KDFs match independent framing', (t) => {
+test('v3 purpose transcript, MACs, agreement, and route KDFs match independent framing', (t) => {
   const fixture = purposeFixture()
   const expectedPre = b4a.concat([
     uint16(Buffer.byteLength('hyperdht-private-routes/m3/peer-route-prepurpose/v2')),
     b4a.from('hyperdht-private-routes/m3/peer-route-prepurpose/v2'),
-    uint32(2),
+    uint32(PEER_PROTOCOL_VERSION),
     sequence(0x01, 32),
     sequence(0x21, 32),
     sequence(0x41, 32),
@@ -702,7 +723,7 @@ test('v2 purpose transcript, MACs, agreement, and route KDFs match independent f
   )
 
   const rejectHeaderBody = b4a.alloc(72)
-  rejectHeaderBody.set(uint32(2), 0)
+  rejectHeaderBody.set(uint32(PEER_PROTOCOL_VERSION), 0)
   rejectHeaderBody[4] = 0x03
   rejectHeaderBody[5] = 0x13
   rejectHeaderBody[6] = 0
@@ -736,18 +757,18 @@ test('v2 purpose transcript, MACs, agreement, and route KDFs match independent f
     fixture.purposeTranscript
   )
   t.alike(keys.forwardKey, expectedForward)
-  t.alike(keys.preSourceMacKey, b4a.from('b6b47d6e1decbee8bd245159a9839098', 'hex'))
-  t.alike(keys.preTerminalMacKey, b4a.from('fca4b5f20b27a180e18624234859fe22', 'hex'))
+  t.alike(keys.preSourceMacKey, b4a.from('6e36b6bfb94da6806d3fe2f3252c4c17', 'hex'))
+  t.alike(keys.preTerminalMacKey, b4a.from('bc3f9d0a72aef77ce66d8c38ac02a3b6', 'hex'))
   t.alike(
     keys.forwardKey,
-    b4a.from('f013048edbf4bb121167b9768320b5f5dc5b01dad902195aa14edea12807dc5b', 'hex')
+    b4a.from('969fcb1fe4326ae2025924c28303bcb819a80f19dd3e698ace6c7a267a73247e', 'hex')
   )
   t.alike(
     keys.reverseKey,
-    b4a.from('bedf0810f498277863cb2ed3c0a381377a7b89ee9a0ab213120f99e087c338ea', 'hex')
+    b4a.from('bfe074ade0b2b6905d0ec2e14586d62ef25d87db5c201a50b39980e4704513f2', 'hex')
   )
-  t.alike(keys.forwardNoncePrefix, b4a.from('bcfef037702da0f74f5ddf48bb9efd6f', 'hex'))
-  t.alike(keys.reverseNoncePrefix, b4a.from('fd220087ff3d9ae37ecd7c33d6b526ee', 'hex'))
+  t.alike(keys.forwardNoncePrefix, b4a.from('5b2bf5a34fb72b18405105e44b8e84c0', 'hex'))
+  t.alike(keys.reverseNoncePrefix, b4a.from('8c5651195d6717482182133523155f71', 'hex'))
   t.alike(keys.reverseKey, expectedReverse)
   t.alike(
     keys.preSourceMacKey,
@@ -767,7 +788,7 @@ test('v2 purpose transcript, MACs, agreement, and route KDFs match independent f
   t.ok(allZero(keys.preSourceMacKey))
 })
 
-test('v2 purpose agreement rejects low-order inputs and MAC forgery', (t) => {
+test('v3 purpose agreement rejects low-order inputs and MAC forgery', (t) => {
   const alicePublic = b4a.alloc(32)
   const aliceSecret = b4a.alloc(32)
   const bobPublic = b4a.alloc(32)
@@ -803,7 +824,7 @@ test('v2 purpose agreement rejects low-order inputs and MAC forgery', (t) => {
   expectCode(t, () => computePeerPurposeMac(sourceKey, b4a.alloc(8)), 'INVALID_ROUTE')
 })
 
-test('v2 purpose and final digests bind every negotiated field and direction', (t) => {
+test('v3 purpose and final digests bind every negotiated field and direction', (t) => {
   const fixture = purposeFixture()
   const digestFields = {
     tailControlTranscriptDigest: sequence(0x01, 32),
@@ -832,11 +853,11 @@ test('v2 purpose and final digests bind every negotiated field and direction', (
   const purposeDigest = createPeerPurposeDigest(digestFields)
   t.alike(
     digestFields.offerDigest,
-    b4a.from('fc128d276e5871c1e0a7351ad192db38be3d0a8d839a5a201e0f4adf35c63cf7', 'hex')
+    b4a.from('fad093d437101d2ad4d39b807270912e74e70eb02f4d3e16c254d124d67b96ac', 'hex')
   )
   t.alike(
     digestFields.acceptDigest,
-    b4a.from('1091e932c0a5f3afa6872b6bb78be2a7f0cecbfc988547daec78141a84633b0b', 'hex')
+    b4a.from('8a8918a08617ba1a9f5681f67180809f66d3dfe59394fabdc4688802fbb76c18', 'hex')
   )
   const changed = createPeerPurposeDigest({
     ...digestFields,
@@ -845,7 +866,7 @@ test('v2 purpose and final digests bind every negotiated field and direction', (
   t.unlike(purposeDigest, changed)
   t.alike(
     purposeDigest,
-    b4a.from('7129808f0223eb417786f67478ed204b3045d8dbf01c18c2a60e79608c6dd7ae', 'hex')
+    b4a.from('dff13a2d50b1d4271bcc6bdb756c89bc832f197d0da743e55a6b0680bcdab60a', 'hex')
   )
 
   const sourceBody = sequence(0x91, 64)
@@ -871,7 +892,7 @@ test('v2 purpose and final digests bind every negotiated field and direction', (
   })
   t.alike(
     finalDigest,
-    b4a.from('57edc09c02cc467d18de3965875afdca2725c85b7b3ac85b3d9f45864f487006', 'hex')
+    b4a.from('e17f0aae747c2b20ec8bd5f3be56c7f3fe75be19a3f39e5c3cc5d87c41cbb2c0', 'hex')
   )
   t.unlike(
     finalDigest,
@@ -884,4 +905,355 @@ test('v2 purpose and final digests bind every negotiated field and direction', (
       terminalConfirmDigest
     })
   )
+})
+
+function x25519KeyPair(seedByte) {
+  const publicKey = b4a.alloc(32)
+  const secretKey = b4a.alloc(32, seedByte)
+  sodium.crypto_scalarmult_base(publicKey, secretKey)
+  return { publicKey, secretKey }
+}
+
+function x25519(secretKey, publicKey) {
+  const output = b4a.alloc(32)
+  sodium.crypto_scalarmult(output, secretKey, publicKey)
+  return output
+}
+
+function differingBytes(left, right) {
+  let count = 0
+  for (let index = 0; index < left.byteLength; index++) {
+    if (left[index] !== right[index]) count++
+  }
+  return count
+}
+
+function referenceLayerRound(block, roundKey, kind) {
+  const left = block.subarray(0, 32)
+  const right = block.subarray(32)
+  if (kind === 'stream') {
+    const streamKey = b4a.alloc(32)
+    for (let index = 0; index < 32; index++) streamKey[index] = left[index] ^ roundKey[index]
+    const keystream = b4a.alloc(right.byteLength)
+    sodium.crypto_stream_xchacha20(keystream, b4a.alloc(24), streamKey)
+    for (let index = 0; index < right.byteLength; index++) right[index] ^= keystream[index]
+  } else {
+    const digest = b4a.alloc(32)
+    sodium.crypto_generichash(digest, right, roundKey)
+    for (let index = 0; index < 32; index++) left[index] ^= digest[index]
+  }
+}
+
+function referenceSealLayer(roundKeys, input) {
+  const block = b4a.from(input)
+  referenceLayerRound(block, roundKeys[0], 'stream')
+  referenceLayerRound(block, roundKeys[1], 'hash')
+  referenceLayerRound(block, roundKeys[2], 'stream')
+  referenceLayerRound(block, roundKeys[3], 'hash')
+  return block
+}
+
+test('v3 tail secret binds the static agreement, the responder ephemeral agreement, and its public key', (t) => {
+  const staticShared = b4a.alloc(32, 0x21)
+  const ephemeralShared = b4a.alloc(32, 0x22)
+  const responderEphemeral = b4a.alloc(32, 0x23)
+  const expected = referenceDerivePeerKey(
+    staticShared,
+    'hyperdht-private-routes/kdf/v3/tail-secret',
+    b4a.concat([ephemeralShared, responderEphemeral])
+  )
+  const combined = combinePeerTailSecret(staticShared, ephemeralShared, responderEphemeral)
+  t.alike(combined, expected)
+  t.alike(
+    combined,
+    b4a.from('bbb676d5e1bbfb71f8eab433986e8af47babad08dc46127ac6e7ab90ed89a332', 'hex')
+  )
+
+  // Both ends compute the same secret from their own secrets.
+  const client = x25519KeyPair(0x31)
+  const route = x25519KeyPair(0x32)
+  const responder = x25519KeyPair(0x33)
+  const sourceSide = combinePeerTailSecret(
+    x25519(client.secretKey, route.publicKey),
+    x25519(client.secretKey, responder.publicKey),
+    responder.publicKey
+  )
+  const relaySide = combinePeerTailSecret(
+    x25519(route.secretKey, client.publicKey),
+    x25519(responder.secretKey, client.publicKey),
+    responder.publicKey
+  )
+  t.alike(sourceSide, relaySide)
+
+  // A party holding the route secret and the recorded public values, but not the
+  // erased responder ephemeral, cannot reproduce the secret.
+  const withoutEphemeral = combinePeerTailSecret(
+    x25519(route.secretKey, client.publicKey),
+    x25519(route.secretKey, responder.publicKey),
+    responder.publicKey
+  )
+  t.unlike(withoutEphemeral, sourceSide)
+
+  const otherResponder = x25519KeyPair(0x34)
+  t.unlike(
+    combinePeerTailSecret(
+      x25519(client.secretKey, route.publicKey),
+      x25519(client.secretKey, otherResponder.publicKey),
+      otherResponder.publicKey
+    ),
+    sourceSide
+  )
+  t.unlike(
+    combinePeerTailSecret(staticShared, ephemeralShared, b4a.alloc(32, 0x24)),
+    combined,
+    'the responder public key is bound even with equal agreements'
+  )
+
+  expectCode(
+    t,
+    () => combinePeerTailSecret(b4a.alloc(32), ephemeralShared, responderEphemeral),
+    'INVALID_KEY'
+  )
+  expectCode(
+    t,
+    () => combinePeerTailSecret(staticShared, b4a.alloc(32), responderEphemeral),
+    'INVALID_KEY'
+  )
+  expectCode(
+    t,
+    () => combinePeerTailSecret(staticShared, ephemeralShared, b4a.alloc(32)),
+    'INVALID_KEY'
+  )
+  expectCode(
+    t,
+    () => combinePeerTailSecret(staticShared, ephemeralShared, b4a.alloc(31, 1)),
+    'INVALID_KEY'
+  )
+})
+
+test('v3 adjacency header derives one epoch and four counter origins per link from an independent reference', (t) => {
+  const secret = sequence(0x01, 32)
+  const offer = sequence(0x10, 432)
+  const accept = sequence(0x20, 285)
+  const transcript = b4a.concat([
+    referenceHashPeer('hyperdht-private-routes/m3/link-offer-digest/v2', [offer]),
+    referenceHashPeer('hyperdht-private-routes/m3/link-accept-digest/v2', [accept])
+  ])
+  const epochOutput = referenceDerivePeerKey(
+    secret,
+    'hyperdht-private-routes/kdf/v3/link-epoch',
+    transcript
+  )
+  const originOutput = referenceDerivePeerKey(
+    secret,
+    'hyperdht-private-routes/kdf/v3/counter-origin',
+    transcript
+  )
+
+  const header = derivePeerAdjacencyHeader(secret, offer, accept)
+  t.is(header.epoch, epochOutput.readBigUInt64BE(0))
+  t.is(header.origins[0].forward, BigInt(originOutput.readUInt32BE(0)))
+  t.is(header.origins[0].reverse, BigInt(originOutput.readUInt32BE(4)))
+  t.is(header.origins[2].forward, BigInt(originOutput.readUInt32BE(8)))
+  t.is(header.origins[2].reverse, BigInt(originOutput.readUInt32BE(12)))
+  t.is(header.epoch, 0x5235aecc6fe5a2c0n)
+  t.alike(
+    [
+      header.origins[0].forward,
+      header.origins[0].reverse,
+      header.origins[2].forward,
+      header.origins[2].reverse
+    ],
+    [37187354n, 995430871n, 1448339244n, 1087487158n]
+  )
+
+  // Another link differs in every header value, so no clear value repeats across hops.
+  const otherOffer = sequence(0x11, 432)
+  const other = derivePeerAdjacencyHeader(secret, otherOffer, accept)
+  t.not(other.epoch, header.epoch)
+  for (const cellClass of [0, 2]) {
+    t.not(other.origins[cellClass].forward, header.origins[cellClass].forward)
+    t.not(other.origins[cellClass].reverse, header.origins[cellClass].reverse)
+  }
+
+  expectCode(t, () => derivePeerAdjacencyHeader(b4a.alloc(32), offer, accept), 'INVALID_KEY')
+  expectCode(t, () => derivePeerAdjacencyHeader(secret, b4a.alloc(431), accept), 'INVALID_ROUTE')
+  expectCode(t, () => derivePeerAdjacencyHeader(secret, offer, b4a.alloc(284)), 'INVALID_ROUTE')
+})
+
+test('v3 layer keys and wide-block layer transform match an independent reference', (t) => {
+  const transcript = createPeerTailTranscript(TAIL_FIELDS)
+  const secret = b4a.alloc(32, 0x0c)
+  const keys = derivePeerLayerKeys(secret, transcript)
+  const labels = []
+  for (const direction of ['forward', 'reverse']) {
+    for (let round = 1; round <= 4; round++) {
+      labels.push(`hyperdht-private-routes/kdf/v3/layer/${direction}/${round}`)
+    }
+  }
+  const derived = [...keys.forward, ...keys.reverse]
+  t.is(derived.length, 8)
+  for (let index = 0; index < 8; index++) {
+    t.alike(derived[index], referenceDerivePeerKey(secret, labels[index], transcript))
+  }
+  t.is(new Set(derived.map((key) => b4a.toString(key, 'hex'))).size, 8, 'eight distinct keys')
+  t.alike(
+    keys.forward[0],
+    b4a.from('756c924a744c32c956fc0ffe32cbefe9f7f096d193b7579e0572b79aa52c00dd', 'hex')
+  )
+
+  t.is(PEER_LAYER_BLOCK_SIZE, 1101)
+  const plain = sequence(0x00, PEER_LAYER_BLOCK_SIZE)
+  const sealed = sealPeerLayer(keys.forward, b4a.from(plain))
+  t.alike(sealed, referenceSealLayer(keys.forward, plain))
+  t.alike(
+    sealed.subarray(0, 48),
+    b4a.from(
+      'b029b909e54c7052ec23d6381f49eb9a9f97d92e01f98bb3b26e4ffa07a9890b4f431e5402d6129e98e4b9800ce7d49c',
+      'hex'
+    )
+  )
+  t.alike(openPeerLayer(keys.forward, b4a.from(sealed)), plain, 'round trip')
+  t.ok(differingBytes(sealed, plain) > 1000, 'every region of the envelope changes')
+
+  // One flipped input bit changes the whole output.
+  const flippedInput = b4a.from(plain)
+  flippedInput[600] ^= 1
+  t.ok(differingBytes(sealPeerLayer(keys.forward, flippedInput), sealed) > 1000)
+
+  // A modified sealed block opens to unrelated bytes, not to a recognisable mark.
+  const tampered = b4a.from(sealed)
+  tampered[1000] ^= 0x80
+  const opened = openPeerLayer(keys.forward, tampered)
+  t.ok(differingBytes(opened, plain) > 1000, 'tampering is not a controllable change')
+
+  // Two hops' layers over the same envelope are unrelated.
+  const otherKeys = derivePeerLayerKeys(b4a.alloc(32, 0x0d), transcript)
+  t.ok(differingBytes(sealPeerLayer(otherKeys.forward, b4a.from(plain)), sealed) > 1000)
+  t.ok(differingBytes(sealPeerLayer(keys.reverse, b4a.from(plain)), sealed) > 1000)
+
+  expectCode(t, () => sealPeerLayer(keys.forward, b4a.alloc(1100)), 'INVALID_ROUTE')
+  expectCode(t, () => openPeerLayer(keys.forward.slice(0, 3), b4a.alloc(1101)), 'INVALID_ROUTE')
+  expectCode(t, () => derivePeerLayerKeys(b4a.alloc(32), transcript), 'INVALID_KEY')
+  expectCode(t, () => derivePeerLayerKeys(secret, b4a.alloc(289)), 'INVALID_ROUTE')
+
+  clearPeerLayerKeys(keys)
+  t.ok(
+    [...keys.forward, ...keys.reverse].every((key) => allZero(key)),
+    'layer keys erase'
+  )
+})
+
+test('v3 source layer stacks lose one layer per forwarder and give every link its own view', (t) => {
+  const transcript = createPeerTailTranscript(TAIL_FIELDS)
+  const guard = derivePeerLayerKeys(b4a.alloc(32, 0x41), transcript)
+  const safety = derivePeerLayerKeys(b4a.alloc(32, 0x42), transcript)
+  const stack = [guard, safety]
+  const envelope = sequence(0x10, PEER_LAYER_BLOCK_SIZE)
+  const distinct = (views, label) => {
+    for (let a = 0; a < views.length; a++) {
+      for (let b = a + 1; b < views.length; b++) {
+        t.ok(differingBytes(views[a], views[b]) > 1000, `${label} views ${a} and ${b} differ`)
+      }
+    }
+  }
+
+  // Forward: the source wraps once; each forwarder removes exactly its own layer.
+  const sourceToGuard = sealPeerSourceLayers(stack, b4a.from(envelope))
+  const guardToSafety = openPeerLayer(guard.forward, b4a.from(sourceToGuard))
+  const safetyToTerminal = openPeerLayer(safety.forward, b4a.from(guardToSafety))
+  t.alike(safetyToTerminal, envelope, 'the terminal receives the envelope the source sealed')
+  distinct([sourceToGuard, guardToSafety, safetyToTerminal], 'forward')
+
+  // Reverse: each forwarder adds its layer; the source removes them guard first.
+  const safetyToGuard = sealPeerLayer(safety.reverse, b4a.from(envelope))
+  const guardToSource = sealPeerLayer(guard.reverse, b4a.from(safetyToGuard))
+  t.alike(openPeerSourceLayers(stack, b4a.from(guardToSource)), envelope, 'reverse round trip')
+  distinct([envelope, safetyToGuard, guardToSource], 'reverse')
+  t.ok(differingBytes(guardToSource, sourceToGuard) > 1000, 'directions differ on one link')
+
+  // A frame the safety sends itself carries only the guard's layer: removing both layers
+  // gives noise, never a readable frame.
+  const safetyOwn = sealPeerLayer(guard.reverse, b4a.from(envelope))
+  t.ok(differingBytes(openPeerSourceLayers(stack, b4a.from(safetyOwn)), envelope) > 1000)
+
+  // Before any extension the guard is the tail and the stack is empty.
+  t.alike(sealPeerSourceLayers([], b4a.from(envelope)), envelope)
+  t.alike(openPeerSourceLayers([], b4a.from(envelope)), envelope)
+  expectCode(t, () => sealPeerSourceLayers(null, b4a.from(envelope)), 'INVALID_ROUTE')
+  expectCode(t, () => openPeerSourceLayers(stack, b4a.alloc(1100)), 'INVALID_ROUTE')
+  clearPeerLayerKeys(guard)
+  clearPeerLayerKeys(safety)
+})
+
+test('v3 tail agreement runs both agreements under caller custody and erases them', (t) => {
+  const client = x25519KeyPair(0x51)
+  const route = x25519KeyPair(0x52)
+  const responder = x25519KeyPair(0x53)
+  let staticShared = null
+  let ephemeralShared = null
+  const secret = agreePeerTailSecret(
+    () => (staticShared = x25519(client.secretKey, route.publicKey)),
+    () => (ephemeralShared = x25519(client.secretKey, responder.publicKey)),
+    responder.publicKey
+  )
+  t.alike(
+    secret,
+    combinePeerTailSecret(
+      x25519(route.secretKey, client.publicKey),
+      x25519(responder.secretKey, client.publicKey),
+      responder.publicKey
+    ),
+    'the relay side, using its own secrets, derives the same tail secret'
+  )
+  t.ok(allZero(staticShared) && allZero(ephemeralShared), 'both agreements are erased')
+
+  let first = null
+  expectCode(
+    t,
+    () =>
+      agreePeerTailSecret(
+        () => (first = x25519(client.secretKey, route.publicKey)),
+        () => {
+          throw PrivateRouteError.INVALID_KEY()
+        },
+        responder.publicKey
+      ),
+    'INVALID_KEY'
+  )
+  t.ok(allZero(first), 'a failed second agreement still erases the first')
+  expectCode(t, () => agreePeerTailSecret(null, () => null, responder.publicKey), 'INVALID_ROUTE')
+})
+
+test('v3 purpose terminal key pair derives from the final tail secret and agrees under X25519', (t) => {
+  const transcript = createPeerTailTranscript(TAIL_FIELDS)
+  const secret = b4a.alloc(32, 0x0c)
+  const pair = derivePeerPurposeTerminalKeyPair(secret, transcript)
+  t.alike(
+    pair.secretKey,
+    referenceDerivePeerKey(
+      secret,
+      'hyperdht-private-routes/kdf/v3/peer-route/terminal-key',
+      transcript
+    )
+  )
+  const expectedPublic = b4a.alloc(32)
+  sodium.crypto_scalarmult_base(expectedPublic, pair.secretKey)
+  t.alike(pair.publicKey, expectedPublic)
+  t.alike(
+    pair.publicKey,
+    b4a.from('1b6f081f4183f011099d45c752d1eacffd261e9ea23f4ff1bc2f1cac528eab4e', 'hex')
+  )
+
+  const client = x25519KeyPair(0x41)
+  t.alike(
+    derivePeerPurposeSharedSecret(client.secretKey, pair.publicKey),
+    derivePeerPurposeSharedSecret(pair.secretKey, client.publicKey),
+    'source and terminal reach the same purpose agreement'
+  )
+  const otherTail = derivePeerPurposeTerminalKeyPair(b4a.alloc(32, 0x0d), transcript)
+  t.unlike(otherTail.publicKey, pair.publicKey)
+
+  expectCode(t, () => derivePeerPurposeTerminalKeyPair(b4a.alloc(32), transcript), 'INVALID_KEY')
+  expectCode(t, () => derivePeerPurposeTerminalKeyPair(secret, b4a.alloc(290 - 1)), 'INVALID_ROUTE')
 })

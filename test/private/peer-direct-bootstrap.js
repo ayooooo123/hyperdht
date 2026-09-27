@@ -27,6 +27,7 @@ const {
 const { createPeerLedger, readPeerLedger } = require('../../lib/private/peer-ledger')
 const {
   PEER_MESSAGE_ID,
+  PEER_PROTOCOL_VERSION,
   encodePeerObject,
   decodePeerObject
 } = require('../../lib/private/peer-protocol')
@@ -105,8 +106,8 @@ function buildTestAdvertisementFields(edKeys, xKeys, endpoint, expiresAt = 20000
     reachableEndpoint: endpoint,
     routeEncryptionPublicKey32: xKeys.publicKey,
     capabilityMask: mask,
-    minimumVersion: 2,
-    maximumVersion: 2,
+    minimumVersion: 3,
+    maximumVersion: 3,
     datagramReplayWindow: 64,
     maxConcurrentCircuits: 128,
     capacityClass: 1,
@@ -258,7 +259,7 @@ function reSignAdvertisement(body188, secretKey) {
   const sigInput = b4a.concat([
     labelLen,
     label,
-    b4a.from([0, 0, 0, 2]),
+    b4a.from([0, 0, 0, PEER_PROTOCOL_VERSION]),
     b4a.from([0x03, 0x00]),
     b4a.from([0x00, 0xbc]),
     body188
@@ -797,7 +798,7 @@ test('discover rejects same-identity re-signed replacement CAPS against locator 
     const sigInput = b4a.concat([
       labelLen,
       label,
-      b4a.from([0, 0, 0, 2]),
+      b4a.from([0, 0, 0, PEER_PROTOCOL_VERSION]),
       b4a.from([0x03, 0x03]),
       b4a.from([0x01, 0x4f]),
       body

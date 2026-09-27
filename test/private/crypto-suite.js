@@ -109,6 +109,22 @@ test('X25519 rejects a low-order all-zero public key', (t) => {
   expectCode(t, () => cryptoSuite.keyAgreement(alice.secretKey, b4a.alloc(32)), 'INVALID_KEY')
 })
 
+test('X25519 rejects a non-canonical public key whose bit 255 is set', (t) => {
+  const alice = cryptoSuite.encryptionKeyPair(seed(1))
+  const bob = cryptoSuite.encryptionKeyPair(seed(2))
+  t.is(bob.publicKey[31] & 0x80, 0, 'generated public keys are canonical')
+  const alias = b4a.from(bob.publicKey)
+  alias[31] |= 0x80
+  // The alias names the same point, so accepting it would give one shared secret two
+  // distinct public encodings.
+  expectCode(t, () => cryptoSuite.keyAgreement(alice.secretKey, alias), 'INVALID_KEY')
+  t.alike(
+    cryptoSuite.keyAgreement(alice.secretKey, bob.publicKey),
+    cryptoSuite.keyAgreement(bob.secretKey, alice.publicKey),
+    'the canonical encoding still agrees'
+  )
+})
+
 test('X25519 outputs do not alias caller inputs', (t) => {
   const alice = cryptoSuite.encryptionKeyPair(seed(1))
   const bob = cryptoSuite.encryptionKeyPair(seed(2))

@@ -7,7 +7,9 @@ const NativeUDX = require('udx-native')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { CELL_CLASS } = require('../../lib/private/protocol')
+const { PEER_PROTOCOL_VERSION } = require('../../lib/private/peer-protocol')
 const { sealPeerContextFrame, openPeerContextFrame } = require('../../lib/private/peer-m3-context')
+const { sealPeerSourceLayers } = require('../../lib/private/peer-crypto')
 const {
   takeM3RouteTransport,
   sendM3RouteFrame,
@@ -30,7 +32,8 @@ const {
   takePeerTailFinalRuntime,
   isPeerTailControlOwner,
   isPeerTailFinalExitHandoff,
-  takePeerFinalCarrierAuthorization
+  takePeerFinalCarrierAuthorization,
+  readPeerFinalCarrierLayers
 } = require('../../lib/private/peer-tail-control')
 const {
   adoptPeerEstablishedLink,
@@ -158,7 +161,7 @@ test('readPeerTailControl returns nonsecret descriptor, keeps secrets private, a
 
   const desc = readPeerTailControl(responderSession)
   t.is(desc.initiator, false)
-  t.is(desc.protocolVersion, 2)
+  t.is(desc.protocolVersion, PEER_PROTOCOL_VERSION)
   t.is(desc.branchClass, 2)
   t.is(desc.extensionIndex, 2)
   t.is(desc.tailSharedSecret, undefined, 'tailSharedSecret is never exposed in descriptor')
@@ -283,7 +286,7 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
         t,
         native: true,
         basePort: 48300,
-        poolCapacity: 4096,
+        poolCapacity: 8192,
         onTerminalFinalReady(session) {
           terminalSession = session
         }
@@ -364,6 +367,29 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
   const terminalTailSession = await f.terminal.tailStarted
   t.is(terminalSession, terminalTailSession, 'terminal session matches started tail session')
 
+  // Version 3: every hop carries its own identifiers. The source now tracks the terminal's,
+  // and no relay shares a branch, circuit or generation with any other relay.
+  const hopDescriptors = [
+    readPeerTailControl(await f.guard.tailStarted),
+    readPeerTailControl(await f.safety.tailStarted),
+    readPeerTailControl(terminalTailSession)
+  ]
+  const terminalDesc = hopDescriptors[2]
+  t.alike(desc2.branchId, terminalDesc.branchId, 'source tracks the terminal branch identifier')
+  t.alike(desc2.circuitId, terminalDesc.circuitId, 'source tracks the terminal circuit identifier')
+  t.is(desc2.generation, terminalDesc.generation, 'source tracks the terminal generation')
+  for (const [a, b, label] of [
+    [0, 1, 'guard and safety'],
+    [1, 2, 'safety and terminal'],
+    [0, 2, 'guard and terminal']
+  ]) {
+    const left = hopDescriptors[a]
+    const right = hopDescriptors[b]
+    t.absent(b4a.equals(left.branchId, right.branchId), `${label} share no branch identifier`)
+    t.absent(b4a.equals(left.circuitId, right.circuitId), `${label} share no circuit identifier`)
+    t.not(left.generation, right.generation, `${label} share no generation`)
+  }
+
   // Step 5: Final handoff creation on Source
   const handoff = createPeerFinalExitHandoff(sourceTailSession)
   t.ok(handoff, 'final exit handoff created')
@@ -390,7 +416,12 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
   const finalResult = takePeerTailFinalRuntime(sourceTailSession, activationOwner)
   t.ok(finalResult.runtime, 'source final runtime taken')
   t.ok(finalResult.authorization, 'source carrier authorization returned')
-  t.is(finalResult.generation, 1n, 'source generation is 1n')
+  t.is(finalResult.generation, 1n, 'source runtime generation is the guard link generation')
+  // The source removes the guard's and safety's layers; raw injections below are wrapped
+  // the same way so both forwarders deliver them unchanged to the terminal.
+  const sourceLayers = readPeerFinalCarrierLayers(finalResult.authorization, finalResult.runtime)
+  t.is(sourceLayers.length, 2, 'the source holds one layer key set per forwarding hop')
+  const layered = (envelope) => sealPeerSourceLayers(sourceLayers, b4a.from(envelope))
   t.ok(finalResult.clockIdentity, 'source clockIdentity present')
   t.ok(finalResult.parentLocalDeadline > 0n, 'source parentLocalDeadline valid')
   t.ok(finalResult.wireExpiresAt > 0n, 'source wireExpiresAt valid')
@@ -423,7 +454,12 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
   const termResult = takePeerTailFinalRuntime(terminalTailSession, terminalActivationOwner)
   t.ok(termResult.runtime, 'terminal final runtime taken')
   t.ok(termResult.authorization, 'terminal carrier authorization returned')
-  t.is(termResult.generation, 1n, 'terminal generation matches')
+  t.is(
+    termResult.generation,
+    terminalDesc.generation,
+    "terminal runtime generation is the terminal hop's own generation"
+  )
+  t.not(termResult.generation, finalResult.generation, 'guard and terminal links differ')
   t.ok(termResult.clockIdentity, 'terminal clockIdentity present')
   t.ok(termResult.parentLocalDeadline > 0n, 'terminal parentLocalDeadline valid')
   t.ok(termResult.wireExpiresAt > 0n, 'terminal wireExpiresAt valid')
@@ -447,7 +483,7 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
     'ERR_BUSY',
     'a live reader prevents transfer even with genuine final authorization'
   )
-  await sendPeerM3Payload(finalResult.runtime, obsoleteTailEnvelope)
+  await sendPeerM3Payload(finalResult.runtime, layered(obsoleteTailEnvelope))
   const pendingRawPayload = await pendingRawRead
   t.alike(
     pendingRawPayload,
@@ -462,7 +498,10 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
     [prematureRouteEnvelope, termResult.authorization, 'ERR_BUSY'],
     [obsoleteTailEnvelope, Object.freeze({}), 'UNAUTHORIZED']
   ]) {
-    await sendPeerM3Payload(finalResult.runtime, { class: CELL_CLASS.DATAGRAM, payload })
+    await sendPeerM3Payload(finalResult.runtime, {
+      class: CELL_CLASS.DATAGRAM,
+      payload: layered(payload)
+    })
     await new Promise((resolve) => setTimeout(resolve, 10))
     let error = null
     try {
@@ -475,9 +514,9 @@ test('two-extension v2 tail control and one-shot final handoff complete flow ove
     t.alike(retained, payload, 'failed transfer neither drains nor erases the queued envelope')
     retained.fill(0)
   }
-  await sendPeerM3Payload(finalResult.runtime, obsoleteTailEnvelope)
+  await sendPeerM3Payload(finalResult.runtime, layered(obsoleteTailEnvelope))
   holdNextTerminalPacket = true
-  await sendPeerM3Payload(finalResult.runtime, obsoleteTailEnvelope)
+  await sendPeerM3Payload(finalResult.runtime, layered(obsoleteTailEnvelope))
   await heldTail
   obsoleteTailEnvelope.fill(0)
   prematureRouteEnvelope.fill(0)
@@ -698,7 +737,7 @@ test('admitted relay neighbors carry both tail extensions to a ready terminal', 
     t,
     native: true,
     basePort: 48760,
-    poolCapacity: 4096,
+    poolCapacity: 8192,
     admission: true,
     onTerminalFinalReady(session) {
       terminalSession = session
@@ -770,8 +809,8 @@ test('regression: responder tail rejects a signer unrelated to its authenticated
       reachableEndpoint: { host: '127.0.0.1', port: 48999 },
       routeEncryptionPublicKey32: unrelatedRoute.publicKey,
       capabilityMask: 9,
-      minimumVersion: 2,
-      maximumVersion: 2,
+      minimumVersion: 3,
+      maximumVersion: 3,
       datagramReplayWindow: 64,
       maxConcurrentCircuits: 8,
       capacityClass: 0,
@@ -797,7 +836,7 @@ test('regression: responder tail rejects a signer unrelated to its authenticated
     clock,
     native: true,
     basePort: 48350,
-    poolCapacity: 4096,
+    poolCapacity: 8192,
     safetyRelayOwnerOverride: wrongRelayOwner
   })
   t.teardown(async () => {
@@ -841,7 +880,7 @@ test('regression: readiness exhaustion times out and does not hang when TAIL_REA
     clock: c,
     native: true,
     basePort: 48400,
-    poolCapacity: 4096,
+    poolCapacity: 8192,
     suppressSafetyTailReady: true
   })
   const { sourceTailSession, limits } = await f.openSourceA0()
@@ -891,7 +930,7 @@ test('regression: destroy during in-flight discovery cancels operations without 
     t,
     native: true,
     basePort: 48450,
-    poolCapacity: 4096
+    poolCapacity: 8192
   })
   const { sourceTailSession } = await f.openSourceA0()
 
@@ -935,7 +974,7 @@ test('expired discovery candidates release same-tail admission without shortenin
     clock,
     native: true,
     basePort: 49220,
-    poolCapacity: 4096
+    poolCapacity: 8192
   })
   const { sourceTailSession } = await f.openSourceA0()
   const expiredCandidate = await discoverPeerTailCandidate(sourceTailSession, {
@@ -986,7 +1025,7 @@ test('regression: legal asymmetric forward and reverse expiry bounds succeed in 
     t,
     native: true,
     basePort: 48500,
-    poolCapacity: 4096
+    poolCapacity: 8192
   })
   const { sourceTailSession } = await f.openSourceA0()
 
@@ -1072,7 +1111,7 @@ test('regression: duplicate and retry request retransmission from cached respond
     clock: c,
     native: false,
     basePort: 48550,
-    poolCapacity: 4096
+    poolCapacity: 8192
   })
   const { sourceTailSession } = await f.openSourceA0()
 
@@ -1123,7 +1162,7 @@ test('lost EXTENDED reply is recovered after its old tail has become a forwarder
     clock,
     native: false,
     basePort: 48600,
-    poolCapacity: 4096
+    poolCapacity: 8192
   })
   const { sourceTailSession, limits } = await f.openSourceA0()
   const candidate = await discoverPeerTailCandidate(sourceTailSession, {
@@ -1223,7 +1262,7 @@ for (const [index, delay] of [250, 2000].entries()) {
       clock,
       native: false,
       basePort: 48610 + index * 10,
-      poolCapacity: 4096
+      poolCapacity: 8192
     })
     const { sourceTailSession } = await f.openSourceA0()
     inject = true
@@ -1277,7 +1316,7 @@ test('authenticated READY cannot beat an expired operation by preceding its dela
     clock,
     native: false,
     basePort: 48630,
-    poolCapacity: 4096
+    poolCapacity: 8192
   })
   const { sourceTailSession, limits } = await f.openSourceA0()
   const candidate = await discoverPeerTailCandidate(sourceTailSession, {
@@ -1334,6 +1373,7 @@ test('authenticated READY cannot beat an expired operation by preceding its dela
 
 test('terminal carrier retains its original Native READY2 duty after the tail owner closes', async (t) => {
   const clock = fakeClock()
+  const poolCapacity = 8192
   let countFinalSourcePackets = false
   let finalSourcePackets = 0
   let droppedReady = 0
@@ -1361,7 +1401,7 @@ test('terminal carrier retains its original Native READY2 duty after the tail ow
         clock,
         native: true,
         basePort: 48720,
-        poolCapacity: 4096,
+        poolCapacity,
         onTerminalFinalReady(session) {
           try {
             const handoff = createPeerFinalExitHandoff(session)
@@ -1437,7 +1477,7 @@ test('terminal carrier retains its original Native READY2 duty after the tail ow
     spare = reservePeerMemory(
       f.terminal.memoryPool,
       'pending-readiness-capacity-probe',
-      4096 - materialBytes
+      poolCapacity - materialBytes
     )
   } catch {
     refused = true
@@ -1459,7 +1499,7 @@ test('terminal carrier retains its original Native READY2 duty after the tail ow
   const reclaimed = reservePeerMemory(
     f.terminal.memoryPool,
     'finished-readiness-capacity-probe',
-    4096 - materialBytes
+    poolCapacity - materialBytes
   )
   releasePeerMemory(reclaimed)
   destroyFinalExitActivationOwner(terminalActivation)
@@ -1488,7 +1528,7 @@ test('runtime clock reentrancy cannot return a retired runtime as usable', async
     clock,
     native: true,
     basePort: 49260,
-    poolCapacity: 4096
+    poolCapacity: 8192
   })
   const { sourceRuntime } = await f.openSourceA0()
   onClockRead = () => destroyPeerM3Runtime(sourceRuntime)

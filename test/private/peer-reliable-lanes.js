@@ -4,7 +4,7 @@ const test = require('brittle')
 const b4a = require('b4a')
 
 const { PrivateRouteError } = require('../../lib/private/errors')
-const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
+const { PEER_MESSAGE_ID, PEER_PROTOCOL_VERSION } = require('../../lib/private/peer-protocol')
 const { encodePeerSemantic } = require('../../lib/private/peer-semantic-wire')
 const {
   encodePeerTransport,
@@ -949,7 +949,7 @@ function outerReliablePacket({ routeId, sequence, flags = 0, nested }) {
   writeU16BE(body, flags, 26)
   b4a.copy(nested, body, 28)
   const wire = b4a.alloc(8 + body.byteLength)
-  writeU32BE(wire, 2, 0) // PEER_PROTOCOL_VERSION
+  writeU32BE(wire, PEER_PROTOCOL_VERSION, 0)
   writeU16BE(wire, PEER_MESSAGE_ID.PEER_RELIABLE_PACKET_V2, 4)
   writeU16BE(wire, body.byteLength, 6)
   b4a.copy(body, wire, 8)

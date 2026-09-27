@@ -6,6 +6,7 @@ const sodium = require('sodium-universal')
 
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../lib/private/errors')
+const { PEER_PROTOCOL_VERSION } = require('../../lib/private/peer-protocol')
 const {
   encodePeerTailControlAD,
   encodePeerTailFinalizeAD,
@@ -62,10 +63,10 @@ const ROUTE = Object.freeze({
   counter: 0x2122_2324_2526_2728n
 })
 
-test('v2 class5 and class6 associated data freeze exact vectors', (t) => {
+test('v3 class5 and class6 associated data freeze exact vectors', (t) => {
   const tailExpected = b4a.concat([
     b4a.from([5]),
-    uint32(2),
+    uint32(PEER_PROTOCOL_VERSION),
     TAIL.circuitId,
     uint64(TAIL.generation),
     b4a.from([TAIL.direction]),
@@ -73,7 +74,7 @@ test('v2 class5 and class6 associated data freeze exact vectors', (t) => {
   ])
   const routeExpected = b4a.concat([
     b4a.from([6]),
-    uint32(2),
+    uint32(PEER_PROTOCOL_VERSION),
     ROUTE.routeId,
     ROUTE.circuitId,
     uint64(ROUTE.generation),
@@ -396,7 +397,7 @@ test('v2 contextClass 1 associated data freezes exact vector and rejects invalid
 
   t.is(ad.byteLength, 54)
   t.is(ad[0], 1) // contextClass 1
-  t.alike(ad.subarray(1, 5), b4a.from([0, 0, 0, 2])) // PEER_PROTOCOL_VERSION 2
+  t.alike(ad.subarray(1, 5), b4a.from([0, 0, 0, PEER_PROTOCOL_VERSION]))
   t.alike(ad.subarray(5, 21), branchId)
   t.alike(ad.subarray(21, 37), circuitId)
   t.alike(ad.subarray(37, 45), b4a.from([1, 2, 3, 4, 5, 6, 7, 8]))

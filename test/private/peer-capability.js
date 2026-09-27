@@ -57,8 +57,8 @@ function buildTestAdvertisementFields(edKeys, xKeys, endpoint, expiresAt = 20000
     reachableEndpoint: endpoint || { host: '127.0.0.1', port: 40001 },
     routeEncryptionPublicKey32: xKeys.publicKey,
     capabilityMask: mask,
-    minimumVersion: 2,
-    maximumVersion: 2,
+    minimumVersion: 3,
+    maximumVersion: 3,
     datagramReplayWindow: 64,
     maxConcurrentCircuits: 128,
     capacityClass: 1,
@@ -199,8 +199,9 @@ test('createPeerRelayOwner creates, reads, and destroys without leaking raw secr
     'INVALID_ROUTE'
   )
 
-  // REDACTED_PROOF: extensionIndex must be 1 or 2 (not 0).
-  const proof = b4a.alloc(306, 1)
+  // REDACTED_PROOF: extensionIndex must be 1 or 2 (not 0). The v3 body ends with the
+  // responder's nonzero link ephemeral public key.
+  const proof = b4a.alloc(338, 1)
   proof.set(readData.advertisementDigest32, 0)
   proof.set(b4a.alloc(32, 0x11), 32) // initiator
   proof.set(edKeys.publicKey, 64) // responder identity = signer
@@ -242,6 +243,9 @@ test('createPeerRelayOwner creates, reads, and destroys without leaking raw secr
     if (shared) shared.fill(0)
   }
   expectThrows(t, () => readData.agreeRoute(b4a.alloc(32, 0)), 'INVALID_KEY')
+  const alias = b4a.from(remote.publicKey)
+  alias[31] |= 0x80
+  expectThrows(t, () => readData.agreeRoute(alias), 'INVALID_KEY')
   expectThrows(t, () => readPeerRelayOwner(owner, { ...endpoint }), 'INVALID_ROUTE')
 
   destroyPeerRelayOwner(owner)
