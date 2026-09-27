@@ -85,7 +85,7 @@ function clock() {
 function network(t) {
   const c = clock()
   const h = { c, queue: [], sent: [], sides: [], filter: null }
-  h.pair = async (purpose, left = {}, right = {}) => {
+  h.pair = async (purpose, left = {}, right = {}, routeLimits = {}) => {
     const routeId = fill(16, h.sides.length + 1)
     const pair = [left, right].map((options, direction) => {
       const side = {
@@ -105,7 +105,7 @@ function network(t) {
         wireExpiresAt: 20000n,
         localDeadline: 10000n,
         clockIdentity: c,
-        limits: { maxStreams: 16, receiveFrames: 24, receiveBytes: 23448 },
+        limits: { maxStreams: 16, receiveFrames: 24, receiveBytes: 23448, ...routeLimits },
         schedule: c.schedule,
         monotonicNow: c.now,
         wallNow: () => 10000n + c.now()
@@ -1024,4 +1024,191 @@ test('destroyed registration owners release token storage for later routes', asy
   second.service.register(options)
   await h.settle()
   t.is(semanticIds(second).includes(ID.ENTRY_REGISTERED_V2), true)
+})
+
+async function residualFixture(t) {
+  const h = network(t)
+  const ad = advertisement()
+  const entry = {
+    identity: fill(32, 1),
+    epoch: 1n,
+    verifyAdvertisement: (wire) => b4a.equals(wire, ad)
+  }
+  const destinationKey = SecretStream.keyPair()
+  const bounds = { maxFrames: 64, maxBytes: 62528n, idleMs: 5000 }
+  const policy = { ...bounds, entry, applicationFrameFloor: 4, maxApplicationFrames: 32 }
+  const incoming = []
+  const [destination, destinationEntry] = await h.pair(
+    3,
+    {
+      ...policy,
+      onSession(session) {
+        const noise = privateNoise(destinationKey)
+        let lease
+        const events = endpoint({
+          onHandshake(raw) {
+            noise.recv(raw)
+            lease.sendHandshake(noise.send(payload))
+            lease.confirmHandshake(noise.final()).catch(() => {})
+          }
+        })
+        lease = session.attachEndpoint(events.hooks)
+        incoming.push({ lease, events })
+      }
+    },
+    policy,
+    { maxStreams: 5 }
+  )
+  const registration = destination.service.register({
+    maxFrames: 40,
+    maxBytes: 39080n,
+    idleMs: 5000,
+    destinationNoiseKey: destinationKey.publicKey,
+    advertisement: ad,
+    expiresAtUnixMs: 18000n
+  })
+  await h.settle()
+  const descriptor = await registration.whenRegistered()
+  return {
+    h,
+    destination,
+    destinationEntry,
+    incoming,
+    async open({ filter = null } = {}) {
+      const [source, sourceEntry] = await h.pair(2, bounds, { ...bounds, entry }, { maxStreams: 1 })
+      const noise = privateNoise(SecretStream.keyPair(), destinationKey.publicKey)
+      let lease
+      const events = endpoint({
+        onHandshake(raw) {
+          noise.recv(raw)
+          lease.confirmHandshake(noise.final()).catch(() => {})
+        }
+      })
+      const session = source.service.openSession({
+        descriptor,
+        maxFrames: 32,
+        maxBytes: 31264n,
+        idleMs: 5000,
+        expiresAtUnixMs: 17000n
+      })
+      lease = session.attachEndpoint(events.hooks)
+      h.filter = filter
+      lease.sendHandshake(noise.send(payload))
+      await h.settle()
+      h.filter = null
+      return { source, sourceEntry, lease, events, destination: incoming[incoming.length - 1] }
+    }
+  }
+}
+
+test('registration residual quotas preserve unused floors and never refill after close', async (t) => {
+  const f = await residualFixture(t)
+  for (const [index, expected] of [28, 4, 4, 4].entries()) {
+    const connection = await f.open()
+    t.is(
+      connection.events.opens[0].maxFrames,
+      expected,
+      'Noise confirmation binds the reduced quota'
+    )
+    t.is(connection.destination.events.opens[0].maxFrames, expected)
+    t.is(connection.events.opens[0].maxBytes, BigInt(expected) * 977n)
+    t.is(connection.lease.trySendCiphertext(fill(59, index + 1)), true)
+    await f.h.settle()
+    t.alike(connection.destination.events.data, [fill(59, index + 1)])
+    connection.lease.reset()
+    await f.h.settle()
+    for (const side of [f.destination, f.destinationEntry]) {
+      const quota = side.service.diagnostics().registration
+      t.is(quota.remainingStreams, 3 - index)
+      t.is(quota.remainingFrames, 12 - 4 * index, 'reset cannot refund lifetime admission')
+      t.is(quota.remainingBytes, BigInt(12 - 4 * index) * 977n)
+    }
+  }
+  const refused = await f.open()
+  t.is(refused.lease.diagnostics().closed, true)
+  t.is(refused.events.opens.length, 0)
+  t.is(f.incoming.length, 4, 'exhaustion never allocates another destination endpoint')
+  t.is(
+    f.destination.service.diagnostics().active,
+    true,
+    'registration stays alive for existing work'
+  )
+})
+
+test('registration admission remains spent when Noise never completes', async (t) => {
+  const f = await residualFixture(t)
+  const connection = await f.open({
+    filter: (record) => packetInfo(record).semantic !== ID.PEER_NOISE_FRAGMENT_V2
+  })
+  t.is(connection.events.opens.length, 0)
+  for (const side of [f.destination, f.destinationEntry]) {
+    t.is(side.service.diagnostics().registration.remainingFrames, 12)
+    t.is(side.service.diagnostics().registration.remainingStreams, 3)
+  }
+  connection.lease.reset()
+  await f.h.settle()
+  const next = await f.open()
+  t.is(next.events.opens[0].maxFrames, 4, 'failed handshake did not restore the first admission')
+})
+
+test('one-application routes grant a bounded full window and admit reordered data', async (t) => {
+  const f = await residualFixture(t)
+  const connection = await f.open()
+  const held = []
+  f.h.filter = (record) => {
+    if (
+      record.from !== connection.source ||
+      packetInfo(record).nested?.messageId !== ID.PEER_DATA_V2
+    )
+      return true
+    held.push(record)
+    return false
+  }
+  for (let i = 0; i < 24; i++) t.is(connection.lease.trySendCiphertext(fill(59, i + 1)), true)
+  t.is(
+    connection.lease.trySendCiphertext(fill(59, 25)),
+    false,
+    'the twenty-fifth frame waits for credit'
+  )
+  t.is(connection.sourceEntry.service.diagnostics().receiveSlots, 24)
+  f.h.filter = null
+  f.h.queue.push(...held.reverse())
+  await f.h.settle()
+  t.alike(
+    connection.destination.events.data,
+    Array.from({ length: 24 }, (_, i) => fill(59, i + 1))
+  )
+  t.is(connection.lease.diagnostics().closed, false)
+  t.is(
+    connection.lease.trySendCiphertext(fill(59, 25)),
+    true,
+    'drain renews credit without expanding memory'
+  )
+  await f.h.settle()
+  t.alike(connection.destination.events.data[24], fill(59, 25))
+})
+
+test('receive bytes constrain active windows without limiting serial lifetime admissions', async (t) => {
+  const h = network(t)
+  const key = SecretStream.keyPair()
+  const native = legacyAdapter(key)
+  const [source] = await h.pair(
+    1,
+    { egressServiceIdentity: fill(32, 90) },
+    { legacy: native.adapter, egressServiceIdentity: fill(32, 90) },
+    { maxStreams: 64, receiveFrames: 24, receiveBytes: 977 }
+  )
+  const options = { ...limits, expectedNoiseKey: key.publicKey }
+  const first = source.service.openSession(options).attachEndpoint(endpoint().hooks)
+  t.is(source.service.diagnostics().receiveSlots, 1)
+  t.exception(
+    () => source.service.openSession(options),
+    { code: 'INVALID_ROUTE' },
+    'one raw receive slot is already occupied'
+  )
+  first.revoke()
+  const second = source.service.openSession(options).attachEndpoint(endpoint().hooks)
+  t.is(source.service.diagnostics().receiveSlots, 1)
+  t.is(source.service.diagnostics().streams, 2, 'lifetime count includes the retired stream')
+  t.is(second.diagnostics().closed, false)
 })
