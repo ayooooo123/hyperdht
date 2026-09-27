@@ -72,7 +72,11 @@ const {
   destroyPeerRelayOwner,
   readPeerRelayOwner
 } = require('../../lib/private/peer-capability')
-const { createPeerLedger, readPeerLedger } = require('../../lib/private/peer-ledger')
+const {
+  chargePeerLedger,
+  createPeerLedger,
+  readPeerLedger
+} = require('../../lib/private/peer-ledger')
 const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
 const { encodePeerTransport } = require('../../lib/private/peer-transport-wire')
 const { createM3CellLinkTransferIssuer, registerM3CellLinkTransfer } = endpointModule
@@ -1093,7 +1097,10 @@ test('negative canonical-packet send regressions over native UDX established+lea
   const cookieReceived = new Promise((resolve) => {
     requesterTransport.onPacket((packet) => resolve(b4a.from(packet)))
   })
-  await requesterTransport.send(query)
+  // A requester charges its ledger for the attempt before sending it.
+  const attemptLedger = createPeerLedger({ cells: 1, bytes: 1200n, commands: 0 })
+  chargePeerLedger(attemptLedger, { cells: 1, bytes: 1200n, commands: 0 })
+  await requesterTransport.send(query, attemptLedger)
   const reply = await cookieReceived
   const initialLeftSends = leftSocket._sendCount
   const initialRightSends = rightSocket._sendCount

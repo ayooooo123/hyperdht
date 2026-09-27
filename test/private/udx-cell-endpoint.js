@@ -1594,3 +1594,702 @@ test('authenticated ordinary CONTROL spends no physical-closure allowance', asyn
     destroyTakenPeerEstablishedLink(taken)
   }
 })
+
+// Real DHT nodes, real sockets and one real coherent clock: a leased private endpoint
+// shares the DHT's bound socket without binding or closing it.
+async function leasedDiscoveryPair(t, sequence = null) {
+  const createTestnet = require('../../testnet')
+  const process = require('process')
+  const { createCoherentClock } = require('../../lib/private/runtime-clock')
+  const { createPeerLedger } = require('../../lib/private/peer-ledger')
+  const {
+    createPeerRelayOwner,
+    readPeerRelayOwner,
+    verifyPeerAdvertisement,
+    createPeerCandidateLocator,
+    destroyPeerRelayOwner
+  } = require('../../lib/private/peer-capability')
+  const {
+    createPeerBootstrapResponder,
+    destroyPeerBootstrapResponder
+  } = require('../../lib/private/peer-direct-bootstrap')
+
+  const testnet = await createTestnet(3, { host: '127.0.0.1' })
+  const coherent = createCoherentClock(() => process.hrtime.bigint(), Date.now)
+  const clocks = {
+    clockIdentity: coherent,
+    wallNow: coherent.wallNow,
+    monotonicNow: coherent.monotonicNow,
+    setTimer: setTimeout,
+    clearTimer: clearTimeout
+  }
+  const relayNode = testnet.nodes[1]
+  const sourceNode = testnet.nodes[2]
+  const relayLease = endpointModule.leaseDhtUdxSocket(relayNode.io.serverSocket, 1, sequence)
+  const sourceLease = endpointModule.leaseDhtUdxSocket(sourceNode.io.serverSocket, 2, sequence)
+  const endpointFor = (lease) => {
+    const tuple = endpointModule.readDhtUdxSocketLease(lease)
+    return endpointModule.createLeasedUdxCellEndpoint(
+      {
+        host: tuple.host,
+        port: tuple.port,
+        onBootstrap() {},
+        onCell() {},
+        onLinkFailure() {}
+      },
+      lease
+    )
+  }
+  const relayEndpoint = endpointFor(relayLease)
+  const sourceEndpoint = endpointFor(sourceLease)
+  await relayEndpoint.bind()
+  await sourceEndpoint.bind()
+
+  const now = coherent.wallNow()
+  const adFields = (ed, x, endpoint, mask) => ({
+    relayIdentity32: ed.publicKey,
+    currentDhtNodeId32: cryptoSuite.hash(ed.publicKey),
+    reachableEndpoint: endpoint,
+    routeEncryptionPublicKey32: x.publicKey,
+    capabilityMask: mask,
+    minimumVersion: 3,
+    maximumVersion: 3,
+    datagramReplayWindow: 64,
+    maxConcurrentCircuits: 8,
+    capacityClass: 1,
+    maxCells: 1000,
+    maxBytes: 1_200_000,
+    maxCommands: 1000,
+    idleTimeoutMs: 30000,
+    maxQueuedBytes: 524288,
+    epoch: 1n,
+    issuedAt: now - 1000n,
+    expiresAt: now + 600_000n,
+    policyCount: 0
+  })
+  const relayEd = cryptoSuite.keyPair()
+  const relayX = cryptoSuite.encryptionKeyPair()
+  const relayAddress = { host: '127.0.0.1', port: relayNode.port }
+  const relayOwner = createPeerRelayOwner({
+    endpoint: relayEndpoint,
+    identityKeyPair: relayEd,
+    routeKeyPair: relayX,
+    advertisementFields: adFields(relayEd, relayX, relayAddress, 11),
+    ...clocks
+  })
+  const responder = createPeerBootstrapResponder(relayOwner)
+  const registration = endpointModule.registerPeerDirectResponder(relayEndpoint, responder)
+  const sourceEd = cryptoSuite.keyPair()
+  const sourceX = cryptoSuite.encryptionKeyPair()
+  const sourceOwner = createPeerRelayOwner({
+    endpoint: sourceEndpoint,
+    identityKeyPair: sourceEd,
+    routeKeyPair: sourceX,
+    advertisementFields: adFields(
+      sourceEd,
+      sourceX,
+      { host: '127.0.0.1', port: sourceNode.port },
+      11
+    ),
+    ...clocks
+  })
+  const verifiedRelay = verifyPeerAdvertisement(
+    readPeerRelayOwner(relayOwner, relayEndpoint).canonicalAdvertisement260,
+    {
+      expectedIdentity32: relayEd.publicKey,
+      expectedCapabilityMask: 11,
+      clockIdentity: coherent,
+      wallNow: coherent.wallNow,
+      monotonicNow: coherent.monotonicNow
+    }
+  )
+  const newTransport = () =>
+    endpointModule.createPeerCandidateDirectTransport(
+      sourceEndpoint,
+      createPeerCandidateLocator(sourceOwner, verifiedRelay)
+    )
+  const transport = newTransport()
+  const ledger = createPeerLedger({ cells: 64, bytes: 64n * 1200n, commands: 0 })
+  t.teardown(async () => {
+    try {
+      endpointModule.destroyPeerDirectResponderRegistration(registration)
+    } catch {}
+    try {
+      destroyPeerBootstrapResponder(responder)
+    } catch {}
+    destroyPeerRelayOwner(relayOwner)
+    destroyPeerRelayOwner(sourceOwner)
+    await endpointModule.revokeDhtUdxSocketLease(relayLease)
+    await endpointModule.revokeDhtUdxSocketLease(sourceLease)
+    await testnet.destroy()
+  })
+  return {
+    testnet,
+    relayNode,
+    sourceNode,
+    relayLease,
+    sourceLease,
+    transport,
+    newTransport,
+    ledger
+  }
+}
+
+test('Native: a leased DHT socket carries direct discovery beside ordinary DHT RPC', async (t) => {
+  const {
+    discoverPeerCandidate,
+    destroyPeerActiveCandidate
+  } = require('../../lib/private/peer-direct-bootstrap')
+  const pair = await leasedDiscoveryPair(t)
+  const serverSocket = pair.relayNode.io.serverSocket
+  const candidate = await discoverPeerCandidate(pair.transport, {
+    ledger: pair.ledger,
+    requestedMask: 11,
+    randomTarget: cryptoSuite.randomBytes(32),
+    maximumResults: 1
+  })
+  t.is(candidate.kind, 'peerActiveCandidate', 'discovery completes over the leased sockets')
+  destroyPeerActiveCandidate(candidate)
+  t.ok(
+    await pair.sourceNode.ping({ host: '127.0.0.1', port: pair.relayNode.port }),
+    'ordinary DHT RPC reaches the leased socket'
+  )
+
+  await endpointModule.revokeDhtUdxSocketLease(pair.relayLease)
+  t.is(endpointModule.readDhtUdxSocketLease(pair.relayLease).endpoints, 0, 'revocation joins')
+  t.is(serverSocket.bound, true, 'the DHT still owns its bound socket')
+  t.ok(
+    await pair.sourceNode.ping({ host: '127.0.0.1', port: pair.relayNode.port }),
+    'ordinary DHT RPC continues after the lease ends'
+  )
+  t.exception(
+    () =>
+      endpointModule.createLeasedUdxCellEndpoint(
+        {
+          host: '127.0.0.1',
+          port: pair.relayNode.port,
+          onBootstrap() {},
+          onCell() {},
+          onLinkFailure() {}
+        },
+        pair.relayLease
+      ),
+    /unavailable/i,
+    'a revoked lease builds no endpoint'
+  )
+})
+
+// A2-CONTRACTS §4.3: every kind the emitter can produce, with its class and category.
+// Circuit, neighbor and guard-bootstrap kinds are charged and name their ledger and
+// ordinal; every other kind is uncharged and names the bounded owner that governs it.
+const SEND_KINDS = Object.freeze({
+  circuit: ['circuit', 'circuit'],
+  closure: ['circuit', 'circuit'],
+  'circuit-discovery': ['circuit', 'circuit'],
+  'neighbor-service': ['neighbor', 'service'],
+  'neighbor-close': ['neighbor', 'service'],
+  'neighbor-discovery': ['neighbor', 'service'],
+  'bootstrap-request': ['guard-bootstrap', 'bootstrap'],
+  'link-setup': ['guard-bootstrap', 'bootstrap'],
+  'link-control': ['guard-bootstrap', 'bootstrap'],
+  'discovery-response': ['responder-cache', 'service'],
+  'bootstrap-response': ['responder-cache', 'bootstrap'],
+  'routed-branch': ['v1-routed-branch', 'v1-routed'],
+  'nat-reflection': ['nat-traversal', 'traversal'],
+  'nat-punch': ['nat-traversal', 'traversal']
+})
+const CHARGED_CLASSES = new Set(['circuit', 'neighbor', 'guard-bootstrap'])
+
+function sendOwnerFollowsContract(event) {
+  const rule = SEND_KINDS[event.owner.kind]
+  if (!rule || event.owner.class !== rule[0] || event.owner.category !== rule[1]) return false
+  const charged = CHARGED_CLASSES.has(rule[0])
+  if (event.owner.charged !== charged) return false
+  return charged
+    ? Number.isInteger(event.owner.ledger) &&
+        Number.isInteger(event.owner.ordinal) &&
+        event.owner.ordinal > 0 &&
+        event.owner.governor === null
+    : event.owner.ledger === null &&
+        event.owner.ordinal === null &&
+        Number.isInteger(event.owner.governor)
+}
+
+test('Native: the lease observer sees each private send once with its owner', async (t) => {
+  const {
+    discoverPeerCandidate,
+    destroyPeerActiveCandidate
+  } = require('../../lib/private/peer-direct-bootstrap')
+  const { readPeerLedger } = require('../../lib/private/peer-ledger')
+  // One sequence shared by both leases, as a runtime shares one across its socket
+  // generations.
+  const pair = await leasedDiscoveryPair(t, endpointModule.createSendAttemptSequence())
+  const emitted = []
+  const sourceEvents = []
+  const relayEvents = []
+  const stopSource = endpointModule.observeDhtUdxSocketLease(pair.sourceLease, (event) => {
+    emitted.push(event)
+    sourceEvents.push(event)
+  })
+  const stopRelay = endpointModule.observeDhtUdxSocketLease(pair.relayLease, (event) => {
+    emitted.push(event)
+    relayEvents.push(event)
+    throw new Error('an observer failure cannot affect sends')
+  })
+  const candidate = await discoverPeerCandidate(pair.transport, {
+    ledger: pair.ledger,
+    requestedMask: 11,
+    randomTarget: cryptoSuite.randomBytes(32),
+    maximumResults: 1
+  })
+  destroyPeerActiveCandidate(candidate)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+
+  const attempts = emitted.filter((event) => event.kind === 'attempt')
+  t.ok(
+    attempts.every(
+      (event, index) => index === 0 || event.attemptId > attempts[index - 1].attemptId
+    ),
+    'attempt identifiers increase across both leases of one sequence'
+  )
+  t.ok(attempts.every(sendOwnerFollowsContract), 'every owner follows the documented kind rules')
+
+  const requests = sourceEvents.filter((event) => event.kind === 'attempt')
+  t.is(requests.length, readPeerLedger(pair.ledger).cellsSpent, 'one attempt per charged cell')
+  t.alike(
+    requests.map((event) => event.owner.ordinal),
+    requests.map((_, index) => index + 1),
+    'each request names the ordinal its ledger was charged at'
+  )
+  t.is(new Set(requests.map((event) => event.owner.ledger)).size, 1, 'one ledger owns them all')
+  for (const event of requests) {
+    t.is(event.owner.kind, 'circuit-discovery')
+    t.is(event.socketGeneration, 2)
+    t.is(event.bytes, BOOTSTRAP_SIZE)
+    t.is(event.remote.port, pair.relayNode.port)
+    t.is(event.local.port, pair.sourceNode.port)
+    t.ok(/^[0-9a-f]{64}$/.test(event.digest))
+    t.ok(Object.isFrozen(event) && Object.isFrozen(event.owner))
+  }
+  const completions = sourceEvents.filter((event) => event.kind === 'completion')
+  t.alike(
+    completions.map((event) => event.attemptId).sort((a, b) => a - b),
+    requests.map((event) => event.attemptId),
+    'every attempt reports its native completion'
+  )
+  t.ok(completions.every((event) => event.outcome === 'sent'))
+
+  const responses = relayEvents.filter((event) => event.kind === 'attempt')
+  t.ok(responses.length > 0, 'the responder side observes its replies')
+  t.ok(responses.every((event) => event.owner.kind === 'discovery-response'))
+  t.is(new Set(responses.map((event) => event.owner.governor)).size, 1, 'one responder governs')
+  t.ok(
+    emitted.every((event) => !('packet' in event) && !('payload' in event)),
+    'events carry no datagram bytes'
+  )
+
+  // A revoked observer sees nothing more, while the other lease keeps observing.
+  t.is(stopRelay(), true)
+  t.is(stopRelay(), false, 'revocation happens once')
+  const relayBefore = relayEvents.length
+  const sourceBefore = sourceEvents.length
+  const again = await discoverPeerCandidate(pair.newTransport(), {
+    ledger: pair.ledger,
+    requestedMask: 11,
+    randomTarget: cryptoSuite.randomBytes(32),
+    maximumResults: 1
+  })
+  destroyPeerActiveCandidate(again)
+  t.ok(sourceEvents.length > sourceBefore, 'the live observer sees the second discovery')
+  t.is(relayEvents.length, relayBefore, 'the revoked observer receives nothing')
+  t.is(stopSource(), true)
+})
+
+test('Native: a requester send that names no charged ledger is refused before the socket', async (t) => {
+  const pair = await leasedDiscoveryPair(t)
+  const observed = []
+  endpointModule.observeDhtUdxSocketLease(pair.sourceLease, (event) => observed.push(event))
+  const capability = endpointModule.takePeerDirectRequesterTransport(pair.transport)
+  const body = b4a.alloc(110)
+  body.writeUInt32BE(11, 0)
+  body[68] = 1
+  const { PEER_MESSAGE_ID, encodePeerObject } = require('../../lib/private/peer-protocol')
+  const wire = encodePeerObject({ messageId: PEER_MESSAGE_ID.PEER_CAPS_QUERY_V2, body })
+  const packet = b4a.alloc(BOOTSTRAP_SIZE)
+  packet.writeUInt16BE(0xd301, 0)
+  packet.writeUInt16BE(wire.byteLength, 2)
+  packet.set(wire, 4)
+  await t.exception(capability.send(packet), { code: 'INVALID_ROUTE' })
+  t.is(observed.length, 0, 'nothing was sent or observed')
+  capability.destroy()
+})
+
+function countSends(socket) {
+  const counter = { count: 0 }
+  const send = socket.send
+  socket.send = function countedSend(...args) {
+    counter.count++
+    return send.apply(this, args)
+  }
+  return counter
+}
+
+// Two fake-socket endpoints; the left one opens a guard link through a bootstrap authority
+// funded by `ledger`.
+async function chargedGuardLink(t, leftPort, rightPort, ledger) {
+  const network = new Map()
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const links = linkPair('127.0.0.1', leftPort, '127.0.0.2', rightPort)
+  const observer = {}
+  let leftSession = null
+  let rightSession = null
+  const left = issuer.createUdxCellEndpointForTest(
+    {
+      ...options('127.0.0.1', leftPort, []),
+      onBootstrap(packet) {
+        if (leftSession) void leftSession.receive(packet)
+      }
+    },
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network, null, observer))
+  )
+  const right = issuer.createUdxCellEndpointForTest(
+    {
+      ...options('127.0.0.2', rightPort, []),
+      onBootstrap(packet) {
+        if (rightSession) void rightSession.receive(packet)
+      }
+    },
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
+  )
+  t.teardown(async () => {
+    await left.close()
+    await right.close()
+    links.left.directory.destroy()
+    links.right.directory.destroy()
+  })
+  await left.bind()
+  await right.bind()
+  const authority = createBootstrapUdxAuthority({
+    endpoint: left,
+    configuredEndpoints: [{ host: '127.0.0.2', port: rightPort }],
+    localSecretCapability: createLocalIdentitySecretCapability({
+      localIdentity: links.a.publicKey,
+      localSecretKey: links.a.secretKey
+    }),
+    maxProspectiveGuards: 3,
+    monotonicDeadline: 10_000,
+    guardBootstrapLedger: ledger
+  })
+  bindBootstrapUdxOperation(authority, 10_000, Object.freeze({}))
+  const admission = admitBootstrapUdxGuard(authority, {
+    identity: links.b.publicKey,
+    host: '127.0.0.2',
+    port: rightPort
+  })
+  const leftOptions = linkSessionOptions(links, 'left')
+  leftSession = openBootstrapUdxGuard(
+    authority,
+    admission,
+    links.left.handle,
+    createBootstrapUdxGuardSessionOptions(authority, admission, links.left.handle, {
+      circuitId: leftOptions.setup.circuitId,
+      epoch: leftOptions.setup.epoch,
+      initiatorLocalId: leftOptions.setup.initiatorLocalId,
+      responderLocalId: leftOptions.setup.responderLocalId,
+      expiresAt: leftOptions.setup.expiresAt,
+      responderStaticKey: leftOptions.setup.responderStaticKey,
+      now: leftOptions.now,
+      wallNow: leftOptions.now,
+      handleNow: leftOptions.now,
+      schedule: leftOptions.schedule,
+      cancel: leftOptions.cancel,
+      randomBytes: leftOptions.randomBytes,
+      absoluteDeadline: leftOptions.absoluteDeadline,
+      signedExpiry: leftOptions.signedExpiry
+    })
+  )
+  rightSession = right.openLink(links.right.handle, linkSessionOptions(links, 'right'))
+  const established = await leftSession.open()
+  return { left, observer, established }
+}
+
+test('Native: a circuit cell that lost its funding is refused, never charged as link traffic', async (t) => {
+  const { createPeerLedger, readPeerLedger } = require('../../lib/private/peer-ledger')
+  const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
+  const ledger = createPeerLedger(endpointModule.guardBootstrapPinBudget(60_000))
+  const { left, observer, established } = await chargedGuardLink(t, 47811, 47812, ledger)
+  const setupSpent = readPeerLedger(ledger).cellsSpent
+  t.ok(setupSpent > 0, 'the guard link setup was charged to its guard-bootstrap ledger')
+  const sends = countSends(observer.socket)
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const cell = (extra) => ({
+    class: CELL_CLASS.DATAGRAM,
+    direction: DIRECTION.FORWARD,
+    generation: 1n,
+    payload: b4a.from('circuit'),
+    ...extra
+  })
+  await t.exception(
+    issuer.sendEstablishedForTest(
+      left,
+      established,
+      cell({ [endpointModule.CIRCUIT_SEND_PERMIT]: undefined })
+    ),
+    { code: 'INVALID_ROUTE' },
+    'a circuit cell whose permit is missing is refused'
+  )
+  await t.exception(
+    issuer.sendEstablishedForTest(left, established, cell({})),
+    { code: 'INVALID_ROUTE' },
+    'a native link carries no unpermitted cell as its own traffic'
+  )
+  await settles()
+  t.is(sends.count, 0, 'nothing reached the socket')
+  t.is(readPeerLedger(ledger).cellsSpent, setupSpent, 'the guard link ledger was not charged')
+})
+
+test('Native: a neighbor link without its service ledgers sends nothing', async (t) => {
+  const network = new Map()
+  const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
+  const links = linkPair('127.0.0.1', 47813, '127.0.0.2', 47814)
+  const observer = {}
+  const left = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.1', 47813, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network, null, observer))
+  )
+  const right = issuer.createUdxCellEndpointForTest(
+    options('127.0.0.2', 47814, []),
+    issuer.createTestUdxAdapterAuthority(fakeFactory(network))
+  )
+  t.teardown(async () => {
+    await left.close()
+    await right.close()
+    links.left.directory.destroy()
+    links.right.directory.destroy()
+  })
+  await left.bind()
+  await right.bind()
+  const sends = countSends(observer.socket)
+  const session = left.openLink(links.left.handle, {
+    ...linkSessionOptions(links, 'left'),
+    [endpointModule.LINK_SEND_CLASS]: endpointModule.SEND_CLASS.NEIGHBOR
+  })
+  await t.exception(session.open(), 'the link cannot open without funding')
+  await settles()
+  t.is(sends.count, 0, 'its setup request never reached the socket')
+})
+
+test('Native: a source pins a leased guard with every bootstrap send charged or governed', async (t) => {
+  const createTestnet = require('../../testnet')
+  const process = require('process')
+  const { createCoherentClock } = require('../../lib/private/runtime-clock')
+  const { createPeerLedger, readPeerLedger } = require('../../lib/private/peer-ledger')
+  const { CapsResponder } = require('../../lib/private/caps-responder')
+  const { BootstrapIO, consumeBootstrapGuardPin } = require('../../lib/private/bootstrap-io')
+  const {
+    createRelayCandidateDirectorySink
+  } = require('../../lib/private/relay-candidate-directory')
+  const createDynamicResponderSetup = require('../../lib/private/link-bootstrap-session')[
+    Symbol.for('hyperdht-private-routes/dynamic-responder-setup-factory')
+  ]
+  const {
+    encodeRelayCapabilityAdvertisement,
+    providerServicePolicyForCapabilities,
+    signRelayCapabilityAdvertisement
+  } = require('../../lib/private/relay-capability')
+  const { RELAY_CAPABILITY } = require('../../lib/private/protocol')
+
+  const testnet = await createTestnet(3, { host: '127.0.0.1' })
+  const clock = createCoherentClock(() => process.hrtime.bigint(), Date.now)
+  const sequence = endpointModule.createSendAttemptSequence()
+  const guardNode = testnet.nodes[1]
+  const sourceNode = testnet.nodes[2]
+  const guardLease = endpointModule.leaseDhtUdxSocket(guardNode.io.serverSocket, 1, sequence)
+  const sourceLease = endpointModule.leaseDhtUdxSocket(sourceNode.io.serverSocket, 1, sequence)
+  const events = []
+  endpointModule.observeDhtUdxSocketLease(guardLease, (event) => events.push(['guard', event]))
+  endpointModule.observeDhtUdxSocketLease(sourceLease, (event) => events.push(['source', event]))
+  const endpointFor = (lease) => {
+    const tuple = endpointModule.readDhtUdxSocketLease(lease)
+    return endpointModule.createLeasedUdxCellEndpoint(
+      {
+        host: tuple.host,
+        port: tuple.port,
+        onBootstrap() {},
+        onCell() {
+          return true
+        },
+        onLinkFailure() {}
+      },
+      lease
+    )
+  }
+  const guardEndpoint = endpointFor(guardLease)
+  const sourceEndpoint = endpointFor(sourceLease)
+  await guardEndpoint.bind()
+  await sourceEndpoint.bind()
+
+  const lifetimeMs = 60_000
+  const issuedAt = clock.wallNow()
+  const guardIdentity = safetyIdentity(120)
+  const guardRoute = cryptoSuite.encryptionKeyPair()
+  const reachableEndpoint = encodeCanonicalEndpoint({
+    addressFamily: 4,
+    addressBytes: b4a.from([127, 0, 0, 1]),
+    port: guardNode.port
+  })
+  const caps = new CapsResponder({
+    now: clock.wallNow,
+    advertisement: encodeRelayCapabilityAdvertisement(
+      signRelayCapabilityAdvertisement(
+        {
+          relayIdentity: guardIdentity.publicKey,
+          currentDhtNodeId: deriveM3DhtNodeId(reachableEndpoint),
+          reachableEndpoint,
+          routeEncryptionPublicKey: guardRoute.publicKey,
+          capabilityMask: RELAY_CAPABILITY.CIRCUIT_RELAY_V1,
+          minimumProtocolVersion: 1,
+          maximumProtocolVersion: 1,
+          cellSize: 1200,
+          maxCellPayload: 1146,
+          contextEnvelopeSize: 1101,
+          routeFrameSize: 1100,
+          maxRoutePayload: 1073,
+          datagramReplayWindow: 64,
+          maxConcurrentCircuits: 4,
+          capacityClass: 1,
+          maxCellsPerCircuit: 200,
+          maxBytesPerCircuit: 240_000,
+          maxCommandsPerCircuit: 100,
+          idleTimeoutMs: 30_000,
+          maxQueuedBytes: 524_288,
+          epoch: 11n,
+          issuedAtMs: issuedAt,
+          expiresAtMs: issuedAt + BigInt(lifetimeMs),
+          providerServicePolicyEntries: providerServicePolicyForCapabilities(
+            RELAY_CAPABILITY.CIRCUIT_RELAY_V1
+          )
+        },
+        guardIdentity.secretKey
+      )
+    ),
+    identitySecretKey: guardIdentity.secretKey,
+    routeEncryptionSecretKey: guardRoute.secretKey
+  })
+  const linkBudget = endpointModule.guardBootstrapLinkBudget(lifetimeMs)
+  const guardLedger = createPeerLedger({
+    cells: 2 * linkBudget.cells,
+    bytes: 2n * linkBudget.bytes,
+    commands: 0
+  })
+  const expiry = Number(issuedAt) + lifetimeMs
+  const accepted = []
+  const registration = endpointModule.registerGuardBootstrapResponder(guardEndpoint, {
+    caps,
+    ledger: guardLedger,
+    linkBudget,
+    maxEstablished: 1,
+    acceptOptions: (handle) => ({
+      mode: 'accept',
+      codec: new BootstrapEnvelopeCodec({
+        linkHandle: handle,
+        localIdentitySecretKey: guardIdentity.secretKey,
+        padding: cryptoSuite.randomBytes
+      }),
+      linkSetup: createLinkSetupAuthority({
+        now: () => Number(clock.wallNow()),
+        randomBytes: cryptoSuite.randomBytes
+      }),
+      setup: createDynamicResponderSetup({
+        responderStaticSecretKey: guardRoute.secretKey,
+        responderIdentitySecretKey: guardIdentity.secretKey
+      }),
+      now: () => Number(clock.monotonicNow()),
+      schedule: setTimeout,
+      cancel: clearTimeout,
+      randomBytes: cryptoSuite.randomBytes,
+      absoluteDeadline: Number(clock.monotonicNow()) + 30_000,
+      signedExpiry: expiry,
+      authorizedExpiry: expiry
+    }),
+    onEstablished(established) {
+      accepted.push(established)
+    }
+  })
+
+  const sourceIdentity = cryptoSuite.keyPair()
+  const pinLedger = createPeerLedger(endpointModule.guardBootstrapPinBudget(lifetimeMs))
+  const guards = [{ host: '127.0.0.1', port: guardNode.port }]
+  const authority = createBootstrapUdxAuthority({
+    endpoint: sourceEndpoint,
+    configuredEndpoints: guards,
+    localSecretCapability: createLocalIdentitySecretCapability({
+      localIdentity: sourceIdentity.publicKey,
+      localSecretKey: sourceIdentity.secretKey
+    }),
+    maxProspectiveGuards: 1,
+    monotonicDeadline: clock.monotonicNow,
+    guardBootstrapLedger: pinLedger
+  })
+  const io = new BootstrapIO({
+    endpoints: guards,
+    localIdentity: sourceIdentity.publicKey,
+    localSecretKey: sourceIdentity.secretKey,
+    datagrams: authority,
+    wallNow: clock.wallNow,
+    monotonicNow: clock.monotonicNow,
+    randomBytes: cryptoSuite.randomBytes,
+    candidateDirectorySink: createRelayCandidateDirectorySink({
+      wallNow: clock.wallNow,
+      monotonicNow: clock.monotonicNow,
+      randomBytes: cryptoSuite.randomBytes
+    })
+  })
+  let transfer = null
+  t.teardown(async () => {
+    if (transfer) destroyGuardLeaseMaterial(transfer.guardLeaseMaterial)
+    endpointModule.destroyGuardBootstrapResponderRegistration(registration)
+    caps.destroy()
+    await endpointModule.revokeDhtUdxSocketLease(guardLease)
+    await endpointModule.revokeDhtUdxSocketLease(sourceLease)
+    await testnet.destroy()
+  })
+  transfer = consumeBootstrapGuardPin(await io.start())
+  transfer.candidateDirectory.destroy()
+  for (let turn = 0; turn < 50 && accepted.length === 0; turn++) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  t.is(accepted.length, 1, 'the guard reports the accepted link once, when it establishes')
+  t.alike(transfer.pinnedGuard.identity, guardIdentity.publicKey, 'the source pinned this guard')
+
+  const attempts = events.filter(([, event]) => event.kind === 'attempt')
+  t.ok(
+    attempts.every(([, event]) => sendOwnerFollowsContract(event)),
+    'every owner follows §4.3'
+  )
+  const sourceCharged = attempts.filter(([side, event]) => side === 'source' && event.owner.charged)
+  const sourceKinds = new Set(sourceCharged.map(([, event]) => event.owner.kind))
+  t.ok(sourceKinds.has('bootstrap-request') && sourceKinds.has('link-setup'))
+  t.ok(
+    attempts.every(([side, event]) => side !== 'source' || event.owner.class === 'guard-bootstrap'),
+    'every source send is guard-bootstrap traffic'
+  )
+  t.is(
+    readPeerLedger(pinLedger).cellsSpent,
+    sourceCharged.length,
+    'the pin ledger holds exactly the charged source sends'
+  )
+  const guardSends = attempts.filter(([side]) => side === 'guard').map(([, event]) => event)
+  t.ok(
+    guardSends.some((event) => event.owner.kind === 'bootstrap-response'),
+    'CAPS answers are governed responder traffic'
+  )
+  const guardLinkSends = guardSends.filter((event) => event.owner.charged)
+  t.ok(guardLinkSends.length > 0, 'the accepted link answers its setup')
+  t.is(new Set(guardLinkSends.map((event) => event.owner.ledger)).size, 1, 'one link reservation')
+  t.alike(
+    guardLinkSends.map((event) => event.owner.ordinal),
+    guardLinkSends.map((_, index) => index + 1),
+    'the accepted link spends only its own reservation'
+  )
+})

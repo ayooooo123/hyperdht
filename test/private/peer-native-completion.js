@@ -11,6 +11,7 @@ const {
 const { UDX_ENDPOINT_RESERVATION_STATS } = require('../../lib/private/udx-adapter')
 const { PEER_MESSAGE_ID, encodePeerObject } = require('../../lib/private/peer-protocol')
 const { fakeClock, setupNativePoolPreflight } = require('./peer-native-fixture')
+const { chargePeerLedger, createPeerLedger } = require('../../lib/private/peer-ledger')
 
 async function turns() {
   for (let i = 0; i < 20; i++) await Promise.resolve()
@@ -26,6 +27,13 @@ function query() {
   packet.writeUInt16BE(wire.byteLength, 2)
   packet.set(wire, 4)
   return packet
+}
+
+// A requester charges its ledger for each attempt before handing the packet to send.
+function chargedAttemptLedger() {
+  const ledger = createPeerLedger({ cells: 1, bytes: 1200n, commands: 0 })
+  chargePeerLedger(ledger, { cells: 1, bytes: 1200n, commands: 0 })
+  return ledger
 }
 
 function requester(f) {
@@ -49,7 +57,7 @@ for (const cancel of ['destroy', 'deadline']) {
     const { transport, capability } = requester(f)
     const held = hold(f.localSocket)
     let result = null
-    const sending = capability.send(query()).then(
+    const sending = capability.send(query(), chargedAttemptLedger()).then(
       () => {
         result = 'sent'
       },
