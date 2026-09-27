@@ -259,8 +259,11 @@ test('createServer + connect - same-LAN explicit keypair opens server', async fu
   // the client mark punching done before the LAN shortcut opens the stream.
   const { bootstrap } = await swarm(t, 3)
 
-  const a = new DHT({ bootstrap })
-  const b = new DHT({ bootstrap })
+  // Bind to loopback like the swarm: a wildcard bind advertises the physical
+  // interface while the three-node swarm yields too few NAT samples, so the
+  // server aborts punching before the same-LAN path can open.
+  const a = createDHT({ bootstrap })
+  const b = createDHT({ bootstrap })
 
   await a.fullyBootstrapped()
   await b.fullyBootstrapped()
