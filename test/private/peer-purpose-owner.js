@@ -6,6 +6,14 @@ const sodium = require('sodium-universal')
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../lib/private/errors')
 const {
+  clearPeerPurposeKeys,
+  computePeerPurposeMac,
+  createPeerPurposePreTranscript,
+  createPeerPurposeTranscript,
+  derivePeerPurposeKeys,
+  derivePeerPurposeSharedSecret
+} = require('../../lib/private/peer-crypto')
+const {
   computePeerQueuedBytes,
   computePeerSemanticOwnedBytes,
   createPeerLedger,
@@ -23,7 +31,12 @@ const {
   decodePeerTransport,
   encodePeerTransport
 } = require('../../lib/private/peer-transport-wire')
-const { openPeerContextFrame, sealPeerContextFrame } = require('../../lib/private/peer-m3-context')
+const {
+  encodePeerRouteAD,
+  encodePeerTailFinalizeAD,
+  openPeerContextFrame,
+  sealPeerContextFrame
+} = require('../../lib/private/peer-m3-context')
 
 const MAX_U64 = 0xffff_ffff_ffff_ffffn
 
@@ -100,6 +113,7 @@ function createCarrierPair(clock, options = {}) {
         if (options.falseRoute && options.falseRoute(index, sentRoute.length)) return false
         if (options.promiseFalseRoute && options.promiseFalseRoute(index, sentRoute.length))
           return Promise.resolve(false)
+        if (options.dropInactiveRoute && !peer.activated) return true
         peer.enqueue({ contextClass: 6, frame: b4a.from(frame) })
         return true
       },
@@ -259,6 +273,10 @@ function fixture(options = {}) {
     ...(options.terminalOverrides || {})
   })
   delete terminalOptions.clientEphemeralSecret
+  delete terminalOptions.routeId
+  delete terminalOptions.purpose
+  delete terminalOptions.queryNonce
+  delete terminalOptions.clientEphemeralPublicKey
   return {
     clock,
     carriers,
@@ -281,6 +299,412 @@ async function startHandshake(f) {
   await Promise.all([f.source.whenActive(), f.terminal.whenActive()])
   await tick()
 }
+function finalizeContext(f, direction, counter) {
+  return {
+    contextClass: 5,
+    circuitId: f.route.circuitId,
+    generation: 7n,
+    direction,
+    counter,
+    key: seed(direction === 0 ? 0x41 : 0x61),
+    noncePrefix: seed(direction === 0 ? 0x51 : 0x71, 16)
+  }
+}
+
+function capturedFinalize(f, direction) {
+  const carrier = direction === 0 ? f.carriers.left : f.carriers.right
+  const frame = carrier.sentFinalize[0]
+  const opened = openPeerContextFrame(
+    finalizeContext(f, direction, frame.readBigUInt64BE(0)),
+    frame
+  )
+  const wire = b4a.from(opened.payload)
+  opened.plaintext.fill(0)
+  return wire
+}
+
+function fixturePurposeKeys(f, offer, acceptBody = b4a.alloc(260)) {
+  const body = offer.subarray(8, 220)
+  const pre = createPeerPurposePreTranscript({
+    tailControlTranscriptDigest: seed(0x11),
+    terminalAdvertisementDigest: body.subarray(52, 84),
+    queryNonce: body.subarray(84, 116),
+    clientEphemeralPublicKey: body.subarray(116, 148),
+    terminalRoutePublicKey: f.pair.terminal.publicKey,
+    offerBody: body
+  })
+  const transcript = createPeerPurposeTranscript(pre, offer, acceptBody)
+  const shared = derivePeerPurposeSharedSecret(f.pair.client.secretKey, f.pair.terminal.publicKey)
+  try {
+    return derivePeerPurposeKeys(shared, pre, transcript)
+  } finally {
+    pre.fill(0)
+    transcript.fill(0)
+    shared.fill(0)
+  }
+}
+
+function signOffer(f, offer) {
+  const keys = fixturePurposeKeys(f, offer)
+  try {
+    const mac = computePeerPurposeMac(keys.preSourceMacKey, offer.subarray(0, 220))
+    offer.set(mac, 220)
+    mac.fill(0)
+    return offer
+  } finally {
+    clearPeerPurposeKeys(keys)
+  }
+}
+
+function routeContext(f, keys, direction, counter) {
+  return {
+    contextClass: 6,
+    routeId: f.route.routeId,
+    circuitId: f.route.circuitId,
+    generation: 7n,
+    purpose: 2,
+    direction,
+    counter,
+    key: direction === 0 ? keys.forwardKey : keys.reverseKey,
+    noncePrefix: direction === 0 ? keys.forwardNoncePrefix : keys.reverseNoncePrefix
+  }
+}
+
+function sealInvalidPlaintext(context, mutate) {
+  const ad =
+    context.contextClass === 5 ? encodePeerTailFinalizeAD(context) : encodePeerRouteAD(context)
+  const nonce = b4a.alloc(24)
+  nonce.set(context.noncePrefix)
+  nonce.writeBigUInt64BE(context.counter, 16)
+  const plaintext = b4a.alloc(1076)
+  plaintext[0] = 2
+  mutate(plaintext)
+  const frame = b4a.alloc(1100)
+  frame.writeBigUInt64BE(context.counter, 0)
+  sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+    frame.subarray(8),
+    plaintext,
+    ad,
+    null,
+    nonce,
+    context.key
+  )
+  ad.fill(0)
+  nonce.fill(0)
+  plaintext.fill(0)
+  return frame
+}
+
+test('terminal learns each supported purpose from the authenticated first offer', async (t) => {
+  for (const purpose of [1, 2, 3]) {
+    const f = fixture({
+      carrier: { dropInactiveRoute: true },
+      sourceOverrides: {
+        purpose,
+        routeId: seed(0x90 + purpose, 16),
+        queryNonce: seed(0x30 + purpose)
+      }
+    })
+    t.is(f.terminal.diagnostics().status, 'WAITING_OFFER')
+    t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0)
+    t.is(readPeerMemory(f.terminalMemory).reservedBytes, 0)
+    await startHandshake(f)
+    t.is(f.terminal.route().purpose, purpose)
+    t.alike(f.terminal.route().routeId, seed(0x90 + purpose, 16))
+    t.alike(f.terminal.route().purposeDigest, f.source.route().purposeDigest)
+    t.alike(f.terminal.route().finalTranscriptDigest, f.source.route().finalTranscriptDigest)
+    t.is(f.carriers.left.sentRoute.length, 1)
+    t.is(f.carriers.right.sentRoute.length, 1)
+    const { maxStreams, receiveBytes, semanticOwnedBytes } = f.terminal.route().limits
+    t.is(
+      readPeerMemory(f.terminalMemory).takenBytes,
+      computePeerQueuedBytes({ maxStreams, receiveBytes, semanticOwnedBytes })
+    )
+    t.is(f.terminal.destroy(), true)
+    const ledger = readPeerLedger(f.terminalLedger)
+    const memory = readPeerMemory(f.terminalMemory)
+    t.is(ledger.cellsReserved, 0)
+    t.is(memory.reservedBytes, 0)
+    t.is(memory.takenBytes, 0)
+    t.is(f.terminal.destroy(), false)
+    t.alike(readPeerLedger(f.terminalLedger), ledger)
+    t.alike(readPeerMemory(f.terminalMemory), memory)
+    f.source.destroy()
+  }
+})
+
+test('terminal rejects invalid authenticated first offers before reservation', async (t) => {
+  const cases = [
+    [
+      'parent circuit',
+      (body) => {
+        body[16] ^= 1
+      }
+    ],
+    [
+      'parent generation',
+      (body) => {
+        body.writeBigUInt64BE(8n, 32)
+      }
+    ],
+    [
+      'advertisement',
+      (body) => {
+        body[52] ^= 1
+      }
+    ],
+    [
+      'direction',
+      (body) => {
+        body[41] = 1
+      }
+    ],
+    [
+      'zero purpose',
+      (body) => {
+        body[40] = 0
+      }
+    ],
+    [
+      'presence purpose',
+      (body) => {
+        body[40] = 4
+      }
+    ],
+    ['purpose MAC', null]
+  ]
+  for (const [name, mutate] of cases) {
+    const f = fixture({ carrier: { dropFinalize: () => true } })
+    const pending = f.terminal.whenActive().catch((error) => error)
+    f.terminal.start()
+    f.source.start()
+    const offer = capturedFinalize(f, 0)
+    if (mutate) {
+      mutate(offer.subarray(8, 220))
+      signOffer(f, offer)
+    } else {
+      offer[235] ^= 1
+    }
+    const frame = sealPeerContextFrame({ ...finalizeContext(f, 0, 0n), payload: offer })
+    f.carriers.right.enqueue({ contextClass: 5, frame })
+    const error = await pending
+    t.ok(error instanceof PrivateRouteError, name)
+    t.is(f.carriers.right.sentFinalize.length, 0, name)
+    t.is(f.carriers.right.activated, false, name)
+    t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0, name)
+    t.is(readPeerLedger(f.terminalLedger).cellsSpent, 0, name)
+    t.is(readPeerMemory(f.terminalMemory).reservedBytes, 0, name)
+    f.source.destroy()
+    offer.fill(0)
+  }
+})
+
+test('terminal authenticates the parent transcript before accepting an offer', async (t) => {
+  const f = fixture({ terminalOverrides: { tailControlTranscriptDigest: seed(0x12) } })
+  const pending = f.terminal.whenActive().catch((error) => error)
+  f.terminal.start()
+  f.source.start()
+  t.is((await pending).code, 'ERR_AUTHENTICATION')
+  t.is(f.carriers.right.sentFinalize.length, 0)
+  t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0)
+  t.is(readPeerMemory(f.terminalMemory).reservedBytes, 0)
+  f.source.destroy()
+})
+
+test('terminal exact offers consume only the original response budget and reservation', async (t) => {
+  const f = fixture({ carrier: { dropFinalize: (index) => index === 1 } })
+  f.terminal.start()
+  f.source.start()
+  await tick()
+  const offer = capturedFinalize(f, 0)
+  const accept = capturedFinalize(f, 1)
+  const memory = readPeerMemory(f.terminalMemory)
+  const ledger = readPeerLedger(f.terminalLedger)
+  const { maxStreams, receiveBytes, semanticOwnedBytes } = f.terminalLimits
+  t.is(
+    memory.reservedBytes,
+    computePeerQueuedBytes({ maxStreams, receiveBytes, semanticOwnedBytes })
+  )
+  t.is(memory.takenBytes, 0)
+  t.is(ledger.commandsSpent, 1)
+  f.carriers.right.enqueue({ contextClass: 5, frame: f.carriers.left.sentFinalize[0] })
+  await tick()
+  t.is(f.carriers.right.sentFinalize.length, 1)
+  for (let counter = 1n; counter < 8n; counter++) {
+    f.carriers.right.enqueue({
+      contextClass: 5,
+      frame: sealPeerContextFrame({ ...finalizeContext(f, 0, counter), payload: offer })
+    })
+    await tick()
+    t.alike(readPeerMemory(f.terminalMemory), memory)
+    const current = readPeerLedger(f.terminalLedger)
+    t.is(current.commandsSpent, 1)
+    t.is(current.cellsSpent, ledger.cellsSpent + Number(counter))
+    t.is(current.cellsReserved + current.cellsSpent, ledger.cellsReserved + ledger.cellsSpent)
+    const response = f.carriers.right.sentFinalize[Number(counter)]
+    const opened = openPeerContextFrame(finalizeContext(f, 1, counter), response)
+    t.alike(opened.payload, accept)
+    opened.plaintext.fill(0)
+  }
+  t.is(f.terminal.diagnostics().attempts, 8)
+  f.carriers.right.enqueue({
+    contextClass: 5,
+    frame: sealPeerContextFrame({ ...finalizeContext(f, 0, 8n), payload: offer })
+  })
+  await tick()
+  t.is(f.carriers.right.sentFinalize.length, 8)
+  t.exception(() => f.terminal.diagnostics(), /destroyed/i)
+  t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0)
+  t.is(readPeerMemory(f.terminalMemory).reservedBytes, 0)
+  f.source.destroy()
+  offer.fill(0)
+  accept.fill(0)
+})
+
+test('terminal memory refusal rolls back both directional reservations', async (t) => {
+  const memoryPool = createPeerMemoryPool(1)
+  const f = fixture({ terminalOverrides: { memoryPool } })
+  const pending = f.source.whenActive().catch((error) => error)
+  f.terminal.start()
+  f.source.start()
+  t.is((await pending).code, 'ERR_QUOTA_EXCEEDED')
+  t.is(f.terminal.diagnostics().status, 'TERMINAL_REJECT')
+  t.is(f.carriers.right.activated, false)
+  t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0)
+  t.is(readPeerLedger(f.terminalLedger).commandsSpent, 0)
+  t.is(readPeerMemory(memoryPool).reservedBytes, 0)
+  f.terminal.destroy()
+})
+
+test('purpose owner ignores unauthenticated finalize noise without consuming its counter', async (t) => {
+  const f = fixture({ carrier: { dropFinalize: () => true } })
+  f.terminal.start()
+  f.source.start()
+  const offer = capturedFinalize(f, 0)
+  const context = finalizeContext(f, 0, 1000n)
+  const valid = sealPeerContextFrame({ ...context, payload: offer })
+  const noise = b4a.from(valid)
+  noise[1099] ^= 1
+  const ledger = readPeerLedger(f.terminalLedger)
+  const memory = readPeerMemory(f.terminalMemory)
+  const diagnostic = f.terminal.diagnostics()
+  f.carriers.right.enqueue({ contextClass: 5, frame: noise })
+  await tick()
+  t.alike(f.terminal.diagnostics(), diagnostic)
+  t.alike(readPeerLedger(f.terminalLedger), ledger)
+  t.alike(readPeerMemory(f.terminalMemory), memory)
+  f.carriers.right.enqueue({ contextClass: 5, frame: valid })
+  await tick()
+  t.is(f.terminal.diagnostics().status, 'TERMINAL_WAIT_SOURCE')
+  t.is(f.carriers.right.sentFinalize.length, 1)
+  f.source.destroy()
+  f.terminal.destroy()
+  offer.fill(0)
+})
+
+test('purpose owner ignores active route noise but closes on authenticated violations', async (t) => {
+  for (const direction of [0, 1]) {
+    const f = fixture()
+    await startHandshake(f)
+    const offer = capturedFinalize(f, 0)
+    const accept = capturedFinalize(f, 1)
+    const keys = fixturePurposeKeys(f, offer, accept.subarray(8, 268))
+    const context = routeContext(f, keys, direction, 1000n)
+    const target = direction === 0 ? f.terminal : f.source
+    const carrier = direction === 0 ? f.carriers.right : f.carriers.left
+    const ledger = direction === 0 ? f.terminalLedger : f.sourceLedger
+    const memory = direction === 0 ? f.terminalMemory : f.sourceMemory
+    const beforeLedger = readPeerLedger(ledger)
+    const beforeMemory = readPeerMemory(memory)
+    const diagnostic = target.diagnostics()
+    const violation = sealPeerContextFrame({ ...context, payload: offer })
+    const noise = b4a.from(violation)
+    noise[1099] ^= 1
+    const finalizeNoise = sealPeerContextFrame({
+      ...finalizeContext(f, direction, 1000n),
+      payload: direction === 0 ? offer : accept
+    })
+    finalizeNoise[1099] ^= 1
+    carrier.enqueue({ contextClass: 5, frame: finalizeNoise })
+    carrier.enqueue({ contextClass: 6, frame: noise })
+    await tick()
+    t.alike(target.diagnostics(), diagnostic)
+    t.alike(readPeerLedger(ledger), beforeLedger)
+    t.alike(readPeerMemory(memory), beforeMemory)
+    carrier.enqueue({ contextClass: 6, frame: violation })
+    await tick()
+    t.exception(() => target.diagnostics(), /destroyed/i)
+    t.is(readPeerLedger(ledger).cellsReserved, 0)
+    t.is(readPeerMemory(memory).takenBytes, 0)
+    f.source.destroy()
+    f.terminal.destroy()
+    clearPeerPurposeKeys(keys)
+    offer.fill(0)
+    accept.fill(0)
+  }
+})
+
+test('purpose owner closes on authenticated context framing violations', async (t) => {
+  for (const contextClass of [5, 6]) {
+    for (const mutate of [
+      (plaintext) => {
+        plaintext[0] = 1
+      },
+      (plaintext) => {
+        plaintext.writeUInt16BE(1074, 1)
+      }
+    ]) {
+      const f = fixture()
+      await startHandshake(f)
+      const offer = capturedFinalize(f, 0)
+      const accept = capturedFinalize(f, 1)
+      const keys = fixturePurposeKeys(f, offer, accept.subarray(8, 268))
+      const context =
+        contextClass === 5 ? finalizeContext(f, 0, 10n) : routeContext(f, keys, 0, 10n)
+      f.carriers.right.enqueue({ contextClass, frame: sealInvalidPlaintext(context, mutate) })
+      await tick()
+      t.exception(() => f.terminal.diagnostics(), /destroyed/i)
+      t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0)
+      t.is(readPeerMemory(f.terminalMemory).takenBytes, 0)
+      f.source.destroy()
+      clearPeerPurposeKeys(keys)
+      offer.fill(0)
+      accept.fill(0)
+    }
+  }
+})
+
+test('purpose owner closes on ordinary authenticated route traffic before the sentinel', async (t) => {
+  const f = fixture({ carrier: { dropRoute: () => true } })
+  const pending = f.terminal.whenActive().catch((error) => error)
+  f.terminal.start()
+  f.source.start()
+  await tick()
+  const offer = capturedFinalize(f, 0)
+  const accept = capturedFinalize(f, 1)
+  const keys = fixturePurposeKeys(f, offer, accept.subarray(8, 268))
+  const payload = encodePeerTransport(PEER_MESSAGE_ID.PEER_RELIABLE_ACK_V2, {
+    routeId: f.route.routeId,
+    generation: 7n,
+    dataCumulative: MAX_U64,
+    dataBitmap: 0n,
+    controlCumulative: MAX_U64,
+    controlBitmap: 0n,
+    ackSnapshot: 1,
+    reservedZero: 0
+  })
+  f.carriers.right.enqueue({
+    contextClass: 6,
+    frame: sealPeerContextFrame({ ...routeContext(f, keys, 0, 1n), payload })
+  })
+  t.is((await pending).code, 'ERR_REPLAY')
+  t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0)
+  t.is(readPeerMemory(f.terminalMemory).reservedBytes, 0)
+  f.source.destroy()
+  clearPeerPurposeKeys(keys)
+  offer.fill(0)
+  accept.fill(0)
+})
 
 test('purpose owner activates after offer, accept, and two reliable sentinels', async (t) => {
   const f = fixture()
@@ -617,6 +1041,7 @@ test('purpose owner rejects a conflicting replay and rolls back reservations', a
   t.is(f.terminal.diagnostics().status, 'TERMINAL_WAIT_SOURCE')
   const mutated = b4a.from(opened.payload)
   mutated[20] ^= 1
+  signOffer(f, mutated)
   const forged = sealPeerContextFrame({
     contextClass: 5,
     circuitId: f.route.circuitId,
@@ -635,6 +1060,7 @@ test('purpose owner rejects a conflicting replay and rolls back reservations', a
   t.exception(() => f.terminal.diagnostics(), /destroyed/i)
   t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0)
   t.is(readPeerMemory(f.terminalMemory).reservedBytes, 0)
+  f.source.destroy()
   opened.plaintext.fill(0)
   exact.fill(0)
   mutated.fill(0)
