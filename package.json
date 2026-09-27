@@ -34,6 +34,14 @@
     "child_process": {
       "bare": "bare-node-child-process",
       "default": "child_process"
+    },
+    "path": {
+      "bare": "bare-path",
+      "default": "path"
+    },
+    "os": {
+      "bare": "bare-os",
+      "default": "os"
     }
   },
   "dependencies": {
@@ -55,8 +63,8 @@
     "signal-promise": "^1.0.3",
     "sodium-universal": "^5.0.1",
     "streamx": "2.28.1",
-    "unslab": "^1.3.0",
     "udx-native": "1.20.7",
+    "unslab": "^1.3.0",
     "xache": "^1.1.0"
   },
   "overrides": {
@@ -65,18 +73,26 @@
   "devDependencies": {
     "bare-fs": "4.7.4",
     "bare-node-child-process": "^1.0.1",
+    "bare-os": "^3.9.3",
+    "bare-path": "^3.1.2",
     "bare-runtime": "1.30.3",
     "brittle": "^3.0.0",
     "graceful-goodbye": "^1.3.0",
     "newline-decoder": "^1.0.2",
     "prettier": "^3.6.2",
-    "prettier-config-holepunch": "^2.0.0"
+    "prettier-config-holepunch": "^2.0.0",
+    "protomux": "^3.12.1"
   },
   "scripts": {
     "format": "prettier --write .",
     "test": "prettier --check . && node test/all.js",
     "test:bare": "bare test/all.js",
     "test:generate": "brittle -r test/all.js test/*.js",
+    "test:e2e": "node test/e2e.js",
+    "test:e2e:bare": "bare test/e2e.js",
+    "test:e2e:generate": "brittle -r test/e2e.js test/e2e/*.js",
+    "test:e2e:b1": "brittle test/e2e/b1/*.js",
+    "test:e2e:b1:bare": "brittle-bare test/e2e/b1/*.js",
     "integration": "brittle test/integration/*.js",
     "test:private:process:node": "brittle-node test/private/live-process-node.js",
     "test:private:process:bare": "brittle-node test/private/live-process-bare.js",
