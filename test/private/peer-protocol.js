@@ -95,7 +95,13 @@ const FIXTURES = [
   ['PRIVATE_ACK_V2', 232, 232, 0],
   ['PRIVATE_ACCEPTED_V2', 168, 168, 0],
   ['PRIVATE_SOURCE_RECEIPT_V2', 120, 120, 0],
-  ['PRIVATE_OPEN_V2', 216, 216, 0]
+  ['PRIVATE_OPEN_V2', 216, 216, 0],
+  ['PRESENCE_LOOKUP_V2', 48, 48, 0],
+  ['PRESENCE_STORE_V2', 1011, 1011, 0],
+  ['PRESENCE_RECORD_V2', 979, 979, 0],
+  ['PRESENCE_ABSENT_V2', 16, 16, 0],
+  ['PRESENCE_STORED_V2', 22, 22, 0],
+  ['PRESENCE_UNAVAILABLE_V2', 16, 16, 0]
 ]
 
 test('peer v3 envelopes emit the fixed registry wire identifiers', (t) => {
@@ -105,7 +111,7 @@ test('peer v3 envelopes emit the fixed registry wire identifiers', (t) => {
     0x030c, 0x030d, 0x030e, 0x030f, 0x0310, 0x0311, 0x0312, 0x0313, 0x0314, 0x0315, 0x0316, 0x0317,
     0x0318, 0x0319, 0x031a, 0x031b, 0x031c, 0x031d, 0x031e, 0x031f, 0x0340, 0x0341, 0x0342, 0x0343,
     0x0344, 0x0345, 0x0346, 0x0347, 0x0349, 0x034a, 0x034b, 0x0360, 0x0361, 0x0362, 0x0363, 0x0364,
-    0x0365
+    0x0365, 0x0370, 0x0371, 0x0372, 0x0373, 0x0374, 0x0375
   ]
   for (let index = 0; index < FIXTURES.length; index++) {
     const [name, bodyBytes, , suffixBytes] = FIXTURES[index]

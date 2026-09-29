@@ -38,7 +38,12 @@ const {
   readPeerNeighborAdmission,
   settlePeerNeighborAdmission
 } = require('../../lib/private/peer-neighbor-admission')
-const { createPeerLedger, createPeerMemoryPool } = require('../../lib/private/peer-ledger')
+const {
+  createPeerLedger,
+  createPeerMemoryPool,
+  createPeerBranchSlots,
+  readPeerBranchSlots
+} = require('../../lib/private/peer-ledger')
 const {
   createPeerRelayOwner,
   readPeerRelayOwner,
@@ -747,10 +752,6 @@ async function closeFixture(fixture) {
   fixture.links.right.directory.destroy()
 }
 
-function peerBranchLedgers(branches = 1) {
-  return ledgers(branches)
-}
-
 async function peerGuardFixture(t, leftPort, rightPort, fixtureOptions = {}) {
   const clock = fixtureOptions.clock || fakeClock()
   const clocks = {
@@ -810,9 +811,9 @@ async function peerGuardFixture(t, leftPort, rightPort, fixtureOptions = {}) {
   const localAuthority = createPeerM3AdjacencyAuthority(clocks)
   const guardAuthority = createPeerM3AdjacencyAuthority(clocks)
   let guardRuntime = null
-  const pLedgers = peerBranchLedgers(4)
+  const pSlots = slotPool(4)
   const responder = createPeerLinkResponder(guardOwner, {
-    ...pLedgers,
+    ...pSlots,
     onEstablished(handle) {
       guardRuntime = adoptPeerEstablishedLink(guardAuthority, handle)
       return guardRuntime
@@ -844,10 +845,15 @@ async function peerGuardFixture(t, leftPort, rightPort, fixtureOptions = {}) {
     lease,
     clock,
     localAuthority,
-    peerLedgers: pLedgers,
+    peerSlots: pSlots,
     limits,
     get guardRuntime() {
       return guardRuntime
+    },
+    // Another source owner under the same identity and endpoint that advertises `port`, so
+    // a genuine ACCEPT names a predecessor endpoint this owner does not advertise.
+    sourceOwnerAdvertising(port) {
+      return makeOwner(fixture.left, fixture.links.a, '127.0.0.1', port, 201)
     },
     discover() {
       return discoverPeerCandidate(createPeerGuardBootstrapTransport(lease), {
@@ -877,7 +883,7 @@ async function peerGuardFixture(t, leftPort, rightPort, fixtureOptions = {}) {
         forwardLimits: limits,
         reverseLimits: limits,
         operationDeadline: clock.monotonicNow() + 2000n,
-        ...peerBranchLedgers(),
+        ...slotPool(),
         ...overrides
       })
     }
@@ -1083,9 +1089,9 @@ async function setupFourNodeNativeFixture({
 
     let guardRuntime = null
     let guardTailSession = null
-    const guardParentLedgers = ledgers(2)
+    const guardSlots = slotPool(2)
     const guardResponder = createPeerLinkResponder(guardRelayOwner, {
-      ...guardParentLedgers,
+      ...guardSlots,
       onEstablished(handle) {
         guardRuntime = adoptPeerEstablishedLink(guardAuthority, handle)
         queueMicrotask(() => {
@@ -1096,10 +1102,7 @@ async function setupFourNodeNativeFixture({
                 neighborPool: guardPool,
                 runtimeAuthority: guardAuthority,
                 memoryPool: grdPool,
-                sendLedger: guardParentLedgers.sendLedger,
-                receiveLedger: guardParentLedgers.receiveLedger,
-                teardownSendLedger: guardParentLedgers.teardownSendLedger,
-                teardownReceiveLedger: guardParentLedgers.teardownReceiveLedger
+                branchSlots: guardSlots.branchSlots
               })
               cleanup.push(() => destroyPeerTailControl(guardTailSession))
               guardTailStarted.resolve(guardTailSession)
@@ -1184,9 +1187,9 @@ async function setupFourNodeNativeFixture({
 
     let safetyRuntime = null
     let safetyTailSession = null
-    const safetyParentLedgers = ledgers(2)
+    const safetySlots = slotPool(2)
     const safetyResponder = createPeerLinkResponder(safetyRelayOwner, {
-      ...safetyParentLedgers,
+      ...safetySlots,
       onEstablished(handle) {
         safetyRuntime = adoptPeerEstablishedLink(safetyAuthority, handle)
         if (suppressSafetyTailReady) {
@@ -1201,10 +1204,7 @@ async function setupFourNodeNativeFixture({
                 neighborPool: safetyPool,
                 runtimeAuthority: safetyAuthority,
                 memoryPool: sftPool,
-                sendLedger: safetyParentLedgers.sendLedger,
-                receiveLedger: safetyParentLedgers.receiveLedger,
-                teardownSendLedger: safetyParentLedgers.teardownSendLedger,
-                teardownReceiveLedger: safetyParentLedgers.teardownReceiveLedger
+                branchSlots: safetySlots.branchSlots
               })
               cleanup.push(() => destroyPeerTailControl(safetyTailSession))
               safetyTailStarted.resolve(safetyTailSession)
@@ -1413,9 +1413,9 @@ async function setupFourNodeNativeFixture({
 
     let terminalRuntime = null
     let terminalTailSession = null
-    const terminalParentLedgers = ledgers(1)
+    const terminalSlots = slotPool(1)
     const terminalResponder = createPeerLinkResponder(terminalRelayOwner, {
-      ...terminalParentLedgers,
+      ...terminalSlots,
       onEstablished(handle) {
         terminalRuntime = adoptPeerEstablishedLink(terminalAuthority, handle)
         queueMicrotask(() => {
@@ -1705,7 +1705,7 @@ async function setupFourNodeNativeFixture({
         forwardLimits: limits,
         reverseLimits: limits,
         operationDeadline: c.monotonicNow() + 2000n,
-        ...ledgers(),
+        ...slotPool(),
         ...overrides
       })
       const sourceRuntime = adoptPeerEstablishedLink(localAuthority, handle)
@@ -2210,17 +2210,20 @@ async function setupTwoEndedNativeAdjacency({
   }
 }
 
-// Parent ledgers for `branches` branches of the fixtures' 60-cell limits, apart from the
-// 10-cell closure partition each branch reserves separately.
-function ledgers(branches = 1) {
-  const budget = { cells: 50 * branches, bytes: 60000n * BigInt(branches), commands: 20 * branches }
-  const closure = { cells: 10 * branches, bytes: 12000n * BigInt(branches), commands: branches }
-  return {
-    sendLedger: createPeerLedger(budget),
-    receiveLedger: createPeerLedger(budget),
-    teardownSendLedger: createPeerLedger(closure),
-    teardownReceiveLedger: createPeerLedger(closure)
-  }
+// Admission options holding a branch-slot pool for `branches` branches at once. Every
+// admitted branch takes a slot with fresh authority of exactly its admitted rows.
+function slotPool(branches = 1) {
+  return { branchSlots: createPeerBranchSlots(branches) }
+}
+
+// What a pool's branches spent of one ledger kind, live and retired together.
+function branchSpent(pool, kind) {
+  return readPeerBranchSlots(pool.branchSlots).spent[kind]
+}
+
+// What a pool's live branches, closing ones included, hold of one ledger kind.
+function branchReserved(pool, kind) {
+  return readPeerBranchSlots(pool.branchSlots).reserved[kind]
 }
 
 async function authenticatedPeer(t, port, extensionIndex = 2, native = false, options = {}) {
@@ -2246,11 +2249,11 @@ async function authenticatedPeer(t, port, extensionIndex = 2, native = false, op
   }
   const localAuthority = createPeerM3AdjacencyAuthority(authorityOptions)
   const peerAuthority = createPeerM3AdjacencyAuthority(authorityOptions)
-  const peerLedgers = ledgers(options.peerBranches || 6)
+  const peerSlots = slotPool(options.peerBranches || 6)
   const adoptedPeerRuntimes = []
   let peerRuntime = null
   const responder = createPeerLinkResponder(f.peerRelayOwner, {
-    ...peerLedgers,
+    ...peerSlots,
     onEstablished(handle) {
       peerRuntime = adoptPeerEstablishedLink(peerAuthority, handle)
       adoptedPeerRuntimes.push(peerRuntime)
@@ -2275,7 +2278,7 @@ async function authenticatedPeer(t, port, extensionIndex = 2, native = false, op
   async function openAdditional({
     forwardLimits = limits,
     reverseLimits = limits,
-    localLedgers = ledgers()
+    localSlots = slotPool()
   } = {}) {
     const number = branchNumber++
     const handle = await openPeerNeighborLink({
@@ -2294,9 +2297,9 @@ async function authenticatedPeer(t, port, extensionIndex = 2, native = false, op
       forwardLimits,
       reverseLimits,
       operationDeadline: clock.monotonicNow() + 2000n,
-      ...localLedgers
+      ...localSlots
     })
-    return { handle, peerRuntime, localLedgers }
+    return { handle, peerRuntime, localSlots }
   }
   return {
     f,
@@ -2306,7 +2309,7 @@ async function authenticatedPeer(t, port, extensionIndex = 2, native = false, op
     localAuthority,
     peerAuthority,
     limits,
-    peerLedgers,
+    peerSlots,
     ...(await openAdditional()),
     openAdditional
   }
@@ -2529,7 +2532,7 @@ async function setupDistinctNativeNeighbor(
     forwardLimits = branchLimits,
     reverseLimits = branchLimits,
     activeCandidate = null,
-    localLedgers = ledgers(4)
+    localSlots = slotPool(4)
   } = {}) {
     const n = branchCount++
     const handle = await openPeerNeighborLink({
@@ -2548,12 +2551,12 @@ async function setupDistinctNativeNeighbor(
       forwardLimits,
       reverseLimits,
       operationDeadline: f.clock.monotonicNow() + 2000n,
-      ...localLedgers
+      ...localSlots
     })
     return {
       handle,
       peerRuntime: adoptedPeerRuntimes ? adoptedPeerRuntimes[adoptedPeerRuntimes.length - 1] : null,
-      localLedgers
+      localSlots
     }
   }
 
@@ -2577,7 +2580,9 @@ async function setupDistinctNativeNeighbor(
 
 module.exports = {
   seed,
-  ledgers,
+  slotPool,
+  branchSpent,
+  branchReserved,
   authenticatedPeer,
   safetyIdentity,
   fixtureKeys,
@@ -2596,7 +2601,6 @@ module.exports = {
   pinnedMaterialFixture,
   leaseOptions,
   closeFixture,
-  peerBranchLedgers,
   peerGuardFixture,
   setupFourNodeNativeFixture,
   distinctSafetyIdentity

@@ -27,9 +27,9 @@ const {
 } = require('../../lib/private/peer-transport-wire')
 const { digestPeerLimits } = require('../../lib/private/peer-crypto')
 const {
-  createPeerLedger,
-  readPeerLedger,
-  chargePeerLedger
+  chargePeerLedger,
+  createPeerBranchSlots,
+  readPeerBranchSlots
 } = require('../../lib/private/peer-ledger')
 const {
   PEER_MESSAGE_ID,
@@ -53,9 +53,11 @@ const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const {
   createPeerM3AdjacencyAuthority,
   adoptPeerEstablishedLink,
-  isPeerM3Runtime
+  isPeerM3Runtime,
+  beginPeerM3BranchTeardown
 } = require('../../lib/private/peer-m3-adjacency-runtime')
-const { fakeClock, ledgers } = require('./peer-native-fixture')
+const { destroyGuardLease } = require('../../lib/private/guard-lease')
+const { fakeClock, slotPool, peerGuardFixture } = require('./peer-native-fixture')
 
 const seed = (val) => b4a.alloc(32, val)
 
@@ -326,10 +328,9 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
     clearTimer: clock.clearTimer
   })
 
-  const sendLedger = createPeerLedger({ cells: 60, bytes: 72000n, commands: 60 })
-  const teardownSendLedger = createPeerLedger({ cells: 30, bytes: 36000n, commands: 3 })
-  const receiveLedger = createPeerLedger({ cells: 60, bytes: 72000n, commands: 60 })
-  const teardownReceiveLedger = createPeerLedger({ cells: 30, bytes: 36000n, commands: 3 })
+  // Two admitted branches at once, each taking its own slot with fresh authority.
+  const branchSlots = createPeerBranchSlots(2)
+  const spent = (kind) => readPeerBranchSlots(branchSlots).spent[kind]
 
   const adoptedRuntimes = []
   const responder = createPeerLinkResponder(rightRelayOwner, {
@@ -338,10 +339,7 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
       adoptedRuntimes.push(runtime)
       return runtime
     },
-    sendLedger,
-    teardownSendLedger,
-    receiveLedger,
-    teardownReceiveLedger
+    branchSlots
   })
   t.ok(responder, 'responder created')
 
@@ -417,14 +415,7 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
     }
   }
   t.is(
-    rejection(() =>
-      createPeerLinkResponder(rightRelayOwner, {
-        sendLedger,
-        receiveLedger,
-        teardownSendLedger,
-        teardownReceiveLedger
-      })
-    ),
+    rejection(() => createPeerLinkResponder(rightRelayOwner, { branchSlots })),
     'INVALID_ROUTE',
     'a responder requires an owner that synchronously adopts each established link'
   )
@@ -496,8 +487,18 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
     'admittedLimitsDigest is digestPeerLimits(R26, F26, C32)'
   )
 
-  const parents = [sendLedger, receiveLedger, teardownSendLedger, teardownReceiveLedger]
-  const before = parents.map(readPeerLedger)
+  // The admitted branch holds exactly its offered rows less closure: its send partition is
+  // the requested reverse row and its receive partition the initiator's forward row.
+  t.alike(
+    readPeerBranchSlots(branchSlots).reserved,
+    {
+      sendLedger: { cells: 10, bytes: 12000n, commands: 10 },
+      receiveLedger: { cells: 11, bytes: 13200n, commands: 11 },
+      teardownSendLedger: { cells: 10, bytes: 12000n, commands: 1 },
+      teardownReceiveLedger: { cells: 10, bytes: 12000n, commands: 1 }
+    },
+    'the admitted branch holds its exact rows and two disjoint closure partitions'
+  )
   const successorFields = {
     ...offerFields,
     branchId: b4a.alloc(16, 0x71),
@@ -506,34 +507,6 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
     clientNonce: b4a.alloc(32, 0x73)
   }
   const otherBinding = takePeerLinkResponderBinding(responder, rightEstablished, rightEndpoint)
-  const oversizedForwardCells = readPeerLedger(receiveLedger).cellsRemaining + 11
-  let admissionError = null
-  try {
-    binding.accept({
-      offer: signOffer({
-        ...successorFields,
-        initiatorForwardLimits: {
-          ...forwardLimits,
-          maxCells: oversizedForwardCells,
-          maxBytes: oversizedForwardCells * 1200
-        }
-      }),
-      established: rightEstablished,
-      reservePhysical
-    })
-  } catch (err) {
-    admissionError = err
-  }
-  t.is(
-    admissionError && admissionError.code,
-    'INVALID_ROUTE',
-    'insufficient receive capacity rejects admission after reserving send capacity'
-  )
-  t.alike(
-    parents.map(readPeerLedger),
-    before,
-    'partial admission returns every unspent reservation'
-  )
   const successorReply = otherBinding.accept({
     offer: signOffer(successorFields),
     established: rightEstablished,
@@ -578,11 +551,11 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
   t.is(isPeerM3Runtime(adoptedRuntimes[0]), false, 'ninth OFFER revokes its adopted runtime')
   t.is(isPeerM3Runtime(adoptedRuntimes[1]), true, 'the independent sibling is still live')
   t.is(
-    readPeerLedger(receiveLedger).cellsSpent,
+    spent('receiveLedger').cells,
     10,
     'nine first-branch arrivals and one sibling arrival are retained'
   )
-  t.is(readPeerLedger(receiveLedger).commandsSpent, 2, 'retransmissions allocate no new command')
+  t.is(spent('receiveLedger').commands, 2, 'retransmissions allocate no new command')
   t.is(
     rejection(() =>
       binding.accept({
@@ -612,7 +585,7 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
     'changed OFFER revokes its original adopted runtime'
   )
   t.is(
-    readPeerLedger(receiveLedger).cellsSpent,
+    spent('receiveLedger').cells,
     11,
     'the changed OFFER is charged to the original owner before a third admission'
   )
@@ -671,7 +644,7 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
     'the original deadline ends reply authority'
   )
   t.is(
-    readPeerLedger(receiveLedger).cellsSpent,
+    spent('receiveLedger').cells,
     13,
     'the first late authenticated arrival is accounted before retirement'
   )
@@ -680,10 +653,10 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
     'UNAUTHORIZED'
   )
 
-  const bindingParents = ledgers()
+  const bindingSlots = slotPool()
   let bindingRuntime = null
   const bindingResponder = createPeerLinkResponder(rightRelayOwner, {
-    ...bindingParents,
+    ...bindingSlots,
     onEstablished(handle) {
       bindingRuntime = adoptPeerEstablishedLink(responderAuthority, handle)
       revokedBinding.destroy()
@@ -731,14 +704,125 @@ test('responder binding.accept and takePeerLinkReplyAttempt produce genuine 695-
   await leftEndpoint.close()
   await rightEndpoint.close()
   await new Promise((resolve) => setImmediate(resolve))
-  for (const parent of parents) t.is(readPeerLedger(parent).cellsReserved, 0)
-  for (const parent of Object.values(bindingParents)) t.is(readPeerLedger(parent).cellsReserved, 0)
-  t.is(readPeerLedger(sendLedger).cellsSpent, 1, 'closing adopted owners never refunds spent work')
-  t.is(
-    readPeerLedger(sendLedger).commandsSpent,
-    3,
-    'released admissions never refund allocation commands'
-  )
+  t.is(readPeerBranchSlots(branchSlots).live, 0, 'every admitted branch has retired')
+  t.is(readPeerBranchSlots(bindingSlots.branchSlots).live, 0)
+  t.is(spent('sendLedger').cells, 1, 'closing adopted owners never refunds spent work')
+  t.is(spent('sendLedger').commands, 3, 'released admissions never refund allocation commands')
   leftDir.destroy()
   rightDir.destroy()
+})
+
+// Hop zero takes consuming custody of the caller's client tail ephemeral secret. Once admitted,
+// openPeerGuardLink erases it in place as soon as both tail agreements exist, and on every
+// failure, timeout or cancellation. A refusal before admission leaves it with the caller.
+test('A0 erases an admitted client tail ephemeral on every outcome and leaves a refused one with its caller', async (t) => {
+  const setup = await peerGuardFixture(t, 47711, 47712)
+  const erased = (buffer) => buffer.every((byte) => byte === 0)
+  const tail = () => {
+    const pair = cryptoSuite.encryptionKeyPair()
+    return {
+      secretKey: pair.secretKey,
+      overrides: {
+        clientTailEphemeralPublicKey: pair.publicKey,
+        clientTailSecretKey: pair.secretKey
+      }
+    }
+  }
+  const outcome = (promise) =>
+    promise.then(
+      (handle) => ({ handle }),
+      (error) => ({ error })
+    )
+
+  // Refused before admission: the candidate and the secret stay with the caller.
+  const candidate = await setup.discover()
+  const refused = tail()
+  const retained = b4a.from(refused.secretKey)
+  let error = null
+  try {
+    await setup.open(candidate, { ...refused.overrides, extensionIndex: 1 })
+  } catch (err) {
+    error = err
+  }
+  t.is(error && error.code, 'INVALID_ROUTE', 'a malformed A0 is refused before admission')
+  t.alike(refused.secretKey, retained, 'a refusal before admission leaves the secret intact')
+
+  // Success: the same candidate still admits, and the secret is gone once the link exists.
+  const opened = tail()
+  const runtime = adoptPeerEstablishedLink(
+    setup.localAuthority,
+    await setup.open(candidate, opened.overrides)
+  )
+  t.ok(erased(opened.secretKey), 'an established A0 has erased the secret')
+  t.is(await beginPeerM3BranchTeardown(runtime, b4a.alloc(16, 0x91)), true)
+
+  // A genuine ACCEPT that names another predecessor endpoint is refused after the exchange.
+  const misdirected = tail()
+  const refusedAccept = await outcome(
+    setup.open(await setup.discover(), {
+      ...misdirected.overrides,
+      relayOwner: setup.sourceOwnerAdvertising(47713)
+    })
+  )
+  t.is(refusedAccept.error && refusedAccept.error.code, 'UNAUTHORIZED', 'the ACCEPT is refused')
+  t.ok(erased(misdirected.secretKey), 'a refused ACCEPT erases the secret')
+
+  // The static tail agreement succeeds and the ephemeral one fails.
+  const failing = tail()
+  const scalarmult = sodium.crypto_scalarmult
+  let agreements = 0
+  sodium.crypto_scalarmult = function (output, secretKey, publicKey) {
+    if (secretKey === failing.secretKey && ++agreements === 2) {
+      throw new Error('second tail agreement failure')
+    }
+    return scalarmult.call(this, output, secretKey, publicKey)
+  }
+  let failedAgreement = null
+  try {
+    failedAgreement = await outcome(setup.open(await setup.discover(), failing.overrides))
+  } finally {
+    sodium.crypto_scalarmult = scalarmult
+  }
+  t.is(agreements, 2, 'the first tail agreement succeeded before the second failed')
+  t.is(failedAgreement.error && failedAgreement.error.code, 'INVALID_ROUTE')
+  t.ok(erased(failing.secretKey), 'a failed second agreement erases the secret')
+
+  // Timeout: every guard reply is lost until the A0 deadline passes.
+  const socket = setup.fixture.rightObserver.socket
+  const send = socket.send
+  const late = tail()
+  const lateCandidate = await setup.discover()
+  socket.send = () => true
+  let timedOut = null
+  try {
+    const pending = outcome(setup.open(lateCandidate, late.overrides))
+    for (let step = 0; step < 10; step++) {
+      setup.clock.advance(250)
+      await new Promise(setImmediate)
+    }
+    timedOut = await pending
+  } finally {
+    socket.send = send
+  }
+  t.ok(timedOut.error instanceof PrivateRouteError, 'an A0 without an ACCEPT fails at its deadline')
+  t.ok(erased(late.secretKey), 'a timed-out A0 erases the secret')
+
+  // Cancellation: destroying the guard lease ends a pending A0 before its deadline.
+  const doomed = tail()
+  const doomedCandidate = await setup.discover()
+  socket.send = () => true
+  let cancelled = null
+  try {
+    const pending = outcome(setup.open(doomedCandidate, doomed.overrides))
+    await new Promise(setImmediate)
+    destroyGuardLease(setup.lease)
+    cancelled = await Promise.race([
+      pending,
+      new Promise((resolve) => setTimeout(() => resolve({ stalled: true }), 1000))
+    ])
+  } finally {
+    socket.send = send
+  }
+  t.ok(cancelled.error instanceof PrivateRouteError, 'destroying the lease ends the pending A0')
+  t.ok(erased(doomed.secretKey), 'a cancelled A0 erases the secret')
 })

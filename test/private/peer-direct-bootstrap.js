@@ -979,3 +979,125 @@ test('duplicate direct responder registration rejects before second token consum
   destroyPeerBootstrapResponder(responderA)
   destroyPeerBootstrapResponder(responderB)
 })
+
+// A phase1 query nonce unique to one endpoint and one row.
+function rowNonce(endpointIndex, row) {
+  const nonce = b4a.alloc(32)
+  nonce.writeUInt32BE(endpointIndex + 1, 0)
+  nonce.writeUInt32BE(row + 1, 4)
+  return nonce
+}
+
+// Runs phase0 and then phase1 for one query from `endpoint19`. Returns whether phase1 was
+// admitted, the CAPS response it sent (null if none) and the exact phase1 packet.
+function openRow(binding, endpoint19, nonce) {
+  let reply = null
+  const send = (packet) => {
+    reply = b4a.from(packet)
+  }
+  const target = b4a.alloc(32, 0x22)
+  if (!binding.receive(buildCapsQuery(11, target, nonce, 0, 0n, null), endpoint19, send)) {
+    return { admitted: false, reply: null, phase1: null }
+  }
+  const challenge = unwrapDirectRpcPacket(reply)
+  const cookieExp = challenge.body.readBigUInt64BE(32)
+  const cookie = b4a.from(challenge.body.subarray(40, 72))
+  reply = null
+  const phase1 = buildCapsQuery(11, target, nonce, 1, cookieExp, cookie)
+  const admitted = binding.receive(phase1, endpoint19, send)
+  return { admitted, reply, phase1, cookieExp, cookie, nonce }
+}
+
+function replay(binding, endpoint19, phase1) {
+  let reply = null
+  const admitted = binding.receive(phase1, endpoint19, (packet) => {
+    reply = b4a.from(packet)
+  })
+  return { admitted, reply }
+}
+
+function spendRow(t, binding, endpoint19, edKeys, row) {
+  const caps = unwrapDirectRpcPacket(row.reply)
+  const { readVerifiedPeerAdvertisement } = require('../../lib/private/peer-capability')
+  const ad = readVerifiedPeerAdvertisement(verifyPeerAdvertisement(caps.body.subarray(75, 335)))
+  const body = b4a.alloc(176, 0)
+  body.set(ad.advertisementDigest32, 0)
+  body.set(edKeys.publicKey, 32)
+  body.set(generateX25519KeyPair().publicKey, 64)
+  body.writeBigUInt64BE(row.cookieExp < ad.expiresAt ? row.cookieExp : ad.expiresAt, 96)
+  body.set(row.nonce, 104)
+  body.writeBigUInt64BE(row.cookieExp, 136)
+  body.set(row.cookie, 144)
+  let response = null
+  t.is(
+    binding.receive(wrapInner(PEER_MESSAGE_ID.PEER_ACTIVE_CHALLENGE_V2, body), endpoint19, (p) => {
+      response = b4a.from(p)
+    }),
+    true
+  )
+  t.is(unwrapDirectRpcPacket(response).messageId, PEER_MESSAGE_ID.PEER_ACTIVE_CHALLENGE_RESPONSE_V2)
+}
+
+// Packet §3.2: an observed endpoint holds at most 32 unexpired rows, LIVE and SPENT alike.
+test('one endpoint holds at most 32 unexpired rows, exact retries still replay at capacity', (t) => {
+  const clock = createMockClock()
+  const { edKeys, owner, endpointToken } = makeRelay(11, '127.0.0.1', 40001, clock)
+  const responder = createPeerBootstrapResponder(owner)
+  const binding = takePeerBootstrapResponderBinding(responder, endpointToken)
+  const a = encodeReachableEndpoint({ host: '10.0.0.5', port: 50005 })
+  const b = encodeReachableEndpoint({ host: '10.0.0.6', port: 50006 })
+  const rows = []
+  for (let row = 0; row < 32; row++) rows.push(openRow(binding, a, rowNonce(0, row)))
+  t.ok(
+    rows.every((row) => row.admitted && row.reply !== null),
+    'thirty-two rows are admitted'
+  )
+  // Spent rows keep counting until their cookie deadline.
+  for (const row of rows.slice(0, 4)) spendRow(t, binding, a, edKeys, row)
+  const refused = openRow(binding, a, rowNonce(0, 32))
+  t.alike([refused.admitted, refused.reply], [false, null], 'the thirty-third row gets no reply')
+  const again = replay(binding, a, rows[5].phase1)
+  t.is(again.admitted, true, 'an exact retry at capacity is admitted')
+  t.alike(again.reply, rows[5].reply, 'and replays the cached response without a new row')
+  const other = openRow(binding, b, rowNonce(1, 0))
+  t.is(other.admitted, true, 'another endpoint is unaffected')
+  destroyPeerBootstrapResponder(responder)
+})
+
+test('the responder pool stays 256 rows across endpoints', (t) => {
+  const clock = createMockClock()
+  const { owner, endpointToken } = makeRelay(11, '127.0.0.1', 40001, clock)
+  const responder = createPeerBootstrapResponder(owner)
+  const binding = takePeerBootstrapResponderBinding(responder, endpointToken)
+  const endpoint = (index) => encodeReachableEndpoint({ host: `10.0.1.${index + 1}`, port: 51000 })
+  let admitted = 0
+  for (let index = 0; index < 8; index++) {
+    for (let row = 0; row < 32; row++) {
+      if (openRow(binding, endpoint(index), rowNonce(index, row)).admitted) admitted++
+    }
+  }
+  t.is(admitted, 256, 'eight endpoints fill the pool')
+  const ninth = openRow(binding, endpoint(8), rowNonce(8, 0))
+  t.alike([ninth.admitted, ninth.reply], [false, null], 'a full pool refuses any other endpoint')
+  destroyPeerBootstrapResponder(responder)
+})
+
+test('rows free at their original cookie deadline and an expired row never replays', (t) => {
+  const clock = createMockClock()
+  const { owner, endpointToken } = makeRelay(11, '127.0.0.1', 40001, clock)
+  const responder = createPeerBootstrapResponder(owner)
+  const binding = takePeerBootstrapResponderBinding(responder, endpointToken)
+  const a = encodeReachableEndpoint({ host: '10.0.0.5', port: 50005 })
+  const rows = []
+  for (let row = 0; row < 32; row++) rows.push(openRow(binding, a, rowNonce(0, row)))
+  clock.advance(4000)
+  t.is(replay(binding, a, rows[0].phase1).admitted, true, 'a retry before the deadline replays')
+  clock.advance(999)
+  t.is(openRow(binding, a, rowNonce(0, 40)).admitted, false, 'no row has expired yet')
+  clock.advance(1)
+  const expired = replay(binding, a, rows[0].phase1)
+  t.alike([expired.admitted, expired.reply], [false, null], 'the retry did not extend its row')
+  const fresh = openRow(binding, a, rowNonce(0, 41))
+  t.is(fresh.admitted, true, 'expired rows are reclaimed for new queries')
+  destroyPeerBootstrapResponder(responder)
+})

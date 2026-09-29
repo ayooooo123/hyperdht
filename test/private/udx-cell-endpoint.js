@@ -1346,7 +1346,7 @@ test('Native: stored deadline unchanged by wall rollback and forward wall expiry
 })
 
 test('Native: ordinary traffic cannot access teardown ledger, forged closure tokens reject', async (t) => {
-  const { authenticatedPeer } = require('./peer-native-fixture')
+  const { authenticatedPeer, branchSpent } = require('./peer-native-fixture')
   const {
     takePeerEstablishedLink,
     destroyTakenPeerEstablishedLink
@@ -1354,7 +1354,6 @@ test('Native: ordinary traffic cannot access teardown ledger, forged closure tok
   const { registerPeerM3CellLinkTransfer } = require('../../lib/private/udx-cell-endpoint')
   const { CellCodec } = require('../../lib/private/cell-codec')
   const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
-  const { readPeerLedger } = require('../../lib/private/peer-ledger')
   const { receivePeerM3Payload } = require('../../lib/private/peer-m3-adjacency-runtime')
   const p = await authenticatedPeer(t, 48611)
   const taken = takePeerEstablishedLink(p.handle)
@@ -1392,12 +1391,88 @@ test('Native: ordinary traffic cannot access teardown ledger, forged closure tok
     await transfer.send(packet, taken.sendLedger)
     t.alike(await receiving, payload, 'same authenticated packet succeeds on its ordinary ledger')
   }
-  t.is(readPeerLedger(p.localLedgers.teardownSendLedger).cellsSpent, 0)
+  t.is(branchSpent(p.localSlots, 'teardownSendLedger').cells, 0)
+})
+
+// Receiver side of the per-link header (packet §4.5.3). A cell whose MAC is valid under the
+// link keys but whose clear header names the circuit generation instead of the link epoch is
+// dropped where it arrives, without delivery and without consuming its counter: the genuine
+// cell with the same counter is delivered afterwards.
+test('Native: a receiver drops a valid-MAC cell that names the generation as its epoch', async (t) => {
+  const { authenticatedPeer } = require('./peer-native-fixture')
+  const {
+    takePeerEstablishedLink,
+    destroyTakenPeerEstablishedLink
+  } = require('../../lib/private/peer-guard-link')
+  const { registerPeerM3CellLinkTransfer } = require('../../lib/private/udx-cell-endpoint')
+  const { CellCodec } = require('../../lib/private/cell-codec')
+  const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
+  const { receivePeerM3Payload } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const p = await authenticatedPeer(t, 48651)
+  const taken = takePeerEstablishedLink(p.handle)
+  const transfer = registerPeerM3CellLinkTransfer(taken.physicalChannel, taken.m3BranchBinding)
+  t.teardown(() => {
+    transfer.destroy()
+    destroyTakenPeerEstablishedLink(taken)
+  })
+  const codec = new CellCodec({ crypto: cryptoSuite, cellSize: BOOTSTRAP_SIZE })
+  const socket = p.f.localSocket
+  const inject = (packet) => socket.send(packet, p.f.peerPort, p.f.peerHost)
+  const settled = (promise) =>
+    Promise.race([
+      promise.then(
+        (value) => ({ value }),
+        (error) => ({ error })
+      ),
+      new Promise((resolve) => setTimeout(() => resolve(null), 50))
+    ])
+  t.not(taken.linkEpoch, taken.generation)
+  for (const cellClass of [CELL_CLASS.DATAGRAM, CELL_CLASS.CONTROL]) {
+    const context = taken.contexts[cellClass].tx
+    const payload = b4a.from(`authenticated payload in class ${cellClass}`)
+    // Both cells use the same counter, the one the link would send next.
+    const counter = context.counter.next()
+    const seal = (epoch) =>
+      codec.seal({
+        key: context.key,
+        noncePrefix: context.noncePrefix,
+        senderCounter: { next: () => counter },
+        class: cellClass,
+        direction: DIRECTION.FORWARD,
+        epoch,
+        circuitId: taken.peerLocalId,
+        payload
+      })
+    // Capture the genuine cell as the link puts it on the wire, without delivering it.
+    const send = socket.send
+    let wire = null
+    socket.send = (packet) => {
+      wire = b4a.from(packet)
+      return true
+    }
+    try {
+      await transfer.send(seal(taken.linkEpoch), taken.sendLedger)
+    } finally {
+      socket.send = send
+    }
+    t.is(wire && wire.byteLength, BOOTSTRAP_SIZE, 'a cell travels as one sealed packet')
+
+    const receiving = receivePeerM3Payload(p.peerRuntime)
+    inject(seal(taken.generation))
+    t.is(await settled(receiving), null, 'the generation-epoch cell is not delivered')
+    inject(wire)
+    const delivered = await settled(receiving)
+    t.alike(
+      delivered && delivered.value,
+      payload,
+      'the genuine cell with the same counter is delivered afterwards'
+    )
+  }
 })
 
 test('Native: genuine closure dispatch charges teardown partition and releases its branch', async (t) => {
-  const { authenticatedPeer } = require('./peer-native-fixture')
-  const { readPeerLedger } = require('../../lib/private/peer-ledger')
+  const { authenticatedPeer, branchSpent } = require('./peer-native-fixture')
+  const { readPeerBranchSlots } = require('../../lib/private/peer-ledger')
   const { readPeerNativeNeighborDiagnostics } = require('../../lib/private/peer-native-neighbors')
   const {
     adoptPeerEstablishedLink,
@@ -1405,14 +1480,321 @@ test('Native: genuine closure dispatch charges teardown partition and releases i
   } = require('../../lib/private/peer-m3-adjacency-runtime')
   const p = await authenticatedPeer(t, 48631)
   const localRuntime = adoptPeerEstablishedLink(p.localAuthority, p.handle)
-  const ordinaryBefore = readPeerLedger(p.localLedgers.sendLedger)
+  const ordinaryBefore = branchSpent(p.localSlots, 'sendLedger')
   t.is(await beginPeerM3BranchTeardown(localRuntime, b4a.alloc(16, 0x99)), true)
-  const spent = readPeerLedger(p.localLedgers.teardownSendLedger)
-  t.is(spent.commandsSpent, 1)
-  t.is(spent.cellsSpent, 1)
-  t.is(spent.bytesSpent, 1200n)
-  t.is(readPeerLedger(p.localLedgers.sendLedger).cellsSpent, ordinaryBefore.cellsSpent)
+  t.alike(branchSpent(p.localSlots, 'teardownSendLedger'), { cells: 1, bytes: 1200n, commands: 1 })
+  t.alike(branchSpent(p.localSlots, 'sendLedger'), ordinaryBefore, 'closure spends no ordinary row')
+  t.is(readPeerBranchSlots(p.localSlots.branchSlots).live, 0, 'the closed branch has retired')
   t.is(readPeerNativeNeighborDiagnostics(p.f.pool).reservationCount, 0)
+})
+
+// A branch whose closure send is still completing natively must keep its slot and its
+// retained accounting until the last native callback joins: logical binding removal is
+// not proof of completion (the join-barrier rule of section 10).
+test('Native: a held closure completion keeps its branch slot occupied until the native join', async (t) => {
+  const { authenticatedPeer, slotPool, branchSpent } = require('./peer-native-fixture')
+  const {
+    takePeerBranchAuthority,
+    readPeerBranchSlots,
+    closePeerBranchSlots
+  } = require('../../lib/private/peer-ledger')
+  const {
+    adoptPeerEstablishedLink,
+    beginPeerM3BranchTeardown,
+    sendPeerM3Payload
+  } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const { CELL_CLASS } = require('../../lib/private/protocol')
+  const rows = () => ({
+    sendLedger: { cells: 50, bytes: 60000n, commands: 20 },
+    receiveLedger: { cells: 40, bytes: 48000n, commands: 10 },
+    teardownSendLedger: { cells: 10, bytes: 12000n, commands: 1 },
+    teardownReceiveLedger: { cells: 10, bytes: 12000n, commands: 1 }
+  })
+  // Two independent peers share one two-slot pool: the sibling must stay usable while
+  // the first branch hangs unjoined.
+  const pA = await authenticatedPeer(t, 48750)
+  const pB = await authenticatedPeer(t, 48754)
+  const shared = slotPool(2)
+  const first = await pA.openAdditional({ localSlots: shared })
+  const sibling = await pB.openAdditional({ localSlots: shared })
+  const before = readPeerBranchSlots(shared.branchSlots)
+  t.is(before.live, 2, 'both branch slots are occupied')
+  t.is(before.reserved.teardownSendLedger.cells, 20, 'both teardown rows are reserved')
+  const firstRuntime = adoptPeerEstablishedLink(pA.localAuthority, first.handle)
+  const siblingRuntime = adoptPeerEstablishedLink(pB.localAuthority, sibling.handle)
+
+  // The sibling branch serves ordinary traffic before anything stalls.
+  await sendPeerM3Payload(siblingRuntime, b4a.from('sibling ordinary cell'))
+  const siblingSent = branchSpent(shared, 'sendLedger').cells
+  t.ok(siblingSent >= 1, 'the sibling branch spent its own ordinary row')
+
+  // Hold the first branch's closure cell at the socket: its native completion fires
+  // only when this test releases it.
+  const realSend = pA.f.localSocket.send
+  let holding = true
+  let releaseNative = null
+  pA.f.localSocket.send = (packet, port, host) => {
+    if (
+      holding &&
+      b4a.isBuffer(packet) &&
+      packet.byteLength === BOOTSTRAP_SIZE &&
+      packet[1] === CELL_CLASS.DATAGRAM
+    ) {
+      holding = false
+      return new Promise((resolve) => {
+        releaseNative = resolve
+      })
+    }
+    return realSend.call(pA.f.localSocket, packet, port, host)
+  }
+  t.teardown(() => {
+    pA.f.localSocket.send = realSend
+    if (releaseNative) releaseNative(false)
+  })
+  const teardown = beginPeerM3BranchTeardown(firstRuntime, b4a.alloc(16, 0x66))
+  void teardown.catch(() => {})
+  for (let i = 0; i < 20 && releaseNative === null; i++) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  t.ok(releaseNative !== null, 'the closure send is dispatched and its native completion is held')
+  t.alike(
+    branchSpent(shared, 'teardownSendLedger'),
+    { cells: 1, bytes: 1200n, commands: 1 },
+    'the held closure send already spent its teardown row'
+  )
+
+  // The stuck send's completion deadline invalidates the stuck link: the logical binding
+  // is removed while the native callback is still outstanding.
+  pA.clock.advance(1000)
+  await new Promise((resolve) => setImmediate(resolve))
+  let slots = readPeerBranchSlots(shared.branchSlots)
+  t.is(slots.live, 2, 'the unjoined branch still occupies its slot')
+  t.is(slots.retired, 0, 'nothing has retired before the join')
+  t.is(
+    slots.reserved.teardownSendLedger.cells,
+    20,
+    'the unjoined branch keeps its retained accounting'
+  )
+  let refused = null
+  try {
+    takePeerBranchAuthority(shared.branchSlots, rows())
+  } catch (err) {
+    refused = err
+  }
+  t.is(
+    refused && refused.code,
+    'ERR_QUOTA_EXCEEDED',
+    'replacement admission is refused while the slot is unjoined'
+  )
+
+  // The unaffected sibling on its own peer keeps serving ordinary traffic.
+  await sendPeerM3Payload(siblingRuntime, b4a.from('sibling still serving'))
+  t.is(branchSpent(shared, 'sendLedger').cells, siblingSent + 1, 'the sibling branch is unaffected')
+
+  // Join: the held native completion settles, and only now may the slot retire.
+  releaseNative(true)
+  releaseNative = null
+  for (let i = 0; i < 6; i++) await new Promise((resolve) => setImmediate(resolve))
+  t.is(await teardown, false, 'the invalidated branch ends its teardown duty as lost')
+  slots = readPeerBranchSlots(shared.branchSlots)
+  t.is(slots.live, 1, 'the joined branch retired exactly once')
+  t.is(slots.retired, 1)
+  t.is(slots.reserved.teardownSendLedger.cells, 10, 'retired accounting moved out of reserved')
+  t.is(slots.spent.teardownSendLedger.cells, 1, 'its spend is retained in the pool totals')
+
+  // Only after the join can the freed slot be admitted again.
+  takePeerBranchAuthority(shared.branchSlots, rows())
+  t.is(readPeerBranchSlots(shared.branchSlots).live, 2, 'the replacement takes the freed slot')
+
+  // Repeated close: admission stops, joined and live branches retire once, nothing twice.
+  t.is(closePeerBranchSlots(shared.branchSlots), true)
+  t.is(closePeerBranchSlots(shared.branchSlots), false, 'a repeated close is a no-op')
+  slots = readPeerBranchSlots(shared.branchSlots)
+  t.is(slots.live, 0)
+  t.is(slots.retired, 3, 'every branch retired exactly once')
+})
+
+test('Native: a rejected closure completion still joins and retires its branch exactly once', async (t) => {
+  const { authenticatedPeer, branchSpent } = require('./peer-native-fixture')
+  const {
+    takePeerBranchAuthority,
+    readPeerBranchSlots,
+    closePeerBranchSlots
+  } = require('../../lib/private/peer-ledger')
+  const {
+    adoptPeerEstablishedLink,
+    beginPeerM3BranchTeardown
+  } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const { CELL_CLASS } = require('../../lib/private/protocol')
+  const rows = () => ({
+    sendLedger: { cells: 50, bytes: 60000n, commands: 20 },
+    receiveLedger: { cells: 40, bytes: 48000n, commands: 10 },
+    teardownSendLedger: { cells: 10, bytes: 12000n, commands: 1 },
+    teardownReceiveLedger: { cells: 10, bytes: 12000n, commands: 1 }
+  })
+  const p = await authenticatedPeer(t, 48756)
+  const runtime = adoptPeerEstablishedLink(p.localAuthority, p.handle)
+  const realSend = p.f.localSocket.send
+  let holding = true
+  let releaseNative = null
+  p.f.localSocket.send = (packet, port, host) => {
+    if (
+      holding &&
+      b4a.isBuffer(packet) &&
+      packet.byteLength === BOOTSTRAP_SIZE &&
+      packet[1] === CELL_CLASS.DATAGRAM
+    ) {
+      holding = false
+      return new Promise((resolve) => {
+        releaseNative = resolve
+      })
+    }
+    return realSend.call(p.f.localSocket, packet, port, host)
+  }
+  t.teardown(() => {
+    p.f.localSocket.send = realSend
+    if (releaseNative) releaseNative(false)
+  })
+  const teardown = beginPeerM3BranchTeardown(runtime, b4a.alloc(16, 0x67))
+  void teardown.catch(() => {})
+  for (let i = 0; i < 20 && releaseNative === null; i++) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  t.ok(releaseNative !== null, 'the closure send is dispatched and held')
+  p.clock.advance(1000)
+  await new Promise((resolve) => setImmediate(resolve))
+  const slots = p.localSlots.branchSlots
+  t.is(readPeerBranchSlots(slots).live, 1, 'the unjoined branch still occupies its slot')
+  let refused = null
+  try {
+    takePeerBranchAuthority(slots, rows())
+  } catch (err) {
+    refused = err
+  }
+  t.is(refused && refused.code, 'ERR_QUOTA_EXCEEDED', 'a full pool refuses while unjoined')
+
+  // The held native callback fails late: the duty still fails, the branch still joins
+  // exactly once, and only then may a replacement be admitted.
+  releaseNative(false)
+  releaseNative = null
+  for (let i = 0; i < 6; i++) await new Promise((resolve) => setImmediate(resolve))
+  t.is(await teardown, false, 'the failed branch ends its teardown duty as lost')
+  t.alike(branchSpent(p.localSlots, 'teardownSendLedger'), {
+    cells: 1,
+    bytes: 1200n,
+    commands: 1
+  })
+  const after = readPeerBranchSlots(slots)
+  t.is(after.live, 0, 'the rejected completion still retired the branch at the join')
+  t.is(after.retired, 1, 'exactly one retirement')
+  takePeerBranchAuthority(slots, rows())
+  t.is(readPeerBranchSlots(slots).live, 1, 'the freed slot admits a replacement after the join')
+  t.is(closePeerBranchSlots(slots), true)
+  t.is(closePeerBranchSlots(slots), false, 'a repeated close stays a no-op')
+  t.is(readPeerBranchSlots(slots).retired, 2, 'no double retirement')
+})
+
+// Ordinary sends ride no closure permit, so their native completions join through the
+// transfer's own tracking: a held ordinary completion holds the branch slot exactly like
+// a closure one, and the caller's rejection at the stuck-send deadline is never the join.
+test('Native: a held ordinary completion keeps its branch slot occupied until the native join', async (t) => {
+  const { authenticatedPeer, slotPool, branchSpent } = require('./peer-native-fixture')
+  const { takePeerBranchAuthority, readPeerBranchSlots } = require('../../lib/private/peer-ledger')
+  const {
+    adoptPeerEstablishedLink,
+    sendPeerM3Payload
+  } = require('../../lib/private/peer-m3-adjacency-runtime')
+  const { CELL_CLASS } = require('../../lib/private/protocol')
+  const rows = () => ({
+    sendLedger: { cells: 50, bytes: 60000n, commands: 20 },
+    receiveLedger: { cells: 40, bytes: 48000n, commands: 10 },
+    teardownSendLedger: { cells: 10, bytes: 12000n, commands: 1 },
+    teardownReceiveLedger: { cells: 10, bytes: 12000n, commands: 1 }
+  })
+
+  const run = async (t, settleSent, ports) => {
+    const pA = await authenticatedPeer(t, ports[0])
+    const pB = await authenticatedPeer(t, ports[1])
+    const shared = slotPool(2)
+    const first = await pA.openAdditional({ localSlots: shared })
+    const sibling = await pB.openAdditional({ localSlots: shared })
+    const firstRuntime = adoptPeerEstablishedLink(pA.localAuthority, first.handle)
+    const siblingRuntime = adoptPeerEstablishedLink(pB.localAuthority, sibling.handle)
+
+    // Hold the branch's ordinary cell at the socket: the caller promise stays pending
+    // and the native completion never fires until this test releases it.
+    const realSend = pA.f.localSocket.send
+    let holding = true
+    let releaseNative = null
+    pA.f.localSocket.send = (packet, port, host) => {
+      if (
+        holding &&
+        b4a.isBuffer(packet) &&
+        packet.byteLength === BOOTSTRAP_SIZE &&
+        packet[1] === CELL_CLASS.DATAGRAM
+      ) {
+        holding = false
+        return new Promise((resolve) => {
+          releaseNative = resolve
+        })
+      }
+      return realSend.call(pA.f.localSocket, packet, port, host)
+    }
+    t.teardown(() => {
+      pA.f.localSocket.send = realSend
+      if (releaseNative) releaseNative(false)
+    })
+
+    let outcome = null
+    sendPeerM3Payload(firstRuntime, b4a.from('held ordinary payload')).then(
+      () => {
+        outcome = 'sent'
+      },
+      (err) => {
+        outcome = String(err.code || err)
+      }
+    )
+    for (let i = 0; i < 20 && releaseNative === null; i++) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    t.ok(
+      releaseNative !== null,
+      'the ordinary send is dispatched and its native completion is held'
+    )
+
+    // The stuck send's completion deadline rejects the caller and removes the logical
+    // binding, but the native callback is still outstanding.
+    pA.clock.advance(1000)
+    await new Promise((resolve) => setImmediate(resolve))
+    t.is(outcome, 'ROUTE_UNAVAILABLE', 'the caller was rejected at the stuck-send deadline')
+    let slots = readPeerBranchSlots(shared.branchSlots)
+    t.is(slots.live, 2, 'caller rejection is not the join: the slot stays occupied')
+    t.is(slots.retired, 0, 'nothing has retired before the native callback')
+    let refused = null
+    try {
+      takePeerBranchAuthority(shared.branchSlots, rows())
+    } catch (err) {
+      refused = err
+    }
+    t.is(refused && refused.code, 'ERR_QUOTA_EXCEEDED', 'replacement admission refused pre-join')
+
+    // The sibling on its own peer is unaffected by the held branch.
+    await sendPeerM3Payload(siblingRuntime, b4a.from('sibling ordinary cell'))
+    t.ok(branchSpent(shared, 'sendLedger').cells >= 2, 'both branches spent their own rows')
+
+    // The native callback settles: only now may the branch retire, exactly once.
+    releaseNative(settleSent)
+    releaseNative = null
+    for (let i = 0; i < 6; i++) await new Promise((resolve) => setImmediate(resolve))
+    slots = readPeerBranchSlots(shared.branchSlots)
+    t.is(slots.live, 1, 'the joined branch retired exactly once')
+    t.is(slots.retired, 1)
+    takePeerBranchAuthority(shared.branchSlots, rows())
+    t.is(readPeerBranchSlots(shared.branchSlots).live, 2, 'the freed slot admits a replacement')
+  }
+
+  await run(t, true, [48758, 48762])
+  await run(t, false, [48766, 48770])
 })
 
 test('authenticated six- and seven-byte closure prefixes fail without ordinary delivery', async (t) => {
@@ -1472,7 +1854,7 @@ test('authenticated six- and seven-byte closure prefixes fail without ordinary d
 })
 
 test('twelve authenticated teardown requests cannot exceed one branch reserve or borrow from a sibling', async (t) => {
-  const { authenticatedPeer } = require('./peer-native-fixture')
+  const { authenticatedPeer, branchSpent } = require('./peer-native-fixture')
   const {
     takePeerEstablishedLink,
     destroyTakenPeerEstablishedLink
@@ -1485,7 +1867,6 @@ test('twelve authenticated teardown requests cannot exceed one branch reserve or
   const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
   const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
   const { encodePeerTransport } = require('../../lib/private/peer-transport-wire')
-  const { readPeerLedger } = require('../../lib/private/peer-ledger')
   const {
     adoptPeerEstablishedLink,
     isPeerM3Runtime,
@@ -1529,10 +1910,10 @@ test('twelve authenticated teardown requests cannot exceed one branch reserve or
         )
       }
     }
-    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).cellsSpent, 10)
-    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).commandsSpent, 1)
-    t.is(readPeerLedger(p.peerLedgers.teardownSendLedger).cellsSpent, 10)
-    t.is(readPeerLedger(p.peerLedgers.teardownSendLedger).commandsSpent, 1)
+    t.is(branchSpent(p.peerSlots, 'teardownReceiveLedger').cells, 10)
+    t.is(branchSpent(p.peerSlots, 'teardownReceiveLedger').commands, 1)
+    t.is(branchSpent(p.peerSlots, 'teardownSendLedger').cells, 10)
+    t.is(branchSpent(p.peerSlots, 'teardownSendLedger').commands, 1)
     t.is(
       isPeerM3Runtime(p.peerRuntime),
       false,
@@ -1540,11 +1921,11 @@ test('twelve authenticated teardown requests cannot exceed one branch reserve or
     )
     t.is(await beginPeerM3BranchTeardown(siblingRuntime, b4a.alloc(16, 0x7e)), true)
     t.is(
-      readPeerLedger(p.peerLedgers.teardownSendLedger).cellsSpent,
+      branchSpent(p.peerSlots, 'teardownSendLedger').cells,
       11,
       'the sibling retains its own ACK allowance'
     )
-    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).cellsSpent, 11)
+    t.is(branchSpent(p.peerSlots, 'teardownReceiveLedger').cells, 11)
   } finally {
     transfer.destroy()
     destroyTakenPeerEstablishedLink(taken)
@@ -1552,14 +1933,13 @@ test('twelve authenticated teardown requests cannot exceed one branch reserve or
 })
 
 test('authenticated ordinary CONTROL spends no physical-closure allowance', async (t) => {
-  const { authenticatedPeer } = require('./peer-native-fixture')
+  const { authenticatedPeer, branchSpent } = require('./peer-native-fixture')
   const {
     takePeerEstablishedLink,
     destroyTakenPeerEstablishedLink
   } = require('../../lib/private/peer-guard-link')
   const { registerPeerM3CellLinkTransfer } = require('../../lib/private/udx-cell-endpoint')
   const { receivePeerM3Payload } = require('../../lib/private/peer-m3-adjacency-runtime')
-  const { readPeerLedger } = require('../../lib/private/peer-ledger')
   const { CellCodec } = require('../../lib/private/cell-codec')
   const { CELL_CLASS, DIRECTION } = require('../../lib/private/protocol')
   const p = await authenticatedPeer(t, 48742)
@@ -1568,7 +1948,7 @@ test('authenticated ordinary CONTROL spends no physical-closure allowance', asyn
   const codec = new CellCodec({ crypto: cryptoSuite, cellSize: BOOTSTRAP_SIZE })
   const context = taken.contexts[CELL_CLASS.CONTROL].tx
   const payload = b4a.from('ordinary authenticated control')
-  const before = readPeerLedger(p.peerLedgers.receiveLedger)
+  const before = branchSpent(p.peerSlots, 'receiveLedger')
   try {
     const received = receivePeerM3Payload(p.peerRuntime)
     await transfer.send(
@@ -1585,10 +1965,10 @@ test('authenticated ordinary CONTROL spends no physical-closure allowance', asyn
       taken.sendLedger
     )
     t.alike(await received, payload)
-    t.is(readPeerLedger(p.peerLedgers.receiveLedger).cellsSpent, before.cellsSpent + 1)
-    t.is(readPeerLedger(p.peerLedgers.receiveLedger).commandsSpent, before.commandsSpent + 1)
-    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).cellsSpent, 0)
-    t.is(readPeerLedger(p.peerLedgers.teardownReceiveLedger).commandsSpent, 0)
+    t.is(branchSpent(p.peerSlots, 'receiveLedger').cells, before.cells + 1)
+    t.is(branchSpent(p.peerSlots, 'receiveLedger').commands, before.commands + 1)
+    t.is(branchSpent(p.peerSlots, 'teardownReceiveLedger').cells, 0)
+    t.is(branchSpent(p.peerSlots, 'teardownReceiveLedger').commands, 0)
   } finally {
     transfer.destroy()
     destroyTakenPeerEstablishedLink(taken)

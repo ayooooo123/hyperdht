@@ -16,7 +16,12 @@ const {
   takePeerMemory,
   releasePeerMemory,
   narrowPeerReservations,
-  readPeerMemory
+  readPeerMemory,
+  createPeerBranchSlots,
+  takePeerBranchAuthority,
+  releasePeerBranchAuthority,
+  closePeerBranchSlots,
+  readPeerBranchSlots
 } = require('../../lib/private/peer-ledger')
 
 function expectInvalid(t, fn) {
@@ -533,4 +538,125 @@ test('pending narrowing uses descriptor-only arrays and rejects failed snapshots
   expectInvalid(t, () => narrowPeerReservations({ ledgers: [earlier, later.proxy], memory: [] }))
   t.alike([readPeerLedger(root), readPeerLedger(child)], before)
   releasePeerLedger(root)
+})
+
+function branchRows() {
+  return {
+    sendLedger: { cells: 50, bytes: 60000n, commands: 20 },
+    receiveLedger: { cells: 40, bytes: 48000n, commands: 10 },
+    teardownSendLedger: { cells: 10, bytes: 12000n, commands: 1 },
+    teardownReceiveLedger: { cells: 10, bytes: 12000n, commands: 1 }
+  }
+}
+
+function expectCode(t, fn, code) {
+  let err = null
+  try {
+    fn()
+  } catch (e) {
+    err = e
+  }
+  t.is(err && err.code, code)
+}
+
+test('a branch slot admits fresh exact authority, and a refused take changes nothing', (t) => {
+  const pool = createPeerBranchSlots(2)
+  const first = takePeerBranchAuthority(pool, branchRows())
+  t.alike(
+    Object.values(first).map((ledger) => {
+      const { cellsAllocated, bytesAllocated, commandsAllocated, cellsRemaining } =
+        readPeerLedger(ledger)
+      return [cellsAllocated, bytesAllocated, commandsAllocated, cellsRemaining]
+    }),
+    [
+      [50, 60000n, 20, 50],
+      [40, 48000n, 10, 40],
+      [10, 12000n, 1, 10],
+      [10, 12000n, 1, 10]
+    ],
+    'four roots of exactly the admitted rows'
+  )
+  const second = takePeerBranchAuthority(pool, branchRows())
+  const full = readPeerBranchSlots(pool)
+  t.is(full.live, 2)
+  expectCode(t, () => takePeerBranchAuthority(pool, branchRows()), 'ERR_QUOTA_EXCEEDED')
+  t.alike(readPeerBranchSlots(pool), full, 'a full pool refuses without effect')
+
+  releasePeerBranchAuthority(second)
+  const open = readPeerBranchSlots(pool)
+  for (const rows of [
+    { ...branchRows(), extra: { cells: 1, bytes: 1n, commands: 1 } },
+    { ...branchRows(), teardownReceiveLedger: undefined },
+    { ...branchRows(), sendLedger: { cells: -1, bytes: 0n, commands: 0 } },
+    { ...branchRows(), receiveLedger: { cells: 1, bytes: 1, commands: 1 } },
+    { ...branchRows(), teardownSendLedger: { cells: 1, bytes: 1n, commands: 1, more: 1 } }
+  ]) {
+    expectInvalid(t, () => takePeerBranchAuthority(pool, rows))
+  }
+  t.alike(readPeerBranchSlots(pool), open, 'malformed rows take no slot and publish no ledger')
+
+  // Siblings never share authority: exhausting one branch leaves the other whole.
+  const sibling = takePeerBranchAuthority(pool, branchRows())
+  chargePeerLedger(first.sendLedger, { cells: 50, bytes: 60000n, commands: 0 })
+  expectInvalid(t, () =>
+    chargePeerLedger(first.sendLedger, { cells: 1, bytes: 1200n, commands: 0 })
+  )
+  chargePeerLedger(sibling.sendLedger, { cells: 50, bytes: 60000n, commands: 0 })
+  t.is(readPeerBranchSlots(pool).spent.sendLedger.cells, 100)
+})
+
+test('a retired branch keeps its spending, frees its slot and never funds its successor', (t) => {
+  const pool = createPeerBranchSlots(1)
+  const branch = takePeerBranchAuthority(pool, branchRows())
+  chargePeerLedger(branch.sendLedger, { cells: 5, bytes: 6000n, commands: 1 })
+  const discovery = reservePeerLedger(branch.sendLedger, { cells: 10, bytes: 12000n, commands: 0 })
+  chargePeerLedger(discovery, { cells: 2, bytes: 2400n, commands: 0 })
+  chargePeerLedger(branch.teardownReceiveLedger, { cells: 1, bytes: 1200n, commands: 1 })
+  const live = readPeerBranchSlots(pool)
+  t.alike(live.reserved.sendLedger, { cells: 50, bytes: 60000n, commands: 20 })
+  t.alike(live.spent.sendLedger, { cells: 7, bytes: 8400n, commands: 1 })
+
+  t.is(releasePeerBranchAuthority(branch), true)
+  t.is(releasePeerBranchAuthority(branch), false, 'retirement happens once')
+  expectInvalid(t, () =>
+    chargePeerLedger(branch.sendLedger, { cells: 1, bytes: 1200n, commands: 0 })
+  )
+  expectInvalid(t, () => chargePeerLedger(discovery, { cells: 1, bytes: 1200n, commands: 0 }))
+  const retired = readPeerBranchSlots(pool)
+  t.alike([retired.live, retired.retired], [0, 1])
+  t.alike(retired.reserved.sendLedger, { cells: 0, bytes: 0n, commands: 0 })
+  t.alike(retired.spent.sendLedger, { cells: 7, bytes: 8400n, commands: 1 }, 'spending is kept')
+  t.alike(retired.spent.teardownReceiveLedger, { cells: 1, bytes: 1200n, commands: 1 })
+
+  const successor = takePeerBranchAuthority(pool, branchRows())
+  t.alike(
+    [
+      readPeerLedger(successor.sendLedger).cellsSpent,
+      readPeerLedger(successor.sendLedger).cellsRemaining
+    ],
+    [0, 50],
+    'the next branch starts with new authority of its own rows'
+  )
+  chargePeerLedger(successor.sendLedger, { cells: 3, bytes: 3600n, commands: 0 })
+  t.is(readPeerBranchSlots(pool).spent.sendLedger.cells, 10, 'spending accumulates, never resets')
+  expectInvalid(t, () => releasePeerBranchAuthority(branchRows()))
+})
+
+test('closing a branch-slot pool revokes its live branches and admits no more', (t) => {
+  const pool = createPeerBranchSlots(2)
+  const first = takePeerBranchAuthority(pool, branchRows())
+  const second = takePeerBranchAuthority(pool, branchRows())
+  chargePeerLedger(second.sendLedger, { cells: 4, bytes: 4800n, commands: 0 })
+  t.is(closePeerBranchSlots(pool), true)
+  t.is(closePeerBranchSlots(pool), false)
+  const closed = readPeerBranchSlots(pool)
+  t.alike([closed.live, closed.retired, closed.closed], [0, 2, true])
+  t.is(closed.spent.sendLedger.cells, 4)
+  expectInvalid(t, () =>
+    chargePeerLedger(first.sendLedger, { cells: 1, bytes: 1200n, commands: 0 })
+  )
+  expectInvalid(t, () => takePeerBranchAuthority(pool, branchRows()))
+  t.is(releasePeerBranchAuthority(first), false, 'a revoked branch is already retired')
+  expectInvalid(t, () => createPeerBranchSlots(0))
+  expectInvalid(t, () => readPeerBranchSlots({}))
 })

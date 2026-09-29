@@ -58,7 +58,8 @@ const {
   exchangePeerGuardLink,
   destroyPeerGuardPhysicalReservation,
   createPeerGuardBootstrapTransport,
-  MAX_GUARD_LEASE_BRANCH_SLOTS
+  MAX_GUARD_LEASE_BRANCH_SLOTS,
+  MAX_NATIVE_PIN_BRANCH_SLOTS
 } = require('../../lib/private/guard-lease')
 const {
   createPeerBootstrapResponder,
@@ -75,7 +76,8 @@ const {
 const {
   chargePeerLedger,
   createPeerLedger,
-  readPeerLedger
+  readPeerLedger,
+  readPeerBranchSlots
 } = require('../../lib/private/peer-ledger')
 const { PEER_MESSAGE_ID } = require('../../lib/private/peer-protocol')
 const { encodePeerTransport } = require('../../lib/private/peer-transport-wire')
@@ -102,7 +104,9 @@ const {
   pinnedMaterialFixture,
   leaseOptions,
   closeFixture,
-  peerBranchLedgers,
+  slotPool,
+  branchSpent,
+  branchReserved,
   peerGuardFixture
 } = require('./peer-native-fixture')
 const TEST_ONLY_M3_ESTABLISHED_ISSUER = Symbol.for(
@@ -129,10 +133,10 @@ test('A0 rejects a candidate from another grant without consuming the original a
   const original = await peerGuardFixture(t, 47601, 47602, { clock })
   const other = await peerGuardFixture(t, 47601, 47602, { clock, grantId32: seed(95) })
   const candidate = await original.discover()
-  const rejectedLedgers = peerBranchLedgers()
+  const rejectedSlots = slotPool()
   let error = null
   try {
-    await other.open(candidate, rejectedLedgers)
+    await other.open(candidate, rejectedSlots)
   } catch (err) {
     error = err
   }
@@ -142,14 +146,17 @@ test('A0 rejects a candidate from another grant without consuming the original a
     'same identity, endpoint, epoch and clock cannot substitute a different grant'
   )
   t.is(
-    readPeerLedger(rejectedLedgers.sendLedger).cellsSpent,
+    branchSpent(rejectedSlots, 'sendLedger').cells,
     0,
     'cross-grant rejection publishes no OFFER'
   )
-  t.is(
-    readPeerLedger(rejectedLedgers.sendLedger).cellsReserved,
-    0,
-    'rejected admission releases its reservation'
+  t.alike(
+    [
+      readPeerBranchSlots(rejectedSlots.branchSlots).live,
+      readPeerBranchSlots(rejectedSlots.branchSlots).retired
+    ],
+    [0, 0],
+    'a rejected candidate never takes a branch slot'
   )
   const runtime = adoptPeerEstablishedLink(original.localAuthority, await original.open(candidate))
   const payload = b4a.alloc(1100, 0x81)
@@ -174,8 +181,8 @@ test('A0 retires pending admission at the candidate original deadline, not a fre
     held.push({ packet: b4a.from(packet), port, host })
     return true
   }
-  const localLedgers = peerBranchLedgers()
-  const opening = Promise.resolve(setup.open(candidate, localLedgers)).then(
+  const localSlots = slotPool()
+  const opening = Promise.resolve(setup.open(candidate, localSlots)).then(
     (handle) => ({ handle }),
     (error) => ({ error })
   )
@@ -196,14 +203,17 @@ test('A0 retires pending admission at the candidate original deadline, not a fre
   setup.clock.advance(2000)
   await new Promise(setImmediate)
   t.is(
-    readPeerLedger(localLedgers.sendLedger).cellsSpent,
+    branchSpent(localSlots, 'sendLedger').cells,
     1,
     'expired candidate cannot authorize another OFFER retry'
   )
-  t.is(
-    readPeerLedger(localLedgers.sendLedger).cellsReserved,
-    0,
-    'failed admission releases its ordinary child'
+  t.alike(
+    [
+      readPeerBranchSlots(localSlots.branchSlots).live,
+      readPeerBranchSlots(localSlots.branchSlots).retired
+    ],
+    [0, 1],
+    'failed admission retires its branch and frees its slot'
   )
   const fresh = await setup.discover()
   const runtime = adoptPeerEstablishedLink(setup.localAuthority, await setup.open(fresh))
@@ -234,36 +244,33 @@ test('A0 native established lifetime survives the consumed candidate setup deadl
   t.is(await beginPeerM3BranchTeardown(runtime, b4a.alloc(16, 0x86)), true)
 })
 
-test('A0 reserves exact directional children, rolls back failed admission and preserves its sibling', async (t) => {
+test('A0 takes a slot with exact directional authority, a full pool refuses before any OFFER', async (t) => {
   const setup = await peerGuardFixture(t, 47631, 47632, { native: true })
-  const parents = peerBranchLedgers(3)
+  const pool = slotPool(2)
   const first = adoptPeerEstablishedLink(
     setup.localAuthority,
     await setup.open(await setup.discover(), {
-      ...parents,
+      ...pool,
       forwardLimits: { ...setup.limits, idleTimeoutMs: 31000 }
     })
   )
   const firstPeer = setup.guardRuntime
+  t.is(branchReserved(pool, 'sendLedger').cells, 50, 'A0 holds its exact fifty-cell send row')
+  t.is(branchSpent(pool, 'sendLedger').cells, 1, 'and has spent its first OFFER from it')
   t.is(
-    readPeerLedger(parents.sendLedger).cellsReserved,
-    49,
-    'A0 reserves fifty ordinary cells and spends its first OFFER'
-  )
-  t.is(
-    readPeerLedger(parents.teardownSendLedger).cellsReserved,
+    branchReserved(pool, 'teardownSendLedger').cells,
     10,
-    'closure owns a disjoint exact child'
+    'closure owns a disjoint exact partition'
   )
-  const before = Object.values(parents).map(readPeerLedger)
-  const peerBefore = Object.values(setup.peerLedgers).map(readPeerLedger)
+  const before = readPeerBranchSlots(pool.branchSlots)
+  const peerBefore = readPeerBranchSlots(setup.peerSlots.branchSlots)
   for (const override of [
     { reverseLimits: { ...setup.limits, idleTimeoutMs: 31000 } },
     { forwardLimits: { ...setup.limits, expiresAt: 60001n } }
   ]) {
     let error = null
     try {
-      await setup.open(await setup.discover(), override)
+      await setup.open(await setup.discover(), { ...pool, ...override })
     } catch (err) {
       error = err
     }
@@ -273,34 +280,28 @@ test('A0 reserves exact directional children, rolls back failed admission and pr
       'reverse advertisement and forward parent bounds are enforced'
     )
   }
-  const insufficient = {
-    ...peerBranchLedgers(),
-    receiveLedger: createPeerLedger({ cells: 49, bytes: 58800n, commands: 20 })
-  }
-  const rollback = Object.values(insufficient).map(readPeerLedger)
-  let error = null
-  try {
-    await setup.open(await setup.discover(), insufficient)
-  } catch (err) {
-    error = err
-  }
-  t.is(error && error.code, 'INVALID_ROUTE')
+  t.alike(readPeerBranchSlots(pool.branchSlots), before, 'refused profiles take no slot')
   t.alike(
-    Object.values(insufficient).map(readPeerLedger),
-    rollback,
-    'partial receive failure returns the earlier send reservation'
-  )
-  t.alike(Object.values(parents).map(readPeerLedger), before)
-  t.alike(
-    Object.values(setup.peerLedgers).map(readPeerLedger),
+    readPeerBranchSlots(setup.peerSlots.branchSlots),
     peerBefore,
     'rejected A0 admissions send no OFFER or allocate responder commands'
   )
   const second = adoptPeerEstablishedLink(
     setup.localAuthority,
-    await setup.open(await setup.discover(), parents)
+    await setup.open(await setup.discover(), pool)
   )
   const secondPeer = setup.guardRuntime
+  const full = readPeerBranchSlots(pool.branchSlots)
+  const peerFull = readPeerBranchSlots(setup.peerSlots.branchSlots)
+  let error = null
+  try {
+    await setup.open(await setup.discover(), pool)
+  } catch (err) {
+    error = err
+  }
+  t.is(error && error.code, 'ERR_QUOTA_EXCEEDED', 'a full pool refuses a third branch')
+  t.alike(readPeerBranchSlots(pool.branchSlots), full, 'the refusal changes no slot or authority')
+  t.alike(readPeerBranchSlots(setup.peerSlots.branchSlots), peerFull, 'a refused A0 sends no OFFER')
   const payload = b4a.alloc(1100, 0x87)
   let delivered = true
   for (let attempt = 0; attempt < 49; attempt++) {
@@ -322,7 +323,7 @@ test('A0 reserves exact directional children, rolls back failed admission and pr
   t.is(
     error && error.code,
     'ROUTE_UNAVAILABLE',
-    'the first A0 cannot borrow spare parent or sibling capacity'
+    'the first A0 cannot borrow spare pool or sibling capacity'
   )
   t.is(await beginPeerM3BranchTeardown(first, b4a.alloc(16, 0x88)), true)
   const forward = receivePeerM3Payload(secondPeer)
@@ -332,10 +333,9 @@ test('A0 reserves exact directional children, rolls back failed admission and pr
   await sendPeerM3Payload(secondPeer, payload)
   t.alike(await reverse, payload)
   t.is(await beginPeerM3BranchTeardown(second, b4a.alloc(16, 0x89)), true)
-  t.is(
-    Object.values(parents).every((ledger) => readPeerLedger(ledger).cellsReserved === 0),
-    true
-  )
+  const retired = readPeerBranchSlots(pool.branchSlots)
+  t.alike([retired.live, retired.retired], [0, 2], 'both branches retire after their closure')
+  t.is(retired.spent.sendLedger.cells, 52, 'what both branches sent stays spent')
 })
 
 test('GuardLease consumes the opaque BootstrapIO pinned guard transfer shape', async (t) => {
@@ -528,6 +528,39 @@ test('GuardLease bounds shared guard branch issuers and releases logical slots',
   for (const issuer of issuers.slice(1)) t.is(issuer.destroy(), false)
   t.is(replacement.destroy(), false)
 
+  await closeFixture(fixture)
+})
+
+// A native pin carries sixteen branches at once over its one link, where a v1 lease keeps
+// four; the seventeenth waits for a released slot.
+test('a native GuardLease bounds its pinned link at sixteen branches', async (t) => {
+  const fixture = await pinnedMaterialFixture(47215, 47216)
+  const lease = createGuardLease(leaseOptions(fixture, { native: true }))
+  t.is(MAX_NATIVE_PIN_BRANCH_SLOTS, 16)
+  const issuers = []
+  for (let i = 0; i < MAX_NATIVE_PIN_BRANCH_SLOTS; i++) {
+    issuers.push(issueGuardLeaseM3CellLinkTransferIssuer(lease))
+  }
+  t.is(issuers.length, 16, 'sixteen branches share the pinned link')
+  let quota = null
+  try {
+    issueGuardLeaseM3CellLinkTransferIssuer(lease)
+  } catch (err) {
+    quota = err
+  }
+  t.is(quota && quota.code, 'ERR_QUOTA_EXCEEDED', 'the seventeenth finds no free slot')
+  t.is(issuers[0].destroy(), true)
+  t.is(
+    typeof issueGuardLeaseM3CellLinkTransferIssuer(lease).destroy,
+    'function',
+    'a released slot admits the next branch'
+  )
+  t.exception(
+    () => createGuardLease(leaseOptions(fixture, { native: 'yes' })),
+    /invalid/i,
+    'the native flag is a boolean'
+  )
+  t.is(destroyGuardLease(lease), true)
   await closeFixture(fixture)
 })
 

@@ -581,13 +581,13 @@ test('Peer Native Neighbors: accept provisioning aborts immediately on pool dest
 // 10. Branch Slots and Candidate Authority Reservation
 // -----------------------------------------------------------------------------
 
-test('Peer Native Neighbors: four branch slots preserve rejected candidate authority', async (t) => {
+test('Peer Native Neighbors: sixteen branch slots preserve rejected candidate authority', async (t) => {
   const clock = fakeClock()
   const f = await setupTwoEndedNativeAdjacency({ t, clock, localPort: 48119, peerPort: 48120 })
 
   const advertisement260 = readVerifiedPeerAdvertisement(f.verifiedAd).canonicalBytes260
   const reservations = []
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 16; i++) {
     reservations.push(
       reservePeerNeighborLink(f.pool, {
         advertisement260,
@@ -596,10 +596,10 @@ test('Peer Native Neighbors: four branch slots preserve rejected candidate autho
       })
     )
   }
-  const fifth = await f.discover()
-  const request = { advertisement260, activeCandidate: fifth, absoluteDeadline: 50_000n }
+  const seventeenth = await f.discover()
+  const request = { advertisement260, activeCandidate: seventeenth, absoluteDeadline: 50_000n }
   expectCode(t, () => reservePeerNeighborLink(f.pool, request), 'CIRCUIT_LIMIT')
-  t.is(readPeerNativeNeighborDiagnostics(f.pool).reservationCount, 4)
+  t.is(readPeerNativeNeighborDiagnostics(f.pool).reservationCount, 16)
   destroyPeerNeighborReservation(reservations.pop())
   const replacement = reservePeerNeighborLink(f.pool, request)
   const scope = readPeerNeighborReservation(replacement, f.localRelayOwner)

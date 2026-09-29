@@ -2,7 +2,7 @@
 
 const test = require('brittle')
 const b4a = require('b4a')
-const { createPeerLedger, readPeerLedger } = require('../../lib/private/peer-ledger')
+const { readPeerBranchSlots } = require('../../lib/private/peer-ledger')
 const {
   decodePeerTransport,
   encodePeerLimits,
@@ -40,7 +40,8 @@ const {
 const {
   fakeClock,
   seed,
-  ledgers,
+  slotPool,
+  branchSpent,
   authenticatedPeer,
   setupDistinctNativeNeighbor
 } = require('./peer-native-fixture')
@@ -168,7 +169,7 @@ test('closure regression: no remote DESTROY echo', async (t) => {
   // Local runtime should transition to PHYSICALLY_CLOSING/CLOSED without sending any echo back
   t.is(isPeerM3Runtime(runtime), false)
   t.is(fixture.localAuthority.diagnostics().activeRuntimes, 0)
-  t.is(readPeerLedger(fixture.localLedgers.teardownSendLedger).cellsSpent, 0)
+  t.is(branchSpent(fixture.localSlots, 'teardownSendLedger').cells, 0)
 })
 
 test('closure regression: no opposite mode after TEARDOWN', async (t) => {
@@ -180,11 +181,11 @@ test('closure regression: no opposite mode after TEARDOWN', async (t) => {
   const teardownPromise = beginPeerM3BranchTeardown(runtime, teardownId)
   void teardownPromise.catch(() => {})
 
-  const before = readPeerLedger(fixture.localLedgers.teardownSendLedger).cellsSpent
+  const before = branchSpent(fixture.localSlots, 'teardownSendLedger').cells
   destroyPeerM3Runtime(runtime)
   t.is(await teardownPromise, false, 'local destruction settles interrupted teardown')
   t.is(
-    readPeerLedger(fixture.localLedgers.teardownSendLedger).cellsSpent,
+    branchSpent(fixture.localSlots, 'teardownSendLedger').cells,
     before,
     'no opposite-mode packet dispatched'
   )
@@ -240,8 +241,7 @@ test('closure regression: duplicate cached ACK, one drain callback, shared 10 at
   // Responder ACK duty: after the first ACK the retry timer re-sends on
   // LINK_PING_AFTER cadence until the original fixed deadline. Fire the fake
   // clock across the teardown window and count dispatched closure sends.
-  const ledger = readPeerLedger(fixture.peerLedgers.teardownSendLedger)
-  const before = ledger.cellsSpent
+  const before = branchSpent(fixture.peerSlots, 'teardownSendLedger').cells
   t.ok(before >= 1, 'first ACK dispatched on the responder teardown ledger')
 
   fixture.clock.advance(500)
@@ -250,7 +250,7 @@ test('closure regression: duplicate cached ACK, one drain callback, shared 10 at
   await new Promise((resolve) => setImmediate(resolve))
   fixture.clock.advance(500)
   await new Promise((resolve) => setImmediate(resolve))
-  const afterRetries = readPeerLedger(fixture.peerLedgers.teardownSendLedger).cellsSpent
+  const afterRetries = branchSpent(fixture.peerSlots, 'teardownSendLedger').cells
   t.ok(
     afterRetries >= before + 2,
     'timer-driven ACK retries dispatch from the same teardown ledger'
@@ -286,15 +286,17 @@ test('closure regression: first receive-side closure transition charges one comm
   t.is(isPeerM3Runtime(runtime), true)
   t.is(isPeerM3Runtime(peerRuntime), true)
 
-  const before = readPeerLedger(fixture.localLedgers.teardownReceiveLedger)
-  t.is(before.commandsSpent, 0)
+  t.is(branchSpent(fixture.localSlots, 'teardownReceiveLedger').commands, 0)
 
   const teardownId = b4a.alloc(16, 0x66)
   const teardownPromise = beginPeerM3BranchTeardown(runtime, teardownId)
   await teardownPromise
 
-  const after = readPeerLedger(fixture.localLedgers.teardownReceiveLedger)
-  t.is(after.commandsSpent, 1, 'first receive-side closure transition charges exactly 1 command')
+  t.is(
+    branchSpent(fixture.localSlots, 'teardownReceiveLedger').commands,
+    1,
+    'first receive-side closure transition charges exactly 1 command'
+  )
   t.is(isPeerM3Runtime(runtime), false)
 })
 
@@ -405,7 +407,7 @@ test('closure regression: forwarding downstream release before upstream ACK', as
   try {
     t.is(settled, false)
     t.is(
-      readPeerLedger(fixture1.localLedgers.teardownSendLedger).cellsSpent,
+      branchSpent(fixture1.localSlots, 'teardownSendLedger').cells,
       0,
       'no upstream ACK before downstream release'
     )
@@ -415,7 +417,7 @@ test('closure regression: forwarding downstream release before upstream ACK', as
     fixture1.clock.advance(500)
     await new Promise((resolve) => setImmediate(resolve))
     t.is(settled, false, 'duplicate teardown cannot bypass the original drain')
-    t.is(readPeerLedger(fixture1.localLedgers.teardownSendLedger).cellsSpent, 0)
+    t.is(branchSpent(fixture1.localSlots, 'teardownSendLedger').cells, 0)
   } finally {
     socket.send = originalSend
     releaseNative(true)
@@ -505,7 +507,7 @@ test('abrupt branch closure stops at eight authenticated attempts without closin
       'all retries carry the same authenticated body'
     )
     t.is(decodePeerTransport(bodies[0]).messageId, PEER_MESSAGE_ID.PEER_BRANCH_DESTROY_V2)
-    t.is(readPeerLedger(fixture.localLedgers.teardownSendLedger).commandsSpent, 1)
+    t.is(branchSpent(fixture.localSlots, 'teardownSendLedger').commands, 1)
     t.is(readPeerNativeNeighborDiagnostics(fixture.f.pool).reservationCount, 0)
     t.is(readPeerNativeNeighborDiagnostics(fixture.f.pool).neighborCount, 1)
   } finally {
@@ -541,20 +543,15 @@ test('responder branches cannot spend sibling ordinary or physical-closure reser
     fixture.clock.advance(500)
     await new Promise((resolve) => setImmediate(resolve))
   }
-  for (const ledger of Object.values(fixture.peerLedgers)) {
-    t.is(
-      readPeerLedger(ledger).cellsReserved,
-      0,
-      'branch release returns only its unspent reservation'
-    )
-  }
-  t.is(
-    readPeerLedger(fixture.peerLedgers.sendLedger).cellsSpent,
-    52,
-    'spent sends are never refunded'
+  const settled = readPeerBranchSlots(fixture.peerSlots.branchSlots)
+  t.alike(
+    [settled.live, settled.reserved.sendLedger.cells, settled.reserved.receiveLedger.cells],
+    [0, 0, 0],
+    'both branches retire once closed and hold no authority'
   )
-  t.is(readPeerLedger(fixture.peerLedgers.teardownSendLedger).commandsSpent, 2)
-  t.is(readPeerLedger(fixture.peerLedgers.teardownReceiveLedger).commandsSpent, 2)
+  t.is(branchSpent(fixture.peerSlots, 'sendLedger').cells, 52, 'spent sends are never refunded')
+  t.is(branchSpent(fixture.peerSlots, 'teardownSendLedger').commands, 2)
+  t.is(branchSpent(fixture.peerSlots, 'teardownReceiveLedger').commands, 2)
 })
 
 test('delayed setup replies remain charged after transfer without duplicating allocation commands', async (t) => {
@@ -585,28 +582,24 @@ test('delayed setup replies remain charged after transfer without duplicating al
     socket.send = originalSend
   }
   const second = adoptPeerEstablishedLink(fixture.localAuthority, sibling.handle)
-  t.is(readPeerLedger(sibling.localLedgers.sendLedger).cellsSpent, 4)
+  t.is(branchSpent(sibling.localSlots, 'sendLedger').cells, 4)
+  t.is(branchSpent(sibling.localSlots, 'receiveLedger').cells, 1, 'lost replies are not received')
   t.is(
-    readPeerLedger(sibling.localLedgers.receiveLedger).cellsSpent,
-    1,
-    'lost replies are not received'
-  )
-  t.is(
-    readPeerLedger(fixture.peerLedgers.receiveLedger).cellsSpent,
+    branchSpent(fixture.peerSlots, 'receiveLedger').cells,
     5,
     'each OFFER reaches its original branch'
   )
   for (const held of delayed) originalSend(held.packet, ...held.args)
   await new Promise((resolve) => setImmediate(resolve))
   t.is(
-    readPeerLedger(sibling.localLedgers.receiveLedger).cellsSpent,
+    branchSpent(sibling.localSlots, 'receiveLedger').cells,
     4,
     'all three delayed authenticated replies reach the transferred owner'
   )
-  t.is(readPeerLedger(sibling.localLedgers.sendLedger).commandsSpent, 1)
-  t.is(readPeerLedger(sibling.localLedgers.receiveLedger).commandsSpent, 1)
-  t.is(readPeerLedger(fixture.peerLedgers.sendLedger).commandsSpent, 2)
-  t.is(readPeerLedger(fixture.peerLedgers.receiveLedger).commandsSpent, 2)
+  t.is(branchSpent(sibling.localSlots, 'sendLedger').commands, 1)
+  t.is(branchSpent(sibling.localSlots, 'receiveLedger').commands, 1)
+  t.is(branchSpent(fixture.peerSlots, 'sendLedger').commands, 2)
+  t.is(branchSpent(fixture.peerSlots, 'receiveLedger').commands, 2)
   const payload = b4a.from('the original reply allowance remains spent')
   let delivered = true
   for (let attempt = 0; attempt < 46; attempt++) {
@@ -623,11 +616,21 @@ test('delayed setup replies remain charged after transfer without duplicating al
   t.is(await beginPeerM3BranchTeardown(second, b4a.alloc(16, 0x7f)), true)
 })
 
-test('source validates each directional authority and reserves exact partitions before OFFER', async (t) => {
+test('source validates each directional authority and takes an exact branch slot before OFFER', async (t) => {
   const fixture = await authenticatedPeer(t, 48524)
   const runtime = adoptPeerEstablishedLink(fixture.localAuthority, fixture.handle)
-  const existing = Object.values(fixture.localLedgers).map(readPeerLedger)
-  const responder = Object.values(fixture.peerLedgers).map(readPeerLedger)
+  const existing = readPeerBranchSlots(fixture.localSlots.branchSlots)
+  const responder = readPeerBranchSlots(fixture.peerSlots.branchSlots)
+  t.alike(
+    existing.reserved,
+    {
+      sendLedger: { cells: 50, bytes: 60000n, commands: 20 },
+      receiveLedger: { cells: 50, bytes: 60000n, commands: 20 },
+      teardownSendLedger: { cells: 10, bytes: 12000n, commands: 1 },
+      teardownReceiveLedger: { cells: 10, bytes: 12000n, commands: 1 }
+    },
+    'the branch holds exactly its rows less closure, and two closure partitions'
+  )
   t.is(
     await asyncErrorCode(
       fixture.openAdditional({
@@ -647,30 +650,13 @@ test('source validates each directional authority and reserves exact partitions 
     'reverse limits fit the responder advertisement'
   )
   t.is(
-    await asyncErrorCode(
-      fixture.openAdditional({
-        localLedgers: fixture.localLedgers
-      })
-    ),
-    'INVALID_ROUTE',
-    'an existing branch reservation cannot fund another OFFER'
+    await asyncErrorCode(fixture.openAdditional({ localSlots: fixture.localSlots })),
+    'ERR_QUOTA_EXCEEDED',
+    'a pool whose slot a live branch holds cannot fund another OFFER'
   )
-  const localLedgers = {
-    sendLedger: createPeerLedger({ cells: 20, bytes: 24000n, commands: 20 }),
-    receiveLedger: createPeerLedger({ cells: 19, bytes: 22800n, commands: 20 }),
-    teardownSendLedger: createPeerLedger({ cells: 10, bytes: 12000n, commands: 1 }),
-    teardownReceiveLedger: createPeerLedger({ cells: 10, bytes: 12000n, commands: 1 })
-  }
-  const before = Object.values(localLedgers).map(readPeerLedger)
-  t.is(await asyncErrorCode(fixture.openAdditional({ localLedgers })), 'INVALID_ROUTE')
+  t.alike(readPeerBranchSlots(fixture.localSlots.branchSlots), existing)
   t.alike(
-    Object.values(localLedgers).map(readPeerLedger),
-    before,
-    'failed receive reservation returns the earlier send reservation'
-  )
-  t.alike(Object.values(fixture.localLedgers).map(readPeerLedger), existing)
-  t.alike(
-    Object.values(fixture.peerLedgers).map(readPeerLedger),
+    readPeerBranchSlots(fixture.peerSlots.branchSlots),
     responder,
     'none of the rejected requests publishes an OFFER'
   )
@@ -689,7 +675,7 @@ test('responder owner cap of 2 covers separate responder instances and distinct 
   t.is(isPeerM3Runtime(runtime1), true, 'first branch runtime adopted on initiator 1')
   t.is(isPeerM3Runtime(peerRuntime1), true, 'first branch runtime adopted on responder')
   const secondResponder = createPeerLinkResponder(fixture.f.peerRelayOwner, {
-    ...ledgers(4),
+    ...slotPool(4),
     onEstablished(handle) {
       const runtime = adoptPeerEstablishedLink(fixture.peerAuthority, handle)
       fixture.adoptedPeerRuntimes.push(runtime)
@@ -909,11 +895,11 @@ for (const [index, failure] of [
     })
     const original = adoptPeerEstablishedLink(fixture.localAuthority, fixture.handle)
     const originalPeer = fixture.adoptedPeerRuntimes[0]
-    const parents = ledgers(4)
+    const pool = slotPool(4)
     let rejectedRuntime = null
     let callbacks = 0
     const responder = createPeerLinkResponder(fixture.f.peerRelayOwner, {
-      ...parents,
+      ...pool,
       onEstablished(handle) {
         callbacks++
         if (failure === 'unrelated runtime') return originalPeer
@@ -944,9 +930,11 @@ for (const [index, failure] of [
       await new Promise((resolve) => setTimeout(resolve, 5))
       fixture.clock.advance(250)
     }
-    for (const parent of Object.values(parents)) {
-      t.is(readPeerLedger(parent).cellsReserved, 0, 'Native retirement releases failed ownership')
-    }
+    t.is(
+      readPeerBranchSlots(pool.branchSlots).live,
+      0,
+      'Native retirement releases failed ownership'
+    )
     const forward = b4a.from('original branch survives failed callback')
     const receivingForward = receivePeerM3Payload(originalPeer)
     await sendPeerM3Payload(original, forward)
@@ -988,12 +976,65 @@ test('Native upstream loss retires the surviving successor without reporting a f
   )
   t.is(falseLosses, 0, 'retiring a surviving leg does not fabricate its physical loss')
   t.is(
-    readPeerLedger(downstream.localLedgers.teardownSendLedger).cellsSpent,
+    branchSpent(downstream.localSlots, 'teardownSendLedger').cells,
     1,
     'propagation spends the surviving branch closure partition'
   )
   t.is(layer.releases, 1, 'upstream loss releases the forwarder layer keys once')
   destroyPeerM3ForwardingOwner(forwarding)
+  t.is(layer.releases, 1, 'a later destroy does not release them again')
+})
+
+// The mirror of upstream loss: losing the successor's physical link ends the forwarder, which
+// closes its still-live predecessor with authenticated closure and releases its layer keys
+// exactly once, before any explicit destroy. Unlike upstream loss, a downstream loss is
+// reported upstream as a physical loss, once, so the circuit's owners learn it is gone.
+test('Native downstream loss retires the surviving predecessor and releases the layer keys once', async (t) => {
+  const upstream = await authenticatedPeer(t, 48660, 2, true)
+  const downstream = await authenticatedPeer(t, 48664, 2, true)
+  const previous = adoptPeerEstablishedLink(upstream.localAuthority, upstream.handle)
+  const next = adoptPeerEstablishedLink(downstream.localAuthority, downstream.handle)
+  let reportedLosses = 0
+  registerPeerM3PhysicalLossSink(previous, () => {
+    reportedLosses++
+  })
+  const layer = testLayerStack(0x43)
+  let ends = 0
+  const forwarding = createPeerM3ForwardingOwner(previous, next, {
+    layers: layer.stack,
+    onEnd: () => ends++
+  })
+  t.teardown(() => {
+    destroyPeerM3ForwardingOwner(forwarding)
+  })
+  let receivedError = null
+  receivePeerM3Payload(upstream.peerRuntime).catch((error) => {
+    receivedError = error
+  })
+  await downstream.f.localEndpoint.close()
+  for (let turn = 0; turn < 10 && receivedError === null; turn++) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  t.is(
+    receivedError && receivedError.code,
+    'ERR_DESTROYED',
+    'the upstream peer receives authenticated closure over its still-live adjacency'
+  )
+  t.is(reportedLosses, 1, 'the surviving predecessor reports the downstream loss once')
+  t.is(
+    branchSpent(upstream.localSlots, 'teardownSendLedger').cells,
+    1,
+    'propagation spends the surviving branch closure partition'
+  )
+  t.is(layer.releases, 1, 'downstream loss releases the forwarder layer keys once')
+  t.ok(
+    [...layer.stack.keys[0].forward, ...layer.stack.keys[0].reverse].every((key) =>
+      key.every((byte) => byte === 0)
+    ),
+    'the released layer keys are zeroed'
+  )
+  t.is(ends, 1, 'the forwarder ends once')
+  t.is(destroyPeerM3ForwardingOwner(forwarding), false)
   t.is(layer.releases, 1, 'a later destroy does not release them again')
 })
 
@@ -1020,8 +1061,14 @@ test('forwarding owner removes its forward layer, adds its reverse layer and rel
   t.alike(await receivingReverse, expectedReverse, 'upstream sees the envelope with it')
 
   t.is(layer.releases, 0, 'a live forwarder holds its keys')
-  t.is(destroyPeerM3ForwardingOwner(owner), true)
+  const destroying = destroyPeerM3ForwardingOwner(owner)
   t.is(layer.releases, 1, 'destroy releases the keys')
+  // The legs' closure duties run their bounded attempts on the fixture clocks.
+  for (let i = 0; i < 8; i++) {
+    upstream.clock.advance(500)
+    downstream.clock.advance(500)
+  }
+  t.is(await destroying, true, 'the forwarder join settles once both legs finish')
   t.is(destroyPeerM3ForwardingOwner(owner), false)
   t.is(layer.releases, 1, 'the keys are released exactly once')
 })
