@@ -18,6 +18,8 @@ const {
   computePeerSemanticOwnedBytes,
   createPeerLedger,
   createPeerMemoryPool,
+  chargePeerLedger,
+  isPeerLedgerWithin,
   readPeerLedger,
   readPeerMemory
 } = require('../../lib/private/peer-ledger')
@@ -76,17 +78,43 @@ function createCarrierPair(clock, options = {}) {
     let sequence = 0
     const sentFinalize = []
     const sentRoute = []
+    const ledgers = {
+      sendLedger: createPeerLedger(
+        index === 1 && options.terminalSend
+          ? options.terminalSend
+          : { cells: 500, bytes: 1_000_000n, commands: 200 }
+      ),
+      receiveLedger: createPeerLedger({ cells: 500, bytes: 1_000_000n, commands: 200 })
+    }
+    let bound = null
 
     const carrier = {
       [CARRIER_BRAND]: true,
       clock: clock.clock,
       sentFinalize,
       sentRoute,
+      ledgers,
+      bindLedgers(partitions) {
+        if (destroyed) throw PrivateRouteError.ERR_DESTROYED()
+        if (bound) throw PrivateRouteError.ERR_REPLAY()
+        if (
+          !isPeerLedgerWithin(partitions.sendLedger, ledgers.sendLedger) ||
+          !isPeerLedgerWithin(partitions.receiveLedger, ledgers.receiveLedger)
+        )
+          throw PrivateRouteError.INVALID_ROUTE()
+        bound = partitions
+        return true
+      },
       setPeer(value) {
         peer = value
       },
       sendFinalizeFrame(frame) {
         if (destroyed) throw PrivateRouteError.ERR_DESTROYED()
+        chargePeerLedger((bound || ledgers).sendLedger, {
+          cells: 1,
+          bytes: 1200n,
+          commands: 0
+        })
         sentFinalize.push(b4a.from(frame))
         if (options.dropFinalize && options.dropFinalize(index, sentFinalize.length)) return true
         if (options.throwFinalize && options.throwFinalize(index, sentFinalize.length))
@@ -104,6 +132,11 @@ function createCarrierPair(clock, options = {}) {
       },
       sendFrame(frame) {
         if (destroyed) throw PrivateRouteError.ERR_DESTROYED()
+        chargePeerLedger((bound || ledgers).sendLedger, {
+          cells: 1,
+          bytes: 1200n,
+          commands: 0
+        })
         sentRoute.push(b4a.from(frame))
         if (options.dropRoute && options.dropRoute(index, sentRoute.length)) return true
         if (options.throwRoute && options.throwRoute(index, sentRoute.length))
@@ -150,6 +183,11 @@ function createCarrierPair(clock, options = {}) {
       },
       enqueue(envelope) {
         if (destroyed) return
+        chargePeerLedger((bound || ledgers).receiveLedger, {
+          cells: 1,
+          bytes: 1200n,
+          commands: 0
+        })
         const waiter = waiters.shift()
         if (waiter) waiter.resolve(envelope)
         else queue.push(envelope)
@@ -227,7 +265,8 @@ function ownerOptions(carrier, pair, route, localLimits, extras = {}) {
     generation: 7n,
     purpose: 2,
     limits: localLimits,
-    ledger: createPeerLedger({ cells: 500, bytes: 1_000_000n, commands: 200 }),
+    sendLedger: carrier.ledgers.sendLedger,
+    receiveLedger: carrier.ledgers.receiveLedger,
     memoryPool: createPeerMemoryPool(100_000_000),
     parentWireExpiresAt: 20_000n,
     parentLocalDeadline: 20_000n,
@@ -285,8 +324,10 @@ function fixture(options = {}) {
     terminalLimits,
     source: createPeerPurposeSource(sourceOptions),
     terminal: createPeerPurposeTerminal(terminalOptions),
-    sourceLedger: sourceOptions.ledger,
-    terminalLedger: terminalOptions.ledger,
+    sourceLedger: sourceOptions.sendLedger,
+    sourceReceiveLedger: sourceOptions.receiveLedger,
+    terminalLedger: terminalOptions.sendLedger,
+    terminalReceiveLedger: terminalOptions.receiveLedger,
     sourceMemory: sourceOptions.memoryPool,
     terminalMemory: terminalOptions.memoryPool,
     pair
@@ -778,7 +819,7 @@ test('purpose owner rejects nonce accessors and rolls back failed preparation', 
     const ledger = createPeerLedger({ cells: 500, bytes: 1_000_000n, commands: 200 })
     const memoryPool = createPeerMemoryPool(100_000_000)
     const options = ownerOptions(carriers.left, pair, route, limits(), {
-      ledger,
+      sendLedger: ledger,
       memoryPool,
       offerNonce
     })
@@ -821,7 +862,7 @@ test('purpose owner clears staged copies on late constructor faults', (t) => {
     const ledger = createPeerLedger({ cells: 500, bytes: 1_000_000n, commands: 200 })
     const memoryPool = createPeerMemoryPool(100_000_000)
     const options = ownerOptions(carriers.left, pair, route, limits(), {
-      ledger,
+      sendLedger: ledger,
       memoryPool
     })
     mutate(options)
@@ -981,9 +1022,12 @@ test('purpose owner erases pre-shared state after sentinel authentication', asyn
 })
 
 test('purpose owner caches and authenticates a terminal rejection', async (t) => {
-  const terminalLedger = createPeerLedger({ cells: 1, bytes: 1_200n, commands: 1 })
   const terminalMemory = createPeerMemoryPool(1)
-  const f = fixture({ terminalOverrides: { ledger: terminalLedger, memoryPool: terminalMemory } })
+  const f = fixture({
+    carrier: { terminalSend: { cells: 1, bytes: 1_200n, commands: 1 } },
+    terminalOverrides: { memoryPool: terminalMemory }
+  })
+  const terminalLedger = f.terminalLedger
   const terminalPending = f.terminal.whenActive().catch((error) => error)
   f.terminal.start()
   f.source.start()
@@ -998,6 +1042,12 @@ test('purpose owner caches and authenticates a terminal rejection', async (t) =>
   t.is(readPeerMemory(terminalMemory).reservedBytes, 0)
   t.is(readPeerLedger(terminalLedger).cellsSpent, 1)
   t.is(readPeerLedger(terminalLedger).bytesSpent, 1_200n)
+  t.is(readPeerLedger(f.terminalReceiveLedger).cellsReserved, 0)
+  t.is(
+    readPeerLedger(f.terminalReceiveLedger).cellsSpent,
+    1,
+    'pre-bind receipt remains spent after failed child reservation'
+  )
   f.terminal.destroy()
   const terminalError = await terminalPending
   t.is(terminalError && terminalError.code, 'ERR_DESTROYED')
@@ -1326,5 +1376,116 @@ test('purpose owner erases route state on explicit destroy', async (t) => {
   t.is(readPeerMemory(f.sourceMemory).takenBytes, 0)
   t.is(readPeerLedger(f.sourceLedger).cellsReserved, 0)
   t.is(computePeerSemanticOwnedBytes({ purpose: 2, isInitiator: true, maxStreams: 1 }), 133_692)
-  t.is(MAX_U64, 0xffff_ffff_ffff_ffffn)
+})
+
+test('purpose operation admission selects the authenticated outgoing child and rejects incompatible IDs unspent', async (t) => {
+  const f = fixture()
+  await startHandshake(f)
+  const source = readPeerLedger(f.sourceLedger)
+  const terminal = readPeerLedger(f.terminalLedger)
+  for (const id of [0, 0xffff, PEER_MESSAGE_ID.PEER_DATA_V2, PEER_MESSAGE_ID.ENTRY_REGISTER_V2]) {
+    t.exception(() => f.source.admitOperation(id), /invalid/i)
+    t.exception(() => f.terminal.admitOperation(id), /invalid/i)
+  }
+  t.exception(() => f.source.admitOperation(PEER_MESSAGE_ID.PEER_OPEN_V2), /invalid/i)
+  t.alike(readPeerLedger(f.sourceLedger), source)
+  t.alike(readPeerLedger(f.terminalLedger), terminal)
+  const incoming = readPeerLedger(f.terminalReceiveLedger)
+  f.terminal.admitOperation(PEER_MESSAGE_ID.PEER_OPEN_V2)
+  f.terminal.admitOperation(PEER_MESSAGE_ID.PRIVATE_ACTIVATE_V2)
+  t.is(readPeerLedger(f.terminalLedger).commandsSpent, terminal.commandsSpent + 2)
+  t.is(readPeerLedger(f.terminalLedger).cellsSpent, terminal.cellsSpent)
+  t.alike(readPeerLedger(f.terminalReceiveLedger), incoming)
+  f.source.destroy()
+  f.terminal.destroy()
+  await Promise.all([f.source.whenClosed(), f.terminal.whenClosed()])
+})
+
+test('purpose revocation permits only synchronous tombstones and retains children through the carrier join', async (t) => {
+  let f
+  let closures = 0
+  const errors = []
+  f = fixture({
+    sourceOverrides: {
+      streamCallbacks: {
+        onAdmit: () => false,
+        onDeliver: () => false,
+        onFailure() {
+          try {
+            f.source.admitOperation(PEER_MESSAGE_ID.PEER_OPEN_V2)
+          } catch (error) {
+            errors.push(error.code)
+          }
+          f.source.admitOperation(PEER_MESSAGE_ID.PEER_CLOSE_V2)
+          closures++
+        }
+      }
+    }
+  })
+  await startHandshake(f)
+  const before = readPeerLedger(f.sourceLedger).commandsSpent
+  const reservation = readPeerMemory(f.sourceMemory).reservedBytes
+  let release
+  const join = new Promise((resolve) => {
+    release = resolve
+  })
+  const destroyCarrier = f.carriers.left.destroy
+  f.carriers.left.destroy = () => {
+    destroyCarrier()
+    return join
+  }
+  t.is(f.source.destroy(), true)
+  t.is(closures, 1)
+  t.alike(errors, ['ERR_DESTROYED'])
+  t.is(readPeerLedger(f.sourceLedger).commandsSpent, before + 2)
+  t.is(
+    readPeerMemory(f.sourceMemory).reservedBytes,
+    reservation,
+    'native work keeps the owned reservation alive'
+  )
+  t.exception(() => f.source.admitOperation(PEER_MESSAGE_ID.PEER_CLOSE_V2), {
+    code: 'ERR_DESTROYED'
+  })
+  t.is(f.source.destroy(), false)
+  release()
+  await f.source.whenClosed()
+  t.is(readPeerMemory(f.sourceMemory).reservedBytes, 0)
+  t.is(readPeerLedger(f.sourceLedger).cellsReserved, 0)
+  t.is(readPeerLedger(f.sourceLedger).released, false, 'B2 does not release borrowed parents')
+  t.is(readPeerLedger(f.sourceLedger).commandsSpent, before + 2)
+  f.terminal.destroy()
+})
+
+test('purpose command exhaustion rejects before debit and still completes revoked cleanup', async (t) => {
+  let failure
+  const f = fixture({
+    terminalOverrides: {
+      streamCallbacks: {
+        onAdmit: () => false,
+        onDeliver: () => false,
+        onFailure(error) {
+          failure = error
+        }
+      }
+    }
+  })
+  await startHandshake(f)
+  for (let index = 1; index < f.terminalLimits.reverseCommands; index++)
+    f.terminal.admitOperation(PEER_MESSAGE_ID.PEER_OPEN_V2)
+  const spent = readPeerLedger(f.terminalLedger).commandsSpent
+  t.exception(() => f.terminal.admitOperation(PEER_MESSAGE_ID.PRIVATE_ACTIVATE_V2), {
+    code: 'ERR_QUOTA_EXCEEDED'
+  })
+  t.is(readPeerLedger(f.terminalLedger).commandsSpent, spent)
+  f.terminal.destroy()
+  await f.terminal.whenClosed()
+  t.is(failure.code, 'ERR_QUOTA_EXCEEDED')
+  t.is(readPeerMemory(f.terminalMemory).reservedBytes, 0)
+  t.is(readPeerLedger(f.terminalLedger).cellsReserved, 0)
+  t.is(readPeerLedger(f.terminalLedger).released, false)
+  t.exception(() => f.terminal.admitOperation(PEER_MESSAGE_ID.PEER_CLOSE_V2), {
+    code: 'ERR_DESTROYED'
+  })
+  t.is(readPeerLedger(f.terminalLedger).commandsSpent, spent)
+  f.source.destroy()
 })

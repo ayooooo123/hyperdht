@@ -14,6 +14,8 @@ const {
   decodePeerTransport,
   encodePeerTransport
 } = require('../../lib/private/peer-transport-wire')
+const { computePeerRouteBudget } = require('../../lib/private/peer-ledger')
+const { PrivateRouteError } = require('../../lib/private/errors')
 
 const payload = { error: 0, firewall: 0 }
 const limits = { maxFrames: 8, maxBytes: 7816n, idleMs: 5000 }
@@ -111,6 +113,22 @@ function network(t) {
         wallNow: () => 10000n + c.now()
       }
       side.route = route
+      const budget = computePeerRouteBudget({
+        purpose,
+        maxStreams: route.limits.maxStreams,
+        applications: Array(
+          purpose === 3 ? route.limits.maxStreams - 1 : route.limits.maxStreams
+        ).fill({
+          forwardFrames: 1,
+          reverseFrames: 1,
+          forwardBytes: 977n,
+          reverseBytes: 977n,
+          forwardWindow: 1,
+          reverseWindow: 1
+        })
+      }).purpose
+      side.commandsRemaining = budget[direction === 0 ? 'forward' : 'reverse'].commands
+      side.operations = []
       side.lanes = new PeerReliableLanes({
         routeId,
         generation: 1n,
@@ -136,6 +154,12 @@ function network(t) {
         }
       })
       side.owner = {
+        admitOperation(messageId) {
+          if (side.commandsRemaining === 0) throw PrivateRouteError.ERR_QUOTA_EXCEEDED()
+          side.commandsRemaining--
+          side.operations.push(messageId)
+          return true
+        },
         whenActive: () => Promise.resolve(),
         route: () => ({
           ...route,
@@ -163,7 +187,10 @@ function network(t) {
     for (let turn = 0; turn < 400; turn++) {
       await Promise.resolve()
       const records = h.queue.splice(0)
-      for (const record of records) record.from.other.lanes.receive(record.wire)
+      for (const record of records) {
+        const receiver = record.from.other
+        if (!receiver.service.diagnostics().destroyed) receiver.lanes.receive(record.wire)
+      }
       if (records.length || h.queue.length) quiet = 0
       else if (++quiet === 8) {
         const soon = Array.from(c.timers).some((row) => row.at <= c.now() + 10n)
@@ -275,6 +302,7 @@ async function legacyFixture(t, options = {}) {
     { egressServiceIdentity: fill(32, 90) },
     { legacy: native.adapter, egressServiceIdentity: fill(32, 90) }
   )
+  if (options.beforeOpen) options.beforeOpen({ source, terminal, native })
   const events = endpoint({
     onHandshake(raw) {
       events.handshakes.push(b4a.from(raw))
@@ -385,6 +413,7 @@ async function privateFixture(t, options = {}) {
     )
   const descriptor = await registration.whenRegistered()
   const [source, sourceEntry] = await h.pair(2, {}, { entry })
+  if (options.beforeOpen) options.beforeOpen({ source, sourceEntry, destination, destinationEntry })
   const sourceEvents = endpoint({
     onHandshake(raw) {
       sourceEvents.handshakes.push(b4a.from(raw))
@@ -862,6 +891,7 @@ test('owner loss revokes registrations and resets their active dependents', asyn
 
 test('exact semantic replay is idempotent and a conflicting reliable identity fails closed', async (t) => {
   const f = await privateFixture(t)
+  const commands = f.source.commandsRemaining
   const row = f.source.delivered.find(({ wire }) => {
     const d = decodePeerTransport(wire)
     return (
@@ -877,6 +907,7 @@ test('exact semantic replay is idempotent and a conflicting reliable identity fa
   )
   t.is(f.sourceEvents.handshakes.length, 1)
   t.is(f.sourceEvents.opens.length, 1)
+  t.is(f.source.commandsRemaining, commands, 'exact semantic replay has no allocation debit')
   const packet = f.h.sent.find(
     (record) => record.from === f.sourceEntry && packetInfo(record).semantic === ID.PRIVATE_READY_V2
   )
@@ -1211,4 +1242,110 @@ test('receive bytes constrain active windows without limiting serial lifetime ad
   t.is(source.service.diagnostics().receiveSlots, 1)
   t.is(source.service.diagnostics().streams, 2, 'lifetime count includes the retired stream')
   t.is(second.diagnostics().closed, false)
+})
+
+test('exhausted semantic admission precedes legacy resolver and reservation effects', async (t) => {
+  for (const commands of [1, 2]) {
+    const f = await legacyFixture(t, {
+      beforeOpen({ terminal }) {
+        terminal.commandsRemaining = commands
+      }
+    })
+    t.is(f.native.resolves, commands - 1)
+    t.is(f.native.reserves, 0)
+    t.is(f.events.opens.length, 0)
+    t.is(f.terminal.service.diagnostics().receiveSlots, 0)
+    t.is(f.terminal.service.diagnostics().streams, 0)
+    t.is(f.terminal.commandsRemaining, 0)
+  }
+})
+
+test('accepted asynchronous resolver failure stays spent and closes exactly once', async (t) => {
+  let reject
+  const pending = new Promise((resolve, no) => {
+    reject = no
+  })
+  const f = await legacyFixture(t, { resolveLater: pending })
+  t.alike(f.terminal.operations, [ID.PEER_OPEN_V2, ID.LEGACY_RESOLVE_V2])
+  const remaining = f.terminal.commandsRemaining
+  reject(new Error('Resolver failed after admission'))
+  await f.h.settle()
+  t.is(f.native.resolves, 1)
+  t.is(f.native.reserves, 0)
+  t.is(
+    f.terminal.commandsRemaining,
+    remaining - 1,
+    'only the first tombstone adds a command; accepted work is not refunded'
+  )
+  t.is(f.terminal.operations.filter((id) => id === ID.LEGACY_RESOLVE_V2).length, 1)
+  t.is(f.lease.diagnostics().closed, true)
+  f.lease.revoke()
+  f.source.service.destroy()
+  await f.h.settle()
+  t.is(f.terminal.commandsRemaining, remaining - 1)
+})
+
+test('exhausted PRIVATE_ACTIVATE precedes both bridge and destination application effects', async (t) => {
+  for (const target of ['sourceEntry', 'destination']) {
+    const f = await privateFixture(t, {
+      beforeOpen(sides) {
+        sides[target].commandsRemaining = 1
+      }
+    })
+    t.is(f.destinationEvents.handshakes.length, 0)
+    t.is(f.destinationEvents.opens.length, 0)
+    t.is(f.sourceEvents.opens.length, 0)
+    if (target === 'sourceEntry')
+      t.is(
+        f.destinationEntry.service.diagnostics().streams,
+        1,
+        'only the preexisting registration exists; no bridge stream was installed'
+      )
+    t.is(f[target].service.diagnostics().streams, 0)
+    t.is(f[target].service.diagnostics().receiveSlots, 0)
+    t.is(f[target].commandsRemaining, 0)
+  }
+})
+
+test('exhausted registration admission never publishes a registration', async (t) => {
+  const h = network(t)
+  const ad = advertisement()
+  const entry = {
+    identity: fill(32, 1),
+    epoch: 1n,
+    verifyAdvertisement: (wire) => b4a.equals(wire, ad)
+  }
+  const [source, terminal] = await h.pair(3, { entry }, { entry })
+  terminal.commandsRemaining = 1
+  const handle = source.service.register({
+    ...limits,
+    destinationNoiseKey: SecretStream.keyPair().publicKey,
+    advertisement: ad,
+    expiresAtUnixMs: 18000n
+  })
+  await h.settle()
+  t.alike(terminal.operations, [ID.PEER_OPEN_V2])
+  t.is(terminal.service.diagnostics().registration, null)
+  t.is(terminal.service.diagnostics().streams, 0)
+  h.c.advance(2000)
+  await h.settle()
+  await t.exception(handle.whenRegistered(), /unavailable|destroyed|timeout/i)
+})
+
+test('stream tombstone failure revokes first and finishes recursive registration cleanup', async (t) => {
+  const f = await privateFixture(t)
+  f.destination.commandsRemaining = 0
+  t.is(f.destinationLease.revoke(), true)
+  t.is(f.destinationLease.revoke(), false)
+  await f.h.settle()
+  t.is(f.destination.service.diagnostics().destroyed, true)
+  t.is(f.destination.service.diagnostics().streams, 0)
+  t.is(f.destination.service.diagnostics().receiveSlots, 0)
+  t.is(
+    f.destinationEvents.resets.length,
+    0,
+    'a revoked endpoint cannot receive callbacks during failure cleanup'
+  )
+  t.exception(() => f.destinationLease.trySendCiphertext(fill(59, 1)), { code: 'ERR_DESTROYED' })
+  t.is(f.destination.commandsRemaining, 0)
 })

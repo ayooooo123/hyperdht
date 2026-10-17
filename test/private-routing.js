@@ -107,3 +107,7 @@ if (!global.Bare) {
 // this portable aggregate; run them with `npm run test:private:process:node`
 // and `npm run test:private:process:bare`, as the Linux CI job does. The
 // privileged namespace gates are separated the same way.
+
+require('./private/peer-native-config')
+require('./private/peer-native-cli')
+require('./private/peer-native-purpose')
