@@ -200,10 +200,144 @@ The method correction was exercised with four real-native UDX regressions
 (34/34 assertions): immediate multiple admissions, owned-buffer lifetime,
 FIFO/flush/FIN ordering, byte/write bounds including unacknowledged native
 buffers, and exact-once cleanup. Shell parsing and CLI help were checked.
-No corrected throughput matrix or privileged Linux netem run is claimed here.
+Those method checks alone do not establish throughput. The matched corrected
+application-delay runs below now provide before/after measurements; no
+privileged Linux netem run is claimed here.
 
 Compare pre/post changes on the same machine and topology. Successful local runs
 alone do not establish a general anonymity advantage over another implementation.
+
+## Matched corrected-method benchmark: targets remain unmet
+
+Astra reran both sides with `application-udx-delay-line-v2`; **legacy
+callback-held delay rows are not used in this comparison**.
+
+- **Before:** isolated checkout `51da9f7`, retaining production base `6053ee8`,
+  with only `bench/private-routing` overlaid from Vega `069e0dd`.
+- **After:** measured implementation
+  `1e9dfb281f1f540d27ae9ea5ff881ed54fbcd3fa`, containing descriptor `a9213ca`,
+  controls `4b308f4`, retired-ID fixture `876e4fd` and F03/F15 `fcda109`, with
+  local merges of Vega `40570ab` and `069e0dd`.
+- Both use the same installed `node_modules`, through a symlink in the isolated
+  baseline checkout. The precise summary records
+  `sameEnvironmentAndOptionsExceptOutput: true`. The JSONL metadata records
+  Node v22.19.0, macOS arm64, ten logical CPUs, six relay processes, three
+  repetitions per direction, 64 KiB chunks, and 0/5 ms application-delay
+  conditions. The delay line retains the same 64 MiB / 16,384-write bounds.
+- Both fixtures explicitly enable the production privateRouting service on
+  three non-relay bootstrap/storage nodes. This controlled storage setup does
+  not establish general F07 storage availability.
+
+Commands were run in their corresponding checkouts, with no additional selectors:
+
+```sh
+npm run bench:private-routing -- --out=/tmp/hyperdht-council/astra/baseline-corrected-v2.jsonl
+npm run bench:private-routing -- --out=/tmp/hyperdht-council/astra/after-b1-corrected-v2.jsonl
+```
+
+| Outcome                           | Corrected baseline | Measured B1 |
+| --------------------------------- | -----------------: | ----------: |
+| Direct attempts completed         |              42/42 |       42/42 |
+| Alpha attempts completed          |              27/42 |       42/42 |
+| Transfer failures                 |                 15 |           0 |
+| Workers completing clean teardown |              16/16 |       16/16 |
+| Whole-run wall time               |            23.39 s |     64.35 s |
+| Exit code                         |                  1 |           0 |
+
+The reliability improvement is real, but **the M1 performance targets are not
+met**. Whole-run time is not a throughput comparison: failed baseline trials
+transfer less data than successful B1 trials.
+
+Astra's reported alpha measurements, using the same corrected method:
+
+| Metric                                | Corrected baseline | Measured B1 | M1 requirement         |
+| ------------------------------------- | -----------------: | ----------: | ---------------------- |
+| 1 MiB upload, MiB/s                   |               6.22 |        5.82 | At least 2× baseline   |
+| 1 MiB upload relay CPU, ms/MiB        |             579.99 |      563.13 | At most 0.5× baseline  |
+| 5 ms delay, 4 MiB upload, MiB/s       |               4.62 |        3.19 | At least 3× baseline   |
+| 5 ms delay, 4 MiB download, MiB/s     |               4.74 |        5.21 | At least 3× baseline   |
+| 5 ms delay, 64-byte ping upload, ms   |              70.46 |      110.99 | No worse than baseline |
+| 5 ms delay, 64-byte ping download, ms |              68.61 |      113.05 | No worse than baseline |
+
+Baseline 1 MiB download completed **0/3** attempts. The failed 1 MiB download,
+16 MiB and concurrent-bulk baseline groups provide no valid throughput or
+relay-CPU ratio. Missing successful baseline measurements are not
+zero-throughput values and must not be turned into an infinite improvement.
+The modest CPU and delayed-download gains do not meet their required factors;
+the reported upload throughput and delayed ping values worsen. Performance
+work remains necessary, without weakening fixed 1200-byte cells, per-hop
+authentication, bounded buffering or end-to-end Noise.
+
+The two JSONL files above are the raw evidence. Exact measurements, ratios and
+revision/environment provenance are recorded in
+`/tmp/hyperdht-council/astra/benchmark-corrected-v2-summary.json`, which explicitly
+records `performanceTargetsMet: false` and clean workers on both sides.
+These are Astra's supplied runs, not a new Vega benchmark execution. Transfer
+completion does not close the performance gate or substitute for the merged
+M1 correctness gates.
+
+### F17 send-observer boundary: read-only inspection
+
+Source inspection found **no send observer attached by the throughput harness**.
+All files under `bench/private-routing` and `testnet.js` were byte-identical
+between the isolated baseline, Astra and Vega checkouts. Neither benchmark
+checkout nor either existing JSONL artifact was changed for this inspection.
+
+The exact throughput path is:
+
+- `bench/private-routing/index.js:82-87` forks fresh workers with `execArgv: []`.
+  Its bootstrap/storage setup at `:343-379` uses ordinary public DHT construction,
+  not a test scope or a native send-observer registration.
+- `bench/private-routing/worker.js:142-159` constructs the alpha DHT without an
+  observer. `index.js:655-668` likewise passes no observer to the controller.
+  At the measured implementation `1e9dfb2`, `private-peer-controller.js:2206`
+  defaults it to null, and `:293-306` returns before snapshot copying/freezing
+  when no observer exists. The baseline's separate test-observer default is
+  also null; the benchmark never invokes its setter.
+- No `observeSendAttempts` or `scope.create` attachment occurs from worker
+  startup through `worker.js:253-260` joined stream/server/node teardown.
+  Thus the harness's send-observer attachment lifetime is **none**, not an
+  observer removed only after timing.
+- The nonzero-delay hook is different: `worker.js:17` installs it before DHT
+  construction; `worker.js:259` closes it after node destruction.
+  `delay.js:22-28,237-278` wraps UDX write/ACK/final/flush handling and restores
+  the original methods on close. Zero delay returns native passthrough at
+  `delay.js:56-57`. This bounded delay/counter machinery does not hash packets
+  or freeze send-observation records. The payload seed hash in
+  `protocol.js:48-53` runs during preparation, before relay CPU timing and
+  transfer timestamps, and is not a per-send observer.
+
+The native warning applies to an explicitly observed native runtime, a separate
+path inspected in Opus's checkout. In `lib/private/peer-native-runtime.js`,
+`:1521-1523` initializes the listener to null; `observeSendAttempts` at
+`:1601-1618` attaches to an existing lease or records the listener for
+`leaseCurrentSocket` at `:401-410`, and returns `stopObservingSends` to detach.
+Suspend removes the lease attachment during `stopRuntime` at `:1479-1499`;
+an undisposed listener is retained for resume. Joined destroy detaches through
+that shutdown path, not synchronously at the initial `destroy()` call.
+`lib/private/udx-cell-endpoint.js:4214-4244` checks for a lease observer before
+the packet hash and attempt-record freezes; `:4368-4403` also guards send and
+completion observation. No attachment means no hashing/freezing from that
+observation facility, not absence of normal protocol cryptography or funding.
+
+Capture/privacy remains separate. The alpha capture path attaches through
+`test/private/live-peer-capture-node.js:199-210` →
+`test/private/helpers/private-peer.js:34-85` during scoped node construction,
+before readiness. Controller destruction clears its observer; after joined
+node teardown, capture calls `scope.close()` at `:345-348`, which clears any
+remaining scoped callbacks (`helpers/private-peer.js:109-115`). These capture
+paths are not imported by the throughput harness.
+
+No observer-driven harness correction is indicated by this source inspection;
+it is not a new runtime or performance result. If an active observer is later
+introduced, both benchmark checkouts must receive the identical corrected
+harness before a new paired comparison, with prior artifacts retained as a
+separate evidence group. Neither one-sided removal nor subtracting an estimated
+observer cost is a valid correction.
+
+The coordinator accepted this as read-only evidence under R42, not a performance
+pass. Preserve the matched harness and artifacts: **no observer-driven rebaseline
+or lazy-digest work is authorized**.
 
 ## C1 pre-B1 benchmark
 
@@ -394,8 +528,8 @@ changing the 50 ms interval or protocol deadlines.
 Vega's earlier decoder/accounting preparation passed **15/15 tests and 318/318
 assertions on Node and Bare** before the final scope/count-limit binding. The
 final binding and watermark migration were reviewed against the committed
-contract but were not rerun: Astra retained the heavy slot and explicitly
-requested no tests, builds or benchmarks for these edits. Neither those earlier
+contract but were not rerun: Astra held the heavy slot at that stage and
+explicitly requested no tests, builds or benchmarks. Neither those earlier
 unit checks nor Astra's focused regressions replace the merged M1 aggregates,
 Vega's explicit Bare slow-consumer gate, the bidirectional late-cell fixture,
 or the merged active-session/refresh-generation lifecycle gates.
@@ -404,8 +538,9 @@ or the merged active-session/refresh-generation lifecycle gates.
 
 The supplied `shared-links-after.json` records the original complete
 `alpha-shared-links.js` suite passing **3/3 tests and 35/35 assertions** on
-Node (146.801 s) and Bare (150.883 s). These implementation changes are based
-on `ecc3748`; their own commit hash has not yet been supplied.
+Node (146.801 s) and Bare (150.883 s). The F03/F15 shared-funding and pre-seal
+DRR implementation is committed as **`fcda109`**, following the previously
+recorded lifecycle and ownership work.
 
 Five sequential 16 MiB bidirectional sessions carry **80 MiB in each direction
 on one published route**, followed by another useful sibling. Four concurrent
@@ -440,8 +575,11 @@ The initial one-bulk fixture that did not form the intended backlog is excluded
 from the proof. Evidence: `/tmp/hyperdht-council/astra/shared-links-after.json`
 and `/tmp/hyperdht-council/astra/TEST-SEAM.md`.
 
-At this handoff, the new serial dual-credit repeat is still running and is not
-counted as completed evidence. The F03/F15 implementation commit remains pending.
+The latest integrated serial `alpha-flow-control.js` repeat passes **4/4 tests
+and 79/79 assertions on each runtime**: Node 209.906100083 s and Bare 210.189 s
+(Astra artifact 234). This is the integrated data-plane repeat, distinct from
+the earlier `5ed8449` run recorded above. It does not substitute for the merged
+M1 aggregates or establish the still-unmet benchmark performance targets.
 
 ### Control sessions and descriptor cancellation (F09)
 
@@ -504,6 +642,31 @@ Evidence: `/tmp/hyperdht-council/astra/control-sessions-after.json`,
 and relay-owner sections of `TEST-SEAM.md`. F07 storage availability and merged
 M1 acceptance/performance gates remain separate requirements.
 
+### F07 storage choice and remaining availability work
+
+Vega retains docs/e2e ownership. The explicit F07 decision remains **RETAIN
+PLUGIN STORAGE** for alpha. Astra owns bounded capability bootstrap/referrals
+using ordinary announce and capability-only transport queries. Storage must
+not be restricted to a C6-only relay universe. The index API remains unchanged,
+and there is no mutable migration. This design and ownership ruling is not
+completed implementation or availability proof. C7 closest-set/wrong-target results,
+exact-readback checks and benchmarks with deliberately capable storage nodes
+must not be represented as proof that the remaining F07 availability path is
+complete.
+
+### F10 ownership and serialized verification
+
+Opus has released F10 cell-codec, minimal crypto-suite and focused-test
+ownership to Astra, with Opus cross-review. Changes must remain additive and
+preserve the old API until the native A4 cutover. Implementation is underway;
+no completed F10 validation or performance result is claimed here.
+
+The coordinator's current heavy-slot order is **Astra's finite iteration,
+then explicit handoff to Opus** for M3b/A3/native16/funding proof. **Vega remains
+no-heavy**: no suites, builds or benchmarks without an assigned slot. This
+ownership order does not complete any outstanding merged M1 or native gate.
+Vega's runtime work remains deferred pending Opus's verification window.
+
 ### Stream-ownership recheck and late-frame fixture
 
 The initial `alpha-stream-lifecycle.js` compatibility repeat passed **4/4 tests,
@@ -535,7 +698,8 @@ for genuinely unallocated credit with a bounded real-time fixture wait, without
 releasing a sibling's grant. Each injected DATA cell receives one atomic
 `available--` / `inFlight++` debit; RESET is not charged. The immediate sibling
 exchange remains, followed by conservation assertions for both sender pools.
-This owned fixture update has not been rerun during Astra's heavy-slot hold.
+This owned fixture still has not been rerun; Vega remains no-heavy under the
+coordinator's Astra-then-Opus execution order.
 
 ### Completed lifecycle proof and integration boundary
 
@@ -593,6 +757,153 @@ Node/Bare baseline, B1 aggregates and performance gates still require their
 coordinated runs. No tests, builds or benchmarks were launched for this
 documentation update.
 
+## Corrected native C2 acceptance plan
+
+This is a planning contract, not native implementation or runtime proof. The
+coordinator's corrected profile supersedes the earlier R33/R34 arithmetic and
+pool figures.
+
+- **Purpose 2 source:** M=1, W=24, Q=111,852 frames per signed direction.
+- **Purpose 3 registration:** M=17, with actual W=1 per application under one
+  shared **24-frame / 23,448-byte** window, not sixteen independent windows.
+  Aggregate Q is **111,791 per direction**. The first OPEN ceiling is
+  **96,431** after reserving **15 × 1,024** for the remaining applications.
+  Admission grants are nonrefundable; use the actual accepted grant rather
+  than treating every application as independently entitled to the aggregate.
+- Each signed direction has **maxCells=3,579,138** and
+  **maxBytes=4,294,965,600**.
+- Production **maxConcurrentCircuits=24**, not eight. A common entry must fund
+  the registration plus sixteen clients; distributing those clients among
+  source nodes does not remove that shared-entry requirement.
+- After the native16 amendment, **sourcePool=37,457,344 B**,
+  **mask9pool=768,704 B**, **mask11pool=56,848,040 B**, and
+  **maxQueued=2,336,639** for private-purpose sizing. The interim four-slot
+  source pool is **9,364,336 B**.
+  Do not substitute the profile's `maxQueued` for the controller connect-FIFO
+  limit; that limit and its deadline require the actual controller contract.
+
+One pin's sixteen slots count **all CIRCUITS**, including local registrations
+and presence work. They do not promise sixteen application streams in addition
+to those other purposes.
+
+The native acceptance plan retains:
+
+1. **Four sources, sixteen applications:** four streams per source to one
+   destination registration, all held open before exact small duplex transfers.
+   Keep this topology after the native16 amendment; it is not replaced by the
+   single-source boundary case.
+2. **The actual source-slot boundary:** derive the limit from the integrated
+   contract—four before amendment, sixteen afterward. Occupy all slots, then
+   submit the next connect. It waits for joined native circuit-slot release
+   through the bounded queue, or fails closed on queue/deadline exhaustion.
+   No early application acceptance, alpha/direct fallback, or late opening of
+   cancelled requests is permitted.
+3. **Additional native16 single-source coverage:** hold sixteen application
+   streams only with no simultaneous source registration/presence circuit.
+   Use a warm verified cache or explicitly sequence lookup and join its circuit
+   release before the hold. A seventeenth connect exercises the boundary; this
+   is not a generic sixteen-application guarantee when other purposes use slots.
+4. **Shared-entry funding:** exercise production capacity for registration plus
+   sixteen clients at one common entry under the 24-circuit profile, without
+   synthetic funding or increased test-only limits.
+
+Large duplex transfers, private-record fragmentation, lifetime admission
+exhaustion, refresh with retained old streams, nonrefundable budgets and clean
+finite-budget termination remain separate required scenarios. The detailed plan
+is `/tmp/hyperdht-council/vega/C2-PREPARATION.md`. Acceptance still needs the
+committed native integration/amendment and real directional funding, their
+joined-release/queue evidence, and explicit runtime authorization.
+
+## Planned explicit legacy egress — after native M5b
+
+This section records **PLAN R40 as amended by R41 and documentation ledger 27**.
+R41 supersedes R40's terminal-free call shape. These are C2 planning requirements,
+not a claim that M5c is implemented, exercised or operational.
+
+The explicit public request is:
+
+```js
+connect(publicKey, {
+  legacy: true,
+  terminal: { advertisement260 }
+})
+```
+
+`keyPair` is optional. Preserve fresh application identities and expected
+destination Noise-key checking. With no legacy flag, the request remains private
+rendezvous; a present flag must be exactly `true`. **Private mode rejects
+`terminal`; legacy mode rejects `readerSecret`.**
+
+The required terminal is an exact-own-data supplied object. Copy its signed
+260-byte advertisement and authenticate it through the existing admission,
+grant-derived mask-11, epoch, expiry and capacity checks, using existing
+**supplied-terminal mode 2**. There is no random directory selection, blind retry,
+`policyCount` reinterpretation or new wire flag. Advertisements do not disclose
+legacy service opt-in; a refusing or unavailable selected terminal fails closed,
+without choosing a replacement or falling back to private/direct transport.
+
+Terminal service is separately opt-in through optional
+`relayConfig.legacyEgress`: an exact-own-data boolean, default `false`, with
+`true` permitted only on a grant-derived mask-11 terminal. Opus normalizes it
+through `readNativeConfig`; B2 consumes the normalized value and mask. CLI input
+uses the same validator. Disabled terminals must refuse purpose 1 **before
+remote destination contact**.
+
+The legacy allowance is finite: **purpose 1, M=1, Q=20,000, W=24**, permitting
+**19,540,000 raw bytes per direction** with unchanged legacy record limits—not
+that many plaintext application bytes or unlimited streaming. At most **one
+concurrent legacy application per source and per opted-in terminal** shares the
+existing circuit and memory limits. The source **37,457,344 B** and terminal
+**56,848,040 B** pools remain shared ceilings, not additional legacy pools.
+Mixed work may wait or refuse rather than over-admit. The opted-in terminal's
+`maxQueued` must cover helper-derived legacy acceptance; the private-purpose
+2,336,639 figure is not a sufficient legacy acceptance bound. Private
+cell/byte maxima remain the larger directional ceilings.
+
+The terminal necessarily learns and contacts the destination; the unchanged
+destination sees the egress transport endpoint. Do not describe this as native
+private-rendezvous destination hiding. No source-side native/direct upgrade
+toward that destination is permitted.
+
+Orion owns M5c implementation. Opus cross-reviews authority, semantic command
+costs and event ordering, including ACCEPT-before-pair. Both pair-before-ACCEPT
+and ACCEPT-before-pair must work: encrypted IK2 forwarding cannot require a
+premature remote UDX ID, while the authenticated ACCEPT/pair join must validate
+identity before native connect/open. Use production accounting helpers rather
+than duplicating their equations.
+
+### Planned C2 legacy acceptance cases
+
+Only after native M5b, actual M5c integration and explicit runtime authorization:
+
+1. **Unchanged remote server:** use an ordinary HyperDHT server with no native
+   private-routing adaptation. Require exact independent duplex payloads and
+   explicit receipts, in both source-first and destination-first FIN orders;
+   half-closing one direction must not truncate the other.
+2. **Both ACCEPT/pair orders:** exercise each real ordering, preserving encrypted
+   IK2 forwarding and the authenticated identity join. No invented remote UDX ID,
+   premature native connect/open or source direct upgrade may make a case pass.
+3. **Opt-out and incompatible inputs:** prove refusal before terminal-to-remote
+   contact for disabled service, not merely absence of application delivery.
+   Reject missing/invalid supplied terminals, non-true legacy flags, private
+   calls with `terminal`, legacy calls with `readerSecret`, and invalid opt-in
+   configuration. Invalid signatures, epochs, expiry, derived masks and capacity
+   cannot authorize egress.
+4. **No implicit fallback:** private failure never becomes legacy/direct; an
+   explicit legacy refusal never becomes private, source-direct or a randomly
+   selected alternate terminal. The selected terminal's intended ordinary
+   egress connection is not a source fallback.
+5. **Finite budget and shared capacity:** count actual raw frames/records and
+   helper-derived command costs, not just plaintext bytes. Require clean,
+   fail-closed exhaustion without hidden refill or silent truncation; exercise
+   per-source/per-terminal one-legacy limits and mixed private/legacy pool and
+   circuit exhaustion. Queued work may proceed only after real joined release.
+
+Record independent remote-contact, transport/identity, admitted-funding and
+joined-release evidence through the actual implementation's supported seams.
+No M5c implementation, interoperability result or legacy public-path completion
+is claimed by this plan.
+
 ## Scoped private-peer packet capture
 
 `npm run test:private:peer:capture` uses the scoped helper introduced by Astra's
@@ -628,9 +939,11 @@ All five required negative controls execute the real analyzer: missing owner,
 duplicate owner, miscategorized discovery, uncharged retry, and charge after send.
 `fixture.js` exports a complete input for CLI experiments.
 
-Native C2 scenarios target **wire version 3 only**. The analysis document's
-`version: 2` is a JSON schema version, not a wire version. The pre-contract
-SHA-256/invented-event input has been removed, without a compatibility adapter.
+Native private transport legs target **wire version 3**. The explicitly selected
+M5c legacy destination retains ordinary HyperDHT; that is not a source downgrade.
+The analysis document's `version: 2` is a JSON schema version, not a wire version.
+The pre-contract SHA-256/invented-event input has been removed, without a
+compatibility adapter.
 
 ### Unmodified runtime events
 
