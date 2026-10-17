@@ -113,3 +113,4 @@ if (!global.Bare) {
 require('./private/peer-native-config')
 require('./private/peer-native-cli')
 require('./private/peer-native-purpose')
+require('./private/private-native-controller')

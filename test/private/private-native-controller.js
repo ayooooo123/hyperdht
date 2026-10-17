@@ -71,7 +71,7 @@ async function exchange(left, right, text) {
   return pending
 }
 
-async function topology(t) {
+async function topology(t, { legacyEgress = false } = {}) {
   // Three mask-9 relays all have a granted safety and terminal successor. Every
   // ordinary-directory guard choice can form a distinct three-hop native route.
   const network = await createTestnet(10, { host: '127.0.0.1' })
@@ -97,7 +97,8 @@ async function topology(t) {
   edge(relays[1], relays[2])
   edge(relays[2], relays[0])
   for (const relay of relays.slice(0, 3)) edge(relay, relays[3])
-  for (const relay of relays) {
+  for (let index = 0; index < relays.length; index++) {
+    const relay = relays[index]
     const controller = createPrivateNativeController({
       dht: relay.dht,
       baseReady: () => relay.dht.fullyBootstrapped(),
@@ -109,7 +110,8 @@ async function topology(t) {
           authorityPublicKeys: [relay.authority.publicKey],
           epoch: 7n,
           runId32: b4a.alloc(32, 0x52),
-          grants: relay.grants
+          grants: relay.grants,
+          ...(index === 3 && legacyEgress ? { legacyEgress: true } : {})
         }
       }
     })
@@ -685,4 +687,155 @@ test('native listener refresh and application admission share the source circuit
   for (const stream of streams) stream.destroy()
   await closures
   await remoteServer.close()
+})
+
+async function discoverTerminalAdvertisement(fixture) {
+  const dht = fixture.network.createNode()
+  await dht.fullyBootstrapped()
+  const profile = peerNativeProfile()
+  const runtime = createPeerNativeRuntime({
+    dht,
+    config: createPeerNativeRuntimeConfig(
+      sourceOptions(),
+      dht,
+      fixture.relays.slice(0, 3).map((relay) => ({ host: relay.host, port: relay.port }))
+    )
+  })
+  try {
+    const lease = await runtime.buildTail({
+      ...peerNativeBuildLimits(profile.source, profile.limits.idleTimeoutMs),
+      payloadParametersDigest: cryptoSuite.randomBytes(32),
+      terminal: null
+    })
+    const material = lease.consume()
+    try {
+      return b4a.from(material.terminalAdvertisement260)
+    } finally {
+      for (const value of Object.values(material)) if (b4a.isBuffer(value)) value.fill(0)
+      for (const value of Object.values(material.finalizeKeys)) value.fill(0)
+      await lease.revoke()
+    }
+  } finally {
+    await runtime.destroy()
+    await dht.destroy()
+  }
+}
+
+test('native explicit legacy egress connects to an unchanged direct server and refuses opt-out terminals', async (t) => {
+  t.timeout(180_000)
+  const optOutFixture = await topology(t, { legacyEgress: false })
+  const optOutSource = await optOutFixture.source()
+  const optOutAd = await discoverTerminalAdvertisement(optOutFixture)
+  const legacyServerNode = optOutFixture.network.createNode()
+  await legacyServerNode.fullyBootstrapped()
+  const serverKey = cryptoSuite.keyPair()
+  let optOutConnections = 0
+  const optOutServer = legacyServerNode.createServer(() => {
+    optOutConnections++
+  })
+  await optOutServer.listen(serverKey)
+
+  for (const bad of [
+    { legacy: false, terminal: { advertisement260: optOutAd } },
+    { legacy: true },
+    { terminal: { advertisement260: optOutAd } },
+    { legacy: true, terminal: { advertisement260: optOutAd }, readerSecret: b4a.alloc(32, 1) },
+    { legacy: true, terminal: { advertisement260: b4a.alloc(260) } }
+  ]) {
+    t.exception(() => optOutSource.controller.connect(serverKey.publicKey, bad), /invalid/i)
+  }
+
+  const refused = optOutSource.controller.connect(serverKey.publicKey, {
+    legacy: true,
+    terminal: { advertisement260: optOutAd }
+  })
+  refused.on('error', () => {})
+  t.is(
+    await refused.opened,
+    false,
+    'opt-out terminal refuses purpose 1 before contacting destination'
+  )
+  await closed(refused)
+  t.is(optOutConnections, 0, 'destination server never sees a connection from an opt-out terminal')
+  await optOutServer.close()
+  await legacyServerNode.destroy()
+
+  const fixture = await topology(t, { legacyEgress: true })
+  const source = await fixture.source()
+  const terminalAd = await discoverTerminalAdvertisement(fixture)
+  const directNode = fixture.network.createNode()
+  await directNode.fullyBootstrapped()
+  const directKey = cryptoSuite.keyPair()
+  const incoming = []
+  let incomingWait = deferred()
+  const directServer = directNode.createServer((socket) => {
+    socket.on('error', () => {})
+    incoming.push(socket)
+    incomingWait.resolve(socket)
+  })
+  await directServer.listen(directKey)
+
+  const clientKey = cryptoSuite.keyPair()
+  const stream = source.controller.connect(directKey.publicKey, {
+    legacy: true,
+    terminal: { advertisement260: terminalAd },
+    keyPair: clientKey
+  })
+  stream.on('error', () => {})
+  t.is(await stream.opened, true, 'explicit legacy egress opens to unchanged direct server')
+  const remote = await incomingWait.promise
+  t.alike(stream.remotePublicKey, directKey.publicKey)
+  t.alike(remote.remotePublicKey, clientKey.publicKey)
+
+  const largePayload = b4a.alloc(70_000, 0x61)
+  const readingLarge = received(remote, largePayload.length)
+  stream.write(largePayload)
+  t.alike(await readingLarge, largePayload, 'legacy egress preserves >64 KiB atomic records')
+  t.alike(
+    await exchange(remote, stream, 'direct server reply over legacy egress'),
+    b4a.from('direct server reply over legacy egress')
+  )
+
+  const closures = Promise.all([closed(stream), closed(remote)])
+  stream.destroy()
+  await closures
+
+  incomingWait = deferred()
+  const terminalDht = fixture.relays[3].dht
+  const origCreateRawStream = terminalDht.createRawStream.bind(terminalDht)
+  let droppedFirstPairPacket = false
+  terminalDht.createRawStream = function (opts) {
+    const origFirewall = opts && opts.firewall
+    return origCreateRawStream({
+      ...opts,
+      firewall(socket, port, host) {
+        if (!droppedFirstPairPacket) {
+          droppedFirstPairPacket = true
+          return true
+        }
+        return origFirewall ? origFirewall(socket, port, host) : true
+      }
+    })
+  }
+  const delayedStream = source.controller.connect(directKey.publicKey, {
+    legacy: true,
+    terminal: { advertisement260: terminalAd }
+  })
+  delayedStream.on('error', () => {})
+  t.is(
+    await delayedStream.opened,
+    true,
+    'explicit legacy egress opens when ACCEPT arrives before inbound UDX pair'
+  )
+  const delayedRemote = await incomingWait.promise
+  t.alike(
+    await exchange(delayedStream, delayedRemote, 'accept-before-pair payload'),
+    b4a.from('accept-before-pair payload')
+  )
+  const delayedClosures = Promise.all([closed(delayedStream), closed(delayedRemote)])
+  delayedStream.destroy()
+  await delayedClosures
+  terminalDht.createRawStream = origCreateRawStream
+  await directServer.close()
+  await directNode.destroy()
 })

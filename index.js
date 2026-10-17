@@ -103,6 +103,9 @@ class HyperDHT extends DHT {
           connect: (remotePublicKey, connectOptions) =>
             routing.controller.connect(remotePublicKey, connectOptions),
           createServer: (serverOptions, onconnection) => {
+            if (routing.controller.snapshot().profile === 'native-v2') {
+              return routing.controller.createServer(serverOptions, onconnection)
+            }
             if (typeof serverOptions === 'function') {
               return routing.controller.createServer({}, serverOptions)
             }
@@ -118,7 +121,15 @@ class HyperDHT extends DHT {
   static DEFAULTS = DEFAULTS
 
   static bootstrapper(port, host, opts) {
-    if (opts && privateRoutingOptions(opts)) rejectPrivateCommand()
+    if (opts) {
+      const privateOptions = privateRoutingOptions(opts)
+      if (privateOptions) {
+        if (privateOptions.relayConfig) {
+          privateOptions.relayConfig.identityKeyPair.secretKey.fill(0)
+        }
+        rejectPrivateCommand()
+      }
+    }
     return super.bootstrapper(port, host, opts)
   }
 
@@ -642,6 +653,10 @@ function privateRoutingOptions(opts) {
   if (opts === null || (typeof opts !== 'object' && typeof opts !== 'function')) return null
   if (!('privateRouting' in opts)) return null
   const value = ownData(opts, 'privateRouting')
+  if (ownData(value, 'profile') === 'native-v2') {
+    const { validatePeerNativeOptions } = require('./lib/private/peer-native-config')
+    return validatePeerNativeOptions(value)
+  }
   const options = exactPrivateObject(value, [
     'release',
     'acknowledgeAlpha',
@@ -662,6 +677,21 @@ function privateRoutingOptions(opts) {
 
 function createPrivateRouting(options, dht) {
   if (!options || !dht) invalidPrivateOptions()
+  if (options.profile === 'native-v2') {
+    const { createPrivateNativeController } = require('./lib/private/private-native-controller')
+    try {
+      const controller = createPrivateNativeController({
+        dht,
+        config: options,
+        baseReady: () => DHT.prototype.fullyBootstrapped.call(dht)
+      })
+      return { controller }
+    } finally {
+      if (options.relayConfig) {
+        options.relayConfig.identityKeyPair.secretKey.fill(0)
+      }
+    }
+  }
   const { createPrivatePeerController } = require('./lib/private/private-peer-controller')
   const controller = createPrivatePeerController({
     dht,
