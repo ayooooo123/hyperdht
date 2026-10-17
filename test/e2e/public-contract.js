@@ -36,7 +36,8 @@ test('public-contract: invalid option shapes allocate no sockets and invoke no a
     symbol,
     { ...privateRouting(), unknown: true },
     { ...privateRouting(), acknowledgeAlpha: false },
-    { ...privateRouting(), profile: 'native-v2' },
+    { ...privateRouting(), profile: 'unsupported' },
+    { ...privateRouting(true), profile: 'native-v2' },
     { ...privateRouting(), relay: 1 },
     { ...privateRouting(), mode: 'required' }
   ]) {

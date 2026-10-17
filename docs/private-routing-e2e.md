@@ -1170,3 +1170,58 @@ The scenario is IPv4-only; IPv6 /48 remains separate policy coverage. Dummy
 interfaces are not independent hosts/operators, and downstream tuple observations
 are local test evidence, not independent source certification or operator honesty.
 The privileged end-to-end run remains required after C6 integration.
+
+## Native v2 (`profile: 'native-v2'`) and temporary Cloudflare Worker e2e evidence
+
+```sh
+npm run test:e2e:c2:native
+npm run test:e2e:c2:native:bare
+npm run test:e2e:c2:cloudflare
+```
+
+The integrated branch completes the `native-v2` public controller
+(`lib/private/private-native-controller.js`), config/CLI validation
+(`lib/private/peer-native-config.js`, `bin.js`), directional purpose ledger
+funding and authenticated operation command admission
+(`lib/private/peer-purpose-owner.js`, `lib/private/peer-semantic-services.js`),
+64 KiB private record fragmentation (`lib/private/peer-record-adapter.js`), and
+explicit legacy egress (R40/R41).
+
+Exercised native and e2e verification on `darwin 25.5.0` (`arm64`, Node
+`v24.18.0`, Bare `1.30.3`):
+
+- `npx brittle test/private/peer-native-config.js` and `npx brittle-bare`: pass
+  on both runtimes.
+- `npx brittle test/private/peer-native-cli.js` and `npx brittle-bare`: 4/4
+  tests, 28/28 assertions on both runtimes, including live CLI relay startup
+  and `HyperDHT` `profile: 'native-v2'` controller selection.
+- `npx brittle test/private/peer-native-purpose.js` and `npx brittle-bare`: 5/5
+  tests, 470/470 assertions on both runtimes, proving three-relay production
+  `purpose 2` and `purpose 3` first-OFFER admission, all 16 `OPEN` +
+  `PRIVATE_ACTIVATE` pairs spending 32 source allocation commands, funded
+  stream and route tombstones, and disjoint native physical closure partitions.
+- `npx brittle test/private/private-native-controller.js` and
+  `npx brittle-bare`: 11/11 tests, 92/92 assertions on both runtimes, including
+  guard locator publication, reader-policy cache separation, firewall
+  enforcement, make-before-break registration replacement, suspend/resume
+  joins, shared 16-slot ceiling, and explicit legacy egress (`pair-before-ACCEPT`
+  and `ACCEPT-before-pair`, `>64 KiB` records, and opt-out terminal refusal
+  before remote contact).
+- `npm run test:e2e:b1`: 16/16 tests, 186/186 assertions passing.
+- `npm run test:e2e:c2:capture` and `npm run test:e2e:c2:capture:bare`: 32/32
+  tests, 113/113 assertions passing on both runtimes.
+- `npm run test:e2e:c2:native`: 4/4 tests passing (16 MiB byte-exact native
+  private duplex transfer, 16 concurrent streams across 4 source nodes with
+  make-before-break registration refresh, live native send-owner capture
+  reconciliation with zero differences across circuit/service/bootstrap
+  categories, and explicit legacy egress with opt-out terminal refusal).
+- `npm run test:e2e:c2:cloudflare`: 1/1 test, 20/20 assertions passing. Deploys
+  5 temporary Cloudflare Workers (`source`, `guard`, `safety`, `terminal`,
+  `dest`) to `*.workers.dev`, routes a live 5-node `native-v2` private routing
+  topology through the temporary Cloudflare Workers (verified at Cloudflare
+  edge colo `MAD`, 159 private UDP datagrams and 97 fixed 1,200-byte cells
+  audited on the edge with HMAC-SHA256 transit receipts, zero destination key
+  or plaintext leaks on any relay Worker, and zero identical 1,101-byte
+  envelopes across `guard -> safety` vs `safety -> terminal` proving N-1
+  LIONESS per-hop transformation), and deletes all 5 temporary Workers on
+  teardown.

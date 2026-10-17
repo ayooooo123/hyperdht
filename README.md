@@ -107,10 +107,10 @@ const relay = new DHT({
 ```
 
 Every `privateRouting` field must be an own data property on an ordinary object.
-The five fields above are exact and required; `profile` currently accepts only
-`'standard'`. Accessors, inherited fields, unknown fields, `bootstrapEndpoints`,
-and endpoint host/port fields are rejected.
-
+`profile` accepts `'standard'` (directory-sampled alpha) or `'native-v2'` (admitted
+native wire v3 relays; relay nodes supply `relayConfig` or load it via
+`hyperdht --private-routing-config <file>`). Accessors, inherited fields, unknown
+fields, `bootstrapEndpoints`, and endpoint host/port fields are rejected.
 A private server selects distinct destination-guard and entry relays, builds a
 fixed-cell circuit to the entry, and publishes a signed, expiring descriptor
 from its guard. The descriptor is replicated to at least three DHT storage
@@ -206,14 +206,81 @@ This remains an experimental alpha, not a production anonymity claim. Local
 Node/Bare behavior tests do not replace Linux packet-capture evidence or
 external cryptographic review.
 
+### Native v2 profile (`profile: 'native-v2'`)
+
+Selecting `profile: 'native-v2'` uses the native wire-version-3 controller
+(`lib/private/private-native-controller.js`) over admitted native relay
+neighbors (`lib/private/peer-native-runtime.js`):
+
+- **Wire version 3:** Every hop applies a 4-round LIONESS wide-block layer over
+  the 1,101-byte context envelope (`XChaCha20` + keyed `BLAKE2b-256`), uses
+  hop-local circuit/branch identifiers, derives header epochs and counter
+  origins per link, and mixes relay ephemerals into tail and purpose secrets
+  for forward secrecy. Role and extension indexes remain explicit (position
+  hiding is not provided).
+- **Relay admission and roles:** Every native relay identity is `ROLE.SAFETY`.
+  Two-authority format-1 topology grants orient each edge from upstream
+  `SAFETY_GUARD` (1) to downstream `SAFETY_FINAL` (2). A relay's capability
+  mask is derived from its grants: mask `9` if it occupies `SAFETY_GUARD` in at
+  least one grant, or mask `11` if it occupies `SAFETY_FINAL` in every grant.
+  Relay advertisement renewal tears down and reprovisions admission at
+  advertisement expiry; active circuits through that relay end at renewal and
+  new circuits resume once reprovisioned.
+- **Presence and reader policy:** Terminal (mask `11`) relays serve presence
+  over onion-layered circuits identified by a reserved terminal-hop parameter
+  digest (`PRESENCE_PARAMETERS_DIGEST`) backed by Gate D mutable storage
+  quorums. When no `readerSecret` is supplied, both sides derive a public
+  reader capability from the destination public key
+  (`hyperdht-private-routes/presence/public-reader/v1`), so anyone who knows
+  the public key can locate presence while blinding and encryption protect
+  against parties who do not. Supplying an explicit 32-byte `readerSecret` on
+  `createServer` and `connect` restricts presence lookup to authorized readers.
+  Verified presence lookups are cached per destination and reader policy for
+  their validity window.
+- **Finite budgets and record caps:** Native routes enforce finite per-route
+  and per-stream lifetime budgets. Private-to-private legs (purposes 2 and 3)
+  fragment application writes into SecretStream records of at most 64 KiB
+  (65,536 plaintext / 65,556 raw bytes) and reject oversized inbound records at
+  the 3-byte prefix guard before allocating. A source circuit (`purpose 2`,
+  `M = 1`, `W = 24`) admits up to `111,852` frames (`109,279,404` raw bytes)
+  per direction. A listener registration circuit (`purpose 3`, `M = 17`, `W = 1`
+  per application inside a shared 24-frame / 23,448-byte receive pool) admits
+  `111,791` aggregate frames per direction with a `1,024`-frame floor per
+  remaining application slot (`96,431` frames maximum on the first `OPEN`) and
+  refreshes make-before-break when exhausted. When a stream or route budget is
+  exhausted, the stream ends cleanly and the application reconnects on a fresh
+  route. One pinned guard holds at most 16 concurrent native circuits shared
+  across application connections, listener registrations, and presence
+  operations; further `connect()` calls wait in a bounded FIFO queue (16
+  entries) and fail closed with `ROUTE_UNAVAILABLE` past the bound or deadline.
+  Role memory pools are capped at `37,457,344` bytes (source, 16 slots),
+  `768,704` bytes (mask-9 forwarding relay, 24 concurrent circuits), and
+  `56,848,040` bytes (mask-11 terminal relay, 24 concurrent circuits).
+- **Explicit legacy egress:** Calling
+  `dht.privateRouting.connect(publicKey, { legacy: true, terminal: { advertisement260 }, keyPair? })`
+  connects through a caller-supplied, signature-verified mask-11 terminal relay
+  that explicitly opted in via `relayConfig.legacyEgress: true` (default
+  `false`, rejected on mask-9 relays). Legacy egress preserves the standard
+  16,777,218-byte SecretStream record cap with a finite budget of `M = 1`,
+  `W = 24`, `Q = 20,000` frames (`19,540,000` raw bytes) per direction and at
+  most one concurrent legacy stream per source and per opted-in terminal. The
+  egress terminal learns the destination identity and the destination sees the
+  egress terminal's address, not the source's; opt-out terminals refuse
+  purpose 1 before contacting the destination, and there is never an automatic
+  fallback between private, legacy, or direct modes.
+
 ### Local private-routing evidence
 
-Run `npm run test:e2e` and `npm run test:e2e:bare` for the hermetic alpha
-scenarios. The separate `test:e2e:b1` and `test:e2e:b1:bare` commands exercise
-the intended hardening contract and deliberately fail on the pre-B1 baseline.
-`npm run bench:private-routing` prints a direct/alpha performance comparison.
-See [the C1 evidence guide](docs/private-routing-e2e.md) for topology, negative
-controls, benchmark definitions, and the remaining capture/diversity gates.
+Run `npm run test:e2e` and `npm run test:e2e:bare` for the hermetic baseline
+scenarios, `npm run test:e2e:b1` and `npm run test:e2e:b1:bare` for the B1
+hardening and flow-control suite, `npm run test:e2e:c2:capture` and
+`npm run test:e2e:c2:capture:bare` for send-owner capture reconciliation,
+`npm run test:e2e:c2:native` and `npm run test:e2e:c2:native:bare` for the
+native-v2 end-to-end suite, and `npm run test:e2e:c2:cloudflare` for the live
+temporary Cloudflare Worker edge-node e2e suite. `npm run bench:private-routing`
+prints a direct/alpha performance comparison. See
+[the C1 and C2 evidence guide](docs/private-routing-e2e.md) for topology,
+negative controls, benchmark definitions, and capture/diversity gates.
 
 ## API
 
