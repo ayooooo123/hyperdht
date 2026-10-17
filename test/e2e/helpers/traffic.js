@@ -4,6 +4,7 @@ const b4a = require('b4a')
 const c = require('compact-encoding')
 const Protomux = require('protomux')
 const { deadline } = require('./network')
+const observeFlow = require('../support/flow-observer')
 
 function pattern(size, seed) {
   const bytes = b4a.alloc(size)
@@ -171,4 +172,4 @@ async function exchange(
   }
 }
 
-module.exports = { pattern, receiver, event, exchange }
+module.exports = { pattern, receiver, event, exchange, observeFlow }

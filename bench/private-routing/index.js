@@ -8,6 +8,7 @@ const os = require('os')
 const createTestnet = require('../../testnet')
 const { MIB, CHUNK, deferred, deadline, milliseconds } = require('./protocol')
 const summarize = require('./summarize')
+const { METHOD, CAP_BYTES, CAP_WRITES } = require('./delay')
 
 const CASES = [
   { name: 'probe', size: 64, streams: 1, delayMs: 0 },
@@ -28,6 +29,9 @@ function options() {
     directions: ['up', 'down'],
     delays: [0, 5],
     cases: ['probe', 'ping', '1mib', '16mib', '4x4mib', 'delay4mib'],
+    method: 'application',
+    netem: 0,
+    netemlimit: 100000,
     out: null
   }
   for (const arg of process.argv.slice(2)) {
@@ -35,8 +39,9 @@ function options() {
     const match = /^--([a-z]+)=(.+)$/.exec(arg)
     if (!match || !Object.hasOwn(out, match[1])) throw new Error('unknown argument: ' + arg)
     const [, key, value] = match
-    if (key === 'reps' || key === 'timeout') out[key] = Number(value)
+    if (['reps', 'timeout', 'netem', 'netemlimit'].includes(key)) out[key] = Number(value)
     else if (key === 'out') out.out = path.resolve(value)
+    else if (key === 'method') out.method = value
     else out[key] = value.split(',').map((entry) => (key === 'delays' ? Number(entry) : entry))
   }
   for (const key of ['reps', 'timeout']) {
@@ -52,6 +57,25 @@ function options() {
       throw new Error('invalid --' + key)
     }
   }
+  if (!['application', 'netem'].includes(out.method)) throw new Error('invalid --method')
+  if (
+    !Number.isFinite(out.netem) ||
+    out.netem < 0 ||
+    !Number.isSafeInteger(out.netemlimit) ||
+    out.netemlimit < 1
+  ) {
+    throw new Error('invalid netem parameters')
+  }
+  if (out.method === 'netem') {
+    if (
+      process.platform !== 'linux' ||
+      process.env.PR_BENCH_NETEM_ACTIVE !== out.netem + '/' + out.netemlimit ||
+      out.delays.length !== 1 ||
+      out.delays[0] !== 0
+    ) {
+      throw new Error('use bench/private-routing/netem.sh for packet-level delay')
+    }
+  } else if (out.netem !== 0) throw new Error('--netem requires --method=netem')
   return out
 }
 
@@ -225,6 +249,15 @@ async function measure(row, spec, source, destination, relays, id) {
     row.cleanupErrors = cleanup
       .filter((result) => result.status === 'rejected')
       .map((result) => result.reason.message)
+    row.endpointDelay = await Promise.all(
+      [source, destination].map(async (worker) => {
+        try {
+          return { role: worker.role, ...(await worker.call('delayStats')) }
+        } catch (error) {
+          return { role: worker.role, error: error.message }
+        }
+      })
+    )
   }
   return row
 }
@@ -237,6 +270,10 @@ async function main() {
       '  --reps=3 --timeout=120000 --modes=direct,alpha --directions=up,down --delays=0,5'
     )
     console.log('  --cases=probe,ping,1mib,16mib,4x4mib,delay4mib')
+    console.log(
+      'Packet-level variant: bash bench/private-routing/netem.sh [same benchmark options]'
+    )
+    console.log('  PR_NETEM_DELAY_MS=5 PR_NETEM_LIMIT=100000 (dedicated Linux network namespace)')
     console.log('Output files must not already exist. No output file is created without --out.')
     return
   }
@@ -257,6 +294,19 @@ async function main() {
   process.once('SIGTERM', interrupt)
 
   function emit(row) {
+    row.delayMethod = opts.method === 'netem' ? 'packet-tc-netem-v1' : METHOD
+    row.delayParameters = {
+      injectionDelayMs: row.delayMs === undefined ? opts.delays : row.delayMs,
+      admission: 'immediate-ack-owned-copy',
+      zeroInjection: 'native-passthrough',
+      capBytes: CAP_BYTES,
+      capWrites: CAP_WRITES,
+      overflow: 'reject-new-and-destroy-stream',
+      packetOneWayMs: opts.method === 'netem' ? opts.netem : 0,
+      packetLinkRttMs: opts.method === 'netem' ? 2 * opts.netem : 0,
+      packetQueueLimit: opts.method === 'netem' ? opts.netemlimit : null,
+      packetScope: opts.method === 'netem' ? 'all-loopback-egress-in-dedicated-netns' : 'none'
+    }
     rows.push(row)
     if (fd !== null) fs.writeSync(fd, JSON.stringify(row) + '\n')
   }
@@ -264,7 +314,7 @@ async function main() {
   try {
     emit({
       kind: 'environment',
-      schema: 1,
+      schema: 2,
       node: process.version,
       platform: process.platform,
       arch: process.arch,
@@ -275,7 +325,10 @@ async function main() {
       productionPatches: false,
       bootstrapStorage: 'three non-relay nodes with the production privateRouting service enabled',
       clock: 'same-host process.hrtime.bigint monotonic timestamps',
-      delay: 'bounded application-send/UDX-write latency; not WAN/netem',
+      delay:
+        opts.method === 'netem'
+          ? 'packet-level netem on every namespace loopback egress, including discovery and ACKs'
+          : 'bounded immediate-ack application/UDX injection delay; not WAN RTT',
       cpu: 'sum of separate relay processes, including background work and measurement IPC'
     })
     for (const delayMs of opts.delays) {
@@ -366,7 +419,7 @@ async function main() {
       (row) =>
         (row.kind === 'sample' &&
           (!row.ok ||
-            row.cleanupErrors.length > 0 ||
+            (row.cleanupErrors || []).length > 0 ||
             (row.relayCpu || []).some((cpu) => cpu.error))) ||
         (row.kind === 'cleanup' &&
           row.workers.some((worker) => worker.forced || worker.code !== 0 || worker.error))

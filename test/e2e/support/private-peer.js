@@ -1,34 +1,28 @@
 'use strict'
 
-const fs = require('fs')
-const path = require('path')
 const peer = require('../../../lib/private/private-peer-controller')
 
-const seamPath = path.join(__dirname, '../../private/helpers/private-peer.js')
-const seam = fs.existsSync(seamPath) ? require(seamPath) : null
+const {
+  createAdvancingClock,
+  createPrivatePeerTestScope
+} = require('../../private/helpers/private-peer')
 
-// The baseline capture is confined to tests so the same intended-contract tests
-// can demonstrate failures before B1 adds its scoped observation entry point.
+// Retain controller handles only for test fixture setup and fault targeting.
+// Observation and protocol time belong to the settled controller-local scope.
 function createScope() {
-  const scope = seam ? seam.createPrivatePeerTestScope() : null
+  const scope = createPrivatePeerTestScope()
   const controllers = new Map()
   return {
     controllers,
-    hasSeam: scope !== null,
     create(factory, options = {}) {
       let controller
       const original = peer.createPrivatePeerController
-      peer.createPrivatePeerController = function (config) {
-        controller = original(config)
-        if (!scope && options.observer)
-          controller.observer = (event) => {
-            options.observer(event)
-            return undefined
-          }
+      peer.createPrivatePeerController = function (...args) {
+        controller = original.apply(this, args)
         return controller
       }
       try {
-        const node = scope ? scope.create(factory, options) : factory()
+        const node = scope.create(factory, options)
         controllers.set(node, controller)
         return node
       } finally {
@@ -36,21 +30,13 @@ function createScope() {
       }
     },
     guards(node) {
-      if (!scope) throw new Error('B1 read-only pinned-guard seam is not installed')
       return scope.guards(node)
     },
     close() {
-      if (scope) scope.close()
-      for (const controller of controllers.values()) {
-        if (controller && Object.hasOwn(controller, 'observer')) controller.observer = null
-      }
+      scope.close()
+      controllers.clear()
     }
   }
 }
 
-function createAdvancingClock(options) {
-  if (!seam) throw new Error('B1 scoped advancing clock is not installed; E4 requires it')
-  return seam.createAdvancingClock(options)
-}
-
-module.exports = { createScope, createAdvancingClock, hasClock: seam !== null }
+module.exports = { createScope, createAdvancingClock }

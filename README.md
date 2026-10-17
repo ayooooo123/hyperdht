@@ -149,10 +149,28 @@ remains end-to-end between the client and server application keys.
 
 Cell sends, receive buffers, deferred transformations, stream counts, frame
 counts, and byte totals are bounded. Every link charges independent peer-ledger
-budgets. Logical reset and close are stream-scoped and idempotent. Both the
-entry and destination endpoint retain retired stream IDs for the circuit
-lifetime and discard late in-flight DATA, so closing either side of one
-multiplexed stream cannot reset its siblings or the destination circuit.
+budgets. Logical reset and close are stream-scoped and idempotent. The entry and
+destination reject reuse of admitted stream IDs and discard late in-flight
+DATA, so closing either side of one multiplexed stream cannot reset its siblings
+or the destination circuit.
+
+Alpha control version 7 requires both stream and shared-circuit credit before
+DATA is sent. The windows are 512 cells per stream and 2,048 cells per circuit,
+including unused grants and transmitted cells in the circuit pool. Credits
+return when SecretStream consumes raw encrypted bytes, not when a relay merely
+receives DATA or an application reads plaintext. These bounds cover additional
+private-routing buffering, not ordinary SecretStream atomic records (up to
+16,777,215 bytes) or application plaintext buffers. Alpha does not add a
+Noise-aware record-fragmentation adapter.
+
+Each link independently reserves 2,048 pending DATA jobs and 256 control slots;
+writes contain up to 64 cells with at most two transport batches in flight.
+Unused grants are reclaimed on close/reset, after 50 ms of honest writer idle,
+or immediately when stream credit is exhausted. The entry also enforces a
+five-second unused-grant/no-DATA-progress deadline. Already transmitted cells,
+including authenticated late DATA for a retired stream, remain charged until
+consumed or discarded. See [the e2e contract and evidence](docs/private-routing-e2e.md#control-version-7-flow-observations)
+for bounded demand accounting and the remaining integration gates.
 
 Route-only peer information is not added to the caller's routing table and is
 not used for a direct destination ping or dial. Missing, invalid, expired, or

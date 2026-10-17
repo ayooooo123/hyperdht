@@ -19,6 +19,7 @@ test('B1 E1: no relay receives the stable destination key across twenty connects
     if ((i + 1) % 4 === 0) await server.controller._publish(server)
   }
   const counts = views.counts()
+  t.alike(Array.from(views.errors), [], 'relay observations decode without namespace confusion')
   t.ok(
     counts.reads >= 20 && counts.writes >= 20 && counts.plaintexts >= 20,
     'all three relay observation surfaces were exercised'
@@ -38,13 +39,20 @@ test('B1 E3: link epochs and counters are unrelated for the same forwarded frame
   t.teardown(() => views.close())
   const server = await h.listen({}, h.destination, identity)
   const pair = await h.pair(server)
-  await exchange(pair.client, pair.remote, { up: 16389, down: 8197 })
+  await exchange(pair.client, pair.remote, { up: 1048583, down: 524309 })
+  t.alike(Array.from(views.errors), [], 'DATA and flow-control frames decode independently')
+  for (const scope of ['stream', 'circuit']) {
+    t.ok(
+      views.headers.some((header) => header.type === 'credit' && header.scope === scope),
+      scope + ' CREDIT is identified separately from application DATA'
+    )
+  }
   const groups = new Map()
   for (const header of views.headers) {
-    if (header.payload.length < 64) continue
+    if (header.type !== 'data' || header.payload.length < 64) continue
     const id = header.direction + ':' + header.payload
     if (!groups.has(id)) groups.set(id, new Map())
-    groups.get(id).set(header.link, header)
+    groups.get(id).set(header.view, header)
   }
   const sameFrame = Array.from(groups.values()).find((links) => links.size >= 3)
   t.ok(sameFrame, 'one authenticated frame is observed on at least three links')
@@ -62,7 +70,7 @@ test('B1 E3: link epochs and counters are unrelated for the same forwarded frame
   )
   const first = new Map()
   for (const header of views.headers) {
-    const id = header.link + ':' + header.direction
+    const id = header.view
     if (!first.has(id)) first.set(id, header.counter.toString())
   }
   t.is(

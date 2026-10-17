@@ -3,7 +3,7 @@
 const test = require('../helpers/pending')
 const b4a = require('b4a')
 const network = require('../helpers/network')
-const { createAdvancingClock, hasClock } = require('../support/private-peer')
+const { createAdvancingClock } = require('../support/private-peer')
 const { decodeDescriptor } = require('../../../lib/private/overlay-descriptor-service')
 const { exchange } = require('../helpers/traffic')
 
@@ -23,16 +23,23 @@ function coalition(h) {
 }
 
 test('B1 E4: storage coalition cannot link consecutive periods by sequence continuity', async (t) => {
-  if (!hasClock) {
-    t.fail('B1 scoped advancing clock is required; baseline has only global Date.now')
-    return
-  }
   const day = 86400000
   const boundary = Math.ceil(Date.now() / day) * day
   const clock = createAdvancingClock({ now: boundary - 40000, rate: 4 })
-  const h = await network(t, { clock })
+  const publications = []
+  const h = await network(t, {
+    clock,
+    observer(event) {
+      if (event.type === 'descriptor-published') publications.push(event)
+    }
+  })
+  function published(server) {
+    const event = publications.findLast((row) => b4a.equals(row.wire, server._descriptor))
+    if (!event) throw new Error('Missing descriptor-published view for the created listener')
+    return decodeDescriptor(event.wire, { now: clock.now() })
+  }
   const servers = [await h.listen(), await h.listen()]
-  const before = servers.map((server) => decodeDescriptor(server._descriptor, { now: clock.now() }))
+  const before = servers.map(published)
   const oldView = coalition(h)
   t.ok(
     before.every((record) => record.period === BigInt(boundary / day - 1)),
@@ -44,7 +51,7 @@ test('B1 E4: storage coalition cannot link consecutive periods by sequence conti
     clock.setTimeout(resolve, Math.max(1, boundary + 20 - clock.now()))
   )
   for (const server of servers) await server.controller._publish(server)
-  const after = servers.map((server) => decodeDescriptor(server._descriptor, { now: clock.now() }))
+  const after = servers.map(published)
   const newView = coalition(h)
   for (let i = 0; i < servers.length; i++) {
     t.is(after[i].period, before[i].period + 1n)

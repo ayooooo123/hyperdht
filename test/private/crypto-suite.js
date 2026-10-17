@@ -5,7 +5,7 @@ const b4a = require('b4a')
 const crypto = require('hypercore-crypto')
 const sodium = require('sodium-universal')
 
-const { cryptoSuite } = require('../../lib/private/crypto-suite')
+const { cellAead, cryptoSuite } = require('../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../lib/private/errors')
 
 function expectCode(t, fn, code) {
@@ -893,4 +893,72 @@ test('sign, verify, hash, and random byte adapters preserve their contracts', (t
   const secondSnapshot = b4a.from(secondRandom)
   random.fill(0)
   t.alike(secondRandom, secondSnapshot)
+})
+
+test('reusable-cell primitives match allocating AEAD with caller-owned outputs', (t) => {
+  const key = seed(3)
+  const noncePrefix = b4a.alloc(16, 4)
+  const nonce = b4a.alloc(24, 4)
+  nonce.set(b4a.from('0102030405060708', 'hex'), 16)
+  const associatedData = b4a.from('cell-header')
+  const plaintext = b4a.alloc(1148, 0xa7)
+  const snapshots = [key, nonce, associatedData, plaintext].map((value) => b4a.from(value))
+  const ciphertext = b4a.alloc(1164)
+  const output = b4a.alloc(1148)
+  const expected = cryptoSuite.seal({
+    key,
+    noncePrefix,
+    counter: 0x0102_0304_0506_0708n,
+    associatedData,
+    plaintext
+  })
+  cellAead.sealInto(ciphertext, plaintext, associatedData, nonce, key)
+  t.alike(ciphertext, expected)
+  t.is(cellAead.openInto(output, ciphertext, associatedData, nonce, key), true)
+  t.alike(output, plaintext)
+  output.fill(0)
+  t.alike(ciphertext, expected)
+  t.alike(key, snapshots[0])
+  t.alike(nonce, snapshots[1])
+  t.alike(associatedData, snapshots[2])
+  t.alike(plaintext, snapshots[3])
+  ciphertext[1163] ^= 1
+  output.fill(0xaa)
+  t.is(cellAead.openInto(output, ciphertext, associatedData, nonce, key), false)
+  t.alike(output, b4a.alloc(1148))
+})
+
+test('reusable-cell primitives preserve unexpected native failures and wipe partial outputs', (t) => {
+  const key = seed(3)
+  const nonce = b4a.alloc(24, 4)
+  const associatedData = b4a.from('cell-header')
+  const plaintext = b4a.alloc(1148, 0xa7)
+  const ciphertext = b4a.alloc(1164)
+  const output = b4a.alloc(1148)
+  const sentinel = new TypeError('unexpected reusable AEAD failure')
+  for (const sealing of [true, false]) {
+    cellAead.sealInto(ciphertext, plaintext, associatedData, nonce, key)
+    const name = sealing
+      ? 'crypto_aead_xchacha20poly1305_ietf_encrypt'
+      : 'crypto_aead_xchacha20poly1305_ietf_decrypt'
+    const original = sodium[name]
+    sodium[name] = (...args) => {
+      original(...args)
+      throw sentinel
+    }
+    let error = null
+    try {
+      if (sealing) cellAead.sealInto(ciphertext, plaintext, associatedData, nonce, key)
+      else cellAead.openInto(output, ciphertext, associatedData, nonce, key)
+    } catch (err) {
+      error = err
+    } finally {
+      sodium[name] = original
+    }
+    t.is(error, sentinel)
+    t.alike(sealing ? ciphertext : output, b4a.alloc(sealing ? 1164 : 1148))
+    t.alike(key, seed(3))
+    t.alike(nonce, b4a.alloc(24, 4))
+    t.alike(plaintext, b4a.alloc(1148, 0xa7))
+  }
 })

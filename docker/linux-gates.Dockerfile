@@ -16,6 +16,7 @@ FROM node:22-bookworm-slim
 # iproute2, iptables, tcpdump: the namespace gates provision veths and capture.
 # sudo: the provisioner shells out through `sudo -n` even when already root.
 # procps: the provisioner enables ip_forward through sysctl.
+# util-linux: unshare isolates the opt-in packet-level benchmark's loopback qdisc.
 # python3/make/g++: fallback when a native dependency has no prebuild.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -29,6 +30,7 @@ RUN apt-get update \
     python3 \
     sudo \
     tcpdump \
+    util-linux \
   && rm -rf /var/lib/apt/lists/*
 
 # The repository ignores package-lock.json, like upstream hyperdht and its CI, so

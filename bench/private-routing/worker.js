@@ -241,6 +241,10 @@ const operations = {
     return { pid: process.pid, ms: (cpu.user + cpu.system) / 1000, latency: { ...latency.stats } }
   },
 
+  delayStats() {
+    return { scope: 'process-cumulative', ...latency.stats }
+  },
+
   async abort() {
     await closeStreams()
     return true

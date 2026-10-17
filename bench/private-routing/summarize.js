@@ -21,6 +21,35 @@ function cell(rows, value) {
   )
 }
 
+function delayKey(row) {
+  return JSON.stringify([
+    row.delayMethod || 'legacy-callback-held-or-unlabelled',
+    row.delayParameters || { delayMs: row.delayMs }
+  ])
+}
+
+function delayLabel(row) {
+  if (!row.delayMethod || !row.delayParameters) {
+    return 'legacy-callback-held-or-unlabelled, ' + row.delayMs + ' ms (not comparable)'
+  }
+  const p = row.delayParameters
+  return (
+    row.delayMethod +
+    ', injection=' +
+    p.injectionDelayMs +
+    ' ms, packet/link=' +
+    p.packetOneWayMs +
+    ' ms one-way (' +
+    p.packetLinkRttMs +
+    ' ms RTT), bounds=' +
+    p.capBytes +
+    ' B/' +
+    p.capWrites +
+    ' writes, packet limit=' +
+    p.packetQueueLimit
+  )
+}
+
 module.exports = function summarize(all) {
   const samples = all.filter((row) => row.kind === 'sample')
   if (samples.length === 0) return
@@ -58,13 +87,19 @@ module.exports = function summarize(all) {
     'Direct relay CPU is idle/background cost, not direct-path forwarding; no baseline is subtracted.'
   )
   console.log(
-    'The 5 ms condition delays each UDX write batch at every endpoint/relay, with original backpressure.'
+    'Application/UDX injection uses immediate admission callbacks and owned copies; native drain still orders delivery.'
   )
   console.log(
-    'This bounded application-send/UDX-write latency is not WAN/netem: UDP discovery, ACKs and retransmits are not delayed.'
+    'Its process-wide bound includes delayed AND native-unacknowledged buffers; overflow rejects the new write and fails the stream.'
   )
   console.log(
-    'The delay queue is limited to 2 MiB / 256 pending writes per process; overflow fails the stream.'
+    'Application injection is not WAN RTT: discovery, ACKs and retransmits are untouched. Zero injection is native passthrough.'
+  )
+  console.log(
+    'Packet-tc-netem delays every loopback egress in a dedicated namespace, including discovery and transport ACKs.'
+  )
+  console.log(
+    'Methods and all delay parameters form separate comparison groups. Legacy/unlabelled rows never join corrected rows.'
   )
   console.log('')
   if (environment) {
@@ -83,55 +118,60 @@ module.exports = function summarize(all) {
     )
     console.log('')
   }
-  console.log('| Metric | Direction | Direct | Alpha |')
-  console.log('| --- | --- | ---: | ---: |')
+  console.log('| Metric | Direction | Delay method / parameters | Direct | Alpha |')
+  console.log('| --- | --- | --- | ---: | ---: |')
   const groups = new Map()
   for (const sample of samples) {
-    const key = sample.scenario + '/' + sample.delayMs + '/' + sample.direction
+    const key = sample.scenario + '/' + sample.direction + '/' + delayKey(sample)
     if (!groups.has(key)) groups.set(key, [])
     groups.get(key).push(sample)
   }
   for (const rows of groups.values()) {
-    const { scenario, direction, delayMs } = rows[0]
-    const suffix = delayMs === 5 ? ', 5 ms UDX-write latency' : ''
+    const { scenario, direction } = rows[0]
+    const condition = text(delayLabel(rows[0]))
     const direct = rows.filter((row) => row.mode === 'direct')
     const alpha = rows.filter((row) => row.mode === 'alpha')
     const output = (label, value) => {
       console.log(
-        '| ' + [label, direction, cell(direct, value), cell(alpha, value)].join(' | ') + ' |'
+        '| ' +
+          [label, direction, condition, cell(direct, value), cell(alpha, value)].join(' | ') +
+          ' |'
       )
     }
     if (scenario === 'probe') {
       output('Build (ms)', (row) => (row.builds[0] && row.builds[0].ok ? row.builds[0].ms : null))
       output('First byte, 64 B (ms)', (row) => (row.ok ? row.firstByteMs[0] : null))
     } else if (scenario === 'ping') {
-      output('64-byte ping (ms)' + suffix, (row) => (row.ok ? row.pingMs : null))
+      output('64-byte ping (ms)', (row) => (row.ok ? row.pingMs : null))
     } else {
       const label = scenario === '4x4mib' ? '4 concurrent × 4 MiB' : rows[0].size / 1048576 + ' MiB'
-      output(label + ' (MiB/s)' + suffix, (row) => (row.ok ? row.mibPerSecond : null))
-      output(label + ' relay CPU (ms/MiB)' + suffix, (row) =>
-        row.ok ? row.relayCpuMsPerMiB : null
-      )
+      output(label + ' (MiB/s)', (row) => (row.ok ? row.mibPerSecond : null))
+      output(label + ' relay CPU (ms/MiB)', (row) => (row.ok ? row.relayCpuMsPerMiB : null))
     }
   }
   console.log('')
   console.log('## Verified attempts')
   console.log('')
-  for (const mode of ['direct', 'alpha']) {
-    for (const direction of ['up', 'down']) {
-      const rows = samples.filter((row) => row.mode === mode && row.direction === direction)
-      if (rows.length === 0) continue
-      console.log(
-        '- ' +
-          mode +
-          ' ' +
-          direction +
-          ': ' +
-          rows.filter((row) => row.ok).length +
-          '/' +
-          rows.length
-      )
-    }
+  const attempts = new Map()
+  for (const row of samples) {
+    const key = row.mode + '/' + row.direction + '/' + delayKey(row)
+    if (!attempts.has(key)) attempts.set(key, [])
+    attempts.get(key).push(row)
+  }
+  for (const rows of attempts.values()) {
+    const row = rows[0]
+    console.log(
+      '- ' +
+        row.mode +
+        ' ' +
+        row.direction +
+        ', ' +
+        delayLabel(row) +
+        ': ' +
+        rows.filter((sample) => sample.ok).length +
+        '/' +
+        rows.length
+    )
   }
   const failed = samples.filter((row) => !row.ok)
   console.log('')
@@ -154,7 +194,7 @@ module.exports = function summarize(all) {
         '| ' +
           [
             row.mode,
-            row.scenario + ', ' + row.delayMs + ' ms',
+            row.scenario + ', ' + delayLabel(row),
             row.direction,
             row.rep,
             row.phase,

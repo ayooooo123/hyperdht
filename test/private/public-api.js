@@ -13,12 +13,23 @@ const {
   descriptorTarget,
   encodeDescriptor
 } = require('../../lib/private/overlay-descriptor-service')
+const { createPrivatePeerTestScope } = require('./helpers/private-peer')
 const peerController = require('../../lib/private/private-peer-controller')
-const { TEST_ONLY_PRIVATE_PEER_OBSERVER, TEST_ONLY_PRIVATE_PEER_WRITE_ALL } = peerController
 
-const OP_RESOLVE = 2
+require('./alpha-hardening')
+require('./overlay-descriptor-service')
+require('./alpha-guards')
+require('./alpha-diversity')
+require('./alpha-test-scope')
+require('./alpha-stream-lifecycle')
+require('./alpha-flow-control')
+require('./alpha-route-lifecycle')
+require('./alpha-shared-links')
+require('./alpha-control-sessions')
+require('./alpha-descriptor-cancellation')
+
+const CONTROL_VERSION = 7
 const OP_ENTRY_REGISTER = 4
-const STATUS_OK = 0
 const STATUS_UNAVAILABLE = 1
 const ROUTE_CONTEXT_BYTES = 120
 const LOGICAL_DATA = 0
@@ -40,7 +51,13 @@ function privateRouting(relay = false) {
   }
 }
 
-async function network(t, roles = [false, false, true, true, true, true]) {
+async function network(
+  t,
+  roles = [false, false, true, true, true, true],
+  observer = null,
+  onController = null
+) {
+  const scope = createPrivatePeerTestScope()
   const boot = new HyperDHT({
     bootstrap: [],
     host: '127.0.0.1',
@@ -50,20 +67,38 @@ async function network(t, roles = [false, false, true, true, true, true]) {
   })
   await boot.ready()
   const bootstrap = [{ host: '127.0.0.1', port: boot.address().port }]
-  const nodes = roles.map(
-    (relay) =>
-      new HyperDHT({
-        bootstrap,
-        host: '127.0.0.1',
-        port: nextPort++,
-        ephemeral: false,
-        firewalled: false,
-        privateRouting: privateRouting(relay)
-      })
-  )
+  const original = peerController.createPrivatePeerController
+  peerController.createPrivatePeerController = (options) => {
+    const controller = original(options)
+    if (onController) onController(controller)
+    return controller
+  }
+  let nodes
+  try {
+    nodes = roles.map((relay) =>
+      scope.create(
+        () =>
+          new HyperDHT({
+            bootstrap,
+            host: '127.0.0.1',
+            port: nextPort++,
+            ephemeral: false,
+            firewalled: false,
+            privateRouting: privateRouting(relay)
+          }),
+        { observer }
+      )
+    )
+  } finally {
+    peerController.createPrivatePeerController = original
+  }
   t.teardown(async () => {
-    await Promise.allSettled(nodes.reverse().map((node) => node.destroy({ force: true })))
-    await boot.destroy({ force: true })
+    try {
+      await Promise.allSettled(nodes.reverse().map((node) => node.destroy({ force: true })))
+      await boot.destroy({ force: true })
+    } finally {
+      scope.close()
+    }
   })
   await Promise.all(nodes.map((node) => node.ready()))
   await Promise.all(nodes.map((node) => node.privateRouting.ready()))
@@ -148,6 +183,10 @@ function turn() {
 }
 
 test('private cell writes retain queued buffers until transport completion', async (t) => {
+  const node = new HyperDHT({ bootstrap: [], host: '127.0.0.1', privateRouting: privateRouting() })
+  t.teardown(() => node.destroy({ force: true }))
+  await node.privateRouting.ready()
+  const controller = node.privateRouting.createServer().controller
   const writes = []
   const callbacks = []
   const stream = new Writable({
@@ -158,7 +197,7 @@ test('private cell writes retain queued buffers until transport completion', asy
   })
   const first = b4a.alloc(1200, 0x11)
   const second = b4a.alloc(1200, 0x22)
-  const send = peerController[TEST_ONLY_PRIVATE_PEER_WRITE_ALL]
+  const send = (stream, data) => controller._writeControl(stream, data, 0, 'status')
   const firstSending = send(stream, first).finally(() => first.fill(0))
   const secondSending = send(stream, second).finally(() => second.fill(0))
   await turn()
@@ -179,54 +218,9 @@ test('private cell writes retain queued buffers until transport completion', asy
   stream.destroy()
 })
 
-test('pending entry commit excludes resolver admission', async (t) => {
-  let entryRelayPublicKey = null
-  let releaseCommit
-  let resolveCommitHeld
-  const commitHeld = new Promise((resolve) => {
-    resolveCommitHeld = resolve
-  })
-  const commitGate = new Promise((resolve) => {
-    releaseCommit = resolve
-  })
-  let holdCommit = true
-  const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
-    if (holdCommit && event.type === 'entry-commit-pending') {
-      holdCommit = false
-      entryRelayPublicKey = b4a.from(event.entryRelayPublicKey)
-      resolveCommitHeld()
-      return commitGate
-    }
-  })
-  t.teardown(restoreObserver)
-  t.teardown(() => releaseCommit())
-
-  const nodes = await network(t)
-  const source = nodes[0]
-  const destination = nodes[1]
-  const server = destination.privateRouting.createServer((socket) => socket.destroy())
-  t.teardown(() => server.close())
-  const listening = server.listen(HyperDHT.keyPair())
-  await commitHeld
-
-  const resolver = source.connect(entryRelayPublicKey, { keyPair: HyperDHT.keyPair() })
-  resolver.on('error', () => {})
-  t.is(await resolver.opened, true)
-  const response = readBytes(resolver, 1)
-  resolver.write(b4a.from([OP_RESOLVE]))
-  t.is(
-    (await response)[0],
-    STATUS_UNAVAILABLE,
-    'entry reservation rejects resolver before destination-key input'
-  )
-  resolver.destroy()
-
-  releaseCommit()
-  await listening
-  t.ok(server.listening)
-})
 function asyncReplies(values) {
   return {
+    closestReplies: values,
     destroy() {},
     async *[Symbol.asyncIterator]() {
       for (const value of values) yield value
@@ -265,12 +259,15 @@ test('blinded descriptors require quorum storage and exact readback', async (t) 
   )
 
   const dht = {
+    session() {
+      return { destroy() {} }
+    },
     register(name, plugin) {
       plugin.onregister(this)
     }
   }
   const descriptors = new OverlayDescriptorService(dht, null, () => now)
-  t.teardown(() => descriptors.plugin.destroy())
+  t.teardown(() => descriptors.destroy())
 
   descriptors.plugin.query = () => asyncReplies([{ value: wire }])
   t.is(
@@ -304,14 +301,9 @@ test('blinded descriptors require quorum storage and exact readback', async (t) 
     'fewer than three stored replicas cannot publish route state'
   )
 
-  let queries = 0
-  descriptors.plugin.query = () => {
-    queries++
-    return queries === 1
-      ? asyncReplies(storageCandidates)
-      : asyncReplies([{ value: wire }, { value: wire }])
-  }
-  descriptors.plugin.request = async () => {}
+  descriptors.plugin.query = () => asyncReplies(storageCandidates)
+  descriptors.plugin.request = async ({ command }) =>
+    command === DESCRIPTOR_COMMAND_GET ? { value: wire } : undefined
   t.is(await descriptors.put(wire), 3)
   wire.fill(0)
 })
@@ -367,92 +359,40 @@ test('private routing is an optional context on an ordinary HyperDHT node', asyn
   socket.end()
 })
 
+async function reserveLateCell(pool) {
+  const deadline = Date.now() + 10_000
+  while (pool.available === 0) {
+    if (Date.now() >= deadline) throw new Error('Idle circuit credit was not reclaimed')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  // Delayed DATA remains charged even after its logical stream is retired.
+  pool.available--
+  pool.inFlight++
+}
+
 test('private context multiplexes end-to-end Noise streams over transformed route cells', async (t) => {
   let lastSourceOpened = null
   const transformProof = { inbound: null, outbound: null, plaintext: null }
   let selectedSourceRoute = null
-  let latePayload = null
+  let retiredStreamId = null
   let lateLogicalFrame = null
-  let holdLateFrame = false
   let clientLogicalFrame = null
-  let holdClientFrame = false
-  let forcedDestinationGuard = null
-  let rejectedAdmissionRemoteKey = null
-  let rejectedIdentitySends = 0
-  let rejectedIdentityReceives = 0
-  let resolveHeldResolverReleased
   let resolveDestinationReset
-  let resolveLateFrameHeld
   let resolveLateFrameReceived
-  let resolveClientFrameHeld
   let resolveClientFrameReceived
-  let releaseLateFrame
-  let releaseClientFrame
   const destinationResetSeen = new Promise((resolve) => {
     resolveDestinationReset = resolve
-  })
-  const lateFrameHeld = new Promise((resolve) => {
-    resolveLateFrameHeld = resolve
   })
   const lateFrameReceived = new Promise((resolve) => {
     resolveLateFrameReceived = resolve
   })
-  const lateFrameGate = new Promise((resolve) => {
-    releaseLateFrame = resolve
-  })
-  const clientFrameHeld = new Promise((resolve) => {
-    resolveClientFrameHeld = resolve
-  })
   const clientFrameReceived = new Promise((resolve) => {
     resolveClientFrameReceived = resolve
   })
-  const clientFrameGate = new Promise((resolve) => {
-    releaseClientFrame = resolve
-  })
-  const heldResolverReleased = new Promise((resolve) => {
-    resolveHeldResolverReleased = resolve
-  })
-  const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
+  const observer = (event) => {
     if (event.type === 'source-route-selected') {
       selectedSourceRoute = event
       return
-    }
-    if (event.type === 'destination-relay-candidates' && forcedDestinationGuard !== null) {
-      return forcedDestinationGuard
-    }
-    if (
-      forcedDestinationGuard !== null &&
-      event.guardPublicKey &&
-      b4a.equals(event.guardPublicKey, forcedDestinationGuard)
-    ) {
-      if (event.type === 'destination-admission-attempt') {
-        rejectedAdmissionRemoteKey = b4a.from(event.remotePublicKey)
-      } else if (event.type === 'destination-identity-sent') {
-        rejectedIdentitySends++
-      } else if (event.type === 'destination-identity-received') {
-        rejectedIdentityReceives++
-      }
-    }
-    if (
-      event.type === 'resolver-released' &&
-      forcedDestinationGuard !== null &&
-      b4a.equals(event.guardPublicKey, forcedDestinationGuard)
-    ) {
-      resolveHeldResolverReleased()
-      return
-    }
-    if (
-      holdLateFrame &&
-      event.type === 'route-transform' &&
-      event.from === 'guard-destination' &&
-      event.to === 'guard-entry' &&
-      event.plaintext.byteLength > LOGICAL_HEADER_BYTES &&
-      event.plaintext[4] === LOGICAL_DATA
-    ) {
-      holdLateFrame = false
-      lateLogicalFrame = b4a.from(event.plaintext)
-      resolveLateFrameHeld()
-      return lateFrameGate
     }
     if (
       event.type === 'route-cell-opened' &&
@@ -462,19 +402,6 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     ) {
       resolveLateFrameReceived()
       return
-    }
-    if (
-      holdClientFrame &&
-      event.type === 'route-transform' &&
-      event.from === 'guard-entry' &&
-      event.to === 'guard-destination' &&
-      event.plaintext.byteLength > LOGICAL_HEADER_BYTES &&
-      event.plaintext[4] === LOGICAL_DATA
-    ) {
-      holdClientFrame = false
-      clientLogicalFrame = b4a.from(event.plaintext)
-      resolveClientFrameHeld()
-      return clientFrameGate
     }
     if (
       event.type === 'route-cell-opened' &&
@@ -491,6 +418,7 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
       event.plaintext.byteLength === 5 &&
       event.plaintext[4] === LOGICAL_RESET
     ) {
+      retiredStreamId = event.plaintext.readUInt32BE(0)
       resolveDestinationReset()
       return
     }
@@ -519,12 +447,10 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     ) {
       transformProof.outbound = b4a.from(event.cell)
     }
-  })
-  t.teardown(restoreObserver)
-  t.teardown(() => releaseLateFrame())
-  t.teardown(() => releaseClientFrame())
+  }
 
-  const nodes = await network(t)
+  const controllers = []
+  const nodes = await network(t, undefined, observer, (controller) => controllers.push(controller))
   const source = nodes[0]
   const destination = nodes[1]
   const serverKeyPair = HyperDHT.keyPair()
@@ -582,53 +508,6 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   currentTarget.fill(0)
   nextTarget.fill(0)
   stableTarget.fill(0)
-  const relayKeys = await server.controller.descriptors.discoverRelays()
-  const reverseOverlapRelay = relayKeys.find(
-    (relay) =>
-      !b4a.equals(relay, descriptor.destinationGuardPublicKey) &&
-      !b4a.equals(relay, descriptor.entryRelayPublicKey)
-  )
-  if (!reverseOverlapRelay) throw new Error('Missing reverse-overlap relay')
-  const heldResolver = source.connect(reverseOverlapRelay, {
-    keyPair: HyperDHT.keyPair()
-  })
-  heldResolver.on('error', () => {})
-  t.is(await heldResolver.opened, true)
-  const heldResolverStatus = readBytes(heldResolver, 1)
-  heldResolver.write(b4a.from([OP_RESOLVE]))
-  t.is((await heldResolverStatus)[0], STATUS_OK, 'resolver admission remains held before lookup')
-
-  forcedDestinationGuard = reverseOverlapRelay
-  t.is(
-    await code(() => server.controller._publish(server)),
-    'ERR_PRIVACY_UNAVAILABLE',
-    'admitted resolver rejects destination admission'
-  )
-  t.ok(rejectedAdmissionRemoteKey)
-  t.is(
-    b4a.equals(rejectedAdmissionRemoteKey, server.publicKey),
-    false,
-    'rejected destination admission authenticates only an ephemeral Noise identity'
-  )
-  t.is(rejectedIdentitySends, 0, 'rejection sends no destination identity bytes')
-  t.is(rejectedIdentityReceives, 0, 'resolver receives no destination identity bytes')
-  const heldResolverClosed = new Promise((resolve) => heldResolver.once('close', resolve))
-  heldResolver.destroy()
-  await Promise.all([heldResolverClosed, heldResolverReleased])
-  forcedDestinationGuard = null
-  const overlappingResolver = source.connect(descriptor.destinationGuardPublicKey, {
-    keyPair: HyperDHT.keyPair()
-  })
-  overlappingResolver.on('error', () => {})
-  t.is(await overlappingResolver.opened, true)
-  const resolverStatus = readBytes(overlappingResolver, 1)
-  overlappingResolver.write(b4a.from([OP_RESOLVE]))
-  t.is(
-    (await resolverStatus)[0],
-    STATUS_UNAVAILABLE,
-    'destination guard rejects resolver role before the destination key is sent'
-  )
-  overlappingResolver.destroy()
 
   const forgedRegistration = source.connect(descriptor.entryRelayPublicKey, {
     keyPair: HyperDHT.keyPair()
@@ -638,7 +517,7 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   const registrationStatus = readBytes(forgedRegistration, 1)
   forgedRegistration.write(
     b4a.concat([
-      b4a.from([OP_ENTRY_REGISTER]),
+      b4a.from([CONTROL_VERSION, OP_ENTRY_REGISTER]),
       descriptor.wire,
       b4a.alloc(ROUTE_CONTEXT_BYTES, 0x7b)
     ])
@@ -679,15 +558,20 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
     t.alike(data.subarray(0, payloads[index].byteLength), payloads[index])
   })
   t.is(accepted.length, 2, 'one destination circuit accepts two independent logical streams')
-  for (const socket of accepted) t.alike(socket.remotePublicKey, source.defaultKeyPair.publicKey)
-  latePayload = b4a.from('late response crosses reset')
-  holdLateFrame = true
-  sockets[0].write(latePayload)
-  await lateFrameHeld
+  for (let i = 0; i < accepted.length; i++) {
+    t.is(b4a.equals(accepted[i].remotePublicKey, source.defaultKeyPair.publicKey), false)
+  }
+  t.is(b4a.equals(accepted[0].remotePublicKey, accepted[1].remotePublicKey), false)
   const firstClosed = new Promise((resolve) => sockets[0].once('close', resolve))
   sockets[0].destroy()
   await Promise.all([firstClosed, destinationResetSeen])
-  releaseLateFrame()
+  const latePayload = b4a.from('authenticated late response after reset')
+  lateLogicalFrame = b4a.alloc(LOGICAL_HEADER_BYTES + latePayload.byteLength)
+  lateLogicalFrame.writeUInt32BE(retiredStreamId)
+  lateLogicalFrame[4] = LOGICAL_DATA
+  latePayload.copy(lateLogicalFrame, LOGICAL_HEADER_BYTES)
+  await reserveLateCell(server._route.sendPool)
+  await server._route.link.send(lateLogicalFrame)
   await lateFrameReceived
 
   const survivorPayload = b4a.from('sibling stream survives late peer data')
@@ -703,14 +587,25 @@ test('private context multiplexes end-to-end Noise streams over transformed rout
   sockets.push(third)
   t.is(await third.opened, true, 'replacement logical stream opens on the surviving circuit')
   t.is(accepted.length, 3)
-  const clientLatePayload = b4a.from('late client data crosses server reset')
-  holdClientFrame = true
-  third.write(clientLatePayload)
-  await clientFrameHeld
+  const clientLatePayload = b4a.from('authenticated late client data after server reset')
+  const retiredClientId = accepted[2].rawStream.streamId
   const thirdClosed = new Promise((resolve) => third.once('close', resolve))
   accepted[2].destroy()
   await thirdClosed
-  releaseClientFrame()
+  // The fixture owns this relay; inject authenticated hostile traffic through
+  // its actual link rather than granting observer callbacks a forwarding gate.
+  const entryController = controllers.find(
+    (controller) =>
+      controller.relayKeyPair &&
+      b4a.equals(controller.relayKeyPair.publicKey, descriptor.entryRelayPublicKey)
+  )
+  const entry = entryController.entryCircuits.get(b4a.toString(descriptor.routeToken, 'hex'))
+  clientLogicalFrame = b4a.alloc(LOGICAL_HEADER_BYTES + clientLatePayload.byteLength)
+  clientLogicalFrame.writeUInt32BE(retiredClientId)
+  clientLogicalFrame[4] = LOGICAL_DATA
+  clientLatePayload.copy(clientLogicalFrame, LOGICAL_HEADER_BYTES)
+  await reserveLateCell(entry.forwardPool)
+  await entry.link.send(clientLogicalFrame)
   await clientFrameReceived
 
   const reverseSurvivorPayload = b4a.from('sibling survives late client data')
@@ -772,13 +667,14 @@ test('private server firewall sees authenticated peer and suppresses connection'
   t.teardown(() => server.close())
   await server.listen(HyperDHT.keyPair())
 
-  const socket = source.privateRouting.connect(server.publicKey)
+  const clientKeyPair = HyperDHT.keyPair()
+  const socket = source.privateRouting.connect(server.publicKey, { keyPair: clientKeyPair })
   socket.on('error', () => {})
   const closed = new Promise((resolve) => socket.once('close', resolve))
   const opened = socket.opened
   t.alike(
     await firewallSeen,
-    source.defaultKeyPair.publicKey,
+    clientKeyPair.publicKey,
     'server policy receives the authenticated end-to-end Noise identity'
   )
   await closed

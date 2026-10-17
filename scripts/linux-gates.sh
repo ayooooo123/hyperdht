@@ -19,7 +19,13 @@
 #   namespace        namespace projection enforcement
 #   namespace:live   namespace live route with capture oracles
 #   peer:capture    peer-v3 fixed-cell and leak capture on distinct loopback hosts
-#   all              every gate above, in that order (default)
+#   peer:diversity  real non-loopback /24 diversity; intended C6 contract (opt-in)
+#   bench:netem      packet-level benchmark in a dedicated network namespace (opt-in)
+#   all              baseline gates above, excluding peer:diversity and bench:netem (default)
+#
+# peer:diversity requires the C6 established-tuple diversity implementation.
+# The current baseline lacks C6 and is not expected to pass; keep this explicit
+# gate out of `all` until integration, rather than disguising it as a skip.
 
 set -euo pipefail
 
@@ -69,7 +75,7 @@ for gate in "${gates[@]}"; do
     all)
       expanded+=(aggregate:node aggregate:bare process:node process:bare process:node:reverse process:bare:reverse process:node:punch process:bare:punch namespace namespace:live peer:capture)
       ;;
-    aggregate:node | aggregate:bare | process:node | process:bare | process:node:reverse | process:bare:reverse | process:node:punch | process:bare:punch | namespace | namespace:live | peer:capture)
+    aggregate:node | aggregate:bare | process:node | process:bare | process:node:reverse | process:bare:reverse | process:node:punch | process:bare:punch | namespace | namespace:live | peer:capture | peer:diversity | bench:netem)
       expanded+=("$gate")
       ;;
     *)
@@ -92,6 +98,8 @@ command_for() {
     namespace) echo 'npm run --silent test:private:namespace' ;;
     namespace:live) echo 'npm run --silent test:private:namespace:live' ;;
     peer:capture) echo 'npm run --silent test:private:peer:capture' ;;
+    peer:diversity) echo 'node test/e2e/c2/diversity/index.js' ;;
+    bench:netem) echo 'args=(--reps="${PR_BENCH_REPS:-3}" --cases="${PR_BENCH_CASES:-probe,ping,1mib,16mib,4x4mib}"); if [ -n "${PR_BENCH_OUT:-}" ]; then args+=(--out="$PR_BENCH_OUT"); fi; bash bench/private-routing/netem.sh "${args[@]}"' ;;
   esac
 }
 
@@ -112,6 +120,11 @@ for gate in "${expanded[@]}"; do
     --mount type=tmpfs,destination=/tmp \
     -e PR_ROLE_FATAL_LOG=/tmp/role-fatal.log \
     -e PR_CANDIDATE_ORDER="${PR_CANDIDATE_ORDER:-normal}" \
+    -e PR_NETEM_DELAY_MS="${PR_NETEM_DELAY_MS:-5}" \
+    -e PR_NETEM_LIMIT="${PR_NETEM_LIMIT:-100000}" \
+    -e PR_BENCH_REPS="${PR_BENCH_REPS:-3}" \
+    -e PR_BENCH_CASES="${PR_BENCH_CASES:-probe,ping,1mib,16mib,4x4mib}" \
+    -e PR_BENCH_OUT="${PR_BENCH_OUT:-}" \
     -w /app \
     "$image_tag" \
     bash -c "set -o pipefail; $(command_for "$gate"); code=\$?; if [ \$code -ne 0 ] && [ -s /tmp/role-fatal.log ]; then echo '--- role stacks ---'; cat /tmp/role-fatal.log; fi; exit \$code"; then

@@ -3,10 +3,12 @@
 const test = require('../helpers/pending')
 const network = require('../helpers/network')
 const { closePair } = network
-const { exchange } = require('../helpers/traffic')
+const { exchange, observeFlow } = require('../helpers/traffic')
 
 test('B1 multiplex-isolation: seventy sequential sessions do not exhaust a live sibling route', async (t) => {
   const h = await network(t)
+  const flow = observeFlow(h)
+  t.teardown(() => flow.close())
   const server = await h.listen()
   const sibling = await h.pair(server)
   const ids = new Set()
@@ -21,4 +23,5 @@ test('B1 multiplex-isolation: seventy sequential sessions do not exhaust a live 
     up: 49157,
     down: 32771
   })
+  flow.assertBounds(t, { streamCredit: false })
 })

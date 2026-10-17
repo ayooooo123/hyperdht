@@ -9,10 +9,8 @@ const b4a = require('b4a')
 
 const HyperDHT = require('../..')
 const { CELL_SIZE } = require('../../lib/private/cell-codec')
-const peerController = require('../../lib/private/private-peer-controller')
 const { readPcap, contains } = require('./process/pcap')
 
-const { TEST_ONLY_PRIVATE_PEER_OBSERVER } = peerController
 const PORT = 49400
 const HOSTS = Object.freeze([
   '127.70.1.1',
@@ -103,56 +101,87 @@ function readBytes(stream, expected) {
   })
 }
 if (process.platform !== 'linux') {
-  test('peer v3 Linux packet capture', (t) => {
-    t.pass('skipped: requires Linux packet capture')
-  })
+  test.skip('peer v3 Linux packet capture', () => {})
 } else {
+  const { createPrivatePeerTestScope } = require('./helpers/private-peer')
+
   test('peer v3 Linux packet capture', { timeout: 120000 }, async (t) => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'hyperdht-peer-v3-'))
     const captureFile = path.join(directory, 'peer-v3.pcap')
     const retainCapture = process.env.PR_RETAIN_CAPTURE === '1'
     const nodes = []
     let capture = null
-    const openedByLabel = new Map()
     const openedCells = new Map()
     const sealedCells = new Map()
+    const awaitingTransform = []
     const transforms = []
-    const restoreObserver = peerController[TEST_ONLY_PRIVATE_PEER_OBSERVER]((event) => {
+    const observationErrors = []
+    const scope = createPrivatePeerTestScope()
+    function recordCell(views, event, relay) {
+      const circuitId = b4a.toString(event.cell.subarray(12, 28), 'hex')
+      const key = [relay, event.label, circuitId, event.direction].join(':')
+      if (!views.has(key)) {
+        views.set(key, {
+          relay,
+          label: event.label,
+          circuitId,
+          direction: event.direction,
+          cells: []
+        })
+      }
+      const view = views.get(key)
+      view.cells.push(event.cell)
+      return view
+    }
+    const observer = (event) => {
+      if (event.role !== 'relay') return
+      const relay = b4a.toString(event.relayPublicKey, 'hex')
       if (event.type === 'route-cell-opened') {
-        openedByLabel.set(event.label, b4a.from(event.cell))
-        if (!openedCells.has(event.label)) openedCells.set(event.label, [])
-        openedCells.get(event.label).push(b4a.from(event.cell))
+        const view = recordCell(openedCells, event, relay)
+        awaitingTransform.push({ relay, view, event })
         return
       }
       if (event.type === 'route-transform') {
-        const inbound = openedByLabel.get(event.from)
-        if (inbound) {
-          transforms.push({
-            from: event.from,
-            to: event.to,
-            inbound,
-            plaintext: b4a.from(event.plaintext),
-            outbound: null
-          })
+        const matches = awaitingTransform.filter(
+          (row) =>
+            row.relay === relay &&
+            row.view.label === event.from &&
+            b4a.equals(row.event.plaintext, event.plaintext)
+        )
+        if (matches.length !== 1) {
+          observationErrors.push('ambiguous or missing opened view for ' + relay + ':' + event.from)
+          return
         }
+        const row = matches[0]
+        awaitingTransform.splice(awaitingTransform.indexOf(row), 1)
+        transforms.push({
+          relay,
+          from: event.from,
+          to: event.to,
+          inbound: row.event.cell,
+          inboundView: row.view,
+          plaintext: event.plaintext,
+          outbound: null
+        })
         return
       }
       if (event.type === 'route-cell-sealed') {
-        if (!sealedCells.has(event.label)) sealedCells.set(event.label, [])
-        sealedCells.get(event.label).push(b4a.from(event.cell))
-        for (let index = transforms.length - 1; index >= 0; index--) {
-          const transform = transforms[index]
-          if (
-            transform.outbound === null &&
-            transform.to === event.label &&
-            b4a.equals(transform.plaintext, event.plaintext)
-          ) {
-            transform.outbound = b4a.from(event.cell)
-            break
-          }
+        const view = recordCell(sealedCells, event, relay)
+        const matches = transforms.filter(
+          (row) =>
+            row.outbound === null &&
+            row.relay === relay &&
+            row.to === event.label &&
+            b4a.equals(row.plaintext, event.plaintext)
+        )
+        if (matches.length > 1) {
+          observationErrors.push('ambiguous transform for ' + relay + ':' + event.label)
+        } else if (matches.length === 1) {
+          matches[0].outbound = event.cell
+          matches[0].outboundView = view
         }
       }
-    })
+    }
 
     try {
       const boot = new HyperDHT({
@@ -167,14 +196,18 @@ if (process.platform !== 'linux') {
       const bootstrap = [{ host: HOSTS[0], port: PORT }]
       for (let index = 1; index < HOSTS.length; index++) {
         const relay = index >= 3
-        const node = new HyperDHT({
-          bootstrap,
-          host: HOSTS[index],
-          port: PORT,
-          ephemeral: false,
-          firewalled: !relay,
-          privateRouting: privateRouting(relay)
-        })
+        const node = scope.create(
+          () =>
+            new HyperDHT({
+              bootstrap,
+              host: HOSTS[index],
+              port: PORT,
+              ephemeral: false,
+              firewalled: !relay,
+              privateRouting: privateRouting(relay)
+            }),
+          { observer }
+        )
         nodes.push(node)
       }
       await Promise.all(nodes.slice(1).map((node) => node.ready()))
@@ -255,6 +288,7 @@ if (process.platform !== 'linux') {
         'ordinary DHT traffic sharing endpoint addresses carries no stable destination key'
       )
 
+      t.alike(observationErrors, [], 'forwarding observations identify unambiguous relay views')
       const bridgePairs = [
         ['source-safety-1-in', 'source-safety-1-out'],
         ['source-safety-2-in', 'source-safety-2-out'],
@@ -274,31 +308,53 @@ if (process.platform !== 'linux') {
           `${from} -> ${to} changes route-cell bytes`
         )
       }
-      const entryInbound = openedCells.get('entry-source') || []
-      const entryOutbound = sealedCells.get('entry-destination') || []
+      const entryInbound = Array.from(openedCells.values()).filter(
+        (view) => view.label === 'entry-source'
+      )
+      const entryOutbound = Array.from(sealedCells.values()).filter(
+        (view) => view.label === 'entry-destination'
+      )
       t.ok(
         entryInbound.length > 0 && entryOutbound.length > 0,
         'entry opens and reseals route cells'
       )
-      const outboundKeys = new Set(entryOutbound.map((cell) => b4a.toString(cell, 'hex')))
-      t.is(
-        entryInbound.some((cell) => outboundKeys.has(b4a.toString(cell, 'hex'))),
-        false,
-        'entry never forwards an unchanged route cell'
-      )
+      for (const inbound of entryInbound) {
+        const outbound = entryOutbound.filter((view) => view.relay === inbound.relay)
+        t.ok(outbound.length > 0, 'the same entry relay has a destination-leg view')
+        const outboundKeys = new Set(
+          outbound.flatMap((view) => view.cells.map((cell) => b4a.toString(cell, 'hex')))
+        )
+        t.is(
+          inbound.cells.some((cell) => outboundKeys.has(b4a.toString(cell, 'hex'))),
+          false,
+          'entry never forwards an unchanged route cell'
+        )
+      }
 
       sentinel.fill(0)
       payload.fill(0)
       await server.close()
     } finally {
-      if (capture) {
-        capture.kill('SIGKILL')
-        await new Promise((resolve) => capture.once('exit', resolve))
+      try {
+        if (capture && capture.exitCode === null && capture.signalCode === null) {
+          const exited = new Promise((resolve) => capture.once('exit', resolve))
+          capture.kill('SIGKILL')
+          await exited
+        }
+      } finally {
+        const destroyed = await Promise.allSettled(
+          nodes.reverse().map((node) => node.destroy({ force: true }))
+        )
+        scope.close()
+        if (retainCapture) t.comment(`peer capture retained at ${captureFile}`)
+        else fs.rmSync(directory, { recursive: true, force: true })
+        const failures = destroyed.filter((result) => result.status === 'rejected')
+        if (failures.length)
+          throw new AggregateError(
+            failures.map((result) => result.reason),
+            'peer capture node cleanup failed'
+          )
       }
-      restoreObserver()
-      await Promise.allSettled(nodes.reverse().map((node) => node.destroy({ force: true })))
-      if (retainCapture) t.comment(`peer capture retained at ${captureFile}`)
-      else fs.rmSync(directory, { recursive: true, force: true })
     }
   })
 }
