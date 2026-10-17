@@ -3,6 +3,7 @@
 const b4a = require('b4a')
 const {
   CAPACITY_CLASS,
+  CELL_CLASS,
   LINK_OPERATION,
   PROTOCOL_VERSION,
   ROLE,
@@ -177,6 +178,71 @@ function fakeClock(startTime = 1000n) {
         }
       }
     }
+  }
+}
+
+// Logical time must not outrun authenticated replies from the real native sockets.
+function nativeClockDriver(clock, endpoints) {
+  const idle = issuer.captureLinkControlProgress(endpoints)
+  return async (milliseconds) => {
+    clock.advance(milliseconds)
+    while (!idle()) await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+}
+
+async function withDelayedNativeControl(t, clock, milliseconds, setup) {
+  const NativeUDX = require('udx-native')
+  const createSocket = NativeUDX.prototype.createSocket
+  let armed = false
+  let pending = null
+  let resolveDelivery
+  const delivery = new Promise((resolve) => {
+    resolveDelivery = resolve
+  })
+  t.teardown(() => {
+    armed = false
+    if (!pending) return
+    clearTimeout(pending.timer)
+    pending.buffer.fill(0)
+    pending = null
+  })
+  NativeUDX.prototype.createSocket = function (options) {
+    const socket = createSocket.call(this, options)
+    const emit = socket.emit
+    socket.emit = function (event, ...args) {
+      const packet = args[0]
+      if (
+        !armed ||
+        event !== 'message' ||
+        !b4a.isBuffer(packet) ||
+        packet.byteLength !== 1200 ||
+        packet[1] !== CELL_CLASS.CONTROL
+      )
+        return emit.call(this, event, ...args)
+      armed = false
+      const receivedAt = clock.monotonicNow()
+      args[0] = b4a.from(packet)
+      pending = { buffer: args[0], timer: null }
+      pending.timer = setTimeout(() => {
+        pending = null
+        const deliveredAt = clock.monotonicNow()
+        emit.call(socket, event, ...args)
+        resolveDelivery({ receivedAt, deliveredAt })
+      }, milliseconds)
+      return true
+    }
+    return socket
+  }
+  try {
+    return {
+      fixture: await setup(),
+      delayNextControl() {
+        armed = true
+        return delivery
+      }
+    }
+  } finally {
+    NativeUDX.prototype.createSocket = createSocket
   }
 }
 
@@ -2587,6 +2653,8 @@ module.exports = {
   safetyIdentity,
   fixtureKeys,
   fakeClock,
+  nativeClockDriver,
+  withDelayedNativeControl,
   createBoundEndpoint,
   buildSignedGrant,
   buildVerifiedAd,

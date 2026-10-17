@@ -5,6 +5,7 @@ const b4a = require('b4a')
 
 const { cryptoSuite } = require('../../lib/private/crypto-suite')
 const { PrivateRouteError } = require('../../lib/private/errors')
+const { createCoherentClock } = require('../../lib/private/runtime-clock')
 const {
   CAPACITY_CLASS,
   RELAY_CAPABILITY,
@@ -159,6 +160,7 @@ function fakeClock() {
 function fixture(options = {}) {
   const issuer = endpointModule[TEST_ONLY_UDX_ADAPTER_ISSUER]
   const clock = options.clock || fakeClock()
+  const responderClock = options.responderClock || clock
   const local = identityFor(ROLE.SAFETY, 2)
   const configured = [
     endpoint('192.0.2.41', 49737),
@@ -238,9 +240,9 @@ function fixture(options = {}) {
           let capsResponder = capsResponders.get(endpointKey)
           if (!capsResponder) {
             capsResponder = createActiveChallengeResponderAuthority({
-              now: clock.wallNow,
-              setTimeout: clock.setTimer,
-              clearTimeout: clock.clearTimer,
+              now: responderClock.wallNow,
+              setTimeout: responderClock.setTimer,
+              clearTimeout: responderClock.clearTimer,
               crypto: { ...cryptoSuite, randomBytes: (size) => b4a.alloc(size, 0x5d) }
             })
             capsResponders.set(endpointKey, capsResponder)
@@ -254,7 +256,7 @@ function fixture(options = {}) {
               maximumResults: request.maximumResults
             }
             const cookie = capsResponder.issueCookie(query)
-            if (options.onCapsQueryResponse) options.onCapsQueryResponse()
+            if (options.onCapsQueryResponse) options.onCapsQueryResponse(cookie)
             const responseAdvertisements =
               options.incrementalDuplicateEvidence && host === configured[0].host
                 ? [guards[0]]
@@ -370,7 +372,9 @@ function fixture(options = {}) {
     send: datagrams.send.bind(datagrams),
     destroy: datagrams.destroy.bind(datagrams),
     monotonicDeadline:
-      options.reconnectDeadline === undefined ? 10_000 : Number(options.reconnectDeadline)
+      options.reconnectDeadline === undefined
+        ? Number(clock.monotonicNow()) + 10_000
+        : Number(options.reconnectDeadline)
   })
   const randomBytes = (size) => {
     if (options.onRandomBytes && io) options.onRandomBytes({ io, clock, size })
@@ -590,6 +594,155 @@ test('cold start authenticates CAPS through the Task2 cookie binding and encoded
     f.cleanup()
   }
 })
+
+for (const history of [
+  {
+    name: 'monotonic tick before wall tick',
+    warm: 'issuer',
+    wall: 1000,
+    next: 1000,
+    ns: 1_000_000n
+  },
+  {
+    name: 'wall tick before monotonic floor',
+    warm: 'validator',
+    wall: 1000,
+    next: 1001,
+    ns: 500_000n
+  },
+  {
+    name: 'issuer history before instantaneous rollback',
+    warm: 'issuer',
+    wall: 4000,
+    next: 3999,
+    ns: 0n
+  }
+]) {
+  test(`CAPS clock history pins through actual issuance and validation: ${history.name}`, async (t) => {
+    let wall = history.wall
+    let monoNs = 0n
+    const newClock = () => ({
+      ...fakeClock(),
+      ...createCoherentClock(
+        () => monoNs,
+        () => wall
+      )
+    })
+    const issuer = newClock()
+    const validator = newClock()
+    if (history.warm === 'issuer') issuer.wallNow()
+    else validator.wallNow()
+    await Promise.resolve()
+    wall = history.next
+    monoNs = history.ns
+    const expiries = []
+    const f = fixture({
+      configuredCount: 1,
+      onlyGuardAdvertisement: true,
+      clock: validator,
+      responderClock: issuer,
+      onCapsQueryResponse(cookie) {
+        expiries.push(cookie.cookieExpiresAtMs)
+      }
+    })
+    let transfer = null
+    try {
+      transfer = await f.io.start().catch((err) => {
+        t.fail(err.stack)
+        return null
+      })
+      if (!transfer) return
+      const moved = consumeBootstrapGuardPin(transfer)
+      transfer = null
+      try {
+        t.alike(
+          moved.pinnedGuard.advertisement,
+          f.guards[0].bytes,
+          'the authenticated guard is pinned'
+        )
+        t.alike(
+          f.calls.map((call) => call[2] || call[0]),
+          ['caps-query', 'caps-query', 'caps-retry', 'active-challenge', 'link', 'destroy'],
+          'the ordinary first-pin exchange completes without another attempt'
+        )
+        t.is(
+          f.openedLinkOptions.absoluteDeadline,
+          Number(history.ns / 1_000_000n) + 10_000,
+          'the original bootstrap deadline is retained'
+        )
+      } finally {
+        endpointModule.destroyGuardLeaseMaterial(moved.guardLeaseMaterial)
+        moved.candidateDirectory.destroy()
+      }
+    } finally {
+      t.comment(
+        `issued cookie expiries: ${expiries.join(', ')}; raw wall: ${wall}; monotonic ns: ${monoNs}`
+      )
+      if (transfer) revokeBootstrapGuardPin(transfer)
+      f.io.destroy()
+      f.cleanup()
+    }
+  })
+}
+
+for (const boundary of [
+  { name: 'expiry equality', jump: 5_000 },
+  { name: 'past expiry', jump: 5_001 },
+  { name: 'overlong after one-tick rollback', jump: -1 }
+]) {
+  for (const stage of ['query response', 'cookie retry']) {
+    test(`CAPS clock boundary rejects ${boundary.name} at ${stage}`, async (t) => {
+      let wall = 1000
+      const newClock = () => ({
+        ...fakeClock(),
+        ...createCoherentClock(
+          () => 0n,
+          () => wall
+        )
+      })
+      let jumped = false
+      const jump = () => {
+        if (jumped) return
+        jumped = true
+        wall += boundary.jump
+      }
+      const f = fixture({
+        configuredCount: 1,
+        onlyGuardAdvertisement: true,
+        clock: newClock(),
+        responderClock: newClock(),
+        onCapsQueryResponse() {
+          if (stage === 'query response') jump()
+        },
+        onSend({ request }) {
+          if (stage === 'cookie retry' && request.kind === 'caps-retry') jump()
+        }
+      })
+      let transfer = null
+      try {
+        await expectCodeAsync(
+          t,
+          async () => {
+            transfer = await f.io.start()
+          },
+          'ERR_PRIVATE_GUARD_UNAVAILABLE'
+        )
+        t.alike(
+          f.calls.map((call) => call[2] || call[0]),
+          stage === 'query response'
+            ? ['caps-query', 'destroy']
+            : ['caps-query', 'caps-query', 'caps-retry', 'destroy'],
+          'rejection precedes any active challenge or link and does not retry'
+        )
+        t.ok(f.destroyed, 'failed bootstrap relinquishes its send authority')
+      } finally {
+        if (transfer) revokeBootstrapGuardPin(transfer)
+        f.io.destroy()
+        f.cleanup()
+      }
+    })
+  }
+}
 
 test('Task2 CAPS integration rejects forged source cookies and wrong-role advertisements', async (t) => {
   for (const options of [{ forgeCapsSource: true }, { wrongRoleAdvertisement: true }]) {

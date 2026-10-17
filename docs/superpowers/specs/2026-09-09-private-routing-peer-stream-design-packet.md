@@ -7,8 +7,8 @@
 
 The [ratification record](#prerequisite-ratification), [transport specification](#transport-specification), and [semantic specification](#semantic-specification) below form the current integrated specifications, subject to the status above. The intervening review record preserves rejected drafts and earlier proof boundaries as history.
 
-the project owner directed the seat to own the remaining work. The choices below are the
-seat's design direction, not nine unanswered questions for the project owner. They do not
+The project owner directed the seat to own the remaining work. The choices below are the
+seat's design direction, not nine unanswered questions for the owner. They do not
 waive the existing reviewed-wire or external human cryptographic-review gates.
 The earlier packet's claim that legacy egress was ready after a few choices
 was wrong. This revision records the source constraints and the rejected parts
@@ -415,7 +415,7 @@ Main's final integration additionally resolved stale formula copies, offered-ver
 
 Retained evidence includes `peer-stream-final-integration-proof.json`, `peer-stream-handshake-admission-proof.json`, `peer-stream-legacy-scratch-proof.json`, `peer-stream-incremental-confirmation-proof.txt`, `peer-stream-final-correction-proof.json`, `peer-stream-final-correction-python-proof.json`, `peer-stream-proof-manifest.json`, the confirmation vectors, and the native boundary results cited below. `local://` proof citations refer to the ownership session evidence directory:
 
-`/Users/the project owner/.omp/agent/sessions/-.paseo-worktrees-12spyoi5-terrific-crocodile/2026-09-09T20-40-21-583Z_01a087e6-714f-71f9-825e-22a222e31292/local`
+`~/.omp/agent/sessions/-.paseo-worktrees-12spyoi5-terrific-crocodile/2026-09-09T20-40-21-583Z_01a087e6-714f-71f9-825e-22a222e31292/local`
 
 The runtime repair is separately published in [PR #54](https://github.com/ayooooo123/hyperdht/pull/54), merge `02bce1422de05c271260b1f37344d69dbe9afe23`. Accepted candidate, tested PR merge, and published merge share tree `c5aaa6c5b3b5fa1a85ff06d958c0602519787a46`. [Run34437120378](https://github.com/ayooooo123/hyperdht/actions/runs/34437120378) and the automatic [post-merge run34439259570](https://github.com/ayooooo123/hyperdht/actions/runs/34439259570) passed. The detailed119-file capture verification belongs to the former run, not to peer-stream privacy or a second downloaded bundle. Historical punch failure34435307484 remains unexplained; the cause-retention repair and later green runs do not waive it.
 
@@ -505,6 +505,24 @@ Active-candidate consumption explicitly requires the intended provenance kind: `
 
 The direct exchange is the live capability-bootstrap shape with v2 IDs/domains, not the signed link bootstrap envelope. Each object is wrapped as `magic u16=0xd301 | objectLength u16 | complete object | zero padding` to exactly1,200 bytes. Length is 8..1,196 and every padding byte must be zero. The unchanged wrapper magic is grounded at `lib/private/caps-responder.js:18-19` and `lib/private/udx-cell-endpoint.js:91-92`.
 
+**Native clock sampling (R59).** Each new `createCoherentClock` sample reads
+`BigInt(dateNow())` for wall time and `hrtimeBigint() / 1_000_000n` for monotonic
+time independently. Production supplies `Date.now` and `process.hrtime.bigint`.
+Adjacent readers share that pair until its microtask cache clears. There is no
+cross-sample projection, smoothing band, or rollback hold: prior sampling history
+cannot bias a new wall sample. This is not clock synchronization. Differently
+timed or already-cached samples can disagree, and genuine post-issuance rollback
+or remote-clock skew can still correctly reject an exchange.
+
+The guard-bootstrap `BootstrapIO` budget remains10,000ms; its CAPS cookie lifetime
+and strict future-expiry bound remain5,000ms. Expiry equality rejects. Cookie MACs,
+authenticated field binding, immutable local deadlines and all original retry
+caps are unchanged. Direct discovery retains its separately specified5,000ms
+operation bound below. Raw wall sampling grants no tolerance, deadline extension,
+or retry. Regression coverage uses actual cookie issuance and `BootstrapIO`
+validation for original and complementary sample histories and for expiry and
+post-issuance rollback rejection; paired-sample checks remain separate.
+
 `PEER_CAPS_QUERY_V2` body offsets are:
 
 `requestedMask u32@0 | randomTarget32@4 | queryNonce32@36 | maximumResults u8=1@68 | phase u8@69 | cookieExpiresAt u64@70 | returnCookie32@78`.
@@ -571,6 +589,24 @@ V2 LINK_OFFER/ACCEPT on these established links use outer-v0 DATAGRAM carriage a
 The canonical native link reply is expectation-driven: the pending authenticated OFFER's `extensionIndex` determines its exact shape. Index0 accepts only complete ACCEPT285. Indices1/2 accept only `complete ACCEPT285 | complete REDACTED_RESPONDER_PROOF410`, exactly695 bytes, in that order, as one raw outer-v0 DATAGRAM payload. There is no extra wrapper, padding, optional member, trailing byte, standalone proof send, or separate proof retry train. Decode both canonical members and verify both signatures plus every shared OFFER/advertisement/branch/circuit/generation/index/client-tail-key/client-nonce/R/F/C/transcript binding before adjacency adoption or EXTENDED publication. The proof expiry matches the exact accepted reverse partition as §2 defines. Wrong shape or either invalid member rejects the whole reply; it cannot create a partially adopted branch.
 
 The vector is one logical reply under the original eight-attempt owner: each attempt sends one1,200-byte cell; failures remain spent; retries reuse the byte-frozen vector and original physical reservation. All adjacency hashes and KDFs consume only complete OFFER432 and the ACCEPT285 member, never the695-byte vector or proof. The responder's bounded pending-OFFER cache owns695 bytes instead of285 at indices1/2, explicitly adding410 cache bytes per such row outside the bootstrap pool. On the initiator, the validated proof transfers once with the established-link owner into its adjacency runtime; `takePeerM3ExtensionProof` moves it once from a live index1/2 initiator runtime to the EXTENDED builder. Failure, expiry, or destruction erases untransferred proof bytes. The source receives proof bytes only inside EXTENDED; raw ACCEPT bytes, including the observed predecessor endpoint, never enter tail control. This changes neither the `LINK_ACCEPT8` partitions nor `532 + 48*N + 96*M`.
+
+**Native fixture clock coordination (R61).** The owner-cap and callback-sibling
+adjacency cases retain their original clock increments, operation deadlines,
+retry counts, capacities, accounting, and joined-retirement assertions. Between
+manual clock steps, they wait for their captured, still-live native control
+owners to finish both outstanding authenticated PONG challenges and control
+sends. A successful UDP send alone is not proof of a received response. The
+test-only progress reader neither samples clocks nor clears challenges, and a
+closed captured owner fails rather than disappearing from a rescanned set.
+
+The owner-cap regression delays one real native CONTROL receive, delivers its
+unchanged bytes through the original receiver, and requires logical time to
+remain unchanged while that delivery is held. All original admission, payload,
+and sibling-isolation assertions remain. This is fixture coordination, not a
+production heartbeat or clock-policy change; R59 raw-wall pairing is unchanged.
+The retained Bare reservation rejection, Bare isolated timeout, and Node sibling
+observations keep their separate attribution limits. This correction does not
+establish the causes of the separate Node admission or Bare READY1 failures.
 
 ### 4. Dedicated circuit and complete finalization
 

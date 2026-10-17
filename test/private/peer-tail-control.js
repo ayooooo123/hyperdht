@@ -72,6 +72,7 @@ const {
 } = require('../../lib/private/peer-ledger')
 const {
   fakeClock,
+  nativeClockDriver,
   authenticatedPeer,
   setupFourNodeNativeFixture,
   seed,
@@ -1820,11 +1821,16 @@ test('regression: an in-flight READY1 attempt at the deadline holds the duty unt
       payloadParametersDigest: seed(0x53)
     })
     const readyTail = await f.safety.tailStarted
-    // Attempts two through seven go out on their nominal 250ms schedule, keeping every
-    // link's acknowledgement lanes warm; the eighth and last is then dispatched and held
-    // in flight at the socket, so the stall never starves an ack window.
+    const advance = nativeClockDriver(clock, [
+      f.source.endpoint,
+      f.guard.endpoint,
+      f.safety.endpoint,
+      f.terminal.endpoint
+    ])
+    // Drain authenticated control replies between the unchanged warm-up ticks.
+    // The final two clock steps deliberately leave the eighth data send pending.
     for (let i = 0; i < 6; i++) {
-      clock.advance(250)
+      await advance(250)
       await settle()
     }
     holdNext = true

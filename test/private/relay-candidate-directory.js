@@ -897,15 +897,7 @@ test('wall rollback clears directory ownership and no generation or callback sur
   rolled.destroy()
 })
 
-test('runtime clock preserves sample coherence and exposes wall jumps to directory revocation', async (t) => {
-  const skew = runtimeClock()
-  const initialWall = skew.wallNow()
-  const initialMonotonic = skew.monotonicNow()
-  skew.advanceMonotonic(1)
-  await Promise.resolve()
-  t.is(skew.monotonicNow() - initialMonotonic, 1n)
-  t.is(skew.wallNow() - initialWall, 1n, 'one-millisecond sample skew cannot inflate a deadline')
-
+test('runtime clock exposes wall jumps to directory revocation', async (t) => {
   const forwardClock = runtimeClock()
   const forward = install(fixture(1, 1, forwardClock))
   forwardClock.jumpWall(40_000)

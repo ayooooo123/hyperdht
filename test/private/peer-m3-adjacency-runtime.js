@@ -39,6 +39,8 @@ const {
 } = require('../../lib/private/peer-m3-adjacency-runtime')
 const {
   fakeClock,
+  nativeClockDriver,
+  withDelayedNativeControl,
   seed,
   slotPool,
   branchSpent,
@@ -694,15 +696,27 @@ test('responder owner cap of 2 covers separate responder instances and distinct 
     staticSeed: 0xd5
   })
 
-  const third = await setupDistinctNativeNeighbor(fixture.f, {
+  const { fixture: third, delayNextControl } = await withDelayedNativeControl(
     t,
-    responder: secondResponder,
-    adoptedPeerRuntimes: fixture.adoptedPeerRuntimes,
-    port: 48534,
-    limits: fixture.limits,
-    keySeed: 0x80,
-    staticSeed: 0xd6
-  })
+    fixture.clock,
+    50,
+    () =>
+      setupDistinctNativeNeighbor(fixture.f, {
+        t,
+        responder: secondResponder,
+        adoptedPeerRuntimes: fixture.adoptedPeerRuntimes,
+        port: 48534,
+        limits: fixture.limits,
+        keySeed: 0x80,
+        staticSeed: 0xd6
+      })
+  )
+  const advance = nativeClockDriver(fixture.clock, [
+    fixture.f.localEndpoint,
+    fixture.f.peerEndpoint,
+    second.initiator.endpoint,
+    third.initiator.endpoint
+  ])
 
   const binding1 = readPeerEstablishedLinkBinding(
     fixture.f.peerNeighbor.established,
@@ -781,7 +795,7 @@ test('responder owner cap of 2 covers separate responder instances and distinct 
     opening3.catch(() => {})
     for (let attempt = 0; attempt < 8; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 5))
-      fixture.clock.advance(250)
+      await advance(250)
     }
     await opening3
   } catch (err) {
@@ -825,10 +839,17 @@ test('responder owner cap of 2 covers separate responder instances and distinct 
     true,
     'branch 1 teardown is acknowledged before responder ACK-cache retirement'
   )
+  const controlDelivery = delayNextControl()
   for (let tick = 0; tick < 20; tick++) {
     await new Promise((resolve) => setTimeout(resolve, 5))
-    fixture.clock.advance(250)
+    await advance(250)
   }
+  const { receivedAt, deliveredAt } = await controlDelivery
+  t.is(
+    deliveredAt,
+    receivedAt,
+    'logical time does not advance while native control delivery is held'
+  )
 
   const thirdBranch = await third.openBranch()
   const runtime3 = adoptPeerEstablishedLink(third.authority, thirdBranch.handle)
@@ -895,6 +916,10 @@ for (const [index, failure] of [
     })
     const original = adoptPeerEstablishedLink(fixture.localAuthority, fixture.handle)
     const originalPeer = fixture.adoptedPeerRuntimes[0]
+    const advance = nativeClockDriver(fixture.clock, [
+      fixture.f.localEndpoint,
+      fixture.f.peerEndpoint
+    ])
     const pool = slotPool(4)
     let rejectedRuntime = null
     let callbacks = 0
@@ -919,7 +944,7 @@ for (const [index, failure] of [
     const opening = asyncErrorCode(neighbor.openBranch({ activeCandidate: candidate }))
     for (let tick = 0; tick < 8; tick++) {
       await new Promise((resolve) => setTimeout(resolve, 5))
-      fixture.clock.advance(250)
+      await advance(250)
     }
     t.is(await opening, 'ERR_PRIVACY_UNAVAILABLE', 'no failed callback publishes an ACCEPT')
     t.ok(callbacks > 0, 'the authenticated OFFER reaches the failing adoption callback')
@@ -928,7 +953,7 @@ for (const [index, failure] of [
     }
     for (let tick = 0; tick < 20; tick++) {
       await new Promise((resolve) => setTimeout(resolve, 5))
-      fixture.clock.advance(250)
+      await advance(250)
     }
     t.is(
       readPeerBranchSlots(pool.branchSlots).live,
