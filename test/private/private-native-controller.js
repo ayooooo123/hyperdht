@@ -71,7 +71,7 @@ async function exchange(left, right, text) {
   return pending
 }
 
-async function topology(t, { legacyEgress = false } = {}) {
+async function topology(t, { legacyEgress = false, terminals = 1 } = {}) {
   // Three mask-9 relays all have a granted safety and terminal successor. Every
   // ordinary-directory guard choice can form a distinct three-hop native route.
   const network = await createTestnet(10, { host: '127.0.0.1' })
@@ -80,7 +80,7 @@ async function topology(t, { legacyEgress = false } = {}) {
     for (let index = controllers.length - 1; index >= 0; index--) await controllers[index].destroy()
     await network.destroy()
   })
-  const relays = network.nodes.slice(1, 5).map((dht) => ({
+  const relays = network.nodes.slice(1, 4 + terminals).map((dht) => ({
     ...endpoint(dht.address().port, TOPOLOGY_ROLE.SAFETY_GUARD),
     dht,
     grants: []
@@ -96,7 +96,9 @@ async function topology(t, { legacyEgress = false } = {}) {
   edge(relays[0], relays[1])
   edge(relays[1], relays[2])
   edge(relays[2], relays[0])
-  for (const relay of relays.slice(0, 3)) edge(relay, relays[3])
+  for (const relay of relays.slice(0, 3)) {
+    for (const terminal of relays.slice(3)) edge(relay, terminal)
+  }
   for (let index = 0; index < relays.length; index++) {
     const relay = relays[index]
     const controller = createPrivateNativeController({
@@ -635,7 +637,7 @@ test('native terminal refuses authenticated routes below the fixed reviewed prof
 
 test('native listener refresh and application admission share the source circuit ceiling', async (t) => {
   t.timeout(180_000)
-  const fixture = await topology(t)
+  const fixture = await topology(t, { terminals: 3 })
   const source = await fixture.source()
   const destination = await fixture.source()
   const localServer = source.controller.createServer()
