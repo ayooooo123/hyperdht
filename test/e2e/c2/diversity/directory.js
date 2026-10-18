@@ -126,6 +126,7 @@ module.exports = async function directory(t, h) {
   return {
     arm() {
       phase = 'private'
+      h.controller(h.source).descriptors.directoryExpiresAt = 0
     },
     evidence() {
       t.ok(injected, 'one real persistent responder injected the biased lookup response')

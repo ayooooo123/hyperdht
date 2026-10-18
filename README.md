@@ -72,7 +72,7 @@ const dht = new DHT({
     release: 'alpha',
     acknowledgeAlpha: true,
     mode: 'optional',
-    profile: 'standard',
+    profile: 'native-v2',
     relay: false
   }
 })
@@ -100,17 +100,17 @@ const relay = new DHT({
     release: 'alpha',
     acknowledgeAlpha: true,
     mode: 'optional',
-    profile: 'standard',
-    relay: true
-  }
+    profile: 'native-v2',
+    relay: true,
+    relayConfig
 })
 ```
 
 Every `privateRouting` field must be an own data property on an ordinary object.
-`profile` accepts `'standard'` (directory-sampled alpha) or `'native-v2'` (admitted
-native wire v3 relays; relay nodes supply `relayConfig` or load it via
-`hyperdht --private-routing-config <file>`). Accessors, inherited fields, unknown
-fields, `bootstrapEndpoints`, and endpoint host/port fields are rejected.
+`profile` accepts only `'native-v2'` (admitted native wire v3 relays; relay
+nodes supply `relayConfig` or load it via `hyperdht --private-routing-config <file>`).
+Accessors, inherited fields, unknown fields, `'standard'`, `bootstrapEndpoints`,
+and endpoint host/port fields are rejected.
 A private server selects distinct destination-guard and entry relays, builds a
 fixed-cell circuit to the entry, and publishes a signed, expiring descriptor
 from its guard. The descriptor is replicated to at least three DHT storage
@@ -184,7 +184,7 @@ are **not** anonymized by this option.
 
 `dht.privateRouting` is read-only and frozen:
 
-- `release === 'alpha'`, `mode === 'optional'`, `profile === 'standard'`, and
+- `release === 'alpha'`, `mode === 'optional'`, `profile === 'native-v2'`, and
   `relay` report the selected role.
 - `ready()` waits for private subsystem readiness; `dht.ready()` and
   `dht.fullyBootstrapped()` retain normal HyperDHT semantics.
