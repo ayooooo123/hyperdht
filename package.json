@@ -70,6 +70,8 @@
   },
   "overrides": {
     "sodium-native": "github:ayooooo123/sodium-native#562d642e1a78a8e124cf97bfbda77f01c02d1a7f",
+    "bare-assert": "1.2.0",
+    "bare-inspect": "3.1.4",
     "bare-type": "~1.1.1"
   },
   "devDependencies": {
