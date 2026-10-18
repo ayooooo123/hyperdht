@@ -28,7 +28,7 @@ function deferred() {
 }
 
 function turn() {
-  return new Promise((resolve) => setImmediate(resolve))
+  return new Promise((resolve) => setTimeout(resolve, 0))
 }
 
 async function waitFor(predicate) {
@@ -108,10 +108,10 @@ function createSession(options = {}) {
 
   function schedule() {
     if (state.revoked || state.timer !== null) return
-    state.timer = setImmediate(() => {
+    state.timer = setTimeout(() => {
       state.timer = null
       drain()
-    })
+    }, 0)
   }
 
   function drain() {
@@ -216,7 +216,7 @@ function createSession(options = {}) {
       if (state.revoked) return
       state.revoked = true
       state.events.push('revoke')
-      clearImmediate(state.timer)
+      clearTimeout(state.timer)
       state.timer = null
       state.incoming.length = 0
       if (state.onRevoke) state.onRevoke(error)

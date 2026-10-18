@@ -104,7 +104,6 @@
     "test:e2e:c2:capture:bare": "brittle-bare test/e2e/c2/capture/analyzer.test.js",
     "test:e2e:c2:native": "brittle test/e2e/c2/native.js",
     "test:e2e:c2:native:bare": "brittle-bare test/e2e/c2/native.js",
-    "test:e2e:c2:cloudflare": "brittle test/e2e/c2/cloudflare-workers.js",
     "analyze:private-sends": "node test/e2e/c2/capture/cli.js",
     "test:e2e:c2:diversity": "node test/e2e/c2/diversity/index.js",
     "bench:private-routing": "node bench/private-routing/index.js",

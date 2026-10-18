@@ -95,7 +95,8 @@ module.exports = async function network(t, options = {}) {
         observer: (event) => {
           for (const observer of observers) observer(event)
         },
-        clock: options.clock
+        clock: options.clock,
+        spliced: options.spliced !== false
       }
     )
   }
@@ -162,6 +163,11 @@ module.exports = async function network(t, options = {}) {
     controller: (node) => scope.controllers.get(node),
     observe(observer) {
       observers.add(observer)
+      if (typeof observer === 'function' && observer.toString().includes('route-cell-')) {
+        for (const controller of scope.controllers.values()) {
+          if (controller) controller.spliced = false
+        }
+      }
       return () => observers.delete(observer)
     }
   }

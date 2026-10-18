@@ -1171,12 +1171,11 @@ interfaces are not independent hosts/operators, and downstream tuple observation
 are local test evidence, not independent source certification or operator honesty.
 The privileged end-to-end run remains required after C6 integration.
 
-## Native v2 (`profile: 'native-v2'`) and temporary Cloudflare Worker e2e evidence
+## Native v2 (`profile: 'native-v2'`) e2e evidence
 
 ```sh
 npm run test:e2e:c2:native
 npm run test:e2e:c2:native:bare
-npm run test:e2e:c2:cloudflare
 ```
 
 The integrated branch completes the `native-v2` public controller
@@ -1215,13 +1214,3 @@ Exercised native and e2e verification on `darwin 25.5.0` (`arm64`, Node
   make-before-break registration refresh, live native send-owner capture
   reconciliation with zero differences across circuit/service/bootstrap
   categories, and explicit legacy egress with opt-out terminal refusal).
-- `npm run test:e2e:c2:cloudflare`: 1/1 test, 20/20 assertions passing. Deploys
-  5 temporary Cloudflare Workers (`source`, `guard`, `safety`, `terminal`,
-  `dest`) to `*.workers.dev`, routes a live 5-node `native-v2` private routing
-  topology through the temporary Cloudflare Workers (verified at Cloudflare
-  edge colo `MAD`, 159 private UDP datagrams and 97 fixed 1,200-byte cells
-  audited on the edge with HMAC-SHA256 transit receipts, zero destination key
-  or plaintext leaks on any relay Worker, and zero identical 1,101-byte
-  envelopes across `guard -> safety` vs `safety -> terminal` proving N-1
-  LIONESS per-hop transformation), and deletes all 5 temporary Workers on
-  teardown.

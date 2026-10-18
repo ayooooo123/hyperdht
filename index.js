@@ -102,8 +102,18 @@ class HyperDHT extends DHT {
           exposureReport: () => routing.controller.exposureReport(),
           connect: (remotePublicKey, connectOptions) =>
             routing.controller.connect(remotePublicKey, connectOptions),
-          createServer: (serverOptions, onconnection) =>
-            routing.controller.createServer(serverOptions, onconnection)
+          createServer: (serverOptions, onconnection) => {
+            if (routing.controller.snapshot().profile === 'native-v2') {
+              return routing.controller.createServer(serverOptions, onconnection)
+            }
+            if (typeof serverOptions === 'function') {
+              return routing.controller.createServer({}, serverOptions)
+            }
+            if (serverOptions && serverOptions.onconnection) {
+              onconnection = serverOptions.onconnection
+            }
+            return routing.controller.createServer(serverOptions, onconnection)
+          }
         })
       })
     }
@@ -626,29 +636,73 @@ function ownData(object, name) {
   return descriptor.value
 }
 
+function exactPrivateObject(object, fields) {
+  if (
+    object === null ||
+    typeof object !== 'object' ||
+    Object.getPrototypeOf(object) !== Object.prototype ||
+    Reflect.ownKeys(object).length !== fields.length
+  )
+    invalidPrivateOptions()
+  const copy = {}
+  for (const field of fields) copy[field] = ownData(object, field)
+  return copy
+}
+
 function privateRoutingOptions(opts) {
   if (opts === null || (typeof opts !== 'object' && typeof opts !== 'function')) return null
   if (!('privateRouting' in opts)) return null
   const value = ownData(opts, 'privateRouting')
-  const { validatePeerNativeOptions } = require('./lib/private/peer-native-config')
-  return validatePeerNativeOptions(value)
+  if (ownData(value, 'profile') === 'native-v2') {
+    const { validatePeerNativeOptions } = require('./lib/private/peer-native-config')
+    return validatePeerNativeOptions(value)
+  }
+  const options = exactPrivateObject(value, [
+    'release',
+    'acknowledgeAlpha',
+    'mode',
+    'profile',
+    'relay'
+  ])
+  if (
+    options.release !== 'alpha' ||
+    options.acknowledgeAlpha !== true ||
+    options.mode !== 'optional' ||
+    (options.profile !== 'standard' && options.profile !== 'spliced') ||
+    typeof options.relay !== 'boolean'
+  )
+    invalidPrivateOptions()
+  return options
 }
 
 function createPrivateRouting(options, dht) {
   if (!options || !dht) invalidPrivateOptions()
-  const { createPrivateNativeController } = require('./lib/private/private-native-controller')
-  try {
-    const controller = createPrivateNativeController({
-      dht,
-      config: options,
-      baseReady: () => DHT.prototype.fullyBootstrapped.call(dht)
-    })
-    return { controller }
-  } finally {
-    if (options.relayConfig) {
-      options.relayConfig.identityKeyPair.secretKey.fill(0)
+  if (options.profile === 'native-v2') {
+    const { createPrivateNativeController } = require('./lib/private/private-native-controller')
+    try {
+      const controller = createPrivateNativeController({
+        dht,
+        config: options,
+        baseReady: () => DHT.prototype.fullyBootstrapped.call(dht)
+      })
+      return { controller }
+    } finally {
+      if (options.relayConfig) {
+        options.relayConfig.identityKeyPair.secretKey.fill(0)
+      }
     }
   }
+  const { createPrivatePeerController } = require('./lib/private/private-peer-controller')
+  const controller = createPrivatePeerController({
+    dht,
+    keyPair: dht.defaultKeyPair,
+    relay: options.relay,
+    profile: options.profile,
+    baseReady: () => DHT.prototype.fullyBootstrapped.call(dht),
+    createDirectServer: (serverOptions) => new Server(dht, serverOptions),
+    connectDirect: (publicKey, connectOptions) => connect(dht, publicKey, connectOptions)
+  })
+  return { controller }
 }
 
 function mapLookup(node) {

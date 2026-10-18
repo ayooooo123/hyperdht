@@ -29,7 +29,7 @@ function poolTotal(pool) {
 }
 
 test('B1 R5: source reset reaches the peer, retires its ID, and late frames cannot affect siblings', async (t) => {
-  const h = await network(t)
+  const h = await network(t, { spliced: false })
   const server = await h.listen()
   const first = await h.pair(server)
   const firstId = Array.from(server._route.streams.keys())[0]

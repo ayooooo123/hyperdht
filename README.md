@@ -184,8 +184,8 @@ are **not** anonymized by this option.
 
 `dht.privateRouting` is read-only and frozen:
 
-- `release === 'alpha'`, `mode === 'optional'`, `profile === 'native-v2'`, and
-  `relay` report the selected role.
+- `release === 'alpha'`, `mode === 'optional'`, `profile` (`'standard'`,
+  `'spliced'`, or `'native-v2'`), and `relay` report the selected role.
 - `ready()` waits for private subsystem readiness; `dht.ready()` and
   `dht.fullyBootstrapped()` retain normal HyperDHT semantics.
 - `connect()` and `createServer()` select private peer routing explicitly.
@@ -276,8 +276,7 @@ scenarios, `npm run test:e2e:b1` and `npm run test:e2e:b1:bare` for the B1
 hardening and flow-control suite, `npm run test:e2e:c2:capture` and
 `npm run test:e2e:c2:capture:bare` for send-owner capture reconciliation,
 `npm run test:e2e:c2:native` and `npm run test:e2e:c2:native:bare` for the
-native-v2 end-to-end suite, and `npm run test:e2e:c2:cloudflare` for the live
-temporary Cloudflare Worker edge-node e2e suite. `npm run bench:private-routing`
+native-v2 end-to-end suite. `npm run bench:private-routing`
 prints a direct/alpha performance comparison. See
 [the C1 and C2 evidence guide](docs/private-routing-e2e.md) for topology,
 negative controls, benchmark definitions, and capture/diversity gates.
