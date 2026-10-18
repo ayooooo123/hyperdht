@@ -93,7 +93,7 @@
   "scripts": {
     "format": "prettier --write .",
     "test": "prettier --check . && node test/all.js",
-    "test:bare": "bare test/all.js",
+    "test:bare": "node -e \"const {spawnSync}=require('child_process');process.exit(spawnSync(require('bare-runtime')('bare'),['test/all.js'],{stdio:'inherit'}).status??1)\"",
     "test:generate": "brittle -r test/all.js test/*.js",
     "test:e2e": "node test/e2e.js",
     "test:e2e:bare": "bare test/e2e.js",

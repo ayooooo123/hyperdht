@@ -3,21 +3,11 @@
 const process = require('bare-process')
 const { createCoherentClock } = require('../../../lib/private/runtime-clock')
 
-let lastMono = null
-let lastWall = null
+const baseMono = process.hrtime.bigint() / 1_000_000n
+const baseWall = BigInt(Date.now())
 const clock = createCoherentClock(
   () => process.hrtime.bigint(),
-  () => {
-    const mono = process.hrtime.bigint() / 1_000_000n
-    let wall = BigInt(Date.now())
-    if (lastMono !== null) {
-      const expected = lastWall + (mono - lastMono)
-      if (expected - wall === 1n) wall = expected
-    }
-    lastMono = mono
-    lastWall = wall
-    return wall
-  }
+  () => baseWall + (process.hrtime.bigint() / 1_000_000n - baseMono)
 )
 
 module.exports = Object.freeze({
