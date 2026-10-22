@@ -1,0 +1,32 @@
+'use strict'
+
+const b4a = require('b4a')
+
+const CANONICAL_BODY_HEX = '0600000003000161030000000000000001000162070332353500016308000000020001'
+const CANONICAL_FRAME_HEX = `00000023${CANONICAL_BODY_HEX}`
+const CODEC_VECTOR_DIGEST_HEX = '9f8dbbe1bd5ed878b91eadf13d540e51382dc146e4b0cbd0ede2bda5189ec014'
+
+const AUDIT_VECTOR = Object.freeze({
+  closeMAC: 'b5e11b0dbd793e032465b1220f636c46e08f853bfd0aa655142c64a4e8389814',
+  destination: '040000000000000000000000007f400901a419',
+  nonce: '000102030405060708090a0b0c0d0e0f',
+  openMAC: 'f9b306d68ee0069868c44de79e224738df7b676dc9a304b9832de8fd61d83d58',
+  outboundDigest: '3f8f12b4a3182d95f559b9a65ebdda210d4eaa83df628475896f9739f6fe5dfd',
+  outboundPayload: `03083412cb00710949c209${'aa'.repeat(32)}`,
+  recordDigest: 'b1e117412e3a2eeca557cdc298ba9505839fd53c47f78c70731af0f4f011c64d',
+  replyDigest: '5b7215cc1fc9d6f7e0511c5e9fed22602d9f36050ab821809471cfebf3221955',
+  replyPayload: '03043412cb00710949c200',
+  source: '040000000000000000000000007f400401a414'
+})
+
+function canonicalValue() {
+  return { a: 1, b: 255n, c: b4a.from([0, 1]) }
+}
+
+module.exports = Object.freeze({
+  AUDIT_VECTOR,
+  CANONICAL_BODY_HEX,
+  CANONICAL_FRAME_HEX,
+  CODEC_VECTOR_DIGEST_HEX,
+  canonicalValue
+})

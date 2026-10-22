@@ -1,0 +1,127 @@
+name: Remote Mesh
+
+# Holds a mesh of runner peers open. Every member derives every other member's
+# key from the REMOTE_PEER_SECRET repository secret plus the run id, dials each
+# higher index once, and answers a report request, so one collector on a
+# workstation gets the whole pairwise matrix.
+#
+# This exists because private routes need peer-to-peer links, not just
+# workstation-to-peer links: a guard must reach a middle and a middle an exit.
+# Two runners are the endpoint pair; the rest are route candidates.
+#
+# The collector's key is not one of those derived keys. Every member holds the
+# shared secret, so a collector key derived from it would be a key every member
+# could mint, and no member could be told apart from the collector. The collector
+# keeps its secret on the workstation and passes only the matching public key, as
+# the coordinator_key input, which is public material by construction.
+#
+# Dispatch with scripts/remote-mesh.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      members:
+        description: Mesh size (2 to 12)
+        required: true
+        default: '10'
+      seconds:
+        description: How long each member stays open
+        required: true
+        default: '420'
+      settle:
+        description: Seconds every member waits before dialling
+        required: true
+        default: '45'
+      os:
+        description: Runner image
+        required: true
+        default: ubuntu-latest
+        type: choice
+        options:
+          - ubuntu-latest
+          - macos-latest
+      coordinator_key:
+        description: Hex public key of the collector allowed to connect (scripts/remote-peer.sh secret prints it)
+        required: true
+
+jobs:
+  member:
+    strategy:
+      fail-fast: false
+      matrix:
+        index: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Check inputs and skip unused slots
+        id: slot
+        shell: bash
+        env:
+          MEMBERS: ${{ inputs.members }}
+          SECONDS_INPUT: ${{ inputs.seconds }}
+          SETTLE_INPUT: ${{ inputs.settle }}
+          COORDINATOR_KEY: ${{ inputs.coordinator_key }}
+          INDEX: ${{ matrix.index }}
+        run: |
+          case "$MEMBERS" in
+            2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12) ;;
+            *) echo "members must be 2 to 12, got: $MEMBERS" >&2; exit 1 ;;
+          esac
+          for value in "$SECONDS_INPUT" "$SETTLE_INPUT"; do
+            case "$value" in
+              '' | *[!0-9]*) echo "seconds and settle must be whole numbers" >&2; exit 1 ;;
+            esac
+          done
+          if [ "$SECONDS_INPUT" -lt 60 ] || [ "$SECONDS_INPUT" -gt 1500 ]; then
+            echo "seconds must be 60 to 1500, got: $SECONDS_INPUT" >&2
+            exit 1
+          fi
+          if [ "$SETTLE_INPUT" -lt 5 ] || [ "$SETTLE_INPUT" -ge "$SECONDS_INPUT" ]; then
+            echo "settle must be 5 or more and below seconds" >&2
+            exit 1
+          fi
+          # A malformed pin is caught here rather than after the settle window: a
+          # member pinned to nonsense refuses the collector, and the run would look
+          # like a reachability failure instead of a typo. Whitespace is stripped
+          # first so this gate accepts exactly what identity.js accepts.
+          COORDINATOR_KEY="$(printf '%s' "$COORDINATOR_KEY" | tr -d '[:space:]')"
+          case "$COORDINATOR_KEY" in
+            '' | *[!0-9a-fA-F]*)
+              echo "coordinator_key must be hex" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#COORDINATOR_KEY}" -ne 64 ]; then
+            echo "coordinator_key must be 64 hex characters, got ${#COORDINATOR_KEY}" >&2
+            exit 1
+          fi
+          if [ "$INDEX" -le "$MEMBERS" ]; then
+            echo "wanted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "wanted=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        if: steps.slot.outputs.wanted == 'true'
+      - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
+        if: steps.slot.outputs.wanted == 'true'
+        with:
+          node-version: lts/*
+      - run: npm install
+        if: steps.slot.outputs.wanted == 'true'
+      - name: Hold mesh member open
+        if: steps.slot.outputs.wanted == 'true'
+        shell: bash
+        env:
+          REMOTE_PEER_SECRET: ${{ secrets.REMOTE_PEER_SECRET }}
+          REMOTE_PEER_COORDINATOR_KEY: ${{ inputs.coordinator_key }}
+          REMOTE_PEER_RUN_ID: ${{ github.run_id }}
+          MEMBER_INDEX: ${{ matrix.index }}
+          MEMBER_COUNT: ${{ inputs.members }}
+          MEMBER_SECONDS: ${{ inputs.seconds }}
+          MEMBER_SETTLE: ${{ inputs.settle }}
+        run: |
+          node test/remote-peer/mesh.js \
+            --index "$MEMBER_INDEX" \
+            --count "$MEMBER_COUNT" \
+            --seconds "$MEMBER_SECONDS" \
+            --settle "$MEMBER_SETTLE"
