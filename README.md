@@ -87,7 +87,7 @@ const server = dht.privateRouting.createServer(function (socket) {
 await server.listen(keyPair)
 
 const socket = dht.privateRouting.connect(keyPair.publicKey)
-socket.write('private peer payload')
+socket.write(Buffer.from('private peer payload'))
 ```
 
 Relay service is explicit. A node that contributes relay capacity uses the same
