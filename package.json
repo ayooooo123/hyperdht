@@ -5,7 +5,7 @@
   "main": "index.js",
   "browser": "browser.js",
   "bin": {
-    "hyperdht": "./bin.js"
+    "hyperdht": "bin.js"
   },
   "files": [
     "index.js",
@@ -15,10 +15,6 @@
     "lib/**/*.js"
   ],
   "imports": {
-    "#private-route-process": {
-      "bare": "./test/private/process/runtime-bare.js",
-      "default": "./test/private/process/runtime-node.js"
-    },
     "events": {
       "bare": "bare-events",
       "default": "events"
@@ -52,7 +48,7 @@
     "blind-relay": "1.6.1",
     "bogon": "^1.0.0",
     "compact-encoding": "^3.0.0",
-    "dht-rpc": "github:ayooooo123/dht-rpc#fe04496196ea2ce42d1de27b0f770b02d2a87cd5",
+    "dht-rpc": "https://codeload.github.com/ayooooo123/dht-rpc/tar.gz/fe04496196ea2ce42d1de27b0f770b02d2a87cd5",
     "hypercore-crypto": "^3.3.0",
     "hypercore-id-encoding": "^1.2.0",
     "hyperdht-address": "^1.0.1",
@@ -62,6 +58,7 @@
     "record-cache": "^1.1.1",
     "safety-catch": "^1.0.1",
     "signal-promise": "^1.0.3",
+    "sodium-native": "https://codeload.github.com/ayooooo123/sodium-native/tar.gz/562d642e1a78a8e124cf97bfbda77f01c02d1a7f",
     "sodium-universal": "^5.0.1",
     "streamx": "2.28.1",
     "udx-native": "1.20.7",
@@ -69,7 +66,7 @@
     "xache": "^1.1.0"
   },
   "overrides": {
-    "sodium-native": "github:ayooooo123/sodium-native#562d642e1a78a8e124cf97bfbda77f01c02d1a7f",
+    "sodium-native": "https://codeload.github.com/ayooooo123/sodium-native/tar.gz/562d642e1a78a8e124cf97bfbda77f01c02d1a7f",
     "bare-assert": "1.2.0",
     "bare-dns": "~2.1.4",
     "bare-inspect": "3.1.4",
@@ -100,27 +97,16 @@
     "test:e2e:generate": "brittle -r test/e2e.js test/e2e/*.js",
     "test:e2e:b1": "brittle test/e2e/b1/*.js",
     "test:e2e:b1:bare": "brittle-bare test/e2e/b1/*.js",
-    "test:e2e:c2:capture": "brittle test/e2e/c2/capture/analyzer.test.js",
-    "test:e2e:c2:capture:bare": "brittle-bare test/e2e/c2/capture/analyzer.test.js",
-    "test:e2e:c2:native": "brittle test/e2e/c2/native.js",
-    "test:e2e:c2:native:bare": "brittle-bare test/e2e/c2/native.js",
-    "analyze:private-sends": "node test/e2e/c2/capture/cli.js",
     "test:e2e:c2:diversity": "node test/e2e/c2/diversity/index.js",
     "bench:private-routing": "node bench/private-routing/index.js",
     "integration": "brittle test/integration/*.js",
-    "test:private:process:node": "brittle-node test/private/live-process-node.js",
-    "test:private:process:bare": "brittle-node test/private/live-process-bare.js",
-    "test:private:namespace": "brittle-node test/private/namespace-projection.js",
-    "test:private:namespace:live": "brittle-node test/private/live-namespace-node.js",
-    "test:private:peer:capture": "brittle-node test/private/live-peer-capture-node.js",
-    "test:private:linux-gates": "bash scripts/linux-gates.sh",
-    "test:remote:peer": "bash scripts/remote-peer.sh",
-    "test:remote:peer:local": "bash scripts/remote-peer.sh local",
     "end-to-end": "brittle test/end-to-end/*.js"
   },
   "author": "Mathias Buus (@mafintosh)",
   "license": "MIT",
   "directories": {
+    "doc": "docs",
+    "example": "examples",
     "lib": "lib",
     "test": "test"
   },
@@ -132,5 +118,6 @@
   "bugs": {
     "url": "https://github.com/holepunchto/hyperdht/issues"
   },
-  "homepage": "https://github.com/holepunchto/hyperdht#readme"
+  "homepage": "https://github.com/holepunchto/hyperdht#readme",
+  "type": "commonjs"
 }

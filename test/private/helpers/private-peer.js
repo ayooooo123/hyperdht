@@ -31,7 +31,7 @@ function createPrivatePeerTestScope() {
   }
 
   return Object.freeze({
-    create(createNode, { observer = null, clock, spliced } = {}) {
+    create(createNode, { observer = null, clock, spliced, controlLimits } = {}) {
       assertOpen()
       if (
         typeof createNode !== 'function' ||
@@ -56,7 +56,13 @@ function createPrivatePeerTestScope() {
               } catch {}
             }
       peer.createPrivatePeerController = (options) => {
-        const controller = original({ ...options, observer: observe, clock, spliced })
+        const controller = original({
+          ...options,
+          observer: observe,
+          clock,
+          spliced,
+          controlLimits
+        })
         captured.push(controller)
         return controller
       }

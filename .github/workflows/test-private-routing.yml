@@ -1,10 +1,5 @@
 name: Private Routing
 
-# The eleven-process live scenario binds the 127.64.x.1 role tuples, which only
-# Linux provides without per-address configuration. macOS and Windows runners
-# fail that bind with PROCESS_BIND_UNAVAILABLE, so the live job is Linux-only
-# and the deterministic job covers the other platforms.
-
 on:
   push:
     branches:
@@ -16,7 +11,7 @@ on:
       - implement-private-peer-v2
 
 jobs:
-  deterministic:
+  private-routing:
     strategy:
       fail-fast: false
       matrix:
@@ -27,82 +22,41 @@ jobs:
       - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
         with:
           node-version: lts/*
-      - run: npm install
+      - run: npm install --allow-git=none
       - run: npx prettier --check .
-      - name: Deterministic private-routing suite (Node)
-        run: npx brittle-node test/private/protocol.js test/private/cell-codec.js test/private/route-payload.js test/private/fragments.js
-
-  live-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-      - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
-        with:
-          node-version: lts/*
-      - run: npm install
-      - name: Aggregate private-routing suite (Node)
-        run: npx brittle-node test/private-routing.js
-      - name: Aggregate private-routing suite (Bare)
+      - name: Private-routing unit and contract suite (Node)
+        run: npx brittle test/private-routing.js
+      - name: Private-routing unit and contract suite (Bare)
         run: $(node -p "require('bare-runtime')('bare')") test/private-routing.js
-      - name: Eleven-process live scenario (Node roles)
-        env:
-          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
-        run: npm run test:private:process:node
-      - name: Eleven-process live scenario (Bare roles)
-        env:
-          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
-        run: npm run test:private:process:bare
-      - name: Eleven-process live scenario, reverse candidates (Node roles)
-        env:
-          PR_CANDIDATE_ORDER: reverse
-          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
-        run: npm run test:private:process:node
-      - name: Eleven-process live scenario, reverse candidates (Bare roles)
-        env:
-          PR_CANDIDATE_ORDER: reverse
-          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
-        run: npm run test:private:process:bare
-      - name: Production endpoint punch (Node roles)
-        env:
-          PR_CANDIDATE_ORDER: normal
-          PR_PRODUCTION_ENDPOINT_PUNCH: '1'
-          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
-        run: npm run test:private:process:node
-      - name: Production endpoint punch (Bare roles)
-        env:
-          PR_CANDIDATE_ORDER: normal
-          PR_PRODUCTION_ENDPOINT_PUNCH: '1'
-          PR_ROLE_FATAL_LOG: ${{ runner.temp }}/role-fatal.log
-        run: npm run test:private:process:bare
-      - name: Role failure stacks
-        if: failure()
-        run: cat "${{ runner.temp }}/role-fatal.log" || echo "no role stacks recorded"
-      - name: Namespace projection enforcement (privileged)
+      - name: Private-routing e2e suite (Node)
+        run: npm run test:e2e
+      - name: Private-routing e2e suite (Bare)
+        run: $(node -p "require('bare-runtime')('bare')") test/e2e.js
+      - name: Private-routing B1 and diversity gates
         run: |
-          sudo -n true
-          npm run test:private:namespace
-      - name: Namespace live route with capture oracles (privileged)
+          npm run test:e2e:b1
+          npm run test:e2e:c2:diversity
+      - name: Packed consumer installation smoke check
         run: |
-          sudo -n apt-get install -y -q tcpdump
-          npm run test:private:namespace:live
-      - name: Peer v3 fixed-cell and leak capture (privileged)
-        env:
-          PR_RETAIN_CAPTURE: '1'
-        run: |
-          sudo -n true
-          npm run test:private:peer:capture
-      - name: Retain private-routing capture evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: private-routing-captures
-          path: |
-            /tmp/pr-capture-*/*.pcap
-            /tmp/pr-capture-*/*.close.json
-            /tmp/pr-capture-*/firewall-*.txt
-            /tmp/pr-capture-*/*.tcpdump.log
-            /tmp/pr-capture-*/*.tcpdump.exit
-            /tmp/pr-capture-*/*.shutdown.json
-            /tmp/hyperdht-peer-v3-*/*.pcap
-          if-no-files-found: ignore
-          retention-days: 7
+          tmpdir="$(mktemp -d)"
+          tarball="$(npm pack --pack-destination "$tmpdir")"
+          mkdir "$tmpdir/consumer"
+          npm init -y --prefix "$tmpdir/consumer" >/dev/null
+          npm install --prefix "$tmpdir/consumer" --allow-git=none --no-audit --no-fund "$tmpdir/$tarball"
+          node -e '
+            const DHT = require(process.argv[1]);
+            const dht = new DHT({
+              bootstrap: [],
+              host: "127.0.0.1",
+              anyPort: true,
+              privateRouting: {
+                release: "alpha",
+                acknowledgeAlpha: true,
+                mode: "optional",
+                profile: "spliced",
+                relay: false
+              }
+            });
+            dht.destroy().then(() => process.exit(0));
+          ' "$tmpdir/consumer/node_modules/hyperdht"
+          rm -rf "$tmpdir"

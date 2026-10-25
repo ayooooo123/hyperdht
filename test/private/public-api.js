@@ -67,6 +67,16 @@ async function network(
   })
   await boot.ready()
   const bootstrap = [{ host: '127.0.0.1', port: boot.address().port }]
+  const boot2 = new HyperDHT({
+    bootstrap,
+    host: '127.0.0.1',
+    port: nextPort++,
+    ephemeral: false,
+    firewalled: false
+  })
+  await boot2.ready()
+  const bootStorage = new OverlayDescriptorService(boot, boot.defaultKeyPair.publicKey)
+  const boot2Storage = new OverlayDescriptorService(boot2, boot2.defaultKeyPair.publicKey)
   const original = peerController.createPrivatePeerController
   peerController.createPrivatePeerController = (options) => {
     const controller = original(options)
@@ -95,12 +105,17 @@ async function network(
   t.teardown(async () => {
     try {
       await Promise.allSettled(nodes.reverse().map((node) => node.destroy({ force: true })))
-      await boot.destroy({ force: true })
+      await Promise.allSettled([
+        bootStorage.destroy({ force: true }),
+        boot2Storage.destroy({ force: true })
+      ])
+      await Promise.allSettled([boot2.destroy({ force: true }), boot.destroy({ force: true })])
     } finally {
       scope.close()
     }
   })
   await Promise.all(nodes.map((node) => node.ready()))
+  await Promise.all([bootStorage.ready(), boot2Storage.ready()])
   await Promise.all(nodes.map((node) => node.privateRouting.ready()))
   return nodes
 }
@@ -302,8 +317,8 @@ test('blinded descriptors require quorum storage and exact readback', async (t) 
   )
 
   descriptors.plugin.query = () => asyncReplies(storageCandidates)
-  descriptors.plugin.request = async ({ command }) =>
-    command === DESCRIPTOR_COMMAND_GET ? { value: wire } : undefined
+  descriptors.plugin.request = async ({ command }, to) =>
+    command === DESCRIPTOR_COMMAND_GET ? { from: to, value: wire } : { from: to }
   t.is(await descriptors.put(wire), 3)
   wire.fill(0)
 })

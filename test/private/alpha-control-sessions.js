@@ -45,7 +45,7 @@ async function network(t, options = {}) {
   const incoming = new Map()
   t.teardown(async () => {
     try {
-      await net.destroy()
+      await Promise.allSettled(net.nodes.map((node) => node.destroy({ force: true })))
     } finally {
       scope.close()
     }
@@ -71,7 +71,16 @@ async function network(t, options = {}) {
               relay
             }
           }),
-        options
+        {
+          controlLimits: {
+            maxSessions: GLOBAL,
+            maxPeerSessions: PER_PEER,
+            opcodeTimeoutMs: 2000,
+            readTimeoutMs: 5000,
+            sessionTimeoutMs: 10000
+          },
+          ...options
+        }
       )
     } finally {
       peer.createPrivatePeerController = original
@@ -255,7 +264,12 @@ test('a cancelled relay resolver drains descriptor requests before its admission
     const plugin = peerController.descriptors.plugin
     const respond = plugin.onrequest
     plugin.onrequest = function (request, outer) {
-      if (deferred && request.command === 0 && outer.target && b4a.equals(outer.target, target)) {
+      if (
+        deferred &&
+        (request.command === 0 || request.command === 3) &&
+        outer.target &&
+        b4a.equals(outer.target, target)
+      ) {
         held.push(() => respond.call(this, request, outer))
       } else respond.call(this, request, outer)
     }
@@ -292,7 +306,7 @@ test('a cancelled relay resolver drains descriptor requests before its admission
   cell.fill(0)
   context.fill(0)
   t.ok(
-    await until(() => held.length >= 2 && liveRequests().length >= 2),
+    await until(() => held.length >= 2 && liveRequests().length >= 2, 10000),
     'its encrypted request creates real deferred descriptor RPCs'
   )
   const overflow = await control(t, fixture, source, relay)

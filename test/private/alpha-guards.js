@@ -15,7 +15,7 @@ async function network(t, observer = null) {
   const scope = createPrivatePeerTestScope()
   t.teardown(async () => {
     try {
-      await net.destroy()
+      await Promise.allSettled(net.nodes.map((node) => node.destroy({ force: true })))
     } finally {
       scope.close()
     }

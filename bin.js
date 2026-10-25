@@ -1,77 +1,19 @@
 #!/usr/bin/env node
 
-const process = require('process')
+const HyperDHT = require('./')
 
-if (require.main === module) {
-  main().catch(() => {
-    console.error('DHT startup failed')
-    process.exitCode = 1
-  })
-}
+const bootstrap = arg('bootstrap')
+const nodes = arg('node') ? '' : arg('nodes')
 
-async function main() {
-  if (process.argv[2] === 'grant') return runGrantTool(process.argv.slice(3))
-  const HyperDHT = require('./')
-  const bootstrap = arg('bootstrap')
-  const nodes = arg('node') ? '' : arg('nodes')
-  const isBootstrap = bootstrap === '' || (bootstrap !== null && bootstrap.startsWith('--'))
-  const configFile = arg('private-routing-config')
-  let privateRouting = null
+const isBootstrap = bootstrap === '' || (bootstrap !== null && bootstrap.startsWith('--'))
 
-  if (configFile !== null) {
-    try {
-      if (
-        isBootstrap ||
-        (Number(nodes) || 1) !== 1 ||
-        process.argv.filter((value) => value === '--private-routing-config').length !== 1
-      )
-        throw new Error()
-      privateRouting = loadPrivateRoutingConfig(configFile)
-    } catch {
-      console.error('Invalid private routing configuration')
-      process.exitCode = 1
-      return
-    }
-  }
-
-  if (isBootstrap) {
-    const port = Number(arg('port') || '0') || 49737
-    const host = arg('host')
-    if (!host) throw new Error('You need to specify --host <node ip>')
-    await startBootstrapNode(HyperDHT, port, host)
-  } else {
-    await startNodes(
-      HyperDHT,
-      Number(nodes) || 1,
-      bootstrap ? bootstrap.split(',') : undefined,
-      privateRouting
-    )
-  }
-}
-
-function loadPrivateRoutingConfig(path) {
-  const { PrivateRouteError } = require('./lib/private/errors')
-  try {
-    if (typeof path !== 'string' || path.length === 0 || path.startsWith('--')) throw new Error()
-    const { decodePeerNativeConfig } = require('./lib/private/peer-native-config')
-    return decodePeerNativeConfig(require('fs').readFileSync(path, 'utf8'))
-  } catch {
-    throw PrivateRouteError.INVALID_ROUTE()
-  }
-}
-
-// Experimental: offline two-authority topology grants for native relay
-// neighbors. See docs/superpowers/specs/2026-09-25-*-neighbor-admission-design.md.
-function runGrantTool(argv) {
-  const fs = require('fs')
-  const { GrantToolError, run } = require('./lib/private/grant-tool')
-  try {
-    console.log(run(argv, { readFile: (path) => fs.readFileSync(path, 'utf8') }))
-  } catch (err) {
-    if (err instanceof GrantToolError) console.error(err.message)
-    else console.error(err && err.code ? err.code : err)
-    process.exitCode = 1
-  }
+if (isBootstrap) {
+  const port = Number(arg('port') || '0') || 49737
+  const host = arg('host')
+  if (!host) throw new Error('You need to specify --host <node ip>')
+  startBootstrapNode(port, host)
+} else {
+  startNodes(Number(nodes) || 1, bootstrap ? bootstrap.split(',') : undefined)
 }
 
 function arg(name) {
@@ -80,7 +22,7 @@ function arg(name) {
   return i < process.argv.length - 1 ? process.argv[i + 1] : ''
 }
 
-async function startBootstrapNode(HyperDHT, port, host) {
+async function startBootstrapNode(port, host) {
   console.log('Starting DHT bootstrap node...')
 
   const node = HyperDHT.bootstrapper(port, host)
@@ -90,6 +32,7 @@ async function startBootstrapNode(HyperDHT, port, host) {
     console.log('Bootstrap node closed')
   })
 
+  node.log = true
   console.log('Bootstrap node bound to', node.address())
   console.log('Fully started Hyperswarm DHT bootstrap node')
 
@@ -98,7 +41,7 @@ async function startBootstrapNode(HyperDHT, port, host) {
   })
 }
 
-async function startNodes(HyperDHT, cnt, bootstrap, privateRouting) {
+async function startNodes(cnt, bootstrap) {
   console.log('Booting DHT nodes...')
 
   const port = Number(arg('port') || '0') || 0
@@ -107,36 +50,24 @@ async function startNodes(HyperDHT, cnt, bootstrap, privateRouting) {
 
   if (port && cnt !== 1) throw new Error('--port is only valid when running a single node')
 
-  try {
-    while (all.length < cnt) {
-      const options = { host, port, anyPort: !port, bootstrap }
-      if (privateRouting) {
-        options.privateRouting = privateRouting
-        options.ephemeral = false
-      }
-      const node = new HyperDHT(options)
-      const id = all.push(node) - 1
-      await node.ready()
-      if (privateRouting) await node.privateRouting.ready()
-      console.log('Node #' + id + ' bound to', node.address())
+  while (all.length < cnt) {
+    const node = new HyperDHT({ host, port, anyPort: !port, bootstrap })
+    await node.ready()
 
-      node.on('ephemeral', function () {
-        console.log('Node #' + id + ' is ephemeral', node.address())
-      })
+    const id = all.push(node) - 1
+    console.log('Node #' + id + ' bound to', node.address())
 
-      node.on('persistent', function () {
-        console.log('Node #' + id + ' is persistent, joining remote routing tables', node.address())
-      })
+    node.on('ephemeral', function () {
+      console.log('Node #' + id + ' is ephemeral', node.address())
+    })
 
-      node.on('close', function () {
-        console.log('Node #' + id + ' closed')
-      })
-    }
-  } catch (error) {
-    await Promise.allSettled(all.map((node) => node.destroy({ force: true })))
-    throw error
-  } finally {
-    if (privateRouting) privateRouting.relayConfig.identityKeyPair.secretKey.fill(0)
+    node.on('persistent', function () {
+      console.log('Node #' + id + ' is persistent, joining remote routing tables', node.address())
+    })
+
+    node.on('close', function () {
+      console.log('Node #' + id + ' closed')
+    })
   }
 
   console.log('Fully started ' + cnt + ' Hyperswarm DHT node' + (cnt === 1 ? '' : 's'))
@@ -149,5 +80,3 @@ async function startNodes(HyperDHT, cnt, bootstrap, privateRouting) {
     }
   })
 }
-
-module.exports = { loadPrivateRoutingConfig }

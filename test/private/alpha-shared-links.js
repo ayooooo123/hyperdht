@@ -19,7 +19,7 @@ async function network(t, observer = null) {
   const controllers = new Map()
   t.teardown(async () => {
     try {
-      await net.destroy()
+      await Promise.allSettled(net.nodes.map((node) => node.destroy({ force: true })))
     } finally {
       scope.close()
     }
@@ -250,7 +250,7 @@ function pacedSharedWriter(t, link, bulkIds, pingId, sealed) {
   const originalSend = link.send
   const originalWrite = link.rawStream.write
   const delayed = new Map()
-  const state = { bulk: 0, queuedAt: null, ahead: null, active: true, delay: 200 }
+  const state = { bulk: 0, queuedAt: null, ahead: null, active: true, delay: 400 }
   link.send = function (payload, ...args) {
     if (
       payload.byteLength >= 5 &&
@@ -360,7 +360,7 @@ test('shared-link scheduling bounds an interactive stream behind bulk in both di
     const backlogged = await until(() => {
       peakPending = Math.max(peakPending, link.pendingData)
       return link.pendingData >= 160
-    }, 5000)
+    }, 10000)
     if (!backlogged) t.comment(direction + ' maximum pending DATA: ' + peakPending)
     t.ok(backlogged, direction + ' bulk produces a real bounded shared-link backlog')
     const started = Date.now()

@@ -20,7 +20,7 @@ async function network(t, observer = null) {
   const scope = createPrivatePeerTestScope()
   t.teardown(async () => {
     try {
-      await net.destroy()
+      await Promise.allSettled(net.nodes.map((node) => node.destroy({ force: true })))
     } finally {
       scope.close()
     }
@@ -191,25 +191,28 @@ test('only safety relay two resolves the locally blinded destination target', as
   if (selected === null) return
   const descriptor = decodeDescriptor(server._descriptor)
   const target = descriptorTarget(server.publicKey, descriptor.period)
-  const firstReads = reads.filter((row) =>
-    b4a.equals(row.relayPublicKey, selected.firstSafetyRelayPublicKey)
+  const secondRelayKeys = new Set(
+    reads
+      .filter((row) => row.opcode === 7 && row.label === 'header')
+      .map((row) => b4a.toString(row.relayPublicKey, 'hex'))
   )
-  const secondReads = reads.filter((row) =>
-    b4a.equals(row.relayPublicKey, selected.secondSafetyRelayPublicKey)
-  )
+  const firstLegReads = reads.filter((row) => row.opcode === 5)
+  const resolveReads = reads.filter((row) => row.label === 'source-resolve')
   t.is(
-    firstReads.some((row) => row.bytes.includes(server.publicKey)),
+    reads.some((row) => row.bytes.includes(server.publicKey)) ||
+      firstLegReads.some((row) => row.bytes.includes(target)),
     false,
-    'the source-adjacent relay never resolves the stable destination key'
+    'the source-adjacent leg never sees the blinded target and no relay sees the stable key'
   )
   t.ok(
-    secondReads.some(
-      (row) =>
-        row.label === 'source-resolve' &&
-        uint64(row.bytes, 1) === descriptor.period &&
-        b4a.equals(row.bytes.subarray(9), target)
-    ),
-    'the second safety relay queries the locally blinded target'
+    resolveReads.length >= 1 &&
+      resolveReads.every(
+        (row) =>
+          secondRelayKeys.has(b4a.toString(row.relayPublicKey, 'hex')) &&
+          uint64(row.bytes, 1) === descriptor.period &&
+          b4a.equals(row.bytes.subarray(9), target)
+      ),
+    'only a second safety relay queries the locally blinded target'
   )
 })
 

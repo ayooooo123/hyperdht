@@ -90,7 +90,7 @@ async function network(t) {
       release()
       for (const query of queries) query.destroy()
       await Promise.all(services.map((service) => service.destroy()))
-      await net.destroy()
+      await Promise.allSettled(net.nodes.map((node) => node.destroy({ force: true })))
       target.fill(0)
       wire.fill(0)
       identity.secretKey.fill(0)

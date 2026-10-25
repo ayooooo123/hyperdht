@@ -19,7 +19,7 @@ async function network(t) {
   const controllers = new Map()
   t.teardown(async () => {
     try {
-      await net.destroy()
+      await Promise.allSettled(net.nodes.map((node) => node.destroy({ force: true })))
     } finally {
       scope.close()
     }
