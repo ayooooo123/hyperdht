@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "baseline",
+  "source_worktree": "hyperdht-private-routing-baseline",
+  "base_commit": "ab818f9e278d5f3452f95e916093f2b1414b7163",
+  "source_head": "ab818f9e278d5f3452f95e916093f2b1414b7163",
+  "source_branch": null,
+  "status": "historical",
+  "notes": [
+    "Historical detached baseline experiment for private routing.",
+    "Preserved tracked modifications including docs preservation notice."
+  ],
+  "history_patch": null,
+  "working_patch": "working.patch",
+  "files": [
+    {
+      "path": "docs/private-routing-migration.md",
+      "sha256": "f5cdb424fdc84a2043207535ba00ecd526fdc540043fc7bedbb27b6336d522ea"
+    },
+    {
+      "path": "lib/private/relay-candidate-directory.js",
+      "sha256": "83906a1ec02dde23542129a386b0cb084ed72bace825550d95ace613256b14f5"
+    },
+    {
+      "path": "test/private/process/role-runner.js",
+      "sha256": "93afc231faebbc32769e21d2abe243656a67355e90d7eb562f00a9425879fe4a"
+    }
+  ]
+}

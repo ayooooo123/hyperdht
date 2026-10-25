@@ -32,6 +32,7 @@ async function startBootstrapNode(port, host) {
     console.log('Bootstrap node closed')
   })
 
+  node.log = true
   console.log('Bootstrap node bound to', node.address())
   console.log('Fully started Hyperswarm DHT bootstrap node')
 

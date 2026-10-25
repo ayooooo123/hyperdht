@@ -1,0 +1,286 @@
+{
+  "schema_version": 1,
+  "recorded_on": "2026-09-05",
+  "accepted_tip_before_collection": "6468028d405fa573284ea96f9291be07f1332353",
+  "fork": "https://github.com/ayooooo123/hyperdht.git",
+  "refs": [
+    {
+      "branch": "cell-evidence",
+      "commit": "ce6c6961d50693ee0365fb95ad4f87ed5a1f1e38",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "cell-mapping",
+      "commit": "3219341bfa68096bb4826ee0b1ac6f381c8bb7cf",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "cell-punch",
+      "commit": "f0c42bd564a5cda13cda7d843e70f5b72771932d",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "dht-reflect",
+      "commit": "1f90ed50d356c789e2da6aa9de43c961ff7dfc50",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "dispatch-findings-record",
+      "commit": "938951be6a5e8b524263aa7e9db68add0f5a4970",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "dispatch-reaches-32-of-33",
+      "commit": "3be18d88a9511a41ab3933b039cd02ce31717877",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "dispatch-runtime-pin",
+      "commit": "5e30dac39d146dd0d33e6d3b83e352fa9bcb8c64",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "divergent-addressing-and-credential-split",
+      "commit": "c0b49e0d7e8f37a51cba360e85c79a5fc111aa7f",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "exit-dht-socket-agreement",
+      "commit": "8fa09f93e6251450e5d58d5ea8a355dc95bf5002",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "gate-c-surb-integration",
+      "commit": "6c307fa8edbd380be4ff9a6a1bce0c1fd926e903",
+      "already_on_origin": false,
+      "archive": "gate-c-surb",
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "ki10-blackhole-chain",
+      "commit": "7aeee57b59d5db63cda23f32bd29146d0f330fa9",
+      "already_on_origin": false,
+      "archive": "ki10-blackhole-history",
+      "reachable_from_accepted_before_collection": false
+    },
+    {
+      "branch": "ki7-advertised-address",
+      "commit": "c934e212fb63b36d197fb21685e0f139b293b394",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "ki7-bootstrap-path",
+      "commit": "bad6a803d57abf8506a7ce06d1316816e750bbd8",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "live-route-harness",
+      "commit": "7c572bedddc6531debd42fee0cbd1cb44e439bf9",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "liveness-expiry-punch",
+      "commit": "395c4490218a7bde3eace6f50132777c089a3eec",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "mesh-evidence",
+      "commit": "4133cd8eed15a0a0ddb3980847d6b93e586d05e0",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "mesh-plan-layers",
+      "commit": "c69035f78a6af3ab555acfa4ca3ddeb5fd8c4f0c",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "mesh-topology",
+      "commit": "9acd254594c64cdb84fec0ff5e9d4a5afc9e2074",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "nat-endpoint-finding",
+      "commit": "9b3dd897bcc2e3df166a171476875088066fe858",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "pr50-reviewed-continuation",
+      "commit": "ba1f87e4a79ba9417c2da38547fead2de5f67d8d",
+      "already_on_origin": false,
+      "archive": "pr50-history",
+      "reachable_from_accepted_before_collection": false
+    },
+    {
+      "branch": "private-presence-gate-d",
+      "commit": "2ac6b64381ec05fdfc886ee29f90bdfb991cd0b0",
+      "already_on_origin": false,
+      "archive": "presence-gate-d",
+      "reachable_from_accepted_before_collection": false
+    },
+    {
+      "branch": "private-routing-v1",
+      "commit": "6468028d405fa573284ea96f9291be07f1332353",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "production-nat-traversal",
+      "commit": "924fd55a53c58eae769e301cb0dd1d07ce2f85b3",
+      "already_on_origin": false,
+      "archive": "production-nat",
+      "reachable_from_accepted_before_collection": false
+    },
+    {
+      "branch": "punch-tag",
+      "commit": "e50e2c12fdc179e130ecf30cb3bc5b30ee9abd74",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "rebind-probe",
+      "commit": "9f16a0810dfaa2e3817eb4642f2d99321ec0db5f",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "remote-mesh",
+      "commit": "eb00808bdf5f6fab31a23a30572b779c389b5b99",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "remote-peer-evidence",
+      "commit": "1cab84802b85790ed763e20e7636899df92f9c0c",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "remote-peer-harness",
+      "commit": "1b81bbbc06a8e6ef8c8f522de33eaca5373dcb0c",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "remote-role-exit",
+      "commit": "9c39328110762cb37f30003162e07dc31ec7804e",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "remote-role-fidelity",
+      "commit": "27273a7a900a7ff39fd6a1db46bd4891cb2fba2f",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "route-transport-drain",
+      "commit": "4419ee273605df0351bee38a4736c741de596c50",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "setup-audit-retransmission",
+      "commit": "65f58316a102a557fe5f951de714e11379f8bd2f",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    },
+    {
+      "branch": "workstation-driven-dispatch",
+      "commit": "5535e069f0bd2ab335f6534475286e7483c39e05",
+      "already_on_origin": true,
+      "archive": null,
+      "reachable_from_accepted_before_collection": true
+    }
+  ],
+  "detached_archives": ["blackhole-isolation", "baseline"],
+  "external_archive": "handoff",
+  "external_histories": [
+    {
+      "source_checkout": "source-hyperdht",
+      "branch": "claude/hyperdht-hyperswarm-transports-71d7fn",
+      "commit": "b329b8b417183ac2e9438cfb2a3da1be561f40db",
+      "status": "historical",
+      "already_on_origin": true,
+      "reachable_from_accepted_before_collection": false,
+      "preservation": "Archive-only merge parent; four legacy Tor transport commits are retained without activating their code."
+    }
+  ],
+  "excluded_generated_files": [
+    "hyperdht-blackhole-isolation/choose.log",
+    "hyperdht-blackhole-isolation/hook.log"
+  ],
+  "missing_external_dependencies": ["/tmp/surb_vectors.txt"],
+  "preservation_commits": [
+    {
+      "archive": "gate-c-surb",
+      "local_branch": "gate-c-surb-integration",
+      "commit": "f709162842e5071718de698a82cdff4251ec606a"
+    },
+    {
+      "archive": "production-nat",
+      "local_branch": "production-nat-traversal",
+      "commit": "35672d0b1c7ec966091c274fa46a2e22fddbe4a4"
+    },
+    {
+      "archive": "presence-gate-d",
+      "local_branch": "private-presence-gate-d",
+      "commit": "aeeb16586210609da8ba0323be000390ac315b19"
+    },
+    {
+      "archive": "blackhole-isolation",
+      "local_branch": "archive/blackhole-isolation-2026-09-05",
+      "commit": "329c8c0ccfc6ecbbb253d60c6b31d2b5e8bd49c0"
+    },
+    {
+      "archive": "baseline",
+      "local_branch": "archive/private-routing-baseline-2026-09-05",
+      "commit": "80e3498d70da1d5ab007119415504bfb139362d6"
+    }
+  ],
+  "publication_branch": "private-routing-v1",
+  "history_policy": "Preserve original and local snapshot commits through an archive-only merge that leaves the accepted tree unchanged; do not activate rejected code."
+}

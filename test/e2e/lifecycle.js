@@ -1,0 +1,76 @@
+'use strict'
+
+const test = require('brittle')
+const network = require('./helpers/network')
+const { closed, deadline } = network
+const { exchange } = require('./helpers/traffic')
+
+test('lifecycle: suspend joins streams, refuses new work, and resume republishes', async (t) => {
+  const h = await network(t)
+  const server = await h.listen()
+  const pair = await h.pair(server)
+  await exchange(pair.client, pair.remote)
+  const closes = Promise.all([closed(pair.client), closed(pair.remote)])
+  await deadline(h.destination.suspend(), 'destination suspend')
+  await deadline(closes, 'suspended route close')
+  t.is(h.destination.privateRouting.status(), 'SUSPENDED')
+  t.is(server._route, null)
+  await h.source.suspend()
+  const rejected = h.track(h.source.privateRouting.connect(server.publicKey))
+  t.is(await deadline(rejected.opened, 'suspended connect'), false)
+  t.ok(h.errors.get(rejected).some((error) => error.code === 'ERR_PRIVACY_UNAVAILABLE'))
+  await h.source.resume()
+  await h.destination.resume()
+  t.is(h.destination.privateRouting.status(), 'READY')
+  const resumed = await h.pair(server)
+  t.alike(await exchange(resumed.client, resumed.remote, { id: 'resumed' }), {
+    up: 49157,
+    down: 32771
+  })
+  await h.destroy()
+  await h.destroy()
+  t.is(h.source.privateRouting.status(), 'DESTROYED')
+  t.is(h.destination.privateRouting.status(), 'DESTROYED')
+  h.oracle.assertNoDirect(h.source, h.destination)
+  t.pass('no destination UDP attempt through suspend, resume, or final join')
+})
+
+test('lifecycle: closing a listener joins an in-flight publication', async (t) => {
+  const h = await network(t)
+  const server = await h.listen()
+  const publication = server.controller._publish(server)
+  await deadline(Promise.allSettled([publication, server.close()]), 'publication and close join')
+  t.is(server.closed, true)
+  t.is(server._route, null, 'late publication cannot reinstall a route')
+  t.is(server._publishing, null)
+  t.is(server._refreshTimer, null)
+  await server.close()
+  t.absent(server.controller.servers.has(server))
+})
+
+test('lifecycle: suspension during route build rejects the pending connection', async (t) => {
+  const h = await network(t)
+  const server = await h.listen()
+  const pending = h.track(h.source.privateRouting.connect(server.publicKey))
+  await h.source.suspend()
+  t.is(await deadline(pending.opened, 'build cancellation'), false)
+  await deadline(closed(pending), 'cancelled build close')
+  await h.source.resume()
+  const pair = await h.pair(server)
+  t.alike(await exchange(pair.client, pair.remote), { up: 49157, down: 32771 })
+  h.oracle.assertNoDirect(h.source, h.destination)
+})
+
+test('lifecycle: suspension during data transfer joins both application streams', async (t) => {
+  const h = await network(t)
+  const server = await h.listen()
+  const pair = await h.pair(server)
+  const started = new Promise((resolve) => pair.remote.once('data', resolve))
+  const closes = Promise.all([closed(pair.client), closed(pair.remote)])
+  pair.client.write(require('b4a').alloc(65536, 0x47))
+  await deadline(started, 'data arrival')
+  await h.source.suspend()
+  await deadline(closes, 'active data cancellation')
+  t.ok(pair.client.destroyed && pair.remote.destroyed)
+  h.oracle.assertNoDirect(h.source, h.destination)
+})

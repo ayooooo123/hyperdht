@@ -1,0 +1,62 @@
+name: Private Routing
+
+on:
+  push:
+    branches:
+      - main
+      - implement-private-peer-v2
+  pull_request:
+    branches:
+      - main
+      - implement-private-peer-v2
+
+jobs:
+  private-routing:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-node@1a4442cacd436585916779262731d5b162bc6ec7 # v3.8.2
+        with:
+          node-version: lts/*
+      - run: npm install --allow-git=none
+      - run: npx prettier --check .
+      - name: Private-routing unit and contract suite (Node)
+        run: npx brittle test/private-routing.js
+      - name: Private-routing unit and contract suite (Bare)
+        run: $(node -p "require('bare-runtime')('bare')") test/private-routing.js
+      - name: Private-routing e2e suite (Node)
+        run: npm run test:e2e
+      - name: Private-routing e2e suite (Bare)
+        run: $(node -p "require('bare-runtime')('bare')") test/e2e.js
+      - name: Private-routing B1 and diversity gates
+        run: |
+          npm run test:e2e:b1
+          npm run test:e2e:c2:diversity
+      - name: Packed consumer installation smoke check
+        run: |
+          tmpdir="$(mktemp -d)"
+          tarball="$(npm pack --pack-destination "$tmpdir")"
+          mkdir "$tmpdir/consumer"
+          npm init -y --prefix "$tmpdir/consumer" >/dev/null
+          npm install --prefix "$tmpdir/consumer" --allow-git=none --no-audit --no-fund "$tmpdir/$tarball"
+          node -e '
+            const DHT = require(process.argv[1]);
+            const dht = new DHT({
+              bootstrap: [],
+              host: "127.0.0.1",
+              anyPort: true,
+              privateRouting: {
+                release: "alpha",
+                acknowledgeAlpha: true,
+                mode: "optional",
+                profile: "spliced",
+                relay: false
+              }
+            });
+            dht.destroy().then(() => process.exit(0));
+          ' "$tmpdir/consumer/node_modules/hyperdht"
+          rm -rf "$tmpdir"

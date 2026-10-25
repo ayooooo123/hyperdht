@@ -13,6 +13,8 @@ Built on top of [dht-rpc](https://github.com/mafintosh/dht-rpc).
 The Hyperswarm DHT uses a series of holepunching techniques to make sure connectivity works on most networks,
 and is mainly used to facilitate finding and connecting to peers using end to end encrypted Noise streams.
 
+> **ALPHA fork API:** An explicitly acknowledged `privateRouting` option adds a separate `dht.privateRouting` peer context. Ordinary `dht.connect()` and `dht.createServer()` remain direct and wire-compatible; only `dht.privateRouting.connect()` and `dht.privateRouting.createServer()` use fail-closed relay circuits with end-to-end Noise. Bootstrap, lookup/announce, immutable and mutable records, plugins, queries, pings, and routing-table maintenance keep their normal direct-overlay behavior and are **not anonymized**. This remains **alpha, not production anonymity**, until Linux privacy evidence and external human cryptographic review are complete; private Hyperswarm integration is not provided. See [ALPHA private peer routing](#alpha-private-peer-routing).
+
 ## Usage
 
 To try it out, first instantiate a DHT instance
@@ -57,6 +59,162 @@ socket.on('open', function () {
 // pipe it somewhere like any duplex stream
 process.stdin.pipe(socket).pipe(process.stdout)
 ```
+
+### ALPHA private peer routing
+
+Private routing is an optional context on an ordinary HyperDHT node. Normal
+`bootstrap` and routing-table discovery supply eligible route hops. No private
+bootstrap endpoint list, bind address, or advertised address is accepted.
+
+```js
+const dht = new DHT({
+  privateRouting: {
+    release: 'alpha',
+    acknowledgeAlpha: true,
+    mode: 'optional',
+    profile: 'spliced',
+    relay: false
+  }
+})
+
+await dht.ready()
+await dht.privateRouting.ready()
+
+const server = dht.privateRouting.createServer(function (socket) {
+  socket.pipe(socket)
+})
+
+await server.listen(keyPair)
+
+const socket = dht.privateRouting.connect(keyPair.publicKey)
+socket.write('private peer payload')
+```
+
+Relay service is explicit. A node that contributes relay capacity uses the same
+five fields with `relay: true` and cannot create or connect private application
+endpoints:
+
+```js
+const relay = new DHT({
+  privateRouting: {
+    release: 'alpha',
+    acknowledgeAlpha: true,
+    mode: 'optional',
+    profile: 'spliced',
+    relay: true
+  }
+})
+```
+
+Every `privateRouting` field must be an own data property on an ordinary object.
+`profile` accepts `'spliced'` (4-hop control admission paired with C-level
+`udxStream.relayTo()` data forwarding for full-rate streaming) or `'standard'`
+(4-hop control admission with per-hop 1,200-byte AEAD cell multiplexing).
+Accessors, inherited fields, unknown fields, `bootstrapEndpoints`, and endpoint
+host/port fields are rejected.
+
+A private server selects distinct destination-guard and entry relays, builds a
+fixed-cell circuit to the entry, and publishes a signed, expiring descriptor
+from its guard. The descriptor is replicated to at least three DHT storage
+nodes and accepted only after an exact two-reply readback quorum. Its wire
+contains a period-blinded signing key, relay identities, and an opaque route
+capability—not the stable destination identity, a destination transport key,
+or a dial address.
+
+A client resolves the descriptor through a first source safety relay that
+cannot reuse either destination role, then selects a distinct second source
+safety relay. The `standard` profile therefore compiles four distinct relay
+identities: two source-selected safety relays followed by the
+destination-selected entry and guard. Resolution is two-phase: the first
+safety relay proves it is not serving as a destination guard or entry, reserves
+the resolver role, and only then accepts the destination application key. A
+forced destination-role candidate rejects before that key is sent.
+
+Destination admission is also two-phase. The endpoint first authenticates with
+a fresh ephemeral Noise key and sends only the build opcode. A relay with an
+active resolver rejects at that point, before seeing application-key bytes.
+After reserving the destination role, the guard issues a random challenge; the
+endpoint signs a domain-separated binding of that challenge, the authenticated
+ephemeral peer, the guard identity, and its application key. Only then does the
+guard recover the signed previous descriptor and later perform descriptor GET
+and PUT operations. Initial publication, restart, and refresh therefore emit no
+descriptor-target storage traffic from the endpoint. The entry stages guard-
+authenticated registration but does not install it until the guard completes
+descriptor quorum publication and sends the commit marker.
+
+The entry multiplexes independent logical streams over the destination circuit.
+Every physical relay hop authenticates and opens each 1200-byte route cell,
+then reseals the payload with a fresh adjacent circuit key, nonce, circuit ID,
+and counter. A relay therefore transforms on-wire bytes rather than forwarding
+an unchanged transparent stream. The application Noise/SecretStream handshake
+remains end-to-end between the client and server application keys.
+
+Cell sends, receive buffers, deferred transformations, stream counts, frame
+counts, and byte totals are bounded. Every link charges independent peer-ledger
+budgets. Logical reset and close are stream-scoped and idempotent. The entry and
+destination reject reuse of admitted stream IDs and discard late in-flight
+DATA, so closing either side of one multiplexed stream cannot reset its siblings
+or the destination circuit.
+
+Alpha control version 7 requires both stream and shared-circuit credit before
+DATA is sent. The windows are 512 cells per stream and 2,048 cells per circuit,
+including unused grants and transmitted cells in the circuit pool. Credits
+return when SecretStream consumes raw encrypted bytes, not when a relay merely
+receives DATA or an application reads plaintext. These bounds cover additional
+private-routing buffering, not ordinary SecretStream atomic records (up to
+16,777,215 bytes) or application plaintext buffers. Alpha does not add a
+Noise-aware record-fragmentation adapter.
+
+Each link independently reserves 2,048 pending DATA jobs and 256 control slots;
+writes contain up to 64 cells with at most two transport batches in flight.
+Unused grants are reclaimed on close/reset, after 50 ms of honest writer idle,
+or immediately when stream credit is exhausted. The entry also enforces a
+five-second unused-grant/no-DATA-progress deadline. Already transmitted cells,
+including authenticated late DATA for a retired stream, remain charged until
+consumed or discarded. See [the e2e contract and evidence](docs/private-routing-e2e.md#control-version-7-flow-observations)
+for bounded demand accounting and the remaining integration gates.
+
+Route-only peer information is not added to the caller's routing table and is
+not used for a direct destination ping or dial. Missing, invalid, expired, or
+insufficiently diverse routes fail closed; there is no direct peer fallback.
+
+Ordinary `dht.connect()` and `dht.createServer()` always retain normal direct
+behavior when the optional context is configured. HyperDHT operations including
+bootstrap, lookup/announce, immutable and mutable records, plugins, queries,
+pings, and routing-table maintenance also retain direct-overlay behavior and
+are **not** anonymized by this option.
+
+`dht.privateRouting` is read-only and frozen:
+
+- `release === 'alpha'`, `mode === 'optional'`, `profile` (`'spliced'` or
+  `'standard'`), and `relay` report the selected role.
+- `ready()` waits for private subsystem readiness; `dht.ready()` and
+  `dht.fullyBootstrapped()` retain normal HyperDHT semantics.
+- `connect()` and `createServer()` select private peer routing explicitly.
+- `status()` returns `BOOTSTRAPPING`, `READY`, `SUSPENDED`, or `DESTROYED`.
+- `exposureReport()` reports the routing model and direct-destination-send trap
+  without exposing keys, addresses, or complete paths.
+- `createServer({ firewall })` evaluates the authenticated end-to-end Noise
+  public key. A refused peer is closed and is never emitted as a server
+  connection. Because the policy runs after Noise authentication, the initiator
+  can observe handshake completion before the refusal closes its stream.
+
+Suspension stops relay advertisement and closes live circuits; resume restarts
+advertisement and republishes listening-server route descriptors. `destroy()`
+closes private servers, relay advertisement, and pending route work with the
+DHT lifecycle.
+
+This remains an experimental alpha, not a production anonymity claim. Local
+Node/Bare behavior tests do not replace Linux packet-capture evidence or
+external cryptographic review.
+
+### Spliced data plane (`profile: 'spliced'`)
+
+Selecting `profile: 'spliced'` keeps the same 4-hop control plane (`Client -> S1 -> S2 -> Entry -> Guard -> Destination`), two-phase blinded descriptor admission, and `/24` IPv4 / `/48` IPv6 diversity verification as `'standard'`, then exchanges hop-local UDX stream identifiers over the encrypted control circuit and calls `udxStream.relayTo()` across each adjacent relay pair. Packet forwarding runs inside `libudx` in C without per-packet JavaScript cell re-wrapping, while end-to-end `NoiseSecretStream` encryption and authentication remain strictly between the client and server application keys and no endpoint IP or port is ever exposed beyond its adjacent hop.
+
+### Local private-routing evidence
+
+Run `npm test` and `npm run test:bare` for the unit and private-routing contract suites, `npm run test:e2e` and `npm run test:e2e:bare` for the hermetic end-to-end scenarios, `npm run test:e2e:b1` and `npm run test:e2e:b1:bare` for the B1 hardening and flow-control suite, and `npm run test:e2e:c2:diversity` for multi-subnet diversity verification. `npm run bench:private-routing` prints a direct vs private-routed throughput comparison.
 
 ## API
 
